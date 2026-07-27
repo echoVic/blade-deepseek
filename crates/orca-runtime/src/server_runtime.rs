@@ -10,13 +10,14 @@ use serde_json::Value;
 
 use crate::protocol;
 use crate::runtime_event_projector::RuntimeEventProjector;
-use crate::runtime_host::{
-    HostedOperationWriter, HostedTurnRequest, OperationHandle, OperationOutcome, RuntimeHost,
-    RuntimeHostError, RuntimeThreadHandle,
+use crate::runtime_host::HostedOperationWriter;
+use crate::server::surface_adapter::{
+    JsonlInteractionTransport, JsonlSurfaceAdapter, JsonlTransportTurn, PreparedJsonlTurn,
 };
 use crate::thread_store::{
-    SessionStore, StoredThreadItem, StoredThreadProjection, StoredThreadTurn, ThreadMetadataPatch,
-    ThreadStore, TurnItemsView,
+    SortDirection, StoredThreadItem, StoredThreadItemPage, StoredThreadProjection,
+    StoredThreadSearchPage, StoredThreadSummaryPage, StoredThreadTurn, StoredThreadTurnPage,
+    ThreadListFilters, ThreadMetadataPatch, ThreadSortKey, TurnItemsView,
 };
 pub use orca_core::config::{
     ActivePermissionProfile, AdditionalWorkingDirectory, PermissionProfileNetworkAccess,
@@ -26,8 +27,8 @@ use orca_core::thread_identity::TurnId;
 use orca_mcp::McpRegistry;
 
 pub struct ServerThreadRuntime {
-    host: Option<RuntimeHost>,
-    threads: HashMap<String, ServerThread>,
+    adapter: JsonlSurfaceAdapter,
+    transport_turns: Vec<JsonlTransportTurn>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -112,32 +113,66 @@ impl PermissionRuleValue {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ServerThreadTurn {
-    prompt: String,
-}
-
-pub struct ServerThread {
-    handle: RuntimeThreadHandle,
-    title: String,
-    cwd: String,
-    runtime_workspace_roots: Vec<std::path::PathBuf>,
-    active_permission_profile: Option<ActivePermissionProfile>,
-    additional_working_directories: Vec<AdditionalWorkingDirectory>,
-    network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
-}
-
 pub(crate) struct ServerThreadSubmissionContext {
     pub(crate) cwd: String,
     pub(crate) runtime_workspace_roots: Vec<std::path::PathBuf>,
     pub(crate) mcp_registry: McpRegistry,
 }
 
+pub struct ServerThreadView {
+    cwd: String,
+    runtime_workspace_roots: Vec<std::path::PathBuf>,
+    active_permission_profile: Option<ActivePermissionProfile>,
+    additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
+    mcp_registry: McpRegistry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServerThreadTurn {
+    prompt: String,
+}
+
+impl ServerThreadTurn {
+    pub fn new(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+        }
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+}
+
+impl ServerThreadView {
+    pub fn additional_working_directories(&self) -> &[AdditionalWorkingDirectory] {
+        &self.additional_working_directories
+    }
+
+    pub fn active_permission_profile(&self) -> Option<&ActivePermissionProfile> {
+        self.active_permission_profile.as_ref()
+    }
+
+    pub fn runtime_workspace_roots(&self) -> &[std::path::PathBuf] {
+        &self.runtime_workspace_roots
+    }
+
+    pub fn network_domain_permissions(&self) -> &HashMap<String, PermissionProfileNetworkAccess> {
+        &self.network_domain_permissions
+    }
+
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    pub fn mcp_registry(&self) -> &McpRegistry {
+        &self.mcp_registry
+    }
+}
+
 pub(crate) struct PreparedServerTurn {
-    thread_id: String,
-    turn_id: TurnId,
-    config: RunConfig,
-    handle: RuntimeThreadHandle,
+    inner: PreparedJsonlTurn,
 }
 
 #[derive(Clone, Default)]
@@ -168,394 +203,48 @@ impl Write for SharedTurnOutput {
     }
 }
 
-impl ServerThreadTurn {
-    pub fn new(prompt: impl Into<String>) -> Self {
-        Self {
-            prompt: prompt.into(),
-        }
-    }
-
-    pub fn prompt(&self) -> &str {
-        &self.prompt
-    }
-}
-
-impl ServerThread {
-    fn from_handle(
-        handle: RuntimeThreadHandle,
-        run_config: &RunConfig,
-        title: impl Into<String>,
-        network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
-    ) -> io::Result<Self> {
-        let cwd = run_config
-            .cwd
-            .clone()
-            .unwrap_or(std::env::current_dir()?)
-            .display()
-            .to_string();
-        Ok(Self {
-            handle,
-            title: title.into(),
-            runtime_workspace_roots: run_config
-                .runtime_workspace_roots
-                .clone()
-                .unwrap_or_else(|| vec![std::path::PathBuf::from(&cwd)]),
-            cwd,
-            active_permission_profile: run_config.active_permission_profile.clone(),
-            additional_working_directories: run_config.additional_working_directories.clone(),
-            network_domain_permissions,
-        })
-    }
-
-    pub fn thread_id(&self) -> &str {
-        self.handle.thread_id()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn jsonl_surface(&self) -> Option<crate::surface::RuntimeSurfaceHandle> {
-        self.handle.jsonl_surface()
-    }
-
-    pub fn active_task_id(&self) -> Option<String> {
-        self.handle
-            .snapshot()
-            .ok()
-            .and_then(|snapshot| snapshot.active_task_id().map(ToString::to_string))
-    }
-
-    pub fn run_turn<W: Write>(
-        &mut self,
-        config: &RunConfig,
-        prompt: &str,
-        writer: W,
-    ) -> io::Result<()> {
-        self.run_turn_request(config, &ServerThreadTurn::new(prompt), writer)
-    }
-
-    pub fn run_turn_request<W: Write>(
-        &mut self,
-        config: &RunConfig,
-        turn: &ServerThreadTurn,
-        mut writer: W,
-    ) -> io::Result<()> {
-        let prepared =
-            self.prepare_turn(config, turn.prompt(), PermissionProfileOverride::default())?;
-        let output = SharedTurnOutput::default();
-        let operation = prepared.start(
-            HostedTurnRequest::new(turn.prompt()).with_wait_for_background_workflows(false),
-            output.clone(),
-        )?;
-        let terminal = operation.wait();
-        writer.write_all(&output.bytes())?;
-        operation_outcome_result(terminal.outcome())
-    }
-
-    fn prepare_turn(
-        &mut self,
-        config: &RunConfig,
-        prompt: &str,
-        permissions: PermissionProfileOverride,
-    ) -> io::Result<PreparedServerTurn> {
-        if self.handle.state().map_err(runtime_host_error)?
-            != crate::runtime_host::RuntimeThreadState::Idle
-        {
-            return Err(io::Error::other(format!(
-                "thread is not idle: {}",
-                self.thread_id()
-            )));
-        }
-        let turn_id = TurnId::new();
-        let mut run_config = thread_run_config(config);
-        run_config.prompt = prompt.to_string();
-        run_config.additional_working_directories = self.additional_working_directories.clone();
-        if run_config.runtime_workspace_roots.is_none() {
-            run_config.runtime_workspace_roots = Some(self.runtime_workspace_roots.clone());
-        }
-        if !permissions.is_empty() {
-            apply_permission_override(&mut run_config, permissions);
-            persist_permission_profile(&run_config, self.thread_id())?;
-        }
-        self.active_permission_profile = run_config.active_permission_profile.clone();
-        self.runtime_workspace_roots = run_config
-            .runtime_workspace_roots
-            .clone()
-            .unwrap_or_else(|| vec![std::path::PathBuf::from(&self.cwd)]);
-        self.additional_working_directories = run_config.additional_working_directories.clone();
-        Ok(PreparedServerTurn {
-            thread_id: self.thread_id().to_string(),
-            turn_id,
-            config: run_config,
-            handle: self.handle.clone(),
-        })
-    }
-
-    pub fn read_projection(
-        &self,
-        include_messages: bool,
-        include_turns: bool,
-    ) -> Option<StoredThreadProjection> {
-        let snapshot = self.handle.snapshot().ok()?;
-        let messages = if include_messages {
-            snapshot
-                .messages()
-                .iter()
-                .map(crate::thread_store::message_to_thread_json)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let turns = if include_turns {
-            if let Some(records) = snapshot.conversation_records() {
-                crate::thread_store::conversation_records_to_thread_turns(
-                    self.thread_id(),
-                    records,
-                    usize::MAX,
-                    TurnItemsView::Full,
-                )
-                .ok()?
-            } else {
-                crate::thread_store::messages_to_thread_turns(
-                    self.thread_id(),
-                    snapshot.messages(),
-                    usize::MAX,
-                    TurnItemsView::Full,
-                )
-            }
-        } else {
-            Vec::new()
-        };
-        Some(StoredThreadProjection {
-            thread_id: self.thread_id().to_string(),
-            title: self.title.clone(),
-            cwd: self.cwd.clone(),
-            runtime_workspace_roots: self.runtime_workspace_roots.clone(),
-            active_permission_profile: self.active_permission_profile.clone(),
-            additional_working_directories: self.additional_working_directories.clone(),
-            network_domain_permissions: self.network_domain_permissions.clone(),
-            message_count: snapshot.messages().len(),
-            messages,
-            turns,
-        })
-    }
-
-    pub fn list_turns(
-        &self,
-        cursor: Option<&str>,
-        limit: usize,
-        sort_direction: crate::thread_store::SortDirection,
-        items_view: TurnItemsView,
-    ) -> Option<crate::thread_store::StoredThreadTurnPage> {
-        let snapshot = self.handle.snapshot().ok()?;
-        let turns = if let Some(records) = snapshot.conversation_records() {
-            crate::thread_store::conversation_records_to_thread_turns(
-                self.thread_id(),
-                records,
-                usize::MAX,
-                items_view,
-            )
-            .ok()?
-        } else {
-            crate::thread_store::messages_to_thread_turns(
-                self.thread_id(),
-                snapshot.messages(),
-                usize::MAX,
-                items_view,
-            )
-        };
-        Some(crate::thread_store::page_thread_turns(
-            turns,
-            cursor,
-            limit,
-            sort_direction,
-        ))
-    }
-
-    pub fn list_items(
-        &self,
-        turn_id: Option<&str>,
-        cursor: Option<&str>,
-        limit: usize,
-        sort_direction: crate::thread_store::SortDirection,
-    ) -> Option<crate::thread_store::StoredThreadItemPage> {
-        let snapshot = self.handle.snapshot().ok()?;
-        let items = if let Some(records) = snapshot.conversation_records() {
-            crate::thread_store::conversation_records_to_thread_items(
-                self.thread_id(),
-                records,
-                turn_id,
-                usize::MAX,
-            )
-            .ok()?
-        } else {
-            crate::thread_store::messages_to_thread_items(
-                self.thread_id(),
-                snapshot.messages(),
-                turn_id,
-                usize::MAX,
-            )
-        };
-        Some(crate::thread_store::page_thread_items(
-            items,
-            cursor,
-            limit,
-            sort_direction,
-        ))
-    }
-
-    pub fn update_metadata(&mut self, patch: ThreadMetadataPatch) {
-        if let Some(title) = patch.title {
-            self.title = title;
-        }
-        if let Some(active_permission_profile) = patch.active_permission_profile {
-            self.active_permission_profile = Some(active_permission_profile);
-        }
-        if let Some(runtime_workspace_roots) = patch.runtime_workspace_roots {
-            self.runtime_workspace_roots = runtime_workspace_roots;
-        }
-        if let Some(additional_working_directories) = patch.additional_working_directories {
-            self.additional_working_directories = additional_working_directories;
-        }
-        if let Some(network_domain_permissions) = patch.network_domain_permissions {
-            self.network_domain_permissions = network_domain_permissions;
-        }
-    }
-
-    pub fn task_registry(&self) -> crate::tasks::TaskRegistry {
-        self.handle.task_registry()
-    }
-
-    pub fn additional_working_directories(&self) -> &[AdditionalWorkingDirectory] {
-        &self.additional_working_directories
-    }
-
-    pub fn network_domain_permissions(&self) -> &HashMap<String, PermissionProfileNetworkAccess> {
-        &self.network_domain_permissions
-    }
-
-    pub fn runtime_workspace_roots(&self) -> &[std::path::PathBuf] {
-        &self.runtime_workspace_roots
-    }
-
-    pub fn cwd(&self) -> &str {
-        &self.cwd
-    }
-
-    pub fn mcp_registry(&self) -> McpRegistry {
-        self.handle.mcp_registry()
-    }
-
-    pub fn active_permission_profile(&self) -> Option<&ActivePermissionProfile> {
-        self.active_permission_profile.as_ref()
-    }
-
-    fn submission_context(
-        &self,
-        permissions: &PermissionProfileOverride,
-    ) -> ServerThreadSubmissionContext {
-        ServerThreadSubmissionContext {
-            cwd: self.cwd.clone(),
-            runtime_workspace_roots: permissions
-                .runtime_workspace_roots
-                .clone()
-                .unwrap_or_else(|| self.runtime_workspace_roots.clone()),
-            mcp_registry: self.handle.mcp_registry(),
-        }
+impl HostedOperationWriter for SharedTurnOutput {
+    fn finish_generation(&mut self, _commit_terminal: bool) -> io::Result<()> {
+        self.flush()
     }
 }
 
 impl PreparedServerTurn {
     pub(crate) fn thread_id(&self) -> &str {
-        &self.thread_id
+        self.inner.thread_id()
     }
 
     pub(crate) fn turn_id(&self) -> &TurnId {
-        &self.turn_id
+        self.inner.turn_id()
     }
 
-    pub(crate) fn start<W>(
-        self,
-        request: HostedTurnRequest,
-        writer: W,
-    ) -> io::Result<OperationHandle>
+    pub(crate) fn start_with_output<W>(self, writer: W) -> io::Result<JsonlTransportTurn>
     where
-        W: Write + Send + 'static,
+        W: HostedOperationWriter + Send + 'static,
     {
-        self.handle
-            .start_turn_with_config(request.with_turn_id(self.turn_id), writer, self.config)
-            .map_err(runtime_host_error)
+        self.inner.start(writer)
     }
-
-    pub(crate) fn start_with_output<W>(
-        self,
-        request: HostedTurnRequest,
-        writer: W,
-    ) -> io::Result<OperationHandle>
-    where
-        W: HostedOperationWriter,
-    {
-        self.handle
-            .start_turn_with_config_and_output(
-                request.with_turn_id(self.turn_id),
-                writer,
-                self.config,
-            )
-            .map_err(runtime_host_error)
-    }
-}
-
-fn operation_outcome_result(outcome: &OperationOutcome) -> io::Result<()> {
-    match outcome {
-        OperationOutcome::Completed(_) => Ok(()),
-        OperationOutcome::Backgrounded { task_id } => Err(io::Error::other(format!(
-            "server operation backgrounded unexpectedly as task {task_id}"
-        ))),
-        OperationOutcome::ExecutionFailed { kind, message } => {
-            Err(io::Error::new(*kind, message.clone()))
-        }
-        OperationOutcome::Panicked { message } => Err(io::Error::other(message.clone())),
-    }
-}
-
-fn runtime_host_error(error: RuntimeHostError) -> io::Error {
-    io::Error::other(error.to_string())
 }
 
 impl ServerThreadRuntime {
     pub fn start() -> io::Result<Self> {
         Ok(Self {
-            host: Some(RuntimeHost::start().map_err(runtime_host_error)?),
-            threads: HashMap::new(),
+            adapter: JsonlSurfaceAdapter::start()?,
+            transport_turns: Vec::new(),
         })
     }
 
     pub fn shutdown(&mut self) -> io::Result<()> {
-        let Some(host) = self.host.take() else {
-            return Ok(());
-        };
-        host.shutdown().map_err(runtime_host_error)
-    }
-
-    fn start_record(
-        &mut self,
-        run_config: RunConfig,
-        title: impl Into<String>,
-        network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
-    ) -> io::Result<String> {
-        let handle = self
-            .host
-            .as_ref()
-            .ok_or_else(|| io::Error::other("server runtime host is shut down"))?
-            .start_thread(run_config.clone(), "")
-            .map_err(runtime_host_error)?;
-        let thread =
-            ServerThread::from_handle(handle, &run_config, title, network_domain_permissions)?;
-        let thread_id = thread.thread_id().to_string();
-        self.threads.insert(thread_id.clone(), thread);
-        Ok(thread_id)
+        let result = self.adapter.shutdown();
+        for turn in &mut self.transport_turns {
+            let _ = turn.wait_terminal();
+        }
+        self.transport_turns.clear();
+        result
     }
 
     pub fn start_thread(&mut self, config: &RunConfig) -> io::Result<String> {
-        self.start_record(thread_run_config(config), "(empty prompt)", HashMap::new())
+        self.adapter.start_thread(config)
     }
 
     pub fn resume_thread(&mut self, config: &RunConfig, thread_id: &str) -> io::Result<String> {
@@ -568,34 +257,7 @@ impl ServerThreadRuntime {
         thread_id: &str,
         permissions: PermissionProfileOverride,
     ) -> io::Result<String> {
-        let mut run_config = config.clone();
-        run_config.output_format = OutputFormat::Jsonl;
-        run_config.history_mode = HistoryMode::Resume(thread_id.to_string());
-        run_config.show_session_picker = false;
-        run_config.desktop_notifications = false;
-        merge_stored_permission_profile(&mut run_config, thread_id)?;
-        apply_permission_override(&mut run_config, permissions);
-        persist_permission_profile(&run_config, thread_id)?;
-        if let Some(thread) = self.threads.get_mut(thread_id) {
-            thread.update_metadata(ThreadMetadataPatch {
-                title: None,
-                active_permission_profile: run_config.active_permission_profile.clone(),
-                approval_mode: Some(run_config.approval_mode),
-                runtime_workspace_roots: run_config.runtime_workspace_roots.clone(),
-                permission_rules: Some(run_config.permission_rules.clone()),
-                additional_working_directories: Some(
-                    run_config.additional_working_directories.clone(),
-                ),
-                network_domain_permissions: None,
-            });
-            return Ok(thread_id.to_string());
-        }
-        let transcript = SessionStore::new().load_session(thread_id)?;
-        self.start_record(
-            run_config,
-            "(resumed prompt)",
-            transcript.meta.network_domain_permissions,
-        )
+        self.adapter.resume_thread(config, thread_id, permissions)
     }
 
     pub fn fork_thread(&mut self, config: &RunConfig, thread_id: &str) -> io::Result<String> {
@@ -608,41 +270,38 @@ impl ServerThreadRuntime {
         thread_id: &str,
         permissions: PermissionProfileOverride,
     ) -> io::Result<String> {
-        let mut run_config = config.clone();
-        run_config.output_format = OutputFormat::Jsonl;
-        run_config.history_mode = HistoryMode::Fork(thread_id.to_string());
-        run_config.show_session_picker = false;
-        run_config.desktop_notifications = false;
-        merge_stored_permission_profile(&mut run_config, thread_id)?;
-        apply_permission_override(&mut run_config, permissions);
-        self.start_record(run_config, "(empty prompt)", HashMap::new())
+        self.adapter.fork_thread(config, thread_id, permissions)
     }
 
     pub fn has_thread(&self, thread_id: &str) -> bool {
-        self.threads.contains_key(thread_id)
+        self.adapter.has_thread(thread_id)
     }
 
     pub fn task_registry(&self, thread_id: &str) -> Option<crate::tasks::TaskRegistry> {
-        self.threads.get(thread_id).map(ServerThread::task_registry)
+        self.adapter.task_registry(thread_id)
     }
 
     pub fn additional_working_directories(
         &self,
         thread_id: &str,
     ) -> Option<Vec<std::path::PathBuf>> {
-        self.threads.get(thread_id).map(|thread| {
-            thread
-                .additional_working_directories()
-                .iter()
-                .map(|directory| directory.path.clone())
-                .collect()
-        })
+        self.adapter
+            .read_session(thread_id, false, false)
+            .ok()
+            .map(|thread| {
+                thread
+                    .additional_working_directories
+                    .into_iter()
+                    .map(|directory| directory.path)
+                    .collect()
+            })
     }
 
     pub fn active_permission_profile(&self, thread_id: &str) -> Option<ActivePermissionProfile> {
-        self.threads
-            .get(thread_id)
-            .and_then(|thread| thread.active_permission_profile.clone())
+        self.adapter
+            .read_session(thread_id, false, false)
+            .ok()
+            .and_then(|thread| thread.active_permission_profile)
     }
 
     #[allow(dead_code)]
@@ -650,23 +309,19 @@ impl ServerThreadRuntime {
         &self,
         thread_id: &str,
     ) -> Option<crate::surface::RuntimeSurfaceHandle> {
-        self.threads
-            .get(thread_id)
-            .and_then(ServerThread::jsonl_surface)
+        self.adapter.jsonl_surface(thread_id)
     }
 
-    pub(crate) fn jsonl_surface_for_connection(
-        &self,
-        thread_id: &str,
-        connection_id: crate::surface::SurfaceConnectionId,
-    ) -> Option<crate::surface::RuntimeSurfaceHandle> {
-        self.threads
-            .get(thread_id)
-            .and_then(|thread| thread.handle.jsonl_surface_for_connection(connection_id))
-    }
-
-    pub fn thread(&self, thread_id: &str) -> Option<&ServerThread> {
-        self.threads.get(thread_id)
+    pub fn thread(&self, thread_id: &str) -> Option<ServerThreadView> {
+        let thread = self.adapter.read_session(thread_id, false, false).ok()?;
+        Some(ServerThreadView {
+            cwd: thread.cwd,
+            runtime_workspace_roots: thread.runtime_workspace_roots,
+            active_permission_profile: thread.active_permission_profile,
+            additional_working_directories: thread.additional_working_directories,
+            network_domain_permissions: thread.network_domain_permissions,
+            mcp_registry: self.adapter.mcp_registry(thread_id)?,
+        })
     }
 
     pub fn run_turn<W: Write>(
@@ -676,13 +331,13 @@ impl ServerThreadRuntime {
         prompt: &str,
         writer: W,
     ) -> io::Result<()> {
-        let Some(thread) = self.threads.get_mut(thread_id) else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("unknown thread: {thread_id}"),
-            ));
-        };
-        thread.run_turn(config, prompt, writer)
+        self.run_turn_with_permissions(
+            config,
+            thread_id,
+            prompt,
+            PermissionProfileOverride::default(),
+            writer,
+        )
     }
 
     pub fn run_turn_with_permissions<W: Write>(
@@ -693,22 +348,19 @@ impl ServerThreadRuntime {
         permissions: PermissionProfileOverride,
         writer: W,
     ) -> io::Result<()> {
-        let Some(thread) = self.threads.get_mut(thread_id) else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("unknown thread: {thread_id}"),
-            ));
-        };
-        let prepared = thread.prepare_turn(config, prompt, permissions)?;
-        let output = SharedTurnOutput::default();
-        let operation = prepared.start(
-            HostedTurnRequest::new(prompt).with_wait_for_background_workflows(false),
-            output.clone(),
+        let prepared = self.prepare_turn(
+            config,
+            thread_id,
+            prompt,
+            permissions,
+            &Value::from("synchronous-jsonl-turn"),
         )?;
-        let terminal = operation.wait();
+        let output = SharedTurnOutput::default();
+        let mut operation = prepared.start_with_output(output.clone())?;
+        operation.wait_terminal()?;
         let mut writer = writer;
         writer.write_all(&output.bytes())?;
-        operation_outcome_result(terminal.outcome())
+        Ok(())
     }
 
     pub fn read_thread(
@@ -717,9 +369,9 @@ impl ServerThreadRuntime {
         include_messages: bool,
         include_turns: bool,
     ) -> Option<StoredThreadProjection> {
-        self.threads
-            .get(thread_id)?
-            .read_projection(include_messages, include_turns)
+        self.adapter
+            .read_session(thread_id, include_messages, include_turns)
+            .ok()
     }
 
     pub fn list_thread_turns(
@@ -729,10 +381,10 @@ impl ServerThreadRuntime {
         limit: usize,
         sort_direction: crate::thread_store::SortDirection,
         items_view: TurnItemsView,
-    ) -> Option<crate::thread_store::StoredThreadTurnPage> {
-        self.threads
-            .get(thread_id)?
-            .list_turns(cursor, limit, sort_direction, items_view)
+    ) -> Option<StoredThreadTurnPage> {
+        self.adapter
+            .list_turns(thread_id, cursor, limit, sort_direction, items_view)
+            .ok()
     }
 
     pub fn list_thread_items(
@@ -742,18 +394,14 @@ impl ServerThreadRuntime {
         cursor: Option<&str>,
         limit: usize,
         sort_direction: crate::thread_store::SortDirection,
-    ) -> Option<crate::thread_store::StoredThreadItemPage> {
-        self.threads
-            .get(thread_id)?
-            .list_items(turn_id, cursor, limit, sort_direction)
+    ) -> Option<StoredThreadItemPage> {
+        self.adapter
+            .list_items(thread_id, turn_id, cursor, limit, sort_direction)
+            .ok()
     }
 
     pub fn update_thread_metadata(&mut self, thread_id: &str, patch: ThreadMetadataPatch) -> bool {
-        let Some(thread) = self.threads.get_mut(thread_id) else {
-            return false;
-        };
-        thread.update_metadata(patch);
-        true
+        self.adapter.update_metadata(thread_id, patch).is_ok()
     }
 
     pub fn has_completed_turn(&self, turn_id: &str) -> bool {
@@ -761,19 +409,33 @@ impl ServerThreadRuntime {
     }
 
     pub fn completed_turn_thread_id(&self, turn_id: &str) -> Option<String> {
-        self.threads.values().find_map(|thread| {
-            thread
-                .list_turns(
-                    None,
-                    usize::MAX,
-                    crate::thread_store::SortDirection::Asc,
-                    TurnItemsView::Full,
-                )?
-                .data
-                .into_iter()
-                .find(|turn| turn.turn_id == turn_id)
-                .map(|turn| turn.thread_id)
-        })
+        self.adapter
+            .list_sessions(
+                None,
+                usize::MAX,
+                ThreadListFilters::active(),
+                ThreadSortKey::UpdatedAt,
+                SortDirection::Desc,
+                None,
+            )
+            .ok()?
+            .data
+            .into_iter()
+            .find_map(|thread| {
+                self.adapter
+                    .list_turns(
+                        &thread.thread_id,
+                        None,
+                        usize::MAX,
+                        SortDirection::Asc,
+                        TurnItemsView::Full,
+                    )
+                    .ok()?
+                    .data
+                    .into_iter()
+                    .any(|turn| turn.turn_id == turn_id)
+                    .then_some(thread.thread_id)
+            })
     }
 
     pub(crate) fn submission_context(
@@ -781,9 +443,15 @@ impl ServerThreadRuntime {
         thread_id: &str,
         permissions: &PermissionProfileOverride,
     ) -> Option<ServerThreadSubmissionContext> {
-        self.threads
-            .get(thread_id)
-            .map(|thread| thread.submission_context(permissions))
+        let thread = self.adapter.read_session(thread_id, false, false).ok()?;
+        Some(ServerThreadSubmissionContext {
+            cwd: thread.cwd,
+            runtime_workspace_roots: permissions
+                .runtime_workspace_roots
+                .clone()
+                .unwrap_or(thread.runtime_workspace_roots),
+            mcp_registry: self.adapter.mcp_registry(thread_id)?,
+        })
     }
 
     pub(crate) fn prepare_turn(
@@ -792,35 +460,184 @@ impl ServerThreadRuntime {
         thread_id: &str,
         prompt: &str,
         permissions: PermissionProfileOverride,
+        rpc_id: &Value,
     ) -> io::Result<PreparedServerTurn> {
-        let thread = self.threads.get_mut(thread_id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("unknown thread: {thread_id}"),
+        self.adapter
+            .prepare_turn(config, thread_id, prompt, permissions, rpc_id, None)
+            .map(|inner| PreparedServerTurn { inner })
+    }
+
+    pub(crate) fn prepare_turn_with_interactions(
+        &mut self,
+        config: &RunConfig,
+        thread_id: &str,
+        prompt: &str,
+        permissions: PermissionProfileOverride,
+        rpc_id: &Value,
+        interactions: JsonlInteractionTransport,
+    ) -> io::Result<PreparedServerTurn> {
+        self.adapter
+            .prepare_turn(
+                config,
+                thread_id,
+                prompt,
+                permissions,
+                rpc_id,
+                Some(interactions),
             )
-        })?;
-        thread.prepare_turn(config, prompt, permissions)
+            .map(|inner| PreparedServerTurn { inner })
+    }
+
+    pub(crate) fn register_transport_turn(&mut self, turn: JsonlTransportTurn) {
+        self.transport_turns.push(turn);
+    }
+
+    pub(crate) fn accepts_generation(
+        &self,
+        turn_id: &str,
+        thread_id: &str,
+        _generation: crate::runtime_host::GenerationFence,
+    ) -> bool {
+        self.adapter.accepts_turn(thread_id, turn_id)
+    }
+
+    pub(crate) fn resolve_turn_thread_id(&self, turn_id: &str) -> Option<String> {
+        self.adapter.resolve_turn_thread_id(turn_id)
+    }
+
+    pub(crate) fn resolve_known_turn_thread_id(&self, turn_id: &str) -> Option<String> {
+        self.adapter.resolve_known_turn_thread_id(turn_id)
+    }
+
+    pub(crate) fn prune_finished_turns(&mut self) {
+        let mut pending = Vec::with_capacity(self.transport_turns.len());
+        for mut turn in self.transport_turns.drain(..) {
+            if turn.is_finished() {
+                let _ = turn.wait_terminal();
+            } else {
+                pending.push(turn);
+            }
+        }
+        self.transport_turns = pending;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_active_turns(&mut self) {
+        for turn in &mut self.transport_turns {
+            let _ = turn.wait_terminal();
+        }
+        self.transport_turns.clear();
+    }
+
+    pub(crate) fn control_turn(
+        &mut self,
+        thread_id: Option<&str>,
+        turn_id: &str,
+        action: crate::unstable_surface::JsonlTurnControlAction,
+    ) -> io::Result<crate::unstable_surface::JsonlTurnControlResult> {
+        self.adapter.control_turn(thread_id, turn_id, action, None)
+    }
+
+    pub fn list_threads(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        filters: ThreadListFilters,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+        search_term: Option<&str>,
+    ) -> io::Result<StoredThreadSummaryPage> {
+        self.adapter.list_sessions(
+            cursor,
+            limit,
+            filters,
+            sort_key,
+            sort_direction,
+            search_term,
+        )
+    }
+
+    pub fn search_threads(
+        &self,
+        query: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        include_archived: bool,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+    ) -> io::Result<StoredThreadSearchPage> {
+        self.adapter.search_sessions(
+            query,
+            cursor,
+            limit,
+            include_archived,
+            sort_key,
+            sort_direction,
+        )
+    }
+
+    pub fn read_thread_result(
+        &self,
+        thread_id: &str,
+        include_messages: bool,
+        include_turns: bool,
+    ) -> io::Result<StoredThreadProjection> {
+        self.adapter
+            .read_session(thread_id, include_messages, include_turns)
+    }
+
+    pub fn list_thread_turns_result(
+        &self,
+        thread_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+        items_view: TurnItemsView,
+    ) -> io::Result<StoredThreadTurnPage> {
+        self.adapter
+            .list_turns(thread_id, cursor, limit, sort_direction, items_view)
+    }
+
+    pub fn list_thread_items_result(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+    ) -> io::Result<StoredThreadItemPage> {
+        self.adapter
+            .list_items(thread_id, turn_id, cursor, limit, sort_direction)
+    }
+
+    pub fn update_thread_metadata_result(
+        &self,
+        thread_id: &str,
+        patch: ThreadMetadataPatch,
+    ) -> io::Result<()> {
+        self.adapter.update_metadata(thread_id, patch)
+    }
+
+    pub(crate) fn persist_session_permission_grant(
+        &self,
+        thread_id: &str,
+        client: &crate::unstable_surface::RuntimeSurfaceClientHandle,
+        runtime_workspace_roots: &[std::path::PathBuf],
+        permissions: &crate::protocol::RequestPermissionProfile,
+    ) -> io::Result<()> {
+        self.adapter.persist_session_permission_grant(
+            thread_id,
+            client,
+            runtime_workspace_roots,
+            permissions,
+        )
     }
 }
 
-fn merge_stored_permission_profile(config: &mut RunConfig, thread_id: &str) -> io::Result<()> {
-    let transcript = SessionStore::new().load_session(thread_id)?;
-    if let Some(approval_mode) = transcript.meta.approval_mode {
-        config.approval_mode = approval_mode;
-    }
-    if !transcript.meta.runtime_workspace_roots.is_empty() {
-        config.runtime_workspace_roots = Some(transcript.meta.runtime_workspace_roots);
-    }
-    if let Some(active_permission_profile) = transcript.meta.active_permission_profile {
-        config.active_permission_profile = Some(active_permission_profile);
-    }
-    if !transcript.meta.permission_rules.rules.is_empty() {
-        config.permission_rules = transcript.meta.permission_rules;
-    }
-    Ok(())
-}
-
-fn apply_permission_override(config: &mut RunConfig, permissions: PermissionProfileOverride) {
+pub(crate) fn apply_permission_override(
+    config: &mut RunConfig,
+    permissions: PermissionProfileOverride,
+) {
     if let Some(active_permission_profile) = permissions.active_permission_profile {
         config.active_permission_profile = Some(active_permission_profile);
     }
@@ -903,22 +720,6 @@ fn apply_permission_updates(config: &mut RunConfig, updates: Vec<PermissionUpdat
             }
         }
     }
-}
-
-fn persist_permission_profile(config: &RunConfig, thread_id: &str) -> io::Result<()> {
-    SessionStore::new().update_thread_metadata(
-        thread_id,
-        ThreadMetadataPatch {
-            title: None,
-            active_permission_profile: config.active_permission_profile.clone(),
-            approval_mode: Some(config.approval_mode),
-            runtime_workspace_roots: config.runtime_workspace_roots.clone(),
-            permission_rules: Some(config.permission_rules.clone()),
-            additional_working_directories: Some(config.additional_working_directories.clone()),
-            network_domain_permissions: None,
-        },
-    )?;
-    Ok(())
 }
 
 pub struct ServerRequestWriter<W: Write> {

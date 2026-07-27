@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-mod active_turn_registry;
 mod command_exec_manager;
 mod command_exec_sandbox;
 mod fuzzy_file_search_manager;
@@ -13,6 +12,7 @@ mod mention_search_manager;
 mod permission_manager;
 mod router;
 mod shell_manager;
+pub(crate) mod surface_adapter;
 mod user_input_manager;
 
 use base64::Engine;
@@ -25,10 +25,7 @@ use crate::network_proxy::{
     runtime_network_block_channel,
 };
 use crate::protocol::{self, ClientOp, ServerEvent, Submission};
-use crate::runtime_host::{
-    HostedGenerationHandlers, HostedOperationWriter, HostedTurnRequest, InterruptOperationResult,
-    ResumeOperationResult, SteerOperationResult,
-};
+use crate::runtime_host::HostedOperationWriter;
 use crate::sandbox_denial::{SandboxDenialDiagnostic, diagnose_sandbox_denial};
 use crate::server_runtime::{
     PermissionProfileOverride, ServerRequestWriter, ServerThreadRuntime, thread_item_to_json,
@@ -39,7 +36,6 @@ use crate::thread_store::{
     SessionStore, SortDirection, StoredThreadSummary, ThreadListFilters, ThreadMetadataPatch,
     ThreadSortKey, ThreadStore, TurnItemsView,
 };
-use active_turn_registry::ServerActiveTurnRegistry;
 use command_exec_manager::{
     CommandExecDrainOutcome, CommandExecManager, CommandExecPermissionPolicy, CommandExecProcess,
     CommandExecProcessSnapshot,
@@ -47,15 +43,14 @@ use command_exec_manager::{
 pub use command_exec_sandbox::{CommandExecSandbox, bash_sandbox_for_cwd};
 use command_exec_sandbox::{command_exec_sandbox_mode, materialize_workspace_roots_paths};
 use fuzzy_file_search_manager::FuzzyFileSearchManager;
-use mcp_elicitation_manager::{PendingMcpElicitationManager, ServerMcpElicitationRequestHandler};
+use mcp_elicitation_manager::PendingMcpElicitationManager;
 use mention_search_manager::MentionSearchManager;
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 use permission_manager::{
     PendingCommandExecPermissionRequest, PendingPermissionManager, PendingPermissionRequest,
-    ServerPermissionRequestHandler,
 };
 use shell_manager::ServerShellManager;
-use user_input_manager::{PendingUserInputManager, ServerUserInputRequestHandler};
+use user_input_manager::PendingUserInputManager;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -98,7 +93,6 @@ struct ServerState {
     threads: ServerThreadRuntime,
     shells: ServerShellManager,
     command_exec: CommandExecManager,
-    active_turns: ServerActiveTurnRegistry,
     pending_permissions: PendingPermissionManager,
     pending_user_inputs: PendingUserInputManager,
     pending_mcp_elicitations: PendingMcpElicitationManager,
@@ -112,7 +106,6 @@ impl ServerState {
             threads: ServerThreadRuntime::start()?,
             shells: ServerShellManager::default(),
             command_exec: CommandExecManager::default(),
-            active_turns: ServerActiveTurnRegistry::default(),
             pending_permissions: PendingPermissionManager::default(),
             pending_user_inputs: PendingUserInputManager::default(),
             pending_mcp_elicitations: PendingMcpElicitationManager::default(),
@@ -129,7 +122,6 @@ impl ServerState {
         self.shells.terminate_all();
         self.terminate_searches();
         let result = self.threads.shutdown();
-        self.active_turns.clear();
         result
     }
 
@@ -142,11 +134,11 @@ impl ServerState {
 impl ServerState {
     #[cfg(test)]
     fn join_active_turns(&mut self) {
-        self.active_turns.wait_all();
+        self.threads.wait_active_turns();
     }
 
     fn prune_finished_turns(&mut self) {
-        self.active_turns.prune_finished();
+        self.threads.prune_finished_turns();
     }
 }
 
@@ -1596,6 +1588,7 @@ fn server_cwd(config: &RunConfig) -> io::Result<PathBuf> {
 }
 
 fn run_thread_list<W: Write>(
+    state: &ServerState,
     cursor: Option<&str>,
     limit: usize,
     filters: ThreadListFilters,
@@ -1605,8 +1598,7 @@ fn run_thread_list<W: Write>(
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
-    let store = SessionStore::new();
-    let page = store.list_threads(
+    let page = state.threads.list_threads(
         cursor,
         limit,
         filters,
@@ -1631,6 +1623,7 @@ fn run_thread_list<W: Write>(
 }
 
 fn run_thread_search<W: Write>(
+    state: &ServerState,
     query: &str,
     cursor: Option<&str>,
     limit: usize,
@@ -1647,8 +1640,7 @@ fn run_thread_search<W: Write>(
             ServerEvent::error("thread search term must not be empty"),
         );
     }
-    let store = SessionStore::new();
-    let page = store.search_threads(
+    let page = state.threads.search_threads(
         query,
         cursor,
         limit,
@@ -1754,26 +1746,20 @@ fn run_thread_turns_list<W: Write>(
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
-    let store = SessionStore::new();
-    let page = if let Some(page) =
-        state
+    let page =
+        match state
             .threads
             .list_thread_turns(thread_id, cursor, limit, sort_direction, items_view)
-    {
-        page
-    } else {
-        match store.list_thread_turns(thread_id, cursor, limit, sort_direction, items_view) {
-            Ok(page) => page,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        {
+            Some(page) => page,
+            None => {
                 return protocol::write_server_event(
                     writer,
                     &id,
                     ServerEvent::error(format!("unknown thread: {thread_id}")),
                 );
             }
-            Err(error) => return Err(error),
-        }
-    };
+        };
 
     protocol::write_server_event(
         writer,
@@ -1801,26 +1787,20 @@ fn run_thread_items_list<W: Write>(
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
-    let store = SessionStore::new();
-    let page = if let Some(page) =
-        state
+    let page =
+        match state
             .threads
             .list_thread_items(thread_id, turn_id, cursor, limit, sort_direction)
-    {
-        page
-    } else {
-        match store.list_thread_items(thread_id, turn_id, cursor, limit, sort_direction) {
-            Ok(page) => page,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        {
+            Some(page) => page,
+            None => {
                 return protocol::write_server_event(
                     writer,
                     &id,
                     ServerEvent::error(format!("unknown thread: {thread_id}")),
                 );
             }
-            Err(error) => return Err(error),
-        }
-    };
+        };
 
     protocol::write_server_event(
         writer,
@@ -1942,14 +1922,6 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
         _ => return Ok(()),
     };
 
-    state.prune_finished_turns();
-    if state.active_turns.has_thread(&thread_id) {
-        return write_locked_event(
-            &writer,
-            &id,
-            ServerEvent::error(format!("thread has an active turn: {thread_id}")),
-        );
-    }
     let Some(submission) = state.threads.submission_context(&thread_id, &permissions) else {
         return write_locked_event(
             &writer,
@@ -1971,10 +1943,18 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
             }
         }
     }
-    let prepared = match state
-        .threads
-        .prepare_turn(&run_config, &thread_id, &prompt, permissions)
-    {
+    let prepared = match state.threads.prepare_turn_with_interactions(
+        &run_config,
+        &thread_id,
+        &prompt,
+        permissions,
+        &id,
+        surface_adapter::JsonlInteractionTransport::new(
+            state.pending_permissions.clone(),
+            state.pending_user_inputs.clone(),
+            state.pending_mcp_elicitations.clone(),
+        ),
+    ) {
         Ok(prepared) => prepared,
         Err(error) => {
             return write_locked_event(&writer, &id, ServerEvent::error(error.to_string()));
@@ -1982,62 +1962,16 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
     };
     let active_turn_id = prepared.turn_id().clone();
     let active_thread_id = prepared.thread_id().to_string();
-    let writer_for_handlers = Arc::clone(&writer);
-    let event_id_for_handlers = id.clone();
-    let thread_id_for_handlers = active_thread_id.clone();
-    let turn_id_for_handlers = active_turn_id.to_string();
-    let pending_permissions = state.pending_permissions.clone();
-    let pending_user_inputs = state.pending_user_inputs.clone();
-    let pending_mcp_elicitations = state.pending_mcp_elicitations.clone();
-    let runtime_workspace_roots = submission.runtime_workspace_roots;
-    let request = HostedTurnRequest::new(prompt)
-        .with_wait_for_background_workflows(false)
-        .with_generation_handlers(move |generation, generation_cancel| {
-            let permission_handler = Arc::new(ServerPermissionRequestHandler::new(
-                Arc::clone(&writer_for_handlers),
-                pending_permissions.clone(),
-                event_id_for_handlers.clone(),
-                thread_id_for_handlers.clone(),
-                turn_id_for_handlers.clone(),
-                generation,
-                generation_cancel.clone(),
-                runtime_workspace_roots.clone(),
-            ));
-            let user_input_handler = Arc::new(ServerUserInputRequestHandler::new(
-                Arc::clone(&writer_for_handlers),
-                pending_user_inputs.clone(),
-                event_id_for_handlers.clone(),
-                thread_id_for_handlers.clone(),
-                turn_id_for_handlers.clone(),
-                generation,
-                generation_cancel.clone(),
-            ));
-            let mcp_elicitation_handler = Arc::new(ServerMcpElicitationRequestHandler::new(
-                Arc::clone(&writer_for_handlers),
-                pending_mcp_elicitations.clone(),
-                event_id_for_handlers.clone(),
-                thread_id_for_handlers.clone(),
-                turn_id_for_handlers.clone(),
-                generation,
-                generation_cancel,
-            ));
-            HostedGenerationHandlers::default()
-                .with_permission_handler(permission_handler)
-                .with_user_input_handler(user_input_handler)
-                .with_mcp_elicitation_handler(mcp_elicitation_handler)
-        });
-    let operation = match prepared.start_with_output(
-        request,
-        ServerTurnOutput::new(id.clone(), Arc::clone(&writer)),
-    ) {
-        Ok(operation) => operation,
-        Err(error) => {
-            return write_locked_event(&writer, &id, ServerEvent::error(error.to_string()));
-        }
-    };
-    state
-        .active_turns
-        .insert(active_turn_id, active_thread_id, operation);
+    let operation =
+        match prepared.start_with_output(ServerTurnOutput::new(id.clone(), Arc::clone(&writer))) {
+            Ok(operation) => operation,
+            Err(error) => {
+                return write_locked_event(&writer, &id, ServerEvent::error(error.to_string()));
+            }
+        };
+    debug_assert_eq!(operation.turn_id(), &active_turn_id);
+    debug_assert_eq!(operation.thread_id(), active_thread_id);
+    state.threads.register_transport_turn(operation);
     state.prune_finished_turns();
     Ok(())
 }
@@ -2050,25 +1984,19 @@ fn run_thread_read<W: Write>(
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
-    let store = SessionStore::new();
-    let thread = if let Some(thread) =
-        state
-            .threads
-            .read_thread(thread_id, include_messages, include_turns)
+    let thread = match state
+        .threads
+        .read_thread_result(thread_id, include_messages, include_turns)
     {
-        thread
-    } else {
-        match store.read_thread(thread_id, include_messages, include_turns) {
-            Ok(thread) => thread,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return protocol::write_server_event(
-                    writer,
-                    &id,
-                    ServerEvent::error(format!("unknown thread: {thread_id}")),
-                );
-            }
-            Err(error) => return Err(error),
+        Ok(thread) => thread,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return protocol::write_server_event(
+                writer,
+                &id,
+                ServerEvent::error(format!("unknown thread: {thread_id}")),
+            );
         }
+        Err(error) => return Err(error),
     };
 
     protocol::write_server_event(
@@ -2124,16 +2052,7 @@ fn run_thread_metadata_update<W: Write>(
         );
     };
 
-    let live_thread_updated = state.threads.update_thread_metadata(
-        thread_id,
-        ThreadMetadataPatch {
-            title: Some(title.clone()),
-            ..ThreadMetadataPatch::default()
-        },
-    );
-
-    let store = SessionStore::new();
-    match store.update_thread_metadata(
+    match state.threads.update_thread_metadata_result(
         thread_id,
         ThreadMetadataPatch {
             title: Some(title.clone()),
@@ -2148,16 +2067,6 @@ fn run_thread_metadata_update<W: Write>(
                 title: Value::from(title),
             },
         ),
-        Err(error) if error.kind() == io::ErrorKind::NotFound && live_thread_updated => {
-            protocol::write_server_event(
-                writer,
-                &id,
-                ServerEvent::ThreadMetadataUpdated {
-                    thread_id: Value::from(thread_id.to_string()),
-                    title: Value::from(title),
-                },
-            )
-        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => protocol::write_server_event(
             writer,
             &id,
@@ -5770,6 +5679,7 @@ enabled = true
                     &first_thread,
                     "mock_stream_delay_ms 500",
                     PermissionProfileOverride::default(),
+                    &serde_json::json!("first-turn"),
                 )
                 .expect("prepare first thread turn");
             let second = state
@@ -5779,6 +5689,7 @@ enabled = true
                     &second_thread,
                     "mock_stream_delay_ms 500",
                     PermissionProfileOverride::default(),
+                    &serde_json::json!("second-turn"),
                 )
                 .expect("prepare second thread turn");
             let first_turn_id = first.turn_id().clone();
@@ -5788,39 +5699,34 @@ enabled = true
                 first_turn_id, second_turn_id,
                 "process-level active-turn routing must not reuse a per-thread message index"
             );
+            let writer = Arc::new(Mutex::new(Vec::new()));
             let first_operation = first
-                .start(
-                    HostedTurnRequest::new("mock_stream_delay_ms 500"),
-                    Vec::new(),
-                )
+                .start_with_output(ServerTurnOutput::new(
+                    serde_json::json!("first-turn"),
+                    Arc::clone(&writer),
+                ))
                 .expect("start first thread turn");
             let second_operation = second
-                .start(
-                    HostedTurnRequest::new("mock_stream_delay_ms 500"),
-                    Vec::new(),
-                )
+                .start_with_output(ServerTurnOutput::new(
+                    serde_json::json!("second-turn"),
+                    Arc::clone(&writer),
+                ))
                 .expect("start second thread turn");
-            state
-                .active_turns
-                .insert(first_turn_id.clone(), first_thread.clone(), first_operation);
-            state.active_turns.insert(
-                second_turn_id.clone(),
-                second_thread.clone(),
-                second_operation,
-            );
+            state.threads.register_transport_turn(first_operation);
+            state.threads.register_transport_turn(second_operation);
 
             assert_eq!(
                 state
-                    .active_turns
-                    .get(first_turn_id.as_str())
-                    .map(|turn| turn.thread_id()),
+                    .threads
+                    .resolve_turn_thread_id(first_turn_id.as_str())
+                    .as_deref(),
                 Some(first_thread.as_str())
             );
             assert_eq!(
                 state
-                    .active_turns
-                    .get(second_turn_id.as_str())
-                    .map(|turn| turn.thread_id()),
+                    .threads
+                    .resolve_turn_thread_id(second_turn_id.as_str())
+                    .as_deref(),
                 Some(second_thread.as_str())
             );
             state.join_active_turns();
@@ -5865,12 +5771,9 @@ enabled = true
                 event["id"] == "turn-1" && event["event"] == "turn_completed"
             });
             if completion.is_none() {
-                let terminal = state
-                    .active_turns
-                    .get(&first_turn_id)
-                    .and_then(|turn| turn.operation().completion().try_terminal());
                 panic!(
-                    "timed out waiting for first turn completion; terminal={terminal:?}, events={:?}",
+                    "timed out waiting for first turn completion; route={:?}, events={:?}",
+                    state.threads.resolve_turn_thread_id(&first_turn_id),
                     parse_complete_jsonl(&writer.lock().expect("writer").clone()),
                 );
             }

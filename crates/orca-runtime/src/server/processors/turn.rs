@@ -65,112 +65,90 @@ fn run_turn_control<W: Write + Send + 'static>(
     writer: Arc<Mutex<W>>,
 ) -> io::Result<()> {
     state.prune_finished_turns();
-    let mut steered_item = None;
-    let status = if let Some(turn) = state.active_turns.get(turn_id) {
-        if let Some(expected_thread_id) = thread_id
-            && expected_thread_id != turn.thread_id()
-        {
-            return write_locked_event(
-                &writer,
-                &id,
-                ServerEvent::error(format!(
-                    "turn {turn_id} does not belong to thread {expected_thread_id}"
-                )),
-            );
-        }
-        match action {
-            "interrupt" => match turn.operation().interrupt() {
-                Ok(
-                    InterruptOperationResult::Requested { .. }
-                    | InterruptOperationResult::AlreadyRequested { .. },
-                ) => "interrupted",
-                Ok(
-                    InterruptOperationResult::Stale { .. } | InterruptOperationResult::Idle { .. },
-                ) => {
-                    return write_locked_event(
-                        &writer,
-                        &id,
-                        ServerEvent::error(format!("turn is not active: {turn_id}")),
-                    );
-                }
-                Err(error) => {
-                    return write_locked_event(&writer, &id, ServerEvent::error(error.to_string()));
-                }
-            },
-            "resume" => match turn.operation().resume() {
-                Ok(
-                    ResumeOperationResult::Queued { .. }
-                    | ResumeOperationResult::AlreadyQueued { .. },
-                ) => "resumed",
-                Ok(
-                    ResumeOperationResult::NotInterrupted { .. }
-                    | ResumeOperationResult::NotResumable { .. },
-                ) => {
-                    return write_locked_event(
-                        &writer,
-                        &id,
-                        ServerEvent::error(format!(
-                            "turn is not interrupted or no longer accepts resume: {turn_id}"
-                        )),
-                    );
-                }
-                Ok(ResumeOperationResult::Stale { .. } | ResumeOperationResult::Idle { .. }) => {
-                    return write_locked_event(
-                        &writer,
-                        &id,
-                        ServerEvent::error(format!("turn is not active: {turn_id}")),
-                    );
-                }
-                Err(error) => {
-                    return write_locked_event(&writer, &id, ServerEvent::error(error.to_string()));
-                }
-            },
-            "steer" => match input {
-                Some(input) => match turn.operation().steer(input.clone()) {
-                    Ok(SteerOperationResult::Accepted { .. }) => {
-                        steered_item = Some((turn.thread_id().to_string(), input.clone()));
-                        "steered"
-                    }
-                    Ok(SteerOperationResult::Rejected { .. }) => {
-                        return write_locked_event(
-                            &writer,
-                            &id,
-                            ServerEvent::error(format!(
-                                "turn no longer accepts steer input: {turn_id}"
-                            )),
-                        );
-                    }
-                    Err(error) => {
-                        return write_locked_event(
-                            &writer,
-                            &id,
-                            ServerEvent::error(error.to_string()),
-                        );
-                    }
-                },
-                None => "steered",
-            },
-            _ => "running",
-        }
-    } else if let Some(actual_thread_id) = state.threads.completed_turn_thread_id(turn_id) {
-        if let Some(expected_thread_id) = thread_id
-            && expected_thread_id != actual_thread_id
-        {
-            return write_locked_event(
-                &writer,
-                &id,
-                ServerEvent::error(format!(
-                    "turn {turn_id} does not belong to thread {expected_thread_id}"
-                )),
-            );
-        }
+    let active_thread_id = state.threads.resolve_turn_thread_id(turn_id);
+    let known_thread_id = active_thread_id
+        .clone()
+        .or_else(|| state.threads.resolve_known_turn_thread_id(turn_id));
+    if let (Some(requested), Some(actual)) = (thread_id, known_thread_id.as_deref())
+        && requested != actual
+    {
+        return write_locked_event(
+            &writer,
+            &id,
+            ServerEvent::error(format!(
+                "turn {turn_id} does not belong to thread {requested}"
+            )),
+        );
+    }
+    if active_thread_id.is_none() && known_thread_id.is_some() {
         return write_locked_event(
             &writer,
             &id,
             ServerEvent::error(format!("turn is not active: {turn_id}")),
         );
-    } else {
-        "idle"
+    }
+    let resolved_thread_id = active_thread_id.or_else(|| thread_id.map(ToString::to_string));
+    let surface_action = match action {
+        "interrupt" => crate::unstable_surface::JsonlTurnControlAction::Interrupt,
+        "resume" => crate::unstable_surface::JsonlTurnControlAction::Resume,
+        "steer" => crate::unstable_surface::JsonlTurnControlAction::Steer {
+            input: crate::unstable_surface::SurfaceInputRequest {
+                blocks: crate::unstable_surface::NonEmptyVec::try_new(vec![
+                    crate::unstable_surface::SurfaceInputRequestBlock::Text {
+                        text: crate::unstable_surface::DisplayText::new(
+                            input.cloned().unwrap_or_default(),
+                        ),
+                    },
+                ])
+                .map_err(|error| io::Error::other(error.to_string()))?,
+            },
+        },
+        _ => unreachable!("closed JSONL turn action"),
+    };
+    let result =
+        match state
+            .threads
+            .control_turn(resolved_thread_id.as_deref(), turn_id, surface_action)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return write_locked_event(&writer, &id, ServerEvent::error(error.to_string()));
+            }
+        };
+    let (status, steered_item) = match result {
+        crate::unstable_surface::JsonlTurnControlResult::Idle { .. } => ("idle", None),
+        crate::unstable_surface::JsonlTurnControlResult::Resolved { mutation } => match mutation {
+            crate::unstable_surface::MutationReply::Committed { value, .. } => {
+                let status = match value.echo.status {
+                    crate::unstable_surface::JsonlResolvedTurnControlStatus::Interrupted => {
+                        "interrupted"
+                    }
+                    crate::unstable_surface::JsonlResolvedTurnControlStatus::Resumed => "resumed",
+                    crate::unstable_surface::JsonlResolvedTurnControlStatus::Steered => "steered",
+                };
+                let steered = value.input_item_id.map(|_| {
+                    (
+                        resolved_thread_id.clone().unwrap_or_default(),
+                        input.cloned().unwrap_or_default(),
+                    )
+                });
+                (status, steered)
+            }
+            crate::unstable_surface::MutationReply::Deferred { .. } => {
+                return write_locked_event(
+                    &writer,
+                    &id,
+                    ServerEvent::error("turn control is awaiting durable reconciliation"),
+                );
+            }
+            crate::unstable_surface::MutationReply::Uncommitted { .. } => {
+                return write_locked_event(
+                    &writer,
+                    &id,
+                    ServerEvent::error(format!("turn is not active: {turn_id}")),
+                );
+            }
+        },
     };
     write_locked_event(
         &writer,
@@ -184,7 +162,9 @@ fn run_turn_control<W: Write + Send + 'static>(
                 .unwrap_or(Value::Null),
         },
     )?;
-    if let Some((thread_id, input)) = steered_item {
+    if let Some((thread_id, input)) = steered_item
+        && !thread_id.is_empty()
+    {
         write_locked_event(
             &writer,
             &id,

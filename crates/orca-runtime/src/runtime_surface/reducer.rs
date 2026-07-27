@@ -598,6 +598,15 @@ struct AppliedBatchRecord {
 }
 
 #[derive(Clone, PartialEq)]
+struct AppliedControlIntentRecord {
+    operation_id: SurfaceOperationId,
+    intent: PendingControlIntent,
+    event_id: SurfaceEventId,
+    cursor: SurfaceCursor,
+    commit_class: CommitClass,
+}
+
+#[derive(Clone, PartialEq)]
 struct AppliedGoalRecoveryRecord {
     goal_id: SurfaceGoalId,
     stale_run: SurfaceGoalClosedRunReceipt,
@@ -635,6 +644,7 @@ pub struct SurfaceReducerState {
     snapshot: SurfaceSnapshot,
     applied: BTreeMap<(SurfaceEventId, SurfaceCommitId), AppliedTransitionRecord>,
     applied_batches: BTreeMap<SurfaceCommitId, AppliedBatchRecord>,
+    applied_control_intents: Vec<AppliedControlIntentRecord>,
     applied_goal_receipts: HashSet<(SurfaceCommitId, Sha256Digest)>,
     goal_recoveries: Vec<AppliedGoalRecoveryRecord>,
     goal_successor_authorizations: Vec<AppliedGoalSuccessorAuthorization>,
@@ -649,6 +659,7 @@ impl SurfaceReducerState {
             snapshot,
             applied: BTreeMap::new(),
             applied_batches: BTreeMap::new(),
+            applied_control_intents: Vec::new(),
             applied_goal_receipts: HashSet::new(),
             goal_recoveries: Vec::new(),
             goal_successor_authorizations: Vec::new(),
@@ -660,6 +671,23 @@ impl SurfaceReducerState {
 
     pub fn snapshot(&self) -> &SurfaceSnapshot {
         &self.snapshot
+    }
+
+    pub(crate) fn control_intent_acknowledgement(
+        &self,
+        operation_id: &SurfaceOperationId,
+        intent: &PendingControlIntent,
+    ) -> Option<MutationCommitAck> {
+        self.applied_control_intents
+            .iter()
+            .rev()
+            .find(|record| &record.operation_id == operation_id && &record.intent == intent)
+            .map(|record| MutationCommitAck::ThreadLocalCursor {
+                cursor: record.cursor.clone(),
+                family: SurfaceFactFamily::Operation,
+                event_id: record.event_id.clone(),
+                commit_class: record.commit_class.clone(),
+            })
     }
 
     pub(crate) fn align_rematerialization_baseline(
@@ -4976,6 +5004,7 @@ fn apply_operation_patch(
 ) -> Result<(), SurfaceReducerError> {
     let SurfaceReducerState {
         snapshot,
+        applied_control_intents,
         degraded_finalizations,
         ..
     } = state;
@@ -5264,7 +5293,34 @@ fn apply_operation_patch(
                         ..
                     } => intent_operation == operation_id,
                 };
-            if !identity_matches || operation.pending_control.is_some() {
+            let replaces_pending = matches!(
+                (&operation.pending_control, intent),
+                (
+                    Some(PendingControlIntent::Interrupt {
+                        generation_fence: interrupted,
+                    }),
+                    PendingControlIntent::ResumeAfterInterruptedStop {
+                        generation_fence: resumed,
+                    },
+                ) if interrupted == resumed
+            ) || matches!(
+                (&operation.pending_control, intent),
+                (
+                    Some(PendingControlIntent::ResumeAfterInterruptedStop {
+                        generation_fence: interrupted,
+                    }),
+                    PendingControlIntent::ResumeStarting {
+                        generation_fence: successor,
+                    },
+                ) if successor.operation_id == interrupted.operation_id
+                    && successor.generation_id.get()
+                        == interrupted.generation_id.get().saturating_add(1)
+                    && operation.generations.last().is_some_and(|generation| {
+                        generation.fence == *successor
+                            && generation.predecessor.as_ref() == Some(interrupted)
+                    })
+            );
+            if !identity_matches || (operation.pending_control.is_some() && !replaces_pending) {
                 return Err(event_error(
                     envelope,
                     SurfaceReducerErrorCode::IllegalTransition,
@@ -5272,6 +5328,13 @@ fn apply_operation_patch(
                 ));
             }
             operation.pending_control = Some(intent.clone());
+            applied_control_intents.push(AppliedControlIntentRecord {
+                operation_id: operation_id.clone(),
+                intent: intent.clone(),
+                event_id: envelope.event_id.clone(),
+                cursor: batch.cursor_after.clone(),
+                commit_class: batch.commit_class.clone(),
+            });
             Ok(())
         }
         OperationPatch::GenerationReserved { generation } => {
@@ -5658,6 +5721,29 @@ fn apply_operation_patch(
                     SurfaceReducerErrorCode::IllegalTransition,
                     "operation cannot suspend without its exact stopped generation",
                 ));
+            }
+            if matches!(cause, SuspensionCause::Interrupted { .. }) {
+                let plain_interrupt = matches!(
+                    &operation.pending_control,
+                    Some(PendingControlIntent::Interrupt { generation_fence })
+                        if generation_fence == &generation.fence
+                );
+                let queued_resume = matches!(
+                    &operation.pending_control,
+                    Some(PendingControlIntent::ResumeAfterInterruptedStop {
+                        generation_fence,
+                    }) if generation_fence == &generation.fence
+                );
+                if !plain_interrupt && !queued_resume {
+                    return Err(event_error(
+                        envelope,
+                        SurfaceReducerErrorCode::IllegalTransition,
+                        "interrupted suspension lacks the matching durable control intent",
+                    ));
+                }
+                if plain_interrupt {
+                    operation.pending_control = None;
+                }
             }
             operation.phase = OperationPhase::Suspended {
                 cause: cause.clone(),

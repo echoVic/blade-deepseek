@@ -42,13 +42,36 @@ pub fn should_request_filesystem_permission_with_denied_roots(
     let Some(path) = diagnostic.denied_path.as_deref() else {
         return false;
     };
+    let comparable_path = canonicalize_existing_ancestor(path);
     if denied_roots
         .iter()
-        .any(|root| path == root || path.starts_with(root))
+        .map(|root| canonicalize_existing_ancestor(root))
+        .any(|root| comparable_path == root || comparable_path.starts_with(root))
     {
         return false;
     }
     is_workspace_metadata_path(path) || !path.starts_with(cwd)
+}
+
+fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = ancestor.canonicalize() {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let Some(name) = ancestor.file_name() else {
+            return path.to_path_buf();
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return path.to_path_buf();
+        };
+        ancestor = parent;
+    }
 }
 
 fn is_workspace_metadata_path(path: &Path) -> bool {
@@ -192,6 +215,37 @@ fn git_repo_root_from_denied_path(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_denied_root_matches_through_symlinked_existing_ancestor() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let canonical_root = directory.path().join("canonical");
+        let denied_root = canonical_root.join("secrets");
+        let alias_root = directory.path().join("alias");
+        std::fs::create_dir_all(&denied_root).expect("denied root");
+        std::os::unix::fs::symlink(&canonical_root, &alias_root).expect("root alias");
+        let denied_path = alias_root.join("secrets").join("blocked.txt");
+        let diagnostic = SandboxDenialDiagnostic {
+            denied_path: Some(denied_path.clone()),
+            suggested_write_root: Some(alias_root.join("secrets")),
+            message: "sandbox denied".to_string(),
+        };
+
+        assert!(!should_request_filesystem_permission_with_denied_roots(
+            directory.path(),
+            &diagnostic,
+            &[denied_root],
+        ));
+        assert_eq!(
+            canonicalize_existing_ancestor(&denied_path),
+            canonical_root
+                .canonicalize()
+                .expect("canonical root")
+                .join("secrets")
+                .join("blocked.txt")
+        );
+    }
 
     #[test]
     fn diagnoses_git_index_lock_as_sandbox_denial_not_stale_lock() {

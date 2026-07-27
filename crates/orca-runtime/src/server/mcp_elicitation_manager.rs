@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use crate::protocol::ServerEvent;
 use crate::runtime_host::GenerationFence;
 use crate::runtime_pending_interaction::{RuntimeMcpElicitationMode, RuntimeMcpElicitationRequest};
+use crate::unstable_surface::{RuntimeSurfaceClientHandle, SurfaceInteractionId};
 
 use super::{lock_error, write_locked_event};
 
@@ -32,6 +33,13 @@ impl PendingMcpElicitationRequest {
 struct PendingMcpElicitationState {
     closed: bool,
     pending: HashMap<String, PendingMcpElicitationRequest>,
+    surface_pending: HashMap<String, PendingSurfaceMcpElicitationRequest>,
+}
+
+#[derive(Clone)]
+pub(super) struct PendingSurfaceMcpElicitationRequest {
+    pub(super) client: RuntimeSurfaceClientHandle,
+    pub(super) interaction_id: SurfaceInteractionId,
 }
 
 #[derive(Clone, Default)]
@@ -70,10 +78,51 @@ impl PendingMcpElicitationManager {
         Ok(state.pending.remove(request_id))
     }
 
+    pub(super) fn insert_surface(
+        &self,
+        request_id: String,
+        request: PendingSurfaceMcpElicitationRequest,
+    ) -> io::Result<()> {
+        let mut state = self.state.lock().map_err(lock_error)?;
+        if state.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "server MCP elicitation manager is closed",
+            ));
+        }
+        if state.pending.contains_key(&request_id)
+            || state.surface_pending.contains_key(&request_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("duplicate pending MCP elicitation request id: {request_id}"),
+            ));
+        }
+        state.surface_pending.insert(request_id, request);
+        Ok(())
+    }
+
+    pub(super) fn remove_surface(
+        &self,
+        request_id: &str,
+    ) -> io::Result<Option<PendingSurfaceMcpElicitationRequest>> {
+        let mut state = self.state.lock().map_err(lock_error)?;
+        Ok(state.surface_pending.remove(request_id))
+    }
+
+    pub(super) fn restore_surface(
+        &self,
+        request_id: String,
+        request: PendingSurfaceMcpElicitationRequest,
+    ) -> io::Result<()> {
+        self.insert_surface(request_id, request)
+    }
+
     pub(super) fn close(&self) -> io::Result<()> {
         let pending = {
             let mut state = self.state.lock().map_err(lock_error)?;
             state.closed = true;
+            state.surface_pending.clear();
             std::mem::take(&mut state.pending)
         };
         for request in pending.into_values() {

@@ -542,29 +542,24 @@ fn unsupported_thread_overrides_are_rejected_before_requested() {
         settings_preparation: OperationSettingsPreparation::ApplyThreadOverridesBeforeRequested {
             expected_settings_revision: snapshot.settings.thread_revision,
             expected_policy_epoch: snapshot.settings.effective.policy_epoch,
-            patches: NonEmptyVec::try_new(vec![RuntimeSettingsPatch::SetModel {
-                model: NonEmptyText::try_new("deepseek-v4-pro").unwrap(),
+            patches: NonEmptyVec::try_new(vec![RuntimeSettingsPatch::ApplyPermissionUpdate {
+                update: SurfacePermissionUpdate::SetMode {
+                    destination: SurfaceSettingsDestination::UserSettings,
+                    mode: SurfaceApprovalMode::AutoEdit,
+                },
             }])
             .unwrap(),
         },
     };
 
-    let result = harness
-        .client
-        .reserve_operation(request_id(), intent)
-        .expect("unsupported settings is a committed surface response");
-    match result {
-        MutationReply::Uncommitted {
-            mutation: UncommittedMutation::Invalid { error, .. },
-        } => assert_eq!(error.error().code, SurfaceMutationErrorCode::IllegalState),
-        MutationReply::Committed { .. } => {
-            panic!("unsupported settings unexpectedly requested operation")
-        }
-        MutationReply::Deferred { .. } => panic!("unsupported settings unexpectedly deferred"),
-        MutationReply::Uncommitted { mutation } => {
-            panic!("wrong unsupported-settings classification: {mutation:?}")
-        }
-    }
+    assert_eq!(
+        harness.client.reserve_operation(request_id(), intent).err(),
+        Some(SurfaceClientCommandError::Unauthorized)
+    );
+    let snapshot = fresh_attachment(&harness.surface).baseline.snapshot;
+    assert!(snapshot.foreground_operation.is_none());
+    assert!(snapshot.queued_operations.is_empty());
+    assert!(snapshot.operation_history.is_empty());
     harness.shutdown_host();
 }
 

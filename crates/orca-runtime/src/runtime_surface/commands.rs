@@ -998,6 +998,10 @@ impl RuntimeSurfaceClientHandle {
         self.connection_id.as_ref()
     }
 
+    pub(crate) fn thread_id(&self) -> &SurfaceThreadId {
+        &self.thread_id
+    }
+
     pub(crate) fn grant(&self) -> &SurfaceAttachmentGrant {
         &self.capabilities
     }

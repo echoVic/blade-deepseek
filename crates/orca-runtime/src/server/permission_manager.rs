@@ -12,6 +12,9 @@ use crate::lifecycle::{
 };
 use crate::protocol::{self, ServerEvent};
 use crate::runtime_host::GenerationFence;
+use crate::unstable_surface::{
+    RuntimeSurfaceClientHandle, SurfaceInteractionId, SurfaceInteractionKind,
+};
 
 use super::{lock_error, write_locked_event};
 
@@ -36,6 +39,13 @@ pub(super) enum PendingPermissionRequest {
         generation: GenerationFence,
         runtime_workspace_roots: Vec<PathBuf>,
     },
+    Surface {
+        client: RuntimeSurfaceClientHandle,
+        interaction_id: SurfaceInteractionId,
+        target: SurfaceInteractionKind,
+        thread_id: String,
+        runtime_workspace_roots: Vec<PathBuf>,
+    },
     CommandExec {
         request: Box<PendingCommandExecPermissionRequest>,
     },
@@ -44,7 +54,7 @@ pub(super) enum PendingPermissionRequest {
 impl PendingPermissionRequest {
     pub(super) fn thread_id(&self) -> &str {
         match self {
-            Self::Runtime { thread_id, .. } => thread_id,
+            Self::Runtime { thread_id, .. } | Self::Surface { thread_id, .. } => thread_id,
             Self::CommandExec { request } => &request.thread_id,
         }
     }
@@ -52,6 +62,10 @@ impl PendingPermissionRequest {
     pub(super) fn runtime_workspace_roots(&self) -> &[PathBuf] {
         match self {
             Self::Runtime {
+                runtime_workspace_roots,
+                ..
+            }
+            | Self::Surface {
                 runtime_workspace_roots,
                 ..
             } => runtime_workspace_roots,
@@ -67,7 +81,7 @@ impl PendingPermissionRequest {
                 generation,
                 ..
             } => Some((thread_id, turn_id, *generation)),
-            Self::CommandExec { .. } => None,
+            Self::Surface { .. } | Self::CommandExec { .. } => None,
         }
     }
 }
@@ -106,9 +120,38 @@ impl PendingPermissionManager {
         Ok(())
     }
 
+    pub(super) fn insert_surface(
+        &self,
+        request_id: String,
+        client: RuntimeSurfaceClientHandle,
+        interaction_id: SurfaceInteractionId,
+        target: SurfaceInteractionKind,
+        thread_id: String,
+        runtime_workspace_roots: Vec<PathBuf>,
+    ) -> io::Result<()> {
+        self.insert_runtime(
+            request_id,
+            PendingPermissionRequest::Surface {
+                client,
+                interaction_id,
+                target,
+                thread_id,
+                runtime_workspace_roots,
+            },
+        )
+    }
+
     pub(super) fn remove(&self, request_id: &str) -> io::Result<Option<PendingPermissionRequest>> {
         let mut state = self.state.lock().map_err(lock_error)?;
         Ok(state.pending.remove(request_id))
+    }
+
+    pub(super) fn restore(
+        &self,
+        request_id: String,
+        request: PendingPermissionRequest,
+    ) -> io::Result<()> {
+        self.insert_runtime(request_id, request)
     }
 
     pub(super) fn close(&self) -> io::Result<()> {

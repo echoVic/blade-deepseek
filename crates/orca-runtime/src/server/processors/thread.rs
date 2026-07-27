@@ -46,6 +46,7 @@ pub(in crate::server::router) fn dispatch_query_operation<W: Write>(
             limit,
             filters,
         } => run_thread_list(
+            state,
             cursor.as_deref(),
             *limit,
             filters.clone(),
@@ -63,6 +64,7 @@ pub(in crate::server::router) fn dispatch_query_operation<W: Write>(
             include_archived,
             limit,
         } => run_thread_search(
+            state,
             query,
             cursor.as_deref(),
             *limit,

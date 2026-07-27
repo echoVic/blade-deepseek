@@ -4586,6 +4586,9 @@ fn exercise_operation_transition(
                 GenerationPhase::Stopped,
                 Some(GenerationStopReason::InterruptedResumable),
             ));
+            operation.pending_control = Some(PendingControlIntent::Interrupt {
+                generation_fence: operation.generations[0].fence.clone(),
+            });
             let initial = operation_state(operation.clone(), false);
             let cause = SuspensionCause::Interrupted {
                 generation_id: SurfaceGenerationId::new(0),
@@ -6198,6 +6201,9 @@ fn exercise_operation_generation_invariant(
                 Some(GenerationStopReason::InterruptedResumable),
             );
             operation.generations.push(generation.clone());
+            operation.pending_control = Some(PendingControlIntent::Interrupt {
+                generation_fence: generation.fence.clone(),
+            });
             let initial = operation_state(operation.clone(), false);
             let suspended = |generation_id| OperationPatch::Suspended {
                 operation_id: operation.operation_id.clone(),
@@ -6765,14 +6771,26 @@ fn remaining_operation_generation_suspension_and_finalization_patches_reduce() {
     let stop_first = batch(
         &resolved_state,
         16_103,
-        vec![(
-            generation_scope(&first_generation),
-            SurfaceEvent::Operation(OperationPatch::GenerationStopped {
-                fence: first_generation.fence.clone(),
-                reason: GenerationStopReason::InterruptedResumable,
-                usage_delta: usage(),
-            }),
-        )],
+        vec![
+            (
+                operation_scope(&operation),
+                SurfaceEvent::Operation(OperationPatch::ControlIntentCommitted {
+                    operation_id: operation.operation_id.clone(),
+                    request_id: operation.request_id.clone(),
+                    intent: PendingControlIntent::Interrupt {
+                        generation_fence: first_generation.fence.clone(),
+                    },
+                }),
+            ),
+            (
+                generation_scope(&first_generation),
+                SurfaceEvent::Operation(OperationPatch::GenerationStopped {
+                    fence: first_generation.fence.clone(),
+                    reason: GenerationStopReason::InterruptedResumable,
+                    usage_delta: usage(),
+                }),
+            ),
+        ],
     );
     let stopped = applied(reduce_batch(
         SurfaceReduceMode::Live,

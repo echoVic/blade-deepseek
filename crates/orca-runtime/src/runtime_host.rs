@@ -60,7 +60,9 @@ use crate::runtime_surface as surface;
 use crate::tasks::{DurableTypedProviderOutcome, MainSessionTerminalUpdate, TaskRegistry};
 use crate::thread::RuntimeThread;
 use crate::thread_store::{
-    SessionMeta, SessionStore, SessionTranscript, ThreadMetadataPatch, ThreadStore,
+    SessionMeta, SessionStore, SessionTranscript, SortDirection, StoredThreadItemPage,
+    StoredThreadProjection, StoredThreadSearchPage, StoredThreadSummaryPage, StoredThreadTurnPage,
+    ThreadListFilters, ThreadMetadataPatch, ThreadSortKey, ThreadStore, TurnItemsView,
 };
 use crate::workflow::runner::{WorkflowLaunchRequest, WorkflowRunner};
 use crate::workflow_execution::BackgroundWorkflowRun;
@@ -1408,6 +1410,31 @@ impl RuntimeSurfaceTerminalCreateHandler {
 struct RuntimeSurfaceUserInputHandler {
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     fence: surface::SurfaceOperationFence,
+    cancel: CancelToken,
+}
+
+enum SurfaceInteractionReply<T> {
+    Received(T),
+    Cancelled,
+    Closed,
+}
+
+fn wait_for_surface_interaction_reply<T>(
+    receiver: &mpsc::Receiver<T>,
+    cancel: &CancelToken,
+) -> SurfaceInteractionReply<T> {
+    loop {
+        if cancel.is_cancelled() {
+            return SurfaceInteractionReply::Cancelled;
+        }
+        match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok(value) => return SurfaceInteractionReply::Received(value),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return SurfaceInteractionReply::Closed;
+            }
+        }
+    }
 }
 
 impl RuntimeUserInputHandler for RuntimeSurfaceUserInputHandler {
@@ -1432,23 +1459,27 @@ impl RuntimeUserInputHandler for RuntimeSurfaceUserInputHandler {
                     "runtime interaction actor is unavailable",
                 ),
             })?;
-        reply_rx.recv().map_err(|_| {
-            io::Error::new(
+        match wait_for_surface_interaction_reply(&reply_rx, &self.cancel) {
+            SurfaceInteractionReply::Received(result) => result,
+            SurfaceInteractionReply::Cancelled => Ok(None),
+            SurfaceInteractionReply::Closed => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "runtime interaction actor closed while waiting for user input",
-            )
-        })?
+            )),
+        }
     }
 }
 
 struct RuntimeSurfaceMcpElicitationHandler {
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     fence: surface::SurfaceOperationFence,
+    cancel: CancelToken,
 }
 
 struct RuntimeSurfaceApprovalHandler {
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     fence: surface::SurfaceOperationFence,
+    cancel: CancelToken,
 }
 
 impl RuntimeApprovalHandler for RuntimeSurfaceApprovalHandler {
@@ -1475,18 +1506,24 @@ impl RuntimeApprovalHandler for RuntimeSurfaceApprovalHandler {
                     "runtime interaction actor is unavailable",
                 ),
             })?;
-        reply_rx.recv().map_err(|_| {
-            io::Error::new(
+        match wait_for_surface_interaction_reply(&reply_rx, &self.cancel) {
+            SurfaceInteractionReply::Received(result) => result,
+            SurfaceInteractionReply::Cancelled => Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "tool approval was cancelled before resolution",
+            )),
+            SurfaceInteractionReply::Closed => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "runtime interaction actor closed while waiting for tool approval",
-            )
-        })?
+            )),
+        }
     }
 }
 
 struct RuntimeSurfacePermissionHandler {
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     fence: surface::SurfaceOperationFence,
+    cancel: CancelToken,
 }
 
 impl RuntimePermissionRequestHandler for RuntimeSurfacePermissionHandler {
@@ -1511,12 +1548,17 @@ impl RuntimePermissionRequestHandler for RuntimeSurfacePermissionHandler {
                     "runtime interaction actor is unavailable",
                 ),
             })?;
-        reply_rx.recv().map_err(|_| {
-            io::Error::new(
+        match wait_for_surface_interaction_reply(&reply_rx, &self.cancel) {
+            SurfaceInteractionReply::Received(result) => result,
+            SurfaceInteractionReply::Cancelled => Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "permission request was cancelled before resolution",
+            )),
+            SurfaceInteractionReply::Closed => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "runtime interaction actor closed while waiting for permission response",
-            )
-        })?
+            )),
+        }
     }
 }
 
@@ -1536,9 +1578,13 @@ impl McpElicitationHandler for RuntimeSurfaceMcpElicitationHandler {
                 TrySendError::Full(_) => "runtime interaction mailbox is full".to_string(),
                 TrySendError::Closed(_) => "runtime interaction actor is unavailable".to_string(),
             })?;
-        reply_rx.recv().map_err(|_| {
-            "runtime interaction actor closed while waiting for MCP elicitation".to_string()
-        })?
+        match wait_for_surface_interaction_reply(&reply_rx, &self.cancel) {
+            SurfaceInteractionReply::Received(result) => result,
+            SurfaceInteractionReply::Cancelled => Ok(orca_mcp::McpElicitationResponse::Decline),
+            SurfaceInteractionReply::Closed => Err(
+                "runtime interaction actor closed while waiting for MCP elicitation".to_string(),
+            ),
+        }
     }
 }
 
@@ -1958,6 +2004,38 @@ impl RuntimeThreadStartRequest {
                 };
                 let thread_id = transcript.meta.session_id.clone();
                 let path = transcript.path.clone();
+                self.preloaded = Some(transcript);
+                (thread_id, path)
+            }
+            HistoryMode::Fork(selector) => {
+                let transcript = match self.preloaded.take() {
+                    Some(transcript) => transcript,
+                    None => SessionStore::new()
+                        .load_session(&selector)
+                        .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                            message: error.to_string(),
+                        })?,
+                };
+                let cwd = self.config.cwd.clone().unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+                });
+                let store = SessionStore::new();
+                let mut meta = store.create_fork_meta(
+                    &cwd,
+                    self.config.provider.as_str(),
+                    self.config.model.as_history_value(),
+                    &self.title,
+                    transcript.meta.session_id.clone(),
+                );
+                meta.active_permission_profile = self.config.active_permission_profile.clone();
+                meta.approval_mode = Some(self.config.approval_mode);
+                meta.permission_rules = self.config.permission_rules.clone();
+                meta.additional_working_directories =
+                    self.config.additional_working_directories.clone();
+                let path =
+                    crate::history::prospective_session_path(&meta.session_id, meta.created_at);
+                let thread_id = meta.session_id.clone();
+                self.prepared_record_meta = Some(meta);
                 self.preloaded = Some(transcript);
                 (thread_id, path)
             }
@@ -2488,6 +2566,7 @@ impl RuntimeThreadHandle {
                 surface::SurfaceCapability::ReadSnapshot,
                 surface::SurfaceCapability::SubmitOperation,
                 surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageThreadSettings,
                 surface::SurfaceCapability::RespondGrantedInteraction,
                 surface::SurfaceCapability::RepairThread,
             ]))
@@ -2664,6 +2743,120 @@ impl RuntimeThreadHandle {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.try_send(ThreadCommand::ReadSnapshot { reply: reply_tx })?;
         receive_reply(reply_rx, "runtime thread")?
+    }
+
+    pub(crate) fn jsonl_read_live_projection(
+        &self,
+        include_messages: bool,
+        include_turns: bool,
+    ) -> Result<StoredThreadProjection, RuntimeHostError> {
+        let snapshot = self.snapshot()?;
+        let mut projection = SessionStore::new()
+            .read_thread(self.thread_id(), false, false)
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to read live thread metadata: {error}"),
+            })?;
+        projection.message_count = snapshot.messages().len();
+        projection.messages = if include_messages {
+            snapshot
+                .messages()
+                .iter()
+                .map(crate::thread_store::message_to_thread_json)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        projection.turns = if include_turns {
+            if let Some(records) = snapshot.conversation_records() {
+                crate::thread_store::conversation_records_to_thread_turns(
+                    self.thread_id(),
+                    records,
+                    usize::MAX,
+                    TurnItemsView::Full,
+                )
+                .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                    message: format!("failed to project live thread turns: {error}"),
+                })?
+            } else {
+                crate::thread_store::messages_to_thread_turns(
+                    self.thread_id(),
+                    snapshot.messages(),
+                    usize::MAX,
+                    TurnItemsView::Full,
+                )
+            }
+        } else {
+            Vec::new()
+        };
+        Ok(projection)
+    }
+
+    pub(crate) fn jsonl_list_live_turns(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+        items_view: TurnItemsView,
+    ) -> Result<StoredThreadTurnPage, RuntimeHostError> {
+        let snapshot = self.snapshot()?;
+        let turns = if let Some(records) = snapshot.conversation_records() {
+            crate::thread_store::conversation_records_to_thread_turns(
+                self.thread_id(),
+                records,
+                usize::MAX,
+                items_view,
+            )
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to project live thread turns: {error}"),
+            })?
+        } else {
+            crate::thread_store::messages_to_thread_turns(
+                self.thread_id(),
+                snapshot.messages(),
+                usize::MAX,
+                items_view,
+            )
+        };
+        Ok(crate::thread_store::page_thread_turns(
+            turns,
+            cursor,
+            limit,
+            sort_direction,
+        ))
+    }
+
+    pub(crate) fn jsonl_list_live_items(
+        &self,
+        turn_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+    ) -> Result<StoredThreadItemPage, RuntimeHostError> {
+        let snapshot = self.snapshot()?;
+        let items = if let Some(records) = snapshot.conversation_records() {
+            crate::thread_store::conversation_records_to_thread_items(
+                self.thread_id(),
+                records,
+                turn_id,
+                usize::MAX,
+            )
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to project live thread items: {error}"),
+            })?
+        } else {
+            crate::thread_store::messages_to_thread_items(
+                self.thread_id(),
+                snapshot.messages(),
+                turn_id,
+                usize::MAX,
+            )
+        };
+        Ok(crate::thread_store::page_thread_items(
+            items,
+            cursor,
+            limit,
+            sort_direction,
+        ))
     }
 
     pub fn read_surface_history(
@@ -2857,6 +3050,168 @@ impl RuntimeHostHandle {
     pub(crate) fn host_incarnation(&self) -> &surface::HostIncarnation {
         &self.host_incarnation
     }
+
+    pub(crate) fn jsonl_list_sessions(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        filters: ThreadListFilters,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+        search_term: Option<&str>,
+    ) -> io::Result<StoredThreadSummaryPage> {
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(HostCommand::JsonlListSessions {
+                cursor: cursor.map(ToString::to_string),
+                limit,
+                filters,
+                sort_key,
+                sort_direction,
+                search_term: search_term.map(ToString::to_string),
+                reply,
+            })
+            .map_err(|_| io::Error::other("runtime host is unavailable"))?;
+        receive
+            .recv()
+            .map_err(|_| io::Error::other("runtime host closed JSONL session list"))?
+    }
+
+    pub(crate) fn jsonl_search_sessions(
+        &self,
+        query: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        include_archived: bool,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+    ) -> io::Result<StoredThreadSearchPage> {
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(HostCommand::JsonlSearchSessions {
+                query: query.to_string(),
+                cursor: cursor.map(ToString::to_string),
+                limit,
+                include_archived,
+                sort_key,
+                sort_direction,
+                reply,
+            })
+            .map_err(|_| io::Error::other("runtime host is unavailable"))?;
+        receive
+            .recv()
+            .map_err(|_| io::Error::other("runtime host closed JSONL session search"))?
+    }
+
+    pub(crate) fn jsonl_read_session(
+        &self,
+        thread_id: &str,
+        include_messages: bool,
+        include_turns: bool,
+    ) -> io::Result<StoredThreadProjection> {
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(HostCommand::JsonlReadSession {
+                thread_id: thread_id.to_string(),
+                include_messages,
+                include_turns,
+                reply,
+            })
+            .map_err(|_| io::Error::other("runtime host is unavailable"))?;
+        receive
+            .recv()
+            .map_err(|_| io::Error::other("runtime host closed JSONL session read"))?
+    }
+
+    pub(crate) fn jsonl_list_turns(
+        &self,
+        thread_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+        items_view: TurnItemsView,
+    ) -> io::Result<StoredThreadTurnPage> {
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(HostCommand::JsonlListTurns {
+                thread_id: thread_id.to_string(),
+                cursor: cursor.map(ToString::to_string),
+                limit,
+                sort_direction,
+                items_view,
+                reply,
+            })
+            .map_err(|_| io::Error::other("runtime host is unavailable"))?;
+        receive
+            .recv()
+            .map_err(|_| io::Error::other("runtime host closed JSONL turn list"))?
+    }
+
+    pub(crate) fn jsonl_list_items(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+    ) -> io::Result<StoredThreadItemPage> {
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(HostCommand::JsonlListItems {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.map(ToString::to_string),
+                cursor: cursor.map(ToString::to_string),
+                limit,
+                sort_direction,
+                reply,
+            })
+            .map_err(|_| io::Error::other("runtime host is unavailable"))?;
+        receive
+            .recv()
+            .map_err(|_| io::Error::other("runtime host closed JSONL item list"))?
+    }
+
+    pub(crate) fn jsonl_update_session_metadata(
+        &self,
+        thread_id: &str,
+        patch: ThreadMetadataPatch,
+    ) -> io::Result<()> {
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(HostCommand::JsonlUpdateSessionMetadata {
+                thread_id: thread_id.to_string(),
+                patch,
+                reply,
+            })
+            .map_err(|_| io::Error::other("runtime host is unavailable"))?;
+        receive
+            .recv()
+            .map_err(|_| io::Error::other("runtime host closed JSONL metadata update"))?
+    }
+
+    pub(crate) fn control_jsonl_turn(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        expected_thread_id: Option<surface::SurfaceThreadId>,
+        legacy_turn_id: surface::LegacyTurnId,
+        action: surface::JsonlTurnControlAction,
+    ) -> Result<surface::JsonlTurnControlResult, surface::SurfaceClientCommandError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(HostCommand::ControlJsonlTurn {
+                client,
+                request_id,
+                expected_thread_id,
+                legacy_turn_id,
+                action,
+                reply: reply_tx,
+            })
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        reply_rx
+            .recv()
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
+    }
 }
 
 impl RuntimeHost {
@@ -3001,6 +3356,60 @@ enum HostCommand {
         request: Box<RuntimeThreadStartRequest>,
         reply: SyncSender<Result<RuntimeThreadHandle, RuntimeHostError>>,
     },
+    JsonlListSessions {
+        cursor: Option<String>,
+        limit: usize,
+        filters: ThreadListFilters,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+        search_term: Option<String>,
+        reply: SyncSender<io::Result<StoredThreadSummaryPage>>,
+    },
+    JsonlSearchSessions {
+        query: String,
+        cursor: Option<String>,
+        limit: usize,
+        include_archived: bool,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+        reply: SyncSender<io::Result<StoredThreadSearchPage>>,
+    },
+    JsonlReadSession {
+        thread_id: String,
+        include_messages: bool,
+        include_turns: bool,
+        reply: SyncSender<io::Result<StoredThreadProjection>>,
+    },
+    JsonlListTurns {
+        thread_id: String,
+        cursor: Option<String>,
+        limit: usize,
+        sort_direction: SortDirection,
+        items_view: TurnItemsView,
+        reply: SyncSender<io::Result<StoredThreadTurnPage>>,
+    },
+    JsonlListItems {
+        thread_id: String,
+        turn_id: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        sort_direction: SortDirection,
+        reply: SyncSender<io::Result<StoredThreadItemPage>>,
+    },
+    JsonlUpdateSessionMetadata {
+        thread_id: String,
+        patch: ThreadMetadataPatch,
+        reply: SyncSender<io::Result<()>>,
+    },
+    ControlJsonlTurn {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        expected_thread_id: Option<surface::SurfaceThreadId>,
+        legacy_turn_id: surface::LegacyTurnId,
+        action: surface::JsonlTurnControlAction,
+        reply:
+            SyncSender<Result<surface::JsonlTurnControlResult, surface::SurfaceClientCommandError>>,
+    },
     Shutdown {
         reply: SyncSender<Result<(), RuntimeHostError>>,
     },
@@ -3110,6 +3519,14 @@ enum ThreadCommand {
         reply: SyncSender<
             Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
         >,
+    },
+    SurfaceControlJsonlTurn {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        legacy_turn_id: surface::LegacyTurnId,
+        action: surface::JsonlTurnControlAction,
+        reply:
+            SyncSender<Result<surface::JsonlTurnControlResult, surface::SurfaceClientCommandError>>,
     },
     SurfaceManualCompact {
         client: surface::RuntimeSurfaceClientHandle,
@@ -3690,6 +4107,131 @@ async fn run_host_supervisor(
                 });
                 actors.insert(thread_id, ThreadActorEntry { command_tx, join });
                 let _ = reply.send(Ok(handle));
+            }
+            HostCommand::JsonlListSessions {
+                cursor,
+                limit,
+                filters,
+                sort_key,
+                sort_direction,
+                search_term,
+                reply,
+            } => {
+                let result = SessionStore::new().list_threads(
+                    cursor.as_deref(),
+                    limit,
+                    filters,
+                    sort_key,
+                    sort_direction,
+                    search_term.as_deref(),
+                );
+                let _ = reply.send(result);
+            }
+            HostCommand::JsonlSearchSessions {
+                query,
+                cursor,
+                limit,
+                include_archived,
+                sort_key,
+                sort_direction,
+                reply,
+            } => {
+                let result = SessionStore::new().search_threads(
+                    &query,
+                    cursor.as_deref(),
+                    limit,
+                    include_archived,
+                    sort_key,
+                    sort_direction,
+                );
+                let _ = reply.send(result);
+            }
+            HostCommand::JsonlReadSession {
+                thread_id,
+                include_messages,
+                include_turns,
+                reply,
+            } => {
+                let result =
+                    SessionStore::new().read_thread(&thread_id, include_messages, include_turns);
+                let _ = reply.send(result);
+            }
+            HostCommand::JsonlListTurns {
+                thread_id,
+                cursor,
+                limit,
+                sort_direction,
+                items_view,
+                reply,
+            } => {
+                let result = SessionStore::new().list_thread_turns(
+                    &thread_id,
+                    cursor.as_deref(),
+                    limit,
+                    sort_direction,
+                    items_view,
+                );
+                let _ = reply.send(result);
+            }
+            HostCommand::JsonlListItems {
+                thread_id,
+                turn_id,
+                cursor,
+                limit,
+                sort_direction,
+                reply,
+            } => {
+                let result = SessionStore::new().list_thread_items(
+                    &thread_id,
+                    turn_id.as_deref(),
+                    cursor.as_deref(),
+                    limit,
+                    sort_direction,
+                );
+                let _ = reply.send(result);
+            }
+            HostCommand::JsonlUpdateSessionMetadata {
+                thread_id,
+                patch,
+                reply,
+            } => {
+                let result = SessionStore::new()
+                    .update_thread_metadata(&thread_id, patch)
+                    .map(|_| ());
+                let _ = reply.send(result);
+            }
+            HostCommand::ControlJsonlTurn {
+                client,
+                request_id,
+                expected_thread_id,
+                legacy_turn_id,
+                action,
+                reply,
+            } => {
+                let selected_thread_id = expected_thread_id
+                    .as_ref()
+                    .unwrap_or_else(|| client.thread_id());
+                let selected_thread_id =
+                    uuid::Uuid::from_bytes(*selected_thread_id.as_bytes()).to_string();
+                let Some(actor) = actors.get(&selected_thread_id) else {
+                    let _ = reply.send(Ok(jsonl_idle_turn_control(
+                        request_id,
+                        legacy_turn_id,
+                        &action,
+                    )));
+                    continue;
+                };
+                let command = ThreadCommand::SurfaceControlJsonlTurn {
+                    client,
+                    request_id,
+                    legacy_turn_id,
+                    action,
+                    reply,
+                };
+                if actor.command_tx.try_send(command).is_err() {
+                    // The command owns the reply sender, so a failed send closes
+                    // the caller's receive side as RuntimeUnavailable.
+                }
             }
             HostCommand::Shutdown { reply } => {
                 let mut shutdown_actors = actors
@@ -6702,6 +7244,13 @@ fn bootstrap_recorded_surface(
             .entries
             .as_slice(),
     );
+    persist_surface_settings_metadata(
+        thread.thread_id(),
+        &coordinator.state().snapshot().settings.effective,
+    )
+    .map_err(|error| RuntimeHostError::ThreadStartFailed {
+        message: format!("failed to persist effective typed surface settings: {error}"),
+    })?;
     let authority = surface::SurfaceAttachAuthority::new(
         host_incarnation,
         coordinator.state().snapshot().thread.thread_id.clone(),
@@ -6865,6 +7414,60 @@ fn initial_surface_snapshot(
         orca_core::config::ReasoningEffort::High => surface::SurfaceReasoningEffort::High,
         orca_core::config::ReasoningEffort::Max => surface::SurfaceReasoningEffort::Max,
     };
+    let active_permission_profile = config
+        .active_permission_profile
+        .as_ref()
+        .map(|profile| {
+            Ok(surface::SurfaceActivePermissionProfile {
+                id: surface::NonEmptyText::try_new(profile.id.clone()).map_err(|error| {
+                    RuntimeHostError::ThreadStartFailed {
+                        message: format!("invalid active permission profile id: {error:?}"),
+                    }
+                })?,
+                extends: profile
+                    .extends
+                    .as_ref()
+                    .map(|value| surface::NonEmptyText::try_new(value.clone()))
+                    .transpose()
+                    .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                        message: format!("invalid active permission profile parent: {error:?}"),
+                    })?,
+            })
+        })
+        .transpose()?;
+    let permission_rules = config
+        .permission_rules
+        .rules
+        .iter()
+        .map(|rule| {
+            Ok(surface::SurfacePermissionRule {
+                tool: surface::NonEmptyText::try_new(rule.tool.clone()).map_err(|error| {
+                    RuntimeHostError::ThreadStartFailed {
+                        message: format!("invalid permission rule tool: {error:?}"),
+                    }
+                })?,
+                pattern: surface::NonEmptyText::try_new(rule.pattern.clone()).map_err(|error| {
+                    RuntimeHostError::ThreadStartFailed {
+                        message: format!("invalid permission rule pattern: {error:?}"),
+                    }
+                })?,
+                decision: match rule.decision {
+                    orca_core::approval_types::Decision::Allow => {
+                        surface::SurfacePermissionDecision::Allow
+                    }
+                    orca_core::approval_types::Decision::Prompt => {
+                        surface::SurfacePermissionDecision::Prompt
+                    }
+                    orca_core::approval_types::Decision::Deny => {
+                        surface::SurfacePermissionDecision::Deny
+                    }
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, RuntimeHostError>>()?;
+    let permission_rules_digest = surface_sha256(
+        &serde_json::to_vec(&permission_rules).expect("surface permission rules are serializable"),
+    );
     let settings = surface::SurfaceRuntimeSettings {
         model: surface::NonEmptyText::try_new(
             config
@@ -6877,10 +7480,10 @@ fn initial_surface_snapshot(
         approval_mode,
         cwd: cwd.clone(),
         workspace_roots: workspace_roots.clone(),
-        active_permission_profile: None,
+        active_permission_profile,
         permission_rules: surface::SurfacePermissionRuleSet {
-            ordered_rules: Vec::new(),
-            digest: surface::Sha256Digest::new([0; 32]),
+            ordered_rules: permission_rules,
+            digest: permission_rules_digest,
         },
         additional_working_directories,
         network_permissions: surface::SurfaceNetworkPermissions {
@@ -7011,9 +7614,94 @@ fn apply_runtime_settings_patch(
             };
             settings.approval_mode = *mode;
         }
-        _ => return Err(surface::SurfaceClientCommandError::Unauthorized),
+        surface::RuntimeSettingsPatch::SetCwd { cwd } => {
+            config.cwd = Some(cwd.as_path().to_path_buf());
+            settings.cwd = cwd.clone();
+        }
+        surface::RuntimeSettingsPatch::SetWorkspaceRoots { roots } => {
+            config.runtime_workspace_roots = Some(
+                roots
+                    .iter()
+                    .map(|root| root.as_path().to_path_buf())
+                    .collect(),
+            );
+            settings.workspace_roots = roots.clone();
+        }
+        surface::RuntimeSettingsPatch::SetActivePermissionProfile { profile } => {
+            config.active_permission_profile =
+                profile
+                    .as_ref()
+                    .map(|profile| orca_core::config::ActivePermissionProfile {
+                        id: profile.id.as_str().to_string(),
+                        extends: profile
+                            .extends
+                            .as_ref()
+                            .map(|value| value.as_str().to_string()),
+                    });
+            settings.active_permission_profile = profile.clone();
+        }
+        surface::RuntimeSettingsPatch::ReplacePermissionRules { rules } => {
+            config.permission_rules = orca_core::approval_rules::PermissionRules {
+                rules: rules
+                    .iter()
+                    .map(|rule| {
+                        orca_core::approval_rules::PermissionRule::new(
+                            rule.tool.as_str(),
+                            rule.pattern.as_str(),
+                            match rule.decision {
+                                surface::SurfacePermissionDecision::Allow => {
+                                    orca_core::approval_types::Decision::Allow
+                                }
+                                surface::SurfacePermissionDecision::Prompt => {
+                                    orca_core::approval_types::Decision::Prompt
+                                }
+                                surface::SurfacePermissionDecision::Deny => {
+                                    orca_core::approval_types::Decision::Deny
+                                }
+                            },
+                        )
+                    })
+                    .collect(),
+            };
+            settings.permission_rules = surface::SurfacePermissionRuleSet {
+                ordered_rules: rules.clone(),
+                digest: surface_sha256(
+                    &serde_json::to_vec(rules).expect("surface permission rules are serializable"),
+                ),
+            };
+        }
+        surface::RuntimeSettingsPatch::ReplaceAdditionalWorkingDirectories { directories } => {
+            config.additional_working_directories = directories
+                .iter()
+                .map(|directory| orca_core::config::AdditionalWorkingDirectory {
+                    path: directory.path.as_path().to_path_buf(),
+                    source: directory.source.as_str().to_string(),
+                })
+                .collect();
+            settings.additional_working_directories = directories.clone();
+        }
+        surface::RuntimeSettingsPatch::ReplaceNetworkPermissions { permissions } => {
+            settings.network_permissions = permissions.clone();
+        }
+        surface::RuntimeSettingsPatch::ApplyPermissionUpdate { .. } => {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
     }
     Ok(())
+}
+
+fn runtime_settings_patch_affects_policy(patch: &surface::RuntimeSettingsPatch) -> bool {
+    matches!(
+        patch,
+        surface::RuntimeSettingsPatch::SetApprovalMode { .. }
+            | surface::RuntimeSettingsPatch::SetCwd { .. }
+            | surface::RuntimeSettingsPatch::SetWorkspaceRoots { .. }
+            | surface::RuntimeSettingsPatch::SetActivePermissionProfile { .. }
+            | surface::RuntimeSettingsPatch::ReplacePermissionRules { .. }
+            | surface::RuntimeSettingsPatch::ReplaceAdditionalWorkingDirectories { .. }
+            | surface::RuntimeSettingsPatch::ReplaceNetworkPermissions { .. }
+            | surface::RuntimeSettingsPatch::ApplyPermissionUpdate { .. }
+    )
 }
 
 fn hydrate_run_config_from_surface_settings(
@@ -7042,7 +7730,131 @@ fn hydrate_run_config_from_surface_settings(
             mode: settings.approval_mode,
         },
     )?;
+    apply_runtime_settings_patch(
+        config,
+        &mut restored,
+        &surface::RuntimeSettingsPatch::SetCwd {
+            cwd: settings.cwd.clone(),
+        },
+    )?;
+    apply_runtime_settings_patch(
+        config,
+        &mut restored,
+        &surface::RuntimeSettingsPatch::SetWorkspaceRoots {
+            roots: settings.workspace_roots.clone(),
+        },
+    )?;
+    apply_runtime_settings_patch(
+        config,
+        &mut restored,
+        &surface::RuntimeSettingsPatch::SetActivePermissionProfile {
+            profile: settings.active_permission_profile.clone(),
+        },
+    )?;
+    apply_runtime_settings_patch(
+        config,
+        &mut restored,
+        &surface::RuntimeSettingsPatch::ReplacePermissionRules {
+            rules: settings.permission_rules.ordered_rules.clone(),
+        },
+    )?;
+    apply_runtime_settings_patch(
+        config,
+        &mut restored,
+        &surface::RuntimeSettingsPatch::ReplaceAdditionalWorkingDirectories {
+            directories: settings.additional_working_directories.clone(),
+        },
+    )?;
     Ok(())
+}
+
+fn persist_surface_settings_metadata(
+    thread_id: &str,
+    settings: &surface::SurfaceRuntimeSettings,
+) -> io::Result<()> {
+    let network_domain_permissions = settings
+        .network_permissions
+        .domains
+        .iter()
+        .map(|permission| {
+            (
+                permission.domain.as_str().to_string(),
+                match permission.access {
+                    surface::SurfaceNetworkDomainAccess::Allow => {
+                        orca_core::config::PermissionProfileNetworkAccess::Allow
+                    }
+                    surface::SurfaceNetworkDomainAccess::Deny => {
+                        orca_core::config::PermissionProfileNetworkAccess::Deny
+                    }
+                },
+            )
+        })
+        .collect();
+    SessionStore::new()
+        .update_thread_metadata(
+            thread_id,
+            ThreadMetadataPatch {
+                title: None,
+                active_permission_profile: settings.active_permission_profile.as_ref().map(
+                    |profile| orca_core::config::ActivePermissionProfile {
+                        id: profile.id.as_str().to_string(),
+                        extends: profile
+                            .extends
+                            .as_ref()
+                            .map(|value| value.as_str().to_string()),
+                    },
+                ),
+                approval_mode: Some(match settings.approval_mode {
+                    surface::SurfaceApprovalMode::Suggest => ApprovalMode::Suggest,
+                    surface::SurfaceApprovalMode::AutoEdit => ApprovalMode::AutoEdit,
+                    surface::SurfaceApprovalMode::FullAuto => ApprovalMode::FullAuto,
+                    surface::SurfaceApprovalMode::Plan => ApprovalMode::Plan,
+                }),
+                runtime_workspace_roots: Some(
+                    settings
+                        .workspace_roots
+                        .iter()
+                        .map(|root| root.as_path().to_path_buf())
+                        .collect(),
+                ),
+                permission_rules: Some(orca_core::approval_rules::PermissionRules {
+                    rules: settings
+                        .permission_rules
+                        .ordered_rules
+                        .iter()
+                        .map(|rule| {
+                            orca_core::approval_rules::PermissionRule::new(
+                                rule.tool.as_str(),
+                                rule.pattern.as_str(),
+                                match rule.decision {
+                                    surface::SurfacePermissionDecision::Allow => {
+                                        orca_core::approval_types::Decision::Allow
+                                    }
+                                    surface::SurfacePermissionDecision::Prompt => {
+                                        orca_core::approval_types::Decision::Prompt
+                                    }
+                                    surface::SurfacePermissionDecision::Deny => {
+                                        orca_core::approval_types::Decision::Deny
+                                    }
+                                },
+                            )
+                        })
+                        .collect(),
+                }),
+                additional_working_directories: Some(
+                    settings
+                        .additional_working_directories
+                        .iter()
+                        .map(|directory| orca_core::config::AdditionalWorkingDirectory {
+                            path: directory.path.as_path().to_path_buf(),
+                            source: directory.source.as_str().to_string(),
+                        })
+                        .collect(),
+                ),
+                network_domain_permissions: Some(network_domain_permissions),
+            },
+        )
+        .map(|_| ())
 }
 
 fn recovered_surface_terminals(
@@ -7086,6 +7898,47 @@ fn surface_request_text(request: &surface::SurfaceInputRequest) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn jsonl_turn_control_wire_action(
+    action: &surface::JsonlTurnControlAction,
+) -> surface::JsonlTurnControlWireAction {
+    match action {
+        surface::JsonlTurnControlAction::Interrupt => {
+            surface::JsonlTurnControlWireAction::Interrupt
+        }
+        surface::JsonlTurnControlAction::Resume => surface::JsonlTurnControlWireAction::Resume,
+        surface::JsonlTurnControlAction::Steer { .. } => surface::JsonlTurnControlWireAction::Steer,
+    }
+}
+
+fn jsonl_turn_control_legacy_input(
+    action: &surface::JsonlTurnControlAction,
+) -> Option<surface::DisplayText> {
+    match action {
+        surface::JsonlTurnControlAction::Steer { input } => {
+            Some(surface::DisplayText::new(surface_request_text(input)))
+        }
+        surface::JsonlTurnControlAction::Interrupt | surface::JsonlTurnControlAction::Resume => {
+            None
+        }
+    }
+}
+
+fn jsonl_idle_turn_control(
+    request_id: surface::SurfaceRequestId,
+    legacy_turn_id: surface::LegacyTurnId,
+    action: &surface::JsonlTurnControlAction,
+) -> surface::JsonlTurnControlResult {
+    surface::JsonlTurnControlResult::Idle {
+        request_id,
+        echo: surface::JsonlIdleTurnControlWireEcho {
+            legacy_turn_id,
+            action: jsonl_turn_control_wire_action(action),
+            status: surface::JsonlIdleTurnControlStatus::Idle,
+            legacy_input: jsonl_turn_control_legacy_input(action),
+        },
+    }
 }
 
 fn resolve_surface_input(request: &surface::SurfaceInputRequest) -> Option<surface::SurfaceInput> {
@@ -8946,6 +9799,144 @@ fn surface_permission_profile_is_subset(
     file_system_subset && network_subset && shell_subset
 }
 
+fn surface_session_permission_grant_is_applied(
+    settings: &surface::SurfaceRuntimeSettings,
+    permissions: &surface::SurfacePermissionProfile,
+) -> bool {
+    let paths_applied = permissions.file_system.as_ref().is_none_or(|file_system| {
+        file_system
+            .read
+            .iter()
+            .flatten()
+            .chain(file_system.write.iter().flatten())
+            .all(|path| {
+                surface::CanonicalPath::try_new(std::path::PathBuf::from(path.0.as_str()))
+                    .ok()
+                    .is_some_and(|path| {
+                        settings
+                            .additional_working_directories
+                            .iter()
+                            .any(|directory| directory.path == path)
+                    })
+            })
+    });
+    let network_applied = permissions.network.as_ref().is_none_or(|requested| {
+        let enabled = requested
+            .enabled
+            .is_none_or(|enabled| settings.network_permissions.enabled == Some(enabled));
+        enabled
+            && requested.domains.iter().all(|(domain, access)| {
+                settings
+                    .network_permissions
+                    .domains
+                    .iter()
+                    .any(|permission| {
+                        permission.domain.as_str() == domain.0.as_str()
+                            && permission.access
+                                == match access {
+                                    surface::SurfaceAllowDeny::Allow => {
+                                        surface::SurfaceNetworkDomainAccess::Allow
+                                    }
+                                    surface::SurfaceAllowDeny::Deny => {
+                                        surface::SurfaceNetworkDomainAccess::Deny
+                                    }
+                                }
+                    })
+            })
+    });
+    let shell_applied = permissions
+        .shell
+        .as_ref()
+        .is_none_or(|shell| !shell.unsandboxed);
+    paths_applied && network_applied && shell_applied
+}
+
+fn surface_session_permission_settings_delta_authorized(
+    current: &surface::SurfaceRuntimeSettings,
+    next: &surface::SurfaceRuntimeSettings,
+    requested: &surface::SurfacePermissionProfile,
+) -> bool {
+    if current.model != next.model
+        || current.reasoning_effort != next.reasoning_effort
+        || current.approval_mode != next.approval_mode
+        || current.cwd != next.cwd
+        || current.workspace_roots != next.workspace_roots
+        || current.active_permission_profile != next.active_permission_profile
+        || current.permission_rules != next.permission_rules
+    {
+        return false;
+    }
+    if current
+        .additional_working_directories
+        .iter()
+        .any(|directory| !next.additional_working_directories.contains(directory))
+    {
+        return false;
+    }
+    let requested_paths = requested
+        .file_system
+        .iter()
+        .flat_map(|file_system| {
+            file_system
+                .read
+                .iter()
+                .flatten()
+                .chain(file_system.write.iter().flatten())
+        })
+        .filter_map(|path| {
+            surface::CanonicalPath::try_new(std::path::PathBuf::from(path.0.as_str())).ok()
+        })
+        .collect::<BTreeSet<_>>();
+    if next
+        .additional_working_directories
+        .iter()
+        .filter(|directory| !current.additional_working_directories.contains(directory))
+        .any(|directory| {
+            directory.source.as_str() != "session" || !requested_paths.contains(&directory.path)
+        })
+    {
+        return false;
+    }
+    let requested_network = requested.network.as_ref();
+    if current.network_permissions.enabled != next.network_permissions.enabled
+        && requested_network.and_then(|network| network.enabled) != next.network_permissions.enabled
+    {
+        return false;
+    }
+    let requested_domains = requested_network
+        .into_iter()
+        .flat_map(|network| network.domains.iter())
+        .map(|(domain, access)| {
+            (
+                domain.0.as_str(),
+                match access {
+                    surface::SurfaceAllowDeny::Allow => surface::SurfaceNetworkDomainAccess::Allow,
+                    surface::SurfaceAllowDeny::Deny => surface::SurfaceNetworkDomainAccess::Deny,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let current_domains = current
+        .network_permissions
+        .domains
+        .iter()
+        .map(|permission| (permission.domain.as_str(), permission.access))
+        .collect::<HashMap<_, _>>();
+    next.network_permissions.domains.iter().all(|permission| {
+        current_domains.get(permission.domain.as_str()) == Some(&permission.access)
+            || requested_domains.get(permission.domain.as_str()) == Some(&permission.access)
+    }) && current
+        .network_permissions
+        .domains
+        .iter()
+        .all(|permission| {
+            next.network_permissions
+                .domains
+                .iter()
+                .any(|next| next.domain == permission.domain)
+        })
+}
+
 const PRIVATE_INTERACTION_ANSWER_DEPTH_LIMIT: usize = 64;
 const PRIVATE_INTERACTION_ANSWER_NODE_LIMIT: usize = 16_384;
 
@@ -9402,6 +10393,16 @@ struct ActiveOperation {
     surface_execution_failure: Option<surface::GenerationExecutionFailureClass>,
     surface_background_control: Option<Arc<RuntimeSurfaceBackgroundControl>>,
     pending_surface_background_transfer: Option<PendingSurfaceBackgroundTransfer>,
+}
+
+enum QueuedJsonlResumePreparation {
+    Started {
+        successor_fence: surface::SurfaceOperationFence,
+        task_id: String,
+    },
+    RecoveryRequired {
+        message: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -11456,6 +12457,206 @@ impl ThreadActor {
         Err(io::Error::other(
             "provider semantic batch did not commit after bounded retries",
         ))
+    }
+
+    fn prepare_queued_jsonl_resume(
+        &mut self,
+        active: &ActiveOperation,
+        usage_delta: UsageTotals,
+    ) -> Result<QueuedJsonlResumePreparation, RuntimeHostError> {
+        let interrupted = active.surface_operation.clone().ok_or_else(|| {
+            RuntimeHostError::ThreadStartFailed {
+                message: "queued JSONL resume lost its interrupted generation fence".to_string(),
+            }
+        })?;
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let operation = snapshot
+            .foreground_operation
+            .as_ref()
+            .filter(|operation| operation.operation_id == interrupted.operation_id)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "queued JSONL resume lost its foreground operation".to_string(),
+            })?;
+        if !matches!(
+            &operation.pending_control,
+            Some(surface::PendingControlIntent::ResumeAfterInterruptedStop {
+                generation_fence,
+            }) if generation_fence == &interrupted
+        ) {
+            return Err(RuntimeHostError::ThreadStartFailed {
+                message: "queued JSONL resume lacks its durable control intent".to_string(),
+            });
+        }
+        let generation_id = surface::SurfaceGenerationId::new(
+            interrupted
+                .generation_id
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                    message: "queued JSONL resume generation id exhausted".to_string(),
+                })?,
+        );
+        let successor_fence = surface::SurfaceOperationFence {
+            thread_id: interrupted.thread_id.clone(),
+            thread_owner_epoch: interrupted.thread_owner_epoch,
+            operation_id: interrupted.operation_id.clone(),
+            generation_id,
+        };
+        let previous = operation
+            .generations
+            .last()
+            .filter(|generation| generation.fence == interrupted)
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "queued JSONL resume predecessor disappeared".to_string(),
+            })?;
+        let successor = surface::GenerationRecord {
+            fence: successor_fence.clone(),
+            logical_turn_id: previous.logical_turn_id.clone(),
+            input: previous.input.clone(),
+            predecessor: Some(interrupted.clone()),
+            attempt: surface::GenerationAttempt::RecoveryReplacement,
+            goal_identity: None,
+            replayability: previous.replayability.clone(),
+            required_capabilities: previous.required_capabilities.clone(),
+            capability_fingerprint: previous.capability_fingerprint.clone(),
+            phase: surface::GenerationPhase::Reserved,
+            started_witness: None,
+            stop_reason: None,
+        };
+        let generation_scope = surface::SurfaceScope::Generation {
+            fence: interrupted.clone(),
+        };
+        let mut suspend_events = snapshot
+            .assistant_streams
+            .iter()
+            .filter(|stream| {
+                stream.fence == interrupted
+                    && stream.state == surface::SurfaceAssistantStreamState::Open
+            })
+            .map(|stream| {
+                (
+                    generation_scope.clone(),
+                    surface::SurfaceEvent::Assistant(surface::AssistantPatch::StreamDiscarded {
+                        stream_id: stream.stream_id.clone(),
+                        reason: surface::AssistantDiscardReason::GenerationInterrupted,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        suspend_events.extend([
+            (
+                generation_scope,
+                surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationStopped {
+                    fence: interrupted.clone(),
+                    reason: surface::GenerationStopReason::InterruptedResumable,
+                    usage_delta: surface_usage_totals(usage_delta),
+                }),
+            ),
+            (
+                surface::SurfaceScope::Operation {
+                    operation_id: interrupted.operation_id.clone(),
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::Suspended {
+                    operation_id: interrupted.operation_id.clone(),
+                    cause: surface::SuspensionCause::Interrupted {
+                        generation_id: interrupted.generation_id,
+                    },
+                }),
+            ),
+            (
+                surface::SurfaceScope::Generation {
+                    fence: successor_fence.clone(),
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationReserved {
+                    generation: successor.clone(),
+                }),
+            ),
+            (
+                surface::SurfaceScope::Operation {
+                    operation_id: interrupted.operation_id.clone(),
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::ControlIntentCommitted {
+                    operation_id: interrupted.operation_id.clone(),
+                    request_id: operation.request_id.clone(),
+                    intent: surface::PendingControlIntent::ResumeStarting {
+                        generation_fence: successor_fence.clone(),
+                    },
+                }),
+            ),
+        ]);
+        let suspend_batch = self.surface_event_batch_with_commit_id(suspend_events, None);
+        self.resident_surface
+            .coordinator
+            .commit_live_generation_suspend_batch(interrupted.clone(), &suspend_batch)
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("queued JSONL resume suspension commit failed: {error:?}"),
+            })?;
+
+        let started_commit_id =
+            surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let started_batch = self.surface_operation_batch_with_commit_id(
+            &interrupted.operation_id,
+            vec![surface::OperationPatch::GenerationStarted {
+                fence: successor_fence.clone(),
+                witness: surface::GenerationStartedWitness {
+                    started_commit_id: started_commit_id.clone(),
+                    settings_revision: operation.intent.settings_revision,
+                    policy_epoch: operation.intent.policy_epoch,
+                    durable_replayability_digest: surface::canonical_replayability_digest(
+                        &successor.replayability,
+                    ),
+                    capability_fingerprint: successor.capability_fingerprint.clone(),
+                },
+            }],
+            Some(started_commit_id),
+        );
+        if let Err(error) =
+            self.commit_surface_generation_batch_with_retry(successor_fence.clone(), &started_batch)
+        {
+            let message =
+                format!("queued JSONL resume failed after durable successor reservation: {error}");
+            let _ = self.repair_surface_resume_failure(
+                &successor_fence,
+                None,
+                "queued JSONL resume start repair",
+            );
+            self.surface_terminal_blocked = Some(message.clone());
+            return Ok(QueuedJsonlResumePreparation::RecoveryRequired { message });
+        }
+
+        let task_id = format!("typed-jsonl-resume-{}", uuid::Uuid::now_v7());
+        let loop_batch = self.surface_operation_batch(
+            &interrupted.operation_id,
+            vec![surface::OperationPatch::AgentLoopTurnStarted {
+                turn: surface::SurfaceAgentLoopTurn {
+                    turn_id: successor.logical_turn_id,
+                    fence: successor_fence.clone(),
+                    ordinal: 0,
+                    task_id: surface::SurfaceTaskId::try_new(task_id.clone())
+                        .expect("generated task id is non-empty"),
+                    task_status: surface::SurfaceTaskRunningStatus::Running,
+                },
+            }],
+        );
+        if let Err(error) =
+            self.commit_surface_generation_batch_with_retry(successor_fence.clone(), &loop_batch)
+        {
+            let message =
+                format!("queued JSONL resume failed after durable successor start: {error}");
+            let _ = self.repair_surface_resume_failure(
+                &successor_fence,
+                None,
+                "queued JSONL resume loop repair",
+            );
+            self.surface_terminal_blocked = Some(message.clone());
+            return Ok(QueuedJsonlResumePreparation::RecoveryRequired { message });
+        }
+        Ok(QueuedJsonlResumePreparation::Started {
+            successor_fence,
+            task_id,
+        })
     }
 
     fn commit_surface_background_batch_with_retry(
@@ -15714,6 +16915,16 @@ impl ThreadActor {
     ) {
         let result = (|| -> io::Result<()> {
             let snapshot = self.resident_surface.coordinator.state().snapshot();
+            let jsonl_compatibility_fallback = snapshot
+                .foreground_operation
+                .as_ref()
+                .filter(|operation| operation.operation_id == fence.operation_id)
+                .is_some_and(|operation| {
+                    matches!(
+                        operation.intent.origin,
+                        surface::OperationOrigin::JsonlThreadTurn { .. }
+                    )
+                });
             let tool = Self::surface_tool_for_runtime_request(&snapshot, &fence, &request)?;
             let authority = Self::surface_authority_for_tool(&snapshot, &fence, &tool)?;
             let interaction_request = surface::SurfaceInteractionRequest::ToolApproval {
@@ -15730,6 +16941,9 @@ impl ThreadActor {
                     interaction_request,
                 )?
             else {
+                if jsonl_compatibility_fallback {
+                    active.surface_execution_failure = None;
+                }
                 let _ = reply.send(Ok(orca_core::approval_types::ApprovalResolution {
                     id: approval.id,
                     decision: orca_core::approval_types::ApprovalDecision::Deny,
@@ -16544,7 +17758,18 @@ impl ThreadActor {
             },
         ) = (&interaction.record.request, response.answer())
         {
-            if *scope == surface::PermissionGrantScope::Session {
+            if *scope == surface::PermissionGrantScope::Session
+                && !surface_session_permission_grant_is_applied(
+                    &self
+                        .resident_surface
+                        .coordinator
+                        .state()
+                        .snapshot()
+                        .settings
+                        .effective,
+                    permissions,
+                )
+            {
                 return Ok(Self::uncommitted_interaction_response(
                     request_id,
                     interaction,
@@ -17380,7 +18605,7 @@ impl ThreadActor {
                     task_id: pending.task.task_id.as_str().to_string(),
                 })
                 .with_goal_usage_tracking(true)
-                .with_generation_handlers(move |_, _| {
+                .with_generation_handlers(move |_, cancel| {
                     HostedGenerationHandlers::default()
                         .with_provider_response_ingress(Arc::new(
                             RuntimeSurfaceProviderResponseIngress {
@@ -17391,19 +18616,23 @@ impl ThreadActor {
                         .with_approval_handler(Arc::new(RuntimeSurfaceApprovalHandler {
                             command_tx: interaction_command_tx.clone(),
                             fence: interaction_fence.clone(),
+                            cancel: cancel.clone(),
                         }))
                         .with_permission_handler(Arc::new(RuntimeSurfacePermissionHandler {
                             command_tx: interaction_command_tx.clone(),
                             fence: interaction_fence.clone(),
+                            cancel: cancel.clone(),
                         }))
                         .with_user_input_handler(Arc::new(RuntimeSurfaceUserInputHandler {
                             command_tx: interaction_command_tx.clone(),
                             fence: interaction_fence.clone(),
+                            cancel: cancel.clone(),
                         }))
                         .with_mcp_elicitation_handler(Arc::new(
                             RuntimeSurfaceMcpElicitationHandler {
                                 command_tx: interaction_command_tx.clone(),
                                 fence: interaction_fence.clone(),
+                                cancel,
                             },
                         ))
                 });
@@ -19589,7 +20818,7 @@ impl ThreadActor {
                 },
             });
         }
-        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let mut snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let settings = &snapshot.settings;
         let (expected_settings_revision, expected_policy_epoch) = match &intent.settings_preparation
         {
@@ -19641,42 +20870,89 @@ impl ThreadActor {
                 },
             });
         }
-        if matches!(
-            &intent.settings_preparation,
-            surface::OperationSettingsPreparation::ApplyThreadOverridesBeforeRequested { .. }
-        ) {
-            return Ok(surface::MutationReply::Uncommitted {
-                mutation: surface::UncommittedMutation::Invalid {
-                    request_id,
-                    target: Some(surface::MutationTarget::RuntimeSettings {
-                        host_incarnation: self
-                            .resident_surface
-                            .hub
-                            .authority()
-                            .host_incarnation()
-                            .clone(),
-                        thread_id: Some(snapshot.thread.thread_id.clone()),
-                    }),
-                    error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
-                        code: surface::SurfaceMutationErrorCode::IllegalState,
-                        message: surface::DisplayText::new(
-                            "thread settings overrides are not supported by typed admission",
-                        ),
-                        winning_request_id: None,
-                        current_revision: Some(surface::SurfaceMutationRevision::Settings {
-                            host_incarnation: self
-                                .resident_surface
-                                .hub
-                                .authority()
-                                .host_incarnation()
-                                .clone(),
-                            thread_id: Some(snapshot.thread.thread_id.clone()),
-                            revision: settings.thread_revision,
-                        }),
-                    }),
-                },
-            });
-        }
+        let settings_receipt =
+            match &intent.settings_preparation {
+                surface::OperationSettingsPreparation::UseCurrent { .. } => {
+                    surface::OperationSettingsPreparationReceipt::Current {
+                        settings_revision: settings.thread_revision,
+                        policy_epoch: settings.effective.policy_epoch,
+                    }
+                }
+                surface::OperationSettingsPreparation::ApplyThreadOverridesBeforeRequested {
+                    patches,
+                    ..
+                } => {
+                    let previous_settings_revision = settings.thread_revision;
+                    let mut next_settings = settings.clone();
+                    let mut next_config = self.config.clone();
+                    for patch in patches.as_slice() {
+                        apply_runtime_settings_patch(
+                            &mut next_config,
+                            &mut next_settings.effective,
+                            patch,
+                        )?;
+                    }
+                    next_settings.thread_revision = surface::SettingsRevision::try_new(
+                        previous_settings_revision
+                            .get()
+                            .checked_add(1)
+                            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                    )
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                    if patches
+                        .as_slice()
+                        .iter()
+                        .any(runtime_settings_patch_affects_policy)
+                    {
+                        next_settings.effective.policy_epoch =
+                            surface::PolicyEpoch::try_new(
+                                settings.effective.policy_epoch.get().checked_add(1).ok_or(
+                                    surface::SurfaceClientCommandError::RuntimeUnavailable,
+                                )?,
+                            )
+                            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                    }
+                    next_settings.pending = None;
+                    let host_commit_id =
+                        surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                            .expect("generated UUID is v7");
+                    let settings_batch = self.surface_event_batch_with_commit_id(
+                        vec![(
+                            surface::SurfaceScope::Thread,
+                            surface::SurfaceEvent::Settings(surface::SettingsPatch::Committed {
+                                previous_revision: previous_settings_revision,
+                                snapshot: next_settings.clone(),
+                            }),
+                        )],
+                        Some(host_commit_id.clone()),
+                    );
+                    self.commit_surface_actor_batch_with_retry(&settings_batch)
+                        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                    self.config = next_config;
+                    persist_surface_settings_metadata(
+                        self.handle.thread_id(),
+                        &next_settings.effective,
+                    )
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                    let receipt =
+                        surface::OperationSettingsPreparationReceipt::ThreadOverridesCommitted {
+                            previous_settings_revision,
+                            settings_revision: next_settings.thread_revision,
+                            policy_epoch: next_settings.effective.policy_epoch,
+                            patches_digest: surface_sha256(
+                                &serde_json::to_vec(patches.as_slice())
+                                    .expect("runtime settings patches are serializable"),
+                            ),
+                            host_commit_id,
+                            thread_settings_cursor: settings_batch.cursor_after.clone(),
+                        };
+                    snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+                    receipt
+                }
+            };
+        persist_surface_settings_metadata(self.handle.thread_id(), &snapshot.settings.effective)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let settings = &snapshot.settings;
         let operation_id =
             surface::SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7");
@@ -19772,10 +21048,7 @@ impl ThreadActor {
                 capability_fingerprint: surface_sha256(
                     &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
                 ),
-                settings_receipt: surface::OperationSettingsPreparationReceipt::Current {
-                    settings_revision: settings.thread_revision,
-                    policy_epoch: settings.effective.policy_epoch,
-                },
+                settings_receipt,
             },
             phase: surface::OperationPhase::Requested,
             reservation: lease.clone(),
@@ -21236,6 +22509,7 @@ impl ThreadActor {
         request_id: surface::SurfaceRequestId,
         expected_thread_revision: surface::SettingsRevision,
         patches: surface::NonEmptyVec<surface::RuntimeSettingsPatch>,
+        active_permission_update: bool,
     ) -> Result<
         surface::MutationReply<surface::SettingsMutationOutput>,
         surface::SurfaceClientCommandError,
@@ -21243,11 +22517,11 @@ impl ThreadActor {
         if !self.admits_surface_client(client, surface::SurfaceCapability::ManageThreadSettings) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if self.active.is_some() || self.pending_manual_compaction_completion.is_some() {
+        if self.pending_manual_compaction_completion.is_some() {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        let snapshot = self.resident_surface.coordinator.state().snapshot();
-        let current = &snapshot.settings;
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let current = snapshot.settings;
         if expected_thread_revision != current.thread_revision {
             return Ok(surface::MutationReply::Uncommitted {
                 mutation: surface::UncommittedMutation::Stale {
@@ -21284,6 +22558,29 @@ impl ThreadActor {
         for patch in patches.as_slice() {
             apply_runtime_settings_patch(&mut next_config, &mut next_settings.effective, patch)?;
         }
+        let active_permission_update_authorized =
+            self.resident_surface
+                .interactions
+                .values()
+                .any(|interaction| {
+                    interaction.cancelled.is_none()
+                        && interaction.winning_receipt.is_none()
+                        && interaction_route_admits(&interaction.route, client.attachment_id())
+                        && matches!(
+                            &interaction.record.request,
+                            surface::SurfaceInteractionRequest::PermissionRequest {
+                                permissions,
+                                ..
+                            } if surface_session_permission_settings_delta_authorized(
+                                &current.effective,
+                                &next_settings.effective,
+                                permissions,
+                            )
+                        )
+                });
+        if active_permission_update && !active_permission_update_authorized {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
         let next_revision = surface::SettingsRevision::try_new(
             current
                 .thread_revision
@@ -21293,6 +22590,21 @@ impl ThreadActor {
         )
         .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         next_settings.thread_revision = next_revision;
+        if patches
+            .as_slice()
+            .iter()
+            .any(runtime_settings_patch_affects_policy)
+        {
+            next_settings.effective.policy_epoch = surface::PolicyEpoch::try_new(
+                current
+                    .effective
+                    .policy_epoch
+                    .get()
+                    .checked_add(1)
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+            )
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        }
         next_settings.pending = None;
         let batch = self.surface_event_batch_with_commit_id(
             vec![(
@@ -21318,6 +22630,8 @@ impl ThreadActor {
             }
         }
         self.config = next_config;
+        persist_surface_settings_metadata(self.handle.thread_id(), &next_settings.effective)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         Ok(self.committed_settings_mutation(
             request_id,
             &batch,
@@ -21913,7 +23227,7 @@ impl ThreadActor {
         let mut hosted_request = HostedTurnRequest::new(provider_input)
             .with_backtrack_target(backtrack_target)
             .with_task_description(resolved_input.canonical_text.as_str())
-            .with_generation_handlers(move |_, _| {
+            .with_generation_handlers(move |_, cancel| {
                 HostedGenerationHandlers::default()
                     .with_provider_suspension_control(generation_background_control.clone())
                     .with_provider_response_ingress(Arc::new(
@@ -21941,18 +23255,22 @@ impl ThreadActor {
                     .with_approval_handler(Arc::new(RuntimeSurfaceApprovalHandler {
                         command_tx: interaction_command_tx.clone(),
                         fence: interaction_fence.clone(),
+                        cancel: cancel.clone(),
                     }))
                     .with_permission_handler(Arc::new(RuntimeSurfacePermissionHandler {
                         command_tx: interaction_command_tx.clone(),
                         fence: interaction_fence.clone(),
+                        cancel: cancel.clone(),
                     }))
                     .with_user_input_handler(Arc::new(RuntimeSurfaceUserInputHandler {
                         command_tx: interaction_command_tx.clone(),
                         fence: interaction_fence.clone(),
+                        cancel: cancel.clone(),
                     }))
                     .with_mcp_elicitation_handler(Arc::new(RuntimeSurfaceMcpElicitationHandler {
                         command_tx: interaction_command_tx.clone(),
                         fence: interaction_fence.clone(),
+                        cancel,
                     }))
             });
         if goal_identity.is_some() {
@@ -22932,6 +24250,28 @@ impl ThreadActor {
                             },
                         },
                         surface::OperationTerminal::BudgetExhausted { budget },
+                    )
+                }
+                (
+                    OperationOutcome::Completed(RunStatus::ApprovalRequired),
+                    Some(CompletedTurnOutcome {
+                        status: RunStatus::ApprovalRequired,
+                        ..
+                    }),
+                ) => {
+                    let message = surface::SafeDiagnosticText::try_new(
+                        "foreground operation requires approval",
+                    )
+                    .expect("fixed diagnostic is bounded");
+                    (
+                        surface::GenerationStopReason::ExecutionFailed {
+                            class: surface::GenerationExecutionFailureClass::LegacyApprovalRequired,
+                            message: message.clone(),
+                        },
+                        surface::OperationTerminal::Failed {
+                            class: surface::FailureClass::LegacyApprovalRequired,
+                            message,
+                        },
                     )
                 }
                 (
@@ -24714,7 +26054,7 @@ impl ThreadActor {
                 &operation.intent.origin,
                 surface::OperationOrigin::TuiUser
             ))
-            .with_generation_handlers(move |_, _| {
+            .with_generation_handlers(move |_, cancel| {
                 HostedGenerationHandlers::default()
                     .with_provider_response_ingress(Arc::new(
                         RuntimeSurfaceProviderResponseIngress {
@@ -24735,18 +26075,22 @@ impl ThreadActor {
                     .with_approval_handler(Arc::new(RuntimeSurfaceApprovalHandler {
                         command_tx: interaction_command_tx.clone(),
                         fence: interaction_fence.clone(),
+                        cancel: cancel.clone(),
                     }))
                     .with_permission_handler(Arc::new(RuntimeSurfacePermissionHandler {
                         command_tx: interaction_command_tx.clone(),
                         fence: interaction_fence.clone(),
+                        cancel: cancel.clone(),
                     }))
                     .with_user_input_handler(Arc::new(RuntimeSurfaceUserInputHandler {
                         command_tx: interaction_command_tx.clone(),
                         fence: interaction_fence.clone(),
+                        cancel: cancel.clone(),
                     }))
                     .with_mcp_elicitation_handler(Arc::new(RuntimeSurfaceMcpElicitationHandler {
                         command_tx: interaction_command_tx.clone(),
                         fence: interaction_fence.clone(),
+                        cancel,
                     }))
             });
         if let Some((_, _, _, goal_turn_origin, turn)) = restored_goal_binding.as_ref() {
@@ -25090,6 +26434,438 @@ impl ThreadActor {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         Ok(operation_id)
+    }
+
+    fn resolve_surface_jsonl_turn_operation(
+        &self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        legacy_turn_id: &surface::LegacyTurnId,
+    ) -> Result<Option<surface::OperationRecord>, surface::SurfaceClientCommandError> {
+        let connection_id = client
+            .connection_id()
+            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let mut matches = snapshot
+            .foreground_operation
+            .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
+            .filter(|operation| {
+                matches!(
+                    &operation.intent.origin,
+                    surface::OperationOrigin::JsonlThreadTurn {
+                        connection_id: origin_connection_id,
+                        legacy_turn_id: origin_turn_id,
+                        ..
+                    } if origin_connection_id == connection_id && origin_turn_id == legacy_turn_id
+                )
+            })
+            .cloned();
+        let operation = matches.next();
+        if matches.next().is_some() {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        Ok(operation)
+    }
+
+    fn committed_jsonl_turn_control(
+        request_id: surface::SurfaceRequestId,
+        operation_id: surface::SurfaceOperationId,
+        legacy_turn_id: surface::LegacyTurnId,
+        action: &surface::JsonlTurnControlAction,
+        status: surface::JsonlResolvedTurnControlStatus,
+        batch: &surface::SurfaceCommitBatch,
+        input_item_id: Option<surface::SurfaceItemId>,
+        family: surface::SurfaceFactFamily,
+    ) -> surface::JsonlTurnControlResult {
+        let event = &batch.events.as_slice()[0];
+        surface::JsonlTurnControlResult::Resolved {
+            mutation: surface::MutationReply::Committed {
+                mutation: surface::CommittedMutation {
+                    request_id,
+                    target: surface::MutationTarget::Operation {
+                        thread_id: batch.cursor_after.thread_id.clone(),
+                        operation_id: operation_id.clone(),
+                    },
+                    disposition: surface::MutationDisposition::Accepted,
+                    acknowledgements: surface::NonEmptyVec::try_new(vec![
+                        surface::MutationCommitAck::ThreadLocalCursor {
+                            cursor: batch.cursor_after.clone(),
+                            family,
+                            event_id: event.event_id.clone(),
+                            commit_class: batch.commit_class.clone(),
+                        },
+                    ])
+                    .expect("JSONL turn control commit has one acknowledgement"),
+                },
+                value: surface::JsonlTurnControlledOutput {
+                    operation_id,
+                    echo: surface::JsonlResolvedTurnControlWireEcho {
+                        legacy_turn_id,
+                        action: jsonl_turn_control_wire_action(action),
+                        status,
+                        legacy_input: jsonl_turn_control_legacy_input(action),
+                    },
+                    committed_cursor: batch.cursor_after.clone(),
+                    input_item_id,
+                },
+            },
+        }
+    }
+
+    fn replayed_jsonl_turn_control(
+        request_id: surface::SurfaceRequestId,
+        operation_id: surface::SurfaceOperationId,
+        legacy_turn_id: surface::LegacyTurnId,
+        action: &surface::JsonlTurnControlAction,
+        status: surface::JsonlResolvedTurnControlStatus,
+        acknowledgement: surface::MutationCommitAck,
+    ) -> Result<surface::JsonlTurnControlResult, surface::SurfaceClientCommandError> {
+        let surface::MutationCommitAck::ThreadLocalCursor { cursor, .. } = &acknowledgement else {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        };
+        let cursor = cursor.clone();
+        Ok(surface::JsonlTurnControlResult::Resolved {
+            mutation: surface::MutationReply::Committed {
+                mutation: surface::CommittedMutation {
+                    request_id,
+                    target: surface::MutationTarget::Operation {
+                        thread_id: cursor.thread_id.clone(),
+                        operation_id: operation_id.clone(),
+                    },
+                    disposition: surface::MutationDisposition::AlreadyApplied,
+                    acknowledgements: surface::NonEmptyVec::try_new(vec![acknowledgement])
+                        .expect("JSONL turn control replay has one acknowledgement"),
+                },
+                value: surface::JsonlTurnControlledOutput {
+                    operation_id,
+                    echo: surface::JsonlResolvedTurnControlWireEcho {
+                        legacy_turn_id,
+                        action: jsonl_turn_control_wire_action(action),
+                        status,
+                        legacy_input: jsonl_turn_control_legacy_input(action),
+                    },
+                    committed_cursor: cursor,
+                    input_item_id: None,
+                },
+            },
+        })
+    }
+
+    fn control_jsonl_turn_idle(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        legacy_turn_id: surface::LegacyTurnId,
+        action: surface::JsonlTurnControlAction,
+    ) -> Result<surface::JsonlTurnControlResult, surface::SurfaceClientCommandError> {
+        if !self.admits_surface_client(client, surface::SurfaceCapability::ControlBoundOperation)
+            || client.grant().role != surface::SurfaceAttachmentRole::Jsonl
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        let Some(operation) = self.resolve_surface_jsonl_turn_operation(client, &legacy_turn_id)?
+        else {
+            return Ok(jsonl_idle_turn_control(request_id, legacy_turn_id, &action));
+        };
+        let surface::JsonlTurnControlAction::Resume = action else {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        };
+        let previous = operation
+            .generations
+            .last()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let resume_source = match &previous.replayability {
+            surface::Replayability::Replayable { .. } => {
+                surface::ResumeSourceWitness::DurableReplay {
+                    replayability_digest: surface::canonical_replayability_digest(
+                        &previous.replayability,
+                    ),
+                }
+            }
+            surface::Replayability::NonReplayable { .. } => {
+                return Err(surface::SurfaceClientCommandError::Unauthorized);
+            }
+        };
+        let resumed = self.resume_surface_operation(
+            client,
+            request_id.clone(),
+            operation.operation_id.clone(),
+            previous.fence.generation_id,
+            resume_source,
+        )?;
+        let mapped = match resumed {
+            surface::MutationReply::Committed { mutation, value } => {
+                surface::MutationReply::Committed {
+                    mutation,
+                    value: surface::JsonlTurnControlledOutput {
+                        operation_id: operation.operation_id,
+                        echo: surface::JsonlResolvedTurnControlWireEcho {
+                            legacy_turn_id,
+                            action: surface::JsonlTurnControlWireAction::Resume,
+                            status: surface::JsonlResolvedTurnControlStatus::Resumed,
+                            legacy_input: None,
+                        },
+                        committed_cursor: value.generation_started.cursor,
+                        input_item_id: None,
+                    },
+                }
+            }
+            surface::MutationReply::Deferred { mutation, partial } => {
+                surface::MutationReply::Deferred {
+                    mutation,
+                    partial: match partial {
+                        surface::DeferredCommandValue::NoValue => {
+                            surface::DeferredCommandValue::NoValue
+                        }
+                        surface::DeferredCommandValue::Provisional { value } => {
+                            surface::DeferredCommandValue::Provisional {
+                                value: surface::JsonlTurnControlledOutput {
+                                    operation_id: operation.operation_id,
+                                    echo: surface::JsonlResolvedTurnControlWireEcho {
+                                        legacy_turn_id,
+                                        action: surface::JsonlTurnControlWireAction::Resume,
+                                        status: surface::JsonlResolvedTurnControlStatus::Resumed,
+                                        legacy_input: None,
+                                    },
+                                    committed_cursor: value.generation_started.cursor,
+                                    input_item_id: None,
+                                },
+                            }
+                        }
+                    },
+                }
+            }
+            surface::MutationReply::Uncommitted { mutation } => {
+                surface::MutationReply::Uncommitted { mutation }
+            }
+        };
+        Ok(surface::JsonlTurnControlResult::Resolved { mutation: mapped })
+    }
+
+    fn control_jsonl_turn_running(
+        &mut self,
+        active: &mut ActiveOperation,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        legacy_turn_id: surface::LegacyTurnId,
+        action: surface::JsonlTurnControlAction,
+    ) -> Result<surface::JsonlTurnControlResult, surface::SurfaceClientCommandError> {
+        if !self.admits_surface_client(client, surface::SurfaceCapability::ControlBoundOperation)
+            || client.grant().role != surface::SurfaceAttachmentRole::Jsonl
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        let Some(operation) = self.resolve_surface_jsonl_turn_operation(client, &legacy_turn_id)?
+        else {
+            return Ok(jsonl_idle_turn_control(request_id, legacy_turn_id, &action));
+        };
+        let fence = active
+            .surface_operation
+            .as_ref()
+            .filter(|fence| fence.operation_id == operation.operation_id)
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        match &action {
+            surface::JsonlTurnControlAction::Interrupt => {
+                let intent = surface::PendingControlIntent::Interrupt {
+                    generation_fence: fence.clone(),
+                };
+                if let Some(acknowledgement) = self
+                    .resident_surface
+                    .coordinator
+                    .state()
+                    .control_intent_acknowledgement(&operation.operation_id, &intent)
+                {
+                    return Self::replayed_jsonl_turn_control(
+                        request_id,
+                        operation.operation_id,
+                        legacy_turn_id,
+                        &action,
+                        surface::JsonlResolvedTurnControlStatus::Interrupted,
+                        acknowledgement,
+                    );
+                }
+                if active.generation.cancel.is_cancelled() {
+                    return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+                }
+                let mut interactions = self
+                    .resident_surface
+                    .interactions
+                    .iter()
+                    .filter(|(_, interaction)| {
+                        interaction.record.fence == fence
+                            && interaction.winning_receipt.is_none()
+                            && interaction.cancelled.is_none()
+                            && interaction.private_response.is_none()
+                    })
+                    .map(|(interaction_id, interaction)| {
+                        (interaction_id.clone(), interaction.revision)
+                    })
+                    .collect::<Vec<_>>();
+                interactions.sort_by_key(|(interaction_id, _)| interaction_id.clone());
+                let mut events = vec![(
+                    surface::SurfaceScope::Operation {
+                        operation_id: operation.operation_id.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(
+                        surface::OperationPatch::ControlIntentCommitted {
+                            operation_id: operation.operation_id.clone(),
+                            request_id: operation.request_id,
+                            intent,
+                        },
+                    ),
+                )];
+                for (interaction_id, expected_revision) in &interactions {
+                    events.push((
+                        surface::SurfaceScope::Generation {
+                            fence: fence.clone(),
+                        },
+                        surface::SurfaceEvent::Interaction(surface::InteractionPatch::Cancelled {
+                            interaction_id: interaction_id.clone(),
+                            expected_revision: *expected_revision,
+                            next_revision: surface::InteractionRevision::try_new(
+                                expected_revision.get().saturating_add(1),
+                            )
+                            .expect("interaction revision did not exhaust"),
+                            reason: surface::InteractionCancelReason::OperationCancelled {
+                                reason: surface::CancelReason::User,
+                            },
+                        }),
+                    ));
+                }
+                let batch = self.surface_event_batch_with_commit_id(events, None);
+                self.resident_surface
+                    .coordinator
+                    .commit_actor_generation_interrupt_batch(fence, &batch)
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                self.apply_surface_interaction_cancellations(
+                    &interactions
+                        .into_iter()
+                        .map(|(interaction_id, _)| interaction_id)
+                        .collect::<Vec<_>>(),
+                );
+                active.generation.cancel.cancel();
+                Ok(Self::committed_jsonl_turn_control(
+                    request_id,
+                    operation.operation_id,
+                    legacy_turn_id,
+                    &action,
+                    surface::JsonlResolvedTurnControlStatus::Interrupted,
+                    &batch,
+                    None,
+                    surface::SurfaceFactFamily::Operation,
+                ))
+            }
+            surface::JsonlTurnControlAction::Resume => {
+                let intent = surface::PendingControlIntent::ResumeAfterInterruptedStop {
+                    generation_fence: fence.clone(),
+                };
+                if let Some(acknowledgement) = self
+                    .resident_surface
+                    .coordinator
+                    .state()
+                    .control_intent_acknowledgement(&operation.operation_id, &intent)
+                {
+                    return Self::replayed_jsonl_turn_control(
+                        request_id,
+                        operation.operation_id,
+                        legacy_turn_id,
+                        &action,
+                        surface::JsonlResolvedTurnControlStatus::Resumed,
+                        acknowledgement,
+                    );
+                }
+                if !active.generation.cancel.is_cancelled()
+                    || !matches!(
+                        operation.pending_control,
+                        Some(surface::PendingControlIntent::Interrupt {
+                            generation_fence: ref interrupted,
+                        }) if interrupted == &fence
+                    )
+                {
+                    return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+                }
+                let batch = self.surface_operation_batch(
+                    &operation.operation_id,
+                    vec![surface::OperationPatch::ControlIntentCommitted {
+                        operation_id: operation.operation_id.clone(),
+                        request_id: operation.request_id,
+                        intent,
+                    }],
+                );
+                self.resident_surface
+                    .coordinator
+                    .commit_actor_batch(&batch)
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                Ok(Self::committed_jsonl_turn_control(
+                    request_id,
+                    operation.operation_id,
+                    legacy_turn_id,
+                    &action,
+                    surface::JsonlResolvedTurnControlStatus::Resumed,
+                    &batch,
+                    None,
+                    surface::SurfaceFactFamily::Operation,
+                ))
+            }
+            surface::JsonlTurnControlAction::Steer { input } => {
+                if active.generation.cancel.is_cancelled()
+                    || active.generation.join.is_finished()
+                    || active.resume_queued
+                {
+                    return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+                }
+                let resolved = resolve_surface_input(input)
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                let persisted = surface_input_for_persisted_presentation(&resolved);
+                let input_item_id = surface::SurfaceItemId::new();
+                let batch = self.surface_event_batch_with_commit_id(
+                    vec![(
+                        surface::SurfaceScope::Generation {
+                            fence: fence.clone(),
+                        },
+                        surface::SurfaceEvent::Item(surface::ItemPatch::Added {
+                            item: surface::SurfaceItem::UserMessage {
+                                id: input_item_id.clone(),
+                                turn_id: operation
+                                    .generations
+                                    .last()
+                                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?
+                                    .logical_turn_id
+                                    .clone(),
+                                input: surface::SurfaceUserInputState::Resolved {
+                                    fact: surface::SurfaceResolvedInputFact::Replayable {
+                                        input: persisted,
+                                        request_digest: surface_sha256(
+                                            &serde_json::to_vec(input).expect(
+                                                "JSONL steer input request is serializable",
+                                            ),
+                                        ),
+                                    },
+                                },
+                                pinned: false,
+                                origin: surface::SurfaceItemOrigin::UserInput,
+                            },
+                        }),
+                    )],
+                    None,
+                );
+                self.commit_surface_generation_batch_with_retry(fence, &batch)
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                active.steer_handle.push(resolved.canonical_text.as_str());
+                Ok(Self::committed_jsonl_turn_control(
+                    request_id,
+                    operation.operation_id,
+                    legacy_turn_id,
+                    &action,
+                    surface::JsonlResolvedTurnControlStatus::Steered,
+                    &batch,
+                    Some(input_item_id),
+                    surface::SurfaceFactFamily::Item,
+                ))
+            }
+        }
     }
 
     fn cancel_surface_acp_prompt_idle(
@@ -26320,6 +28096,52 @@ impl ThreadActor {
                                 self.active = Some(active);
                                 continue;
                             }
+                            let current_interrupt_is_durable = active
+                                .surface_operation
+                                .as_ref()
+                                .is_some_and(|fence| {
+                                    self.resident_surface
+                                        .coordinator
+                                        .state()
+                                        .snapshot()
+                                        .foreground_operation
+                                        .as_ref()
+                                        .filter(|operation| operation.operation_id == fence.operation_id)
+                                        .and_then(|operation| operation.pending_control.as_ref())
+                                        .is_some_and(|intent| {
+                                            matches!(
+                                                intent,
+                                                surface::PendingControlIntent::Interrupt {
+                                                    generation_fence,
+                                                } if generation_fence == fence
+                                            )
+                                        })
+                                });
+                            if current_interrupt_is_durable {
+                                command_rx.close();
+                                let pause_result = Self::pause_active_goal(
+                                    &mut active,
+                                    "goal run paused during runtime shutdown",
+                                );
+                                active.generation.cancel.cancel();
+                                Self::drain_closed_thread_commands(&mut command_rx);
+                                let generation_result = (&mut active.generation.join).await;
+                                let finish_result =
+                                    self.finish_generation(active, generation_result, false);
+                                let background_shutdown =
+                                    self.shutdown_background_tasks(reason).await;
+                                let shutdown_result = finish_result
+                                    .and(background_shutdown)
+                                    .and(pause_result);
+                                if let Some(reply) = reply {
+                                    let ack = match shutdown_result {
+                                        Ok(()) => ThreadShutdownAck::Complete,
+                                        Err(error) => ThreadShutdownAck::Failed(error),
+                                    };
+                                    let _ = reply.send(ack);
+                                }
+                                break;
+                            }
                             if active.surface_operation.as_ref().is_some_and(|fence| {
                                 self.resident_surface.capability_calls.iter().any(
                                     |(call_id, resident)| {
@@ -26514,6 +28336,9 @@ impl ThreadActor {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
                 ThreadCommand::SurfaceWaitOperationTerminal { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
+                ThreadCommand::SurfaceControlJsonlTurn { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
                 ThreadCommand::SurfaceManualCompact { reply, .. } => {
@@ -26713,6 +28538,7 @@ impl ThreadActor {
         let permitted_during_manual_retry = matches!(
             &command,
             ThreadCommand::SurfaceWaitOperationTerminal { .. }
+                | ThreadCommand::SurfaceControlJsonlTurn { .. }
                 | ThreadCommand::SurfaceManualCompact { .. }
                 | ThreadCommand::ReadState { .. }
                 | ThreadCommand::ReadSnapshot { .. }
@@ -26906,6 +28732,17 @@ impl ThreadActor {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::Unauthorized));
                 }
             }
+            ThreadCommand::SurfaceControlJsonlTurn {
+                client,
+                request_id,
+                legacy_turn_id,
+                action,
+                reply,
+            } => {
+                let result =
+                    self.control_jsonl_turn_idle(&client, request_id, legacy_turn_id, action);
+                let _ = reply.send(result);
+            }
             ThreadCommand::SurfaceManualCompact {
                 client,
                 request_id,
@@ -26939,6 +28776,7 @@ impl ThreadActor {
                     request_id,
                     expected_thread_revision,
                     patch,
+                    false,
                 );
                 let _ = reply.send(result);
             }
@@ -27466,6 +29304,7 @@ impl ThreadActor {
         let permitted_during_manual_precommit = matches!(
             &command,
             ThreadCommand::SurfaceWaitOperationTerminal { .. }
+                | ThreadCommand::SurfaceControlJsonlTurn { .. }
                 | ThreadCommand::SurfaceManualCompact { .. }
                 | ThreadCommand::ReadState { .. }
         );
@@ -27662,6 +29501,22 @@ impl ThreadActor {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::Unauthorized));
                 }
             }
+            ThreadCommand::SurfaceControlJsonlTurn {
+                client,
+                request_id,
+                legacy_turn_id,
+                action,
+                reply,
+            } => {
+                let result = self.control_jsonl_turn_running(
+                    active,
+                    &client,
+                    request_id,
+                    legacy_turn_id,
+                    action,
+                );
+                let _ = reply.send(result);
+            }
             ThreadCommand::SurfaceManualCompact {
                 client,
                 request_id,
@@ -27735,8 +29590,21 @@ impl ThreadActor {
                 })();
                 let _ = reply.send(result);
             }
-            ThreadCommand::SurfaceUpdateSettings { reply, .. } => {
-                let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+            ThreadCommand::SurfaceUpdateSettings {
+                client,
+                request_id,
+                expected_thread_revision,
+                patch,
+                reply,
+            } => {
+                let result = self.update_surface_settings(
+                    &client,
+                    request_id,
+                    expected_thread_revision,
+                    patch,
+                    true,
+                );
+                let _ = reply.send(result);
             }
             ThreadCommand::SurfacePinnedContextMutation { reply, .. } => {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
@@ -28165,6 +30033,29 @@ impl ThreadActor {
                         .filter(|fence| fence.operation_id == operation_id)
                         .cloned()
                         .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+                    let request_id = Self::surface_operation_record(
+                        self.resident_surface.coordinator.state().snapshot(),
+                        &operation_id,
+                    )
+                    .map(|operation| operation.request_id.clone())
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                    let interrupt_batch = self.surface_operation_batch(
+                        &operation_id,
+                        vec![surface::OperationPatch::ControlIntentCommitted {
+                            operation_id: operation_id.clone(),
+                            request_id,
+                            intent: surface::PendingControlIntent::Interrupt {
+                                generation_fence: fence.clone(),
+                            },
+                        }],
+                    );
+                    self.resident_surface
+                        .coordinator
+                        .commit_actor_generation_interrupt_batch(fence.clone(), &interrupt_batch)
+                        .map_err(|error| {
+                            eprintln!("orca: test interrupt commit failed: {error:?}");
+                            surface::SurfaceClientCommandError::RuntimeUnavailable
+                        })?;
                     let batch = self.surface_operation_batch(
                         &operation_id,
                         vec![
@@ -29122,6 +31013,37 @@ impl ThreadActor {
                         message: error.to_string(),
                     }
                 } else {
+                    let queued_surface_resume = active.surface_operation.as_ref().is_some_and(
+                        |fence| {
+                            self.resident_surface
+                                .coordinator
+                                .state()
+                                .snapshot()
+                                .foreground_operation
+                                .as_ref()
+                                .filter(|operation| operation.operation_id == fence.operation_id)
+                                .is_some_and(|operation| {
+                                    matches!(
+                                        &operation.pending_control,
+                                        Some(
+                                            surface::PendingControlIntent::ResumeAfterInterruptedStop {
+                                                generation_fence,
+                                            },
+                                        ) if generation_fence == fence
+                                    )
+                                })
+                        },
+                    );
+                    let replace_surface_generation = allow_resume
+                        && queued_surface_resume
+                        && active.request.is_resumable()
+                        && matches!(
+                            &result.outcome,
+                            GenerationTaskOutcome::Executed(ThreadOperationOutcome::Completed {
+                                status: RunStatus::Cancelled,
+                                ..
+                            })
+                        );
                     let replace_generation = active.surface_operation.is_none()
                         && allow_resume
                         && active.resume_queued
@@ -29133,7 +31055,120 @@ impl ThreadActor {
                                 ..
                             })
                         );
-                    if replace_generation {
+                    if replace_surface_generation {
+                        if let Err(error) = result.writer.finish_generation(false) {
+                            self.state = Some(result.state);
+                            OperationOutcome::ExecutionFailed {
+                                kind: error.kind(),
+                                message: error.to_string(),
+                            }
+                        } else {
+                            match self.prepare_queued_jsonl_resume(&active, surface_usage) {
+                                Ok(QueuedJsonlResumePreparation::Started {
+                                    successor_fence,
+                                    task_id,
+                                }) => {
+                                    let _ = active.steer_handle.drain();
+                                    result
+                                        .state
+                                        .thread
+                                        .lifecycle_mut()
+                                        .start_task_with_id(RuntimeTaskKind::Agent, &task_id);
+                                    active.runtime_task_id = Some(task_id.clone());
+                                    active.main_session_task_id = None;
+                                    active.request.task_id = Some(task_id);
+                                    active.request.main_session_task_id = None;
+                                    let interaction_command_tx = self.handle.command_tx.clone();
+                                    let interaction_fence = successor_fence.clone();
+                                    active.request.generation_handler_factory =
+                                        Some(Arc::new(move |_, cancel| {
+                                            HostedGenerationHandlers::default()
+                                                .with_provider_response_ingress(Arc::new(
+                                                    RuntimeSurfaceProviderResponseIngress {
+                                                        command_tx: interaction_command_tx.clone(),
+                                                        fence: interaction_fence.clone(),
+                                                    },
+                                                ))
+                                                .with_acp_read_text_file_handler(Arc::new(
+                                                    RuntimeSurfaceReadTextFileHandler {
+                                                        command_tx: interaction_command_tx.clone(),
+                                                        fence: interaction_fence.clone(),
+                                                    },
+                                                ))
+                                                .with_acp_write_text_file_handler(Arc::new(
+                                                    RuntimeSurfaceWriteTextFileHandler {
+                                                        command_tx: interaction_command_tx.clone(),
+                                                        fence: interaction_fence.clone(),
+                                                    },
+                                                ))
+                                                .with_approval_handler(Arc::new(
+                                                    RuntimeSurfaceApprovalHandler {
+                                                        command_tx: interaction_command_tx.clone(),
+                                                        fence: interaction_fence.clone(),
+                                                        cancel: cancel.clone(),
+                                                    },
+                                                ))
+                                                .with_permission_handler(Arc::new(
+                                                    RuntimeSurfacePermissionHandler {
+                                                        command_tx: interaction_command_tx.clone(),
+                                                        fence: interaction_fence.clone(),
+                                                        cancel: cancel.clone(),
+                                                    },
+                                                ))
+                                                .with_user_input_handler(Arc::new(
+                                                    RuntimeSurfaceUserInputHandler {
+                                                        command_tx: interaction_command_tx.clone(),
+                                                        fence: interaction_fence.clone(),
+                                                        cancel: cancel.clone(),
+                                                    },
+                                                ))
+                                                .with_mcp_elicitation_handler(Arc::new(
+                                                    RuntimeSurfaceMcpElicitationHandler {
+                                                        command_tx: interaction_command_tx.clone(),
+                                                        fence: interaction_fence.clone(),
+                                                        cancel,
+                                                    },
+                                                ))
+                                        }));
+                                    let context = GenerationContext::new(
+                                        active.generation.context.fence().next(),
+                                        active.steer_handle.clone(),
+                                        true,
+                                        HostedGenerationHandlers::default(),
+                                        active.config.clone(),
+                                    );
+                                    active.surface_operation = Some(successor_fence);
+                                    active.generation = self.spawn_generation(
+                                        result.state,
+                                        &active.request,
+                                        result.writer,
+                                        context,
+                                    );
+                                    self.active = Some(active);
+                                    return Ok(());
+                                }
+                                Ok(QueuedJsonlResumePreparation::RecoveryRequired { message }) => {
+                                    self.state = Some(result.state);
+                                    let completed = active.completion.complete(OperationTerminal {
+                                        operation_id: active.operation_id,
+                                        outcome: OperationOutcome::ExecutionFailed {
+                                            kind: io::ErrorKind::Other,
+                                            message,
+                                        },
+                                    });
+                                    debug_assert!(completed);
+                                    return Ok(());
+                                }
+                                Err(error) => {
+                                    self.state = Some(result.state);
+                                    OperationOutcome::ExecutionFailed {
+                                        kind: io::ErrorKind::Other,
+                                        message: error.to_string(),
+                                    }
+                                }
+                            }
+                        }
+                    } else if replace_generation {
                         if let Err(error) = result.writer.finish_generation(false) {
                             self.state = Some(result.state);
                             OperationOutcome::ExecutionFailed {
@@ -29295,7 +31330,7 @@ impl ThreadActor {
                             let interaction_command_tx = self.handle.command_tx.clone();
                             let interaction_fence = successor.operation_fence.clone();
                             active.request.generation_handler_factory =
-                                Some(Arc::new(move |_, _| {
+                                Some(Arc::new(move |_, cancel| {
                                     HostedGenerationHandlers::default()
                                         .with_provider_response_ingress(Arc::new(
                                             RuntimeSurfaceProviderResponseIngress {
@@ -29307,24 +31342,28 @@ impl ThreadActor {
                                             RuntimeSurfaceApprovalHandler {
                                                 command_tx: interaction_command_tx.clone(),
                                                 fence: interaction_fence.clone(),
+                                                cancel: cancel.clone(),
                                             },
                                         ))
                                         .with_permission_handler(Arc::new(
                                             RuntimeSurfacePermissionHandler {
                                                 command_tx: interaction_command_tx.clone(),
                                                 fence: interaction_fence.clone(),
+                                                cancel: cancel.clone(),
                                             },
                                         ))
                                         .with_user_input_handler(Arc::new(
                                             RuntimeSurfaceUserInputHandler {
                                                 command_tx: interaction_command_tx.clone(),
                                                 fence: interaction_fence.clone(),
+                                                cancel: cancel.clone(),
                                             },
                                         ))
                                         .with_mcp_elicitation_handler(Arc::new(
                                             RuntimeSurfaceMcpElicitationHandler {
                                                 command_tx: interaction_command_tx.clone(),
                                                 fence: interaction_fence.clone(),
+                                                cancel,
                                             },
                                         ))
                                 }));
@@ -34806,30 +36845,72 @@ mod tests {
             .expect("suspended operation is publicly recoverable");
         assert_eq!(recovery.operation_id(), &operation_id);
         surface::JsonlSurfaceCommitLedger::inject_generation_append_failure_once(transcript_path);
-        assert_eq!(
-            attachment
-                .client
-                .resume_recoverable(surface_request_id(), recovery)
-                .err(),
-            Some(surface::SurfaceClientCommandError::RuntimeUnavailable)
-        );
-        let rebased = fresh_surface_attachment_with_capabilities(
-            &surface,
-            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
-        )
-        .baseline
-        .snapshot;
+        let retry_deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let rebased = loop {
+            let current = fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            let recovery = current
+                .recoverable_user_operation()
+                .expect("suspended operation remains publicly recoverable");
+            assert_eq!(
+                attachment
+                    .client
+                    .resume_recoverable(surface_request_id(), recovery)
+                    .err(),
+                Some(surface::SurfaceClientCommandError::RuntimeUnavailable)
+            );
+            let rebased = fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            let rebased_operation = rebased
+                .foreground_operation
+                .as_ref()
+                .filter(|operation| operation.operation_id == operation_id)
+                .expect("failed resume remains a recoverable foreground operation");
+            if matches!(
+                rebased_operation.phase,
+                surface::OperationPhase::Suspended {
+                    cause: surface::SuspensionCause::RecoveryRequired { .. }
+                }
+            ) {
+                break rebased;
+            }
+            assert!(
+                matches!(
+                    rebased_operation.phase,
+                    surface::OperationPhase::Suspended {
+                        cause: surface::SuspensionCause::Interrupted { .. }
+                    }
+                ),
+                "resume before generation join changed durable state: {rebased_operation:#?}"
+            );
+            assert!(
+                Instant::now() < retry_deadline,
+                "generation did not settle before resume retry deadline"
+            );
+            std::thread::yield_now();
+        };
         let rebased_operation = rebased
             .foreground_operation
             .as_ref()
             .filter(|operation| operation.operation_id == operation_id)
             .expect("failed resume remains a recoverable foreground operation");
-        assert!(matches!(
-            rebased_operation.phase,
-            surface::OperationPhase::Suspended {
-                cause: surface::SuspensionCause::RecoveryRequired { .. }
-            }
-        ));
+        assert!(
+            matches!(
+                rebased_operation.phase,
+                surface::OperationPhase::Suspended {
+                    cause: surface::SuspensionCause::RecoveryRequired { .. }
+                }
+            ),
+            "failed resume state: {rebased_operation:#?}"
+        );
         assert!(rebased_operation.pending_control.is_none());
         assert_eq!(rebased_operation.generations.len(), 2);
         assert!(matches!(

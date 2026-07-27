@@ -6,6 +6,11 @@ use crate::runtime_host::{
     HostedWorkflowRequest, RuntimeHost, RuntimeHostError, RuntimeHostHandle, RuntimeThreadHandle,
     RuntimeThreadStartRequest,
 };
+use crate::thread_store::{
+    SortDirection, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchPage,
+    StoredThreadSummaryPage, StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch,
+    ThreadSortKey, TurnItemsView,
+};
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::goal_runtime::{GoalNextAction, GoalPauseReason, GoalRecord, GoalTurnOrigin};
 use orca_core::goal_types::ThreadGoal;
@@ -140,6 +145,121 @@ impl RuntimeSurfaceHostHandle {
                 RuntimeSurfaceThreadHandle::from_runtime(runtime, self.connection_id().cloned())
             })
     }
+
+    pub(crate) fn jsonl_list_sessions(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        filters: ThreadListFilters,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+        search_term: Option<&str>,
+    ) -> std::io::Result<StoredThreadSummaryPage> {
+        self.require_runtime()?.jsonl_list_sessions(
+            cursor,
+            limit,
+            filters,
+            sort_key,
+            sort_direction,
+            search_term,
+        )
+    }
+
+    pub(crate) fn jsonl_search_sessions(
+        &self,
+        query: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        include_archived: bool,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+    ) -> std::io::Result<StoredThreadSearchPage> {
+        self.require_runtime()?.jsonl_search_sessions(
+            query,
+            cursor,
+            limit,
+            include_archived,
+            sort_key,
+            sort_direction,
+        )
+    }
+
+    pub(crate) fn jsonl_read_session(
+        &self,
+        thread_id: &str,
+        include_messages: bool,
+        include_turns: bool,
+    ) -> std::io::Result<StoredThreadProjection> {
+        self.require_runtime()?
+            .jsonl_read_session(thread_id, include_messages, include_turns)
+    }
+
+    pub(crate) fn jsonl_list_turns(
+        &self,
+        thread_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+        items_view: TurnItemsView,
+    ) -> std::io::Result<StoredThreadTurnPage> {
+        self.require_runtime()?.jsonl_list_turns(
+            thread_id,
+            cursor,
+            limit,
+            sort_direction,
+            items_view,
+        )
+    }
+
+    pub(crate) fn jsonl_list_items(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+    ) -> std::io::Result<StoredThreadItemPage> {
+        self.require_runtime()?
+            .jsonl_list_items(thread_id, turn_id, cursor, limit, sort_direction)
+    }
+
+    pub(crate) fn jsonl_update_session_metadata(
+        &self,
+        thread_id: &str,
+        patch: ThreadMetadataPatch,
+    ) -> std::io::Result<()> {
+        self.require_runtime()?
+            .jsonl_update_session_metadata(thread_id, patch)
+    }
+
+    fn require_runtime(&self) -> std::io::Result<&RuntimeHostHandle> {
+        self.runtime
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("runtime surface host is unavailable"))
+    }
+
+    pub(crate) fn control_jsonl_turn(
+        &self,
+        client: super::RuntimeSurfaceClientHandle,
+        request_id: super::SurfaceRequestId,
+        expected_thread_id: Option<super::SurfaceThreadId>,
+        legacy_turn_id: super::LegacyTurnId,
+        action: super::JsonlTurnControlAction,
+    ) -> Result<super::JsonlTurnControlResult, super::SurfaceClientCommandError> {
+        if self.connection_id() != client.connection_id() {
+            return Err(super::SurfaceClientCommandError::Unauthorized);
+        }
+        self.runtime
+            .as_ref()
+            .ok_or(super::SurfaceClientCommandError::RuntimeUnavailable)?
+            .control_jsonl_turn(
+                client,
+                request_id,
+                expected_thread_id,
+                legacy_turn_id,
+                action,
+            )
+    }
 }
 
 fn with_saved_goal_runtime<T>(
@@ -183,6 +303,51 @@ impl RuntimeSurfaceThreadHandle {
         self.connection_id
             .clone()
             .and_then(|connection_id| self.runtime.acp_surface_for_connection(connection_id))
+    }
+
+    pub(crate) fn jsonl_surface(&self) -> Option<RuntimeSurfaceHandle> {
+        self.connection_id
+            .clone()
+            .and_then(|connection_id| self.runtime.jsonl_surface_for_connection(connection_id))
+    }
+
+    pub(crate) fn task_registry(&self) -> crate::tasks::TaskRegistry {
+        self.runtime.task_registry()
+    }
+
+    pub(crate) fn mcp_registry(&self) -> orca_mcp::McpRegistry {
+        self.runtime.mcp_registry()
+    }
+
+    pub(crate) fn jsonl_read_live_projection(
+        &self,
+        include_messages: bool,
+        include_turns: bool,
+    ) -> Result<StoredThreadProjection, RuntimeHostError> {
+        self.runtime
+            .jsonl_read_live_projection(include_messages, include_turns)
+    }
+
+    pub(crate) fn jsonl_list_live_turns(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+        items_view: TurnItemsView,
+    ) -> Result<StoredThreadTurnPage, RuntimeHostError> {
+        self.runtime
+            .jsonl_list_live_turns(cursor, limit, sort_direction, items_view)
+    }
+
+    pub(crate) fn jsonl_list_live_items(
+        &self,
+        turn_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+    ) -> Result<StoredThreadItemPage, RuntimeHostError> {
+        self.runtime
+            .jsonl_list_live_items(turn_id, cursor, limit, sort_direction)
     }
 
     pub fn read_history(&self) -> Result<Vec<super::SurfaceHistoryMessage>, RuntimeHostError> {

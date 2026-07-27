@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::lifecycle::{RuntimeUserInputHandler, RuntimeUserInputRequest};
 use crate::protocol::ServerEvent;
 use crate::runtime_host::GenerationFence;
+use crate::unstable_surface::{RuntimeSurfaceClientHandle, SurfaceInteractionId};
 
 use super::{lock_error, write_locked_event};
 
@@ -29,6 +30,13 @@ impl PendingUserInputRequest {
 struct PendingUserInputState {
     closed: bool,
     pending: HashMap<String, PendingUserInputRequest>,
+    surface_pending: HashMap<String, PendingSurfaceUserInputRequest>,
+}
+
+#[derive(Clone)]
+pub(super) struct PendingSurfaceUserInputRequest {
+    pub(super) client: RuntimeSurfaceClientHandle,
+    pub(super) interaction_id: SurfaceInteractionId,
 }
 
 #[derive(Clone, Default)]
@@ -64,10 +72,51 @@ impl PendingUserInputManager {
         Ok(state.pending.remove(request_id))
     }
 
+    pub(super) fn insert_surface(
+        &self,
+        request_id: String,
+        request: PendingSurfaceUserInputRequest,
+    ) -> io::Result<()> {
+        let mut state = self.state.lock().map_err(lock_error)?;
+        if state.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "server user input request manager is closed",
+            ));
+        }
+        if state.pending.contains_key(&request_id)
+            || state.surface_pending.contains_key(&request_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("duplicate pending user input request id: {request_id}"),
+            ));
+        }
+        state.surface_pending.insert(request_id, request);
+        Ok(())
+    }
+
+    pub(super) fn remove_surface(
+        &self,
+        request_id: &str,
+    ) -> io::Result<Option<PendingSurfaceUserInputRequest>> {
+        let mut state = self.state.lock().map_err(lock_error)?;
+        Ok(state.surface_pending.remove(request_id))
+    }
+
+    pub(super) fn restore_surface(
+        &self,
+        request_id: String,
+        request: PendingSurfaceUserInputRequest,
+    ) -> io::Result<()> {
+        self.insert_surface(request_id, request)
+    }
+
     pub(super) fn close(&self) -> io::Result<()> {
         let pending = {
             let mut state = self.state.lock().map_err(lock_error)?;
             state.closed = true;
+            state.surface_pending.clear();
             std::mem::take(&mut state.pending)
         };
         for request in pending.into_values() {

@@ -316,21 +316,25 @@ impl InteractiveSession {
                 }
             }
             HistoryMode::Fork(_) => {
-                let parent_id = loaded_transcript
-                    .map(|transcript| transcript.meta.session_id)
-                    .unwrap_or_default();
-                let meta = store.create_fork_meta(
-                    &cwd,
-                    config.provider.as_str(),
-                    config.model.as_history_value(),
-                    prompt_for_title,
-                    parent_id,
-                );
-                let mut meta = meta;
-                meta.active_permission_profile = config.active_permission_profile.clone();
-                meta.approval_mode = Some(config.approval_mode);
-                meta.permission_rules = config.permission_rules.clone();
-                meta.additional_working_directories = config.additional_working_directories.clone();
+                let meta = prepared_record_meta.unwrap_or_else(|| {
+                    let parent_id = loaded_transcript
+                        .as_ref()
+                        .map(|transcript| transcript.meta.session_id.clone())
+                        .unwrap_or_default();
+                    let mut meta = store.create_fork_meta(
+                        &cwd,
+                        config.provider.as_str(),
+                        config.model.as_history_value(),
+                        prompt_for_title,
+                        parent_id,
+                    );
+                    meta.active_permission_profile = config.active_permission_profile.clone();
+                    meta.approval_mode = Some(config.approval_mode);
+                    meta.permission_rules = config.permission_rules.clone();
+                    meta.additional_working_directories =
+                        config.additional_working_directories.clone();
+                    meta
+                });
                 session_id = Some(meta.session_id.clone());
                 start_writer_with_messages(&store, meta, &conversation)
             }
