@@ -13,6 +13,7 @@ use crate::diff_highlight::{
     ParsedDiff, RefinedDiffStyles, compute_parsed_diff_file_scoped_styles,
 };
 use crate::syntax_highlight::{MAX_HIGHLIGHT_BYTES, SyntaxTheme, content_within_limits};
+use crate::terminal_capabilities::TerminalColorLevel;
 
 #[derive(Clone, Debug)]
 pub(crate) struct EditHighlightJob {
@@ -22,6 +23,7 @@ pub(crate) struct EditHighlightJob {
     pub(crate) message_revision: u64,
     pub(crate) syntax_theme_revision: u64,
     pub(crate) syntax_theme: SyntaxTheme,
+    pub(crate) syntax_color_level: TerminalColorLevel,
     pub(crate) absolute_path: PathBuf,
     pub(crate) display_path: String,
     pub(crate) parsed: ParsedDiff,
@@ -51,6 +53,7 @@ fn same_job_identity(left: &EditHighlightJob, right: &EditHighlightJob) -> bool 
         && left.message_revision == right.message_revision
         && left.syntax_theme_revision == right.syntax_theme_revision
         && left.syntax_theme == right.syntax_theme
+        && left.syntax_color_level == right.syntax_color_level
         && left.absolute_path == right.absolute_path
         && left.display_path == right.display_path
         && left.parsed == right.parsed
@@ -130,6 +133,7 @@ fn run_job(job: &EditHighlightJob) -> EditHighlightOutcome {
         &file_text,
         &job.parsed,
         job.syntax_theme,
+        job.syntax_color_level,
     )
     .map(|styles| EditHighlightOutcome::Ready {
         styles: Arc::new(styles),
@@ -363,6 +367,7 @@ mod tests {
         MAX_HIGHLIGHT_BYTES, MAX_HIGHLIGHT_LINE_BYTES, MAX_HIGHLIGHT_LINES, SyntaxTheme,
         highlighter_for_path,
     };
+    use crate::terminal_capabilities::{TerminalColorLevel, syntax_style_revision};
 
     const MATCHING_DIFF: &str = "\
 --- a/src/item.py
@@ -384,8 +389,12 @@ mod tests {
             tool_id: tool_id.to_owned(),
             message_index: 2,
             message_revision: 7,
-            syntax_theme_revision: SyntaxTheme::OneHalfDark.revision(),
+            syntax_theme_revision: syntax_style_revision(
+                SyntaxTheme::OneHalfDark,
+                TerminalColorLevel::TrueColor,
+            ),
             syntax_theme: SyntaxTheme::OneHalfDark,
+            syntax_color_level: TerminalColorLevel::TrueColor,
             absolute_path,
             display_path: display_path.to_owned(),
             parsed: parse_unified_diff(diff),
@@ -399,6 +408,7 @@ mod tests {
         assert_eq!(actual.message_revision, expected.message_revision);
         assert_eq!(actual.syntax_theme_revision, expected.syntax_theme_revision);
         assert_eq!(actual.syntax_theme, expected.syntax_theme);
+        assert_eq!(actual.syntax_color_level, expected.syntax_color_level);
         assert_eq!(actual.absolute_path, expected.absolute_path);
         assert_eq!(actual.display_path, expected.display_path);
         assert_eq!(actual.parsed, expected.parsed);
@@ -467,7 +477,9 @@ mod tests {
         latest_a.message_index = 12;
         latest_a.message_revision = 17;
         latest_a.syntax_theme = SyntaxTheme::OneHalfLight;
-        latest_a.syntax_theme_revision = SyntaxTheme::OneHalfLight.revision();
+        latest_a.syntax_color_level = TerminalColorLevel::Ansi256;
+        latest_a.syntax_theme_revision =
+            syntax_style_revision(SyntaxTheme::OneHalfLight, latest_a.syntax_color_level);
         let latest_b = job(
             3,
             "edit-b",
@@ -511,9 +523,12 @@ mod tests {
         let job = job(1, "edit-a", path, "src/item.py", MATCHING_DIFF);
 
         let styles = ready_styles(run_job(&job));
-        let mut highlighter =
-            highlighter_for_path(Path::new("src/item.py"), SyntaxTheme::OneHalfDark)
-                .expect("known Python syntax");
+        let mut highlighter = highlighter_for_path(
+            Path::new("src/item.py"),
+            SyntaxTheme::OneHalfDark,
+            TerminalColorLevel::TrueColor,
+        )
+        .expect("known Python syntax");
         let expected = highlighter
             .highlight_line("value: int = 42")
             .expect("highlighted Python line");
@@ -884,10 +899,14 @@ mod tests {
         stale.message_revision += 1;
         stale_jobs.push(stale);
         let mut stale = latest_a.clone();
-        stale.syntax_theme_revision = SyntaxTheme::OneHalfLight.revision();
+        stale.syntax_theme_revision =
+            syntax_style_revision(SyntaxTheme::OneHalfLight, stale.syntax_color_level);
         stale_jobs.push(stale);
         let mut stale = latest_a.clone();
         stale.syntax_theme = SyntaxTheme::OneHalfLight;
+        stale_jobs.push(stale);
+        let mut stale = latest_a.clone();
+        stale.syntax_color_level = TerminalColorLevel::Ansi16;
         stale_jobs.push(stale);
         let mut stale = latest_a.clone();
         stale.absolute_path = PathBuf::from("/other");

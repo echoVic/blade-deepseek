@@ -9,6 +9,8 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 use two_face::theme::{EmbeddedLazyThemeSet, EmbeddedThemeName};
 
+use crate::terminal_capabilities::TerminalColorLevel;
+
 pub(crate) const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_HIGHLIGHT_LINES: usize = 10_000;
 pub(crate) const MAX_HIGHLIGHT_LINE_BYTES: usize = 4 * 1024;
@@ -102,7 +104,7 @@ fn find_syntax(token: &str) -> Option<&'static SyntaxReference> {
         .or_else(|| set.find_syntax_by_extension(patched))
 }
 
-fn to_ratatui_style(style: syntect::highlighting::Style) -> Style {
+fn to_ratatui_style(style: syntect::highlighting::Style, color_level: TerminalColorLevel) -> Style {
     let mut output = Style::default().fg(Color::Rgb(
         style.foreground.r,
         style.foreground.g,
@@ -111,7 +113,7 @@ fn to_ratatui_style(style: syntect::highlighting::Style) -> Style {
     if style.font_style.contains(FontStyle::BOLD) {
         output = output.add_modifier(Modifier::BOLD);
     }
-    output
+    color_level.adapt_style(output)
 }
 
 fn structural_line_ending_len(source_line: &str) -> usize {
@@ -127,6 +129,7 @@ fn structural_line_ending_len(source_line: &str) -> usize {
 fn to_spans(
     ranges: Vec<(syntect::highlighting::Style, &str)>,
     structural_ending_len: usize,
+    color_level: TerminalColorLevel,
 ) -> StyledSourceLine {
     let content_len = ranges
         .iter()
@@ -139,7 +142,10 @@ fn to_spans(
         let retained_len = content_len.saturating_sub(consumed).min(segment.len());
         let text = &segment[..retained_len];
         if !text.is_empty() {
-            spans.push(Span::styled(text.to_owned(), to_ratatui_style(style)));
+            spans.push(Span::styled(
+                text.to_owned(),
+                to_ratatui_style(style, color_level),
+            ));
         }
         consumed += segment.len();
     }
@@ -153,6 +159,7 @@ pub(crate) fn highlight_code(
     code: &str,
     language: &str,
     theme: SyntaxTheme,
+    color_level: TerminalColorLevel,
 ) -> Option<Vec<StyledSourceLine>> {
     if code.is_empty() || !content_within_limits(code) {
         return None;
@@ -166,28 +173,34 @@ pub(crate) fn highlight_code(
             highlighter
                 .highlight_line(source_line, syntax_set())
                 .ok()
-                .map(|ranges| to_spans(ranges, structural_ending_len))
+                .map(|ranges| to_spans(ranges, structural_ending_len, color_level))
         })
         .collect()
 }
 
 pub(crate) struct LineHighlighter {
     inner: HighlightLines<'static>,
+    color_level: TerminalColorLevel,
 }
 
 impl LineHighlighter {
     pub(crate) fn highlight_line(&mut self, text: &str) -> Option<StyledSourceLine> {
         let source_line = format!("{text}\n");
         let ranges = self.inner.highlight_line(&source_line, syntax_set()).ok()?;
-        Some(to_spans(ranges, 1))
+        Some(to_spans(ranges, 1, self.color_level))
     }
 }
 
-pub(crate) fn highlighter_for_path(path: &Path, theme: SyntaxTheme) -> Option<LineHighlighter> {
+pub(crate) fn highlighter_for_path(
+    path: &Path,
+    theme: SyntaxTheme,
+    color_level: TerminalColorLevel,
+) -> Option<LineHighlighter> {
     let syntax = find_syntax_for_path(path)?;
 
     Some(LineHighlighter {
         inner: HighlightLines::new(syntax, theme.theme()),
+        color_level,
     })
 }
 
@@ -214,6 +227,7 @@ mod tests {
         MAX_HIGHLIGHT_BYTES, MAX_HIGHLIGHT_LINE_BYTES, MAX_HIGHLIGHT_LINES, SyntaxTheme,
         content_within_limits, find_syntax_for_path, highlight_code, highlighter_for_path,
     };
+    use crate::terminal_capabilities::TerminalColorLevel;
 
     fn distinct_foregrounds(lines: &[Vec<Span<'static>>]) -> usize {
         lines
@@ -224,12 +238,48 @@ mod tests {
             .len()
     }
 
+    fn color_fits(level: TerminalColorLevel, color: Option<Color>) -> bool {
+        match level {
+            TerminalColorLevel::TrueColor => true,
+            TerminalColorLevel::Ansi256 => !matches!(color, Some(Color::Rgb(..))),
+            TerminalColorLevel::Ansi16 => {
+                !matches!(color, Some(Color::Rgb(..) | Color::Indexed(_)))
+            }
+            TerminalColorLevel::Monochrome => color.is_none() || color == Some(Color::Reset),
+        }
+    }
+
+    #[test]
+    fn highlighted_styles_obey_terminal_color_level() {
+        for level in [
+            TerminalColorLevel::TrueColor,
+            TerminalColorLevel::Ansi256,
+            TerminalColorLevel::Ansi16,
+            TerminalColorLevel::Monochrome,
+        ] {
+            let lines = highlight_code(
+                "pub struct Item;\n",
+                "rust",
+                SyntaxTheme::OneHalfDark,
+                level,
+            )
+            .unwrap();
+            assert!(
+                lines
+                    .iter()
+                    .flatten()
+                    .all(|span| color_fits(level, span.style.fg))
+            );
+        }
+    }
+
     #[test]
     fn rust_preserves_source_and_uses_multiple_foregrounds_without_backgrounds() {
         let lines = highlight_code(
             "fn main() { let answer = \"forty two\"; }\n",
             "rust",
             SyntaxTheme::OneHalfDark,
+            TerminalColorLevel::TrueColor,
         )
         .expect("Rust syntax");
 
@@ -248,12 +298,40 @@ mod tests {
     #[test]
     fn fence_metadata_and_aliases_resolve() {
         assert!(
-            highlight_code("let value = 1;\n", "rust,no_run", SyntaxTheme::OneHalfDark).is_some()
+            highlight_code(
+                "let value = 1;\n",
+                "rust,no_run",
+                SyntaxTheme::OneHalfDark,
+                TerminalColorLevel::TrueColor,
+            )
+            .is_some()
         );
-        assert!(highlight_code("print('value')\n", "python3", SyntaxTheme::OneHalfDark).is_some());
-        assert!(highlight_code("echo hi\n", "shell", SyntaxTheme::OneHalfDark).is_some());
         assert!(
-            highlight_code("value\n", "not-a-real-language", SyntaxTheme::OneHalfDark).is_none()
+            highlight_code(
+                "print('value')\n",
+                "python3",
+                SyntaxTheme::OneHalfDark,
+                TerminalColorLevel::TrueColor,
+            )
+            .is_some()
+        );
+        assert!(
+            highlight_code(
+                "echo hi\n",
+                "shell",
+                SyntaxTheme::OneHalfDark,
+                TerminalColorLevel::TrueColor,
+            )
+            .is_some()
+        );
+        assert!(
+            highlight_code(
+                "value\n",
+                "not-a-real-language",
+                SyntaxTheme::OneHalfDark,
+                TerminalColorLevel::TrueColor,
+            )
+            .is_none()
         );
     }
 
@@ -296,6 +374,7 @@ mod tests {
             "fn first() {}\n\nfn second() {}",
             "rust",
             SyntaxTheme::OneHalfDark,
+            TerminalColorLevel::TrueColor,
         )
         .expect("Rust syntax");
 
@@ -311,10 +390,20 @@ mod tests {
 
     #[test]
     fn highlighting_strips_only_structural_line_endings() {
-        let crlf = highlight_code("let first = 1;\r\n", "rust", SyntaxTheme::OneHalfDark)
-            .expect("Rust syntax");
-        let literal_cr = highlight_code("let second = 2;\r", "rust", SyntaxTheme::OneHalfDark)
-            .expect("Rust syntax");
+        let crlf = highlight_code(
+            "let first = 1;\r\n",
+            "rust",
+            SyntaxTheme::OneHalfDark,
+            TerminalColorLevel::TrueColor,
+        )
+        .expect("Rust syntax");
+        let literal_cr = highlight_code(
+            "let second = 2;\r",
+            "rust",
+            SyntaxTheme::OneHalfDark,
+            TerminalColorLevel::TrueColor,
+        )
+        .expect("Rust syntax");
 
         assert_eq!(
             crlf.iter()
@@ -335,9 +424,12 @@ mod tests {
 
     #[test]
     fn path_highlighter_preserves_multiline_parser_state() {
-        let mut continued =
-            highlighter_for_path(Path::new("src/main.rs"), SyntaxTheme::OneHalfDark)
-                .expect("Rust path");
+        let mut continued = highlighter_for_path(
+            Path::new("src/main.rs"),
+            SyntaxTheme::OneHalfDark,
+            TerminalColorLevel::TrueColor,
+        )
+        .expect("Rust path");
         continued
             .highlight_line("/* comment starts")
             .expect("comment start");
@@ -345,8 +437,12 @@ mod tests {
             .highlight_line("still comment */ let value = 1;")
             .expect("continued second line");
 
-        let mut fresh = highlighter_for_path(Path::new("src/main.rs"), SyntaxTheme::OneHalfDark)
-            .expect("fresh Rust path");
+        let mut fresh = highlighter_for_path(
+            Path::new("src/main.rs"),
+            SyntaxTheme::OneHalfDark,
+            TerminalColorLevel::TrueColor,
+        )
+        .expect("fresh Rust path");
         let fresh_second = fresh
             .highlight_line("still comment */ let value = 1;")
             .expect("fresh second line");
@@ -369,7 +465,8 @@ mod tests {
         assert!(
             highlighter_for_path(
                 Path::new("src/file.not-a-real-language"),
-                SyntaxTheme::OneHalfDark
+                SyntaxTheme::OneHalfDark,
+                TerminalColorLevel::TrueColor,
             )
             .is_none()
         );
@@ -393,8 +490,13 @@ mod tests {
 
     #[test]
     fn converted_styles_use_foreground_and_optional_bold_only() {
-        let lines = highlight_code("pub struct Item;\n", "rust", SyntaxTheme::OneHalfDark)
-            .expect("Rust syntax");
+        let lines = highlight_code(
+            "pub struct Item;\n",
+            "rust",
+            SyntaxTheme::OneHalfDark,
+            TerminalColorLevel::TrueColor,
+        )
+        .expect("Rust syntax");
 
         assert!(lines.iter().flatten().all(|span| {
             matches!(span.style.fg, Some(Color::Rgb(_, _, _)))

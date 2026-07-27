@@ -8,6 +8,7 @@ use crate::syntax_highlight::{
     LineHighlighter, MAX_HIGHLIGHT_BYTES, MAX_HIGHLIGHT_LINES, StyledSourceLine, SyntaxTheme,
     content_within_limits, highlighter_for_path,
 };
+use crate::terminal_capabilities::TerminalColorLevel;
 use crate::theme::Theme;
 
 const MAX_RENDERED_DIFF_LINES: usize = 80;
@@ -78,11 +79,12 @@ pub(crate) fn compute_parsed_diff_file_scoped_styles(
     file_text: &str,
     parsed: &ParsedDiff,
     theme: SyntaxTheme,
+    color_level: TerminalColorLevel,
 ) -> Option<RefinedDiffStyles> {
     if parsed.has_multiple_files || !parsed.is_structurally_valid() {
         return None;
     }
-    compute_file_scoped_styles(path, file_text, &parsed.hunks, theme)
+    compute_file_scoped_styles(path, file_text, &parsed.hunks, theme, color_level)
 }
 
 fn compute_file_scoped_styles(
@@ -90,10 +92,16 @@ fn compute_file_scoped_styles(
     file_text: &str,
     hunks: &[DiffHunk],
     theme: SyntaxTheme,
+    color_level: TerminalColorLevel,
 ) -> Option<RefinedDiffStyles> {
-    compute_file_scoped_styles_with(path, file_text, hunks, theme, |highlighter, text| {
-        highlighter.highlight_line(text)
-    })
+    compute_file_scoped_styles_with(
+        path,
+        file_text,
+        hunks,
+        theme,
+        color_level,
+        |highlighter, text| highlighter.highlight_line(text),
+    )
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -102,6 +110,7 @@ fn compute_file_scoped_styles_with(
     file_text: &str,
     hunks: &[DiffHunk],
     theme: SyntaxTheme,
+    color_level: TerminalColorLevel,
     mut highlight_line: impl FnMut(&mut LineHighlighter, &str) -> Option<StyledSourceLine>,
 ) -> Option<RefinedDiffStyles> {
     if !content_within_limits(file_text) {
@@ -126,7 +135,7 @@ fn compute_file_scoped_styles_with(
     }
 
     let max_needed = expected.keys().copied().max()?;
-    let mut highlighter = highlighter_for_path(path, theme)?;
+    let mut highlighter = highlighter_for_path(path, theme, color_level)?;
     let mut refined = RefinedDiffStyles::with_capacity(expected.len());
 
     for (line_index, source_line) in file_text.split_inclusive('\n').enumerate() {
@@ -936,8 +945,10 @@ pub(crate) fn render_parsed_diff(
     render_parsed_diff_with(parsed, theme, |hunk, entry_budget| {
         syntax_path
             .and_then(|path| {
-                let mut old = highlighter_for_path(Path::new(path), theme.syntax_theme)?;
-                let mut new = highlighter_for_path(Path::new(path), theme.syntax_theme)?;
+                let mut old =
+                    highlighter_for_path(Path::new(path), theme.syntax_theme, theme.color_level)?;
+                let mut new =
+                    highlighter_for_path(Path::new(path), theme.syntax_theme, theme.color_level)?;
                 Some(render_hunk_with(
                     hunk,
                     entry_budget,
@@ -980,6 +991,7 @@ mod tests {
         MAX_HIGHLIGHT_BYTES, MAX_HIGHLIGHT_LINE_BYTES, MAX_HIGHLIGHT_LINES, StyledSourceLine,
         highlighter_for_path,
     };
+    use crate::terminal_capabilities::{TerminalBackground, TerminalColorLevel, TerminalProfile};
     use crate::theme::Theme;
 
     const RUST_DIFF: &str = "\
@@ -993,6 +1005,45 @@ mod tests {
 
     fn dark_theme() -> Theme {
         Theme::named(ThemeName::Dark)
+    }
+
+    fn color_fits(level: TerminalColorLevel, color: Option<Color>) -> bool {
+        match level {
+            TerminalColorLevel::TrueColor => true,
+            TerminalColorLevel::Ansi256 => !matches!(color, Some(Color::Rgb(..))),
+            TerminalColorLevel::Ansi16 => {
+                !matches!(color, Some(Color::Rgb(..) | Color::Indexed(_)))
+            }
+            TerminalColorLevel::Monochrome => color.is_none() || color == Some(Color::Reset),
+        }
+    }
+
+    #[test]
+    fn parsed_diff_styles_obey_terminal_color_level() {
+        let parsed = parse_unified_diff(RUST_DIFF);
+
+        for level in [
+            TerminalColorLevel::TrueColor,
+            TerminalColorLevel::Ansi256,
+            TerminalColorLevel::Ansi16,
+            TerminalColorLevel::Monochrome,
+        ] {
+            let theme = Theme::resolve(
+                ThemeName::Dark,
+                TerminalProfile {
+                    background: TerminalBackground::Dark,
+                    color_level: level,
+                },
+            );
+            let rendered = render_parsed_diff(&parsed, &theme, None);
+
+            assert!(
+                rendered
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .all(|span| color_fits(level, span.style.fg))
+            );
+        }
     }
 
     fn rendered_text(line: &Line<'_>) -> String {
@@ -1010,8 +1061,12 @@ mod tests {
     }
 
     fn highlight_sequence(path: &str, source: &[&str], theme: &Theme) -> Vec<StyledSourceLine> {
-        let mut highlighter =
-            highlighter_for_path(Path::new(path), theme.syntax_theme).expect("known syntax");
+        let mut highlighter = highlighter_for_path(
+            Path::new(path),
+            theme.syntax_theme,
+            TerminalColorLevel::TrueColor,
+        )
+        .expect("known syntax");
         source
             .iter()
             .map(|line| highlighter.highlight_line(line).expect("highlighted line"))
@@ -1057,6 +1112,7 @@ mod tests {
                 "let value = 2;\n",
                 &parsed,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_none()
         );
@@ -1257,6 +1313,7 @@ diff --git a/value.rs b/value.rs
                 "let other = 2;\n",
                 &parsed,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_none()
         );
@@ -1617,6 +1674,7 @@ index 333..444 100644
                 "new_b\n",
                 &parsed,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_none()
         );
@@ -2003,6 +2061,7 @@ metadata instead of paired new header
                 file_text,
                 &parsed.hunks,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_some(),
             "low-level hunk API intentionally has no ParsedDiff ambiguity guard"
@@ -2013,6 +2072,7 @@ metadata instead of paired new header
                 file_text,
                 &parsed,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_none()
         );
@@ -2757,6 +2817,7 @@ class Item:
             file_text,
             &parsed.hunks,
             theme.syntax_theme,
+            TerminalColorLevel::TrueColor,
         )
         .expect("verified full-file styles");
         let cold = render_parsed_diff(&parsed, &theme, None);
@@ -2808,6 +2869,7 @@ class Item:
                 drifted_file_text,
                 &parsed.hunks,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_none()
         );
@@ -2837,6 +2899,7 @@ class Item:
             file_text,
             &parsed.hunks,
             theme.syntax_theme,
+            TerminalColorLevel::TrueColor,
         )
         .expect("verified full-file styles");
 
@@ -2875,6 +2938,7 @@ class Item:
                 "value = 1\n",
                 &conflicting,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_none()
         );
@@ -2884,6 +2948,7 @@ class Item:
             "value = 1\n",
             &identical,
             theme.syntax_theme,
+            TerminalColorLevel::TrueColor,
         )
         .expect("identical duplicate");
         assert_eq!(deduped.len(), 1);
@@ -2909,6 +2974,7 @@ class Item:
                 "value = 1\n",
                 &hunks,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_none()
         );
@@ -2933,6 +2999,7 @@ class Item:
                 "value = 1\n",
                 &hunks,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_none()
         );
@@ -2965,6 +3032,7 @@ class Item:
                 "value = 1\nignored = 2\n",
                 &hunks,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_none()
         );
@@ -2988,6 +3056,7 @@ class Item:
                 "only_line = 1\n",
                 &parsed.hunks,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_none()
         );
@@ -3010,6 +3079,7 @@ class Item:
             "",
             &parsed.hunks,
             theme.syntax_theme,
+            TerminalColorLevel::TrueColor,
         )
         .expect("delete-only diff");
 
@@ -3036,6 +3106,7 @@ class Item:
                 &exact_bytes,
                 &parsed.hunks,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_some()
         );
@@ -3047,6 +3118,7 @@ class Item:
                 &over_bytes,
                 &parsed.hunks,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_none()
         );
@@ -3070,6 +3142,7 @@ class Item:
                 &exact_line,
                 &exact_parsed.hunks,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_some()
         );
@@ -3079,6 +3152,7 @@ class Item:
                 &overlong_line,
                 &overlong_parsed.hunks,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_none()
         );
@@ -3105,6 +3179,7 @@ class Item:
                 &over_lines,
                 &parsed.hunks,
                 theme.syntax_theme,
+                TerminalColorLevel::TrueColor,
             )
             .is_none()
         );
@@ -3130,6 +3205,7 @@ class Item:
             &file_text,
             &parsed.hunks,
             theme.syntax_theme,
+            TerminalColorLevel::TrueColor,
             |highlighter, text| {
                 assert_ne!(text, pathological_tail);
                 highlighted_lines += 1;
@@ -3158,6 +3234,7 @@ class Item:
             "value = 1\r\n    field = 2  ",
             &parsed.hunks,
             theme.syntax_theme,
+            TerminalColorLevel::TrueColor,
         )
         .expect("CRLF full-file styles");
 
