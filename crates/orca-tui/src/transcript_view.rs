@@ -235,6 +235,10 @@ struct ThemeIdentity {
     approval: Color,
     diff_add: Color,
     diff_remove: Color,
+    markdown_h1: Color,
+    markdown_h2: Color,
+    markdown_h3: Color,
+    markdown_inline_code: Color,
 }
 
 impl From<&Theme> for ThemeIdentity {
@@ -250,6 +254,10 @@ impl From<&Theme> for ThemeIdentity {
             approval: theme.approval,
             diff_add: theme.diff_add,
             diff_remove: theme.diff_remove,
+            markdown_h1: theme.markdown_h1,
+            markdown_h2: theme.markdown_h2,
+            markdown_h3: theme.markdown_h3,
+            markdown_inline_code: theme.markdown_inline_code,
         }
     }
 }
@@ -1298,10 +1306,32 @@ mod tests {
         counters: RenderCounters<'_>,
     ) {
         let theme = theme();
+        prepare_with_theme_and_counters(
+            cache,
+            messages,
+            revisions,
+            width,
+            &theme,
+            syntax_theme_revision,
+            tick,
+            counters,
+        );
+    }
+
+    fn prepare_with_theme_and_counters(
+        cache: &mut TranscriptRenderCache,
+        messages: &[ChatMessage],
+        revisions: &[u64],
+        width: usize,
+        theme: &Theme,
+        syntax_theme_revision: u64,
+        tick: u64,
+        counters: RenderCounters<'_>,
+    ) {
         cache.prepare(
             messages,
             revisions,
-            TranscriptRenderContext::new(&theme, width, tick, false)
+            TranscriptRenderContext::new(theme, width, tick, false)
                 .with_syntax_theme_revision(syntax_theme_revision),
             |_, message, theme, width, tick, force_expand| {
                 counters
@@ -1408,6 +1438,62 @@ mod tests {
 
         assert_eq!(builds.get(), 1);
         assert_eq!(parses.get(), 1);
+    }
+
+    #[test]
+    fn markdown_theme_color_change_rebuilds_wrapped_lines_once() {
+        let messages = vec![ChatMessage::Assistant(
+            "# Heading\n\nUse `cargo test`.".to_string(),
+        )];
+        let revisions = vec![1];
+        let builds = Cell::new(0);
+        let parses = Cell::new(0);
+        let mut cache = TranscriptRenderCache::default();
+        let theme = theme();
+
+        prepare_with_theme_and_counters(
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            &theme,
+            theme.syntax_theme_revision,
+            0,
+            RenderCounters::new(&builds, &parses),
+        );
+        builds.set(0);
+        parses.set(0);
+
+        let mut changed = theme;
+        changed.markdown_inline_code = Color::Rgb(1, 2, 3);
+        prepare_with_theme_and_counters(
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            &changed,
+            changed.syntax_theme_revision,
+            0,
+            RenderCounters::new(&builds, &parses),
+        );
+        assert_eq!(builds.get(), 1);
+        assert_eq!(parses.get(), 1);
+
+        builds.set(0);
+        parses.set(0);
+        prepare_with_theme_and_counters(
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            &changed,
+            changed.syntax_theme_revision,
+            0,
+            RenderCounters::new(&builds, &parses),
+        );
+        assert_eq!(builds.get(), 0);
+        assert_eq!(parses.get(), 0);
+        assert_eq!(cache.last_prepare_visited(), 0);
     }
 
     #[test]
