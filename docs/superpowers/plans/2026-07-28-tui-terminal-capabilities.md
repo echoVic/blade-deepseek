@@ -4,9 +4,9 @@
 
 **Goal:** Detect terminal background and color depth once before TUI startup, select an automatic light/dark theme, and emit only colors supported by the terminal.
 
-**Architecture:** Core config adds `ThemeName::Auto`. A focused `terminal_capabilities.rs` module models background and color depth, performs deterministic color quantization, and resolves a final immutable `Theme`. Syntax and diff styles receive the same color-level identity at generation time; startup detection is injected and runs before Orca enables raw mode.
+**Architecture:** Core config adds `ThemeName::Auto`. A focused `terminal_capabilities.rs` module models background and color depth, performs deterministic color quantization, and resolves a final immutable `Theme`. Syntax and diff styles receive the same color-level identity at generation time. A dedicated qwertty runtime owns terminal input, probing, raw mode, input modes, and cleanup for the full TUI lifetime; crossterm remains ratatui's output backend only.
 
-**Tech Stack:** Rust 2024, ratatui 0.29, crossterm 0.28, terminal-colorsaurus 1.0.3, supports-color 3.0.2, syntect/two-face.
+**Tech Stack:** Rust 2024, ratatui 0.29, crossterm 0.28, qwertty 0.1.6 with Tokio, supports-color 3.0.2, syntect/two-face.
 
 ---
 
@@ -22,14 +22,20 @@
   - Define background/color-level/profile types.
   - Map supports-color facts.
   - Quantize RGB to ANSI-256/ANSI-16 and adapt styles.
-  - Provide an injected startup detector boundary.
+  - Convert qwertty OSC 11 and supports-color facts into a profile.
+- Add `crates/orca-tui/src/input_adapter.rs`
+  - Convert qwertty's typed input vocabulary to existing crossterm events.
+  - Reassemble segmented UTF-8 paste and reject unsupported input safely.
+- Add `crates/orca-tui/src/input_runtime.rs`
+  - Permanently own `TokioTerminalSession` on a named current-thread runtime.
+  - Probe, enable modes, forward bounded input, and restore on stop or panic.
 - Add `crates/orca-tui/src/capability_backend.rs`
   - Adapt changed ratatui cells as a final output safety boundary.
   - Delegate the complete ratatui Backend API.
 - Modify `crates/orca-tui/src/lib.rs`
   - Register the module.
 - Modify `Cargo.toml`, `crates/orca-tui/Cargo.toml`, `Cargo.lock`
-  - Add terminal-colorsaurus and supports-color.
+  - Add qwertty with Tokio and supports-color.
 - Modify `crates/orca-tui/src/theme.rs`
   - Resolve Auto to Dark/Light.
   - Adapt every theme color.
@@ -45,8 +51,11 @@
 - Modify `crates/orca-tui/src/types.rs`
   - Store syntax color level and reject stale results.
 - Modify `crates/orca-tui/src/app.rs`
-  - Detect profile before raw mode.
-  - Resolve theme and configure syntax state with color level.
+  - Start the input runtime before constructing ratatui.
+  - Consume its bounded event receiver instead of crossterm input.
+  - Drop ratatui before stopping and joining qwertty.
+- Remove production use of `crates/orca-tui/src/terminal_lifecycle.rs`
+  - Qwertty becomes the only raw/alternate/mouse/paste/kitty lifecycle owner.
 - Modify `crates/orca-tui/src/selection.rs`
   - Apply a selection Style instead of background-only color.
 - Modify `crates/orca-tui/src/ui.rs`
@@ -1007,190 +1016,353 @@ git commit -m "feat(tui): enforce terminal-safe output colors" \
 
 ---
 
-### Task 6: Detect Capabilities Before TUI Raw Mode
+### Task 6: Give Qwertty Permanent Terminal Input Ownership
 
 **Files:**
 - Modify: `Cargo.toml`
 - Modify: `Cargo.lock`
 - Modify: `crates/orca-tui/Cargo.toml`
+- Create: `crates/orca-tui/src/input_adapter.rs`
+- Create: `crates/orca-tui/src/input_runtime.rs`
 - Modify: `crates/orca-tui/src/terminal_capabilities.rs`
-- Modify: `crates/orca-tui/src/capability_backend.rs`
 - Modify: `crates/orca-tui/src/app.rs`
 - Modify: `crates/orca-tui/src/lib.rs`
+- Modify: `docs/superpowers/specs/2026-07-28-tui-terminal-capabilities-design.md`
+- Modify: `docs/superpowers/plans/2026-07-28-tui-terminal-capabilities.md`
 
-- [ ] **Step 1: Add dependencies**
+- [ ] **Step 1: Remove the rejected one-shot detector**
 
-Add:
+Delete the `terminal-colorsaurus` detector, timeout/quarantine logic, SSH
+special cases, and the `detect_profile_then_enable_raw` startup helper before
+writing new tests. Restore `app.rs` to the Task 5 input/lifecycle behavior while
+retaining the approved `CapabilityBackend`, resolved theme, syntax color-level,
+and clear-scrollback changes.
+
+This deletion is required because the replacement must be developed test-first,
+not adapted from production code that already implements a different behavior.
+
+- [ ] **Step 2: Add the exact dependencies**
+
+Replace `terminal-colorsaurus` with:
 
 ```toml
-terminal-colorsaurus = "1.0.3"
+qwertty = { version = "=0.1.6", features = ["tokio"] }
 supports-color = "3.0.2"
 ```
 
 to workspace dependencies and reference them with `workspace = true` from
-`orca-tui`.
+`orca-tui`. Also add workspace `tokio` to `orca-tui`.
 
-- [ ] **Step 2: Add failing detector orchestration tests**
+Run `cargo update -p qwertty --precise 0.1.6` after editing manifests.
 
-Define an injectable pure boundary:
+- [ ] **Step 3: Write failing qwertty-to-crossterm adapter tests**
 
-```rust
-trait TerminalDetector {
-    fn background(&mut self) -> TerminalBackground;
-    fn color_level(&mut self) -> TerminalColorLevel;
-}
-
-fn detect_terminal_profile_with(
-    requested: ThemeName,
-    detector: &mut impl TerminalDetector,
-) -> TerminalProfile
-```
-
-Test:
+Create `input_adapter.rs` with tests driving real qwertty values produced by
+`SemanticDecoder` or public constructors. The intended API is:
 
 ```rust
-#[test]
-fn explicit_themes_skip_background_but_still_detect_color_depth() {
-    let mut detector = RecordingDetector::new(
-        TerminalBackground::Light,
-        TerminalColorLevel::Ansi256,
-    );
-    let profile = detect_terminal_profile_with(ThemeName::Solarized, &mut detector);
-
-    assert_eq!(profile.background, TerminalBackground::Unknown);
-    assert_eq!(profile.color_level, TerminalColorLevel::Ansi256);
-    assert_eq!(detector.background_calls, 0);
-    assert_eq!(detector.color_calls, 1);
+#[derive(Default)]
+pub(crate) struct InputAdapter {
+    paste: Option<Vec<u8>>,
 }
 
-#[test]
-fn auto_detects_background_and_color_depth_once() {
-    let mut detector = RecordingDetector::new(
-        TerminalBackground::Light,
-        TerminalColorLevel::TrueColor,
-    );
-    let profile = detect_terminal_profile_with(ThemeName::Auto, &mut detector);
-
-    assert_eq!(profile.background, TerminalBackground::Light);
-    assert_eq!(detector.background_calls, 1);
-    assert_eq!(detector.color_calls, 1);
+impl InputAdapter {
+    pub(crate) fn adapt(
+        &mut self,
+        event: qwertty::Event,
+    ) -> Option<crossterm::event::Event>;
 }
 ```
 
-Add a startup-order helper test:
+Cover these exact mappings:
 
-```rust
-fn detect_profile_then_enable_raw(
-    requested: ThemeName,
-    detector: &mut impl TerminalDetector,
-    enable_raw_mode: impl FnOnce() -> io::Result<()>,
-) -> io::Result<TerminalProfile>
+```text
+Key::Char(c)                  -> KeyCode::Char(c)
+Up/Down/Left/Right            -> matching KeyCode
+Enter/Tab/Backspace/Escape    -> matching KeyCode
+Home/End/PageUp/PageDown      -> matching KeyCode
+Insert/Delete                 -> matching KeyCode
+Function(1..=35)              -> KeyCode::F(n)
+Shift+Tab                     -> KeyCode::BackTab
+Control(0)                    -> Ctrl+Char(' ')
+Control(1..=26)               -> Ctrl+Char('a'..='z')
+Control(28..=31)              -> Ctrl+Char('4'..='7')
 ```
 
-Record calls and assert `background`, `color`, then `raw`.
+Map `SHIFT`, `CTRL`, `ALT`, `SUPER`, `HYPER`, and `META`; map Caps/Num to
+`KeyEventState` without inventing keyboard modifiers. Map qwertty Press,
+Repeat, and Release to crossterm's matching `KeyEventKind`.
 
-- [ ] **Step 3: Run RED**
+Decode mouse fixtures through `SemanticDecoder` and assert:
+
+- `(1, 1)` becomes `(0, 0)`;
+- press/release use the matching standard button;
+- `Moved + standard button` becomes `Drag(button)`;
+- `Moved + None` becomes `Moved`;
+- four scroll directions map directly;
+- zero coordinates and `Other` buttons return `None`.
+
+Decode focus, resize, segmented bracketed paste, malformed UTF-8 paste, and a
+complete unknown OSC token. Assert one final UTF-8 `Event::Paste`, invalid paste
+resets adapter state without emission, and `Event::Syntax` returns `None`.
+
+- [ ] **Step 4: Run adapter RED**
 
 ```sh
-cargo test -p orca-tui explicit_themes_skip_background --lib
-cargo test -p orca-tui auto_detects_background --lib
-cargo test -p orca-tui terminal_detection_precedes_raw_mode --lib
+cargo test -p orca-tui input_adapter --lib
 ```
 
-Expected: detector API missing.
+Expected: `input_adapter` module/API is missing.
 
-- [ ] **Step 4: Implement production detector**
+- [ ] **Step 5: Implement the minimal input adapter**
 
-Add:
+Implement exhaustive `#[non_exhaustive]` matches with a final `_ => None`.
+Use `checked_sub(1)` for both mouse coordinates. Do not use qwertty associated
+text as a second business event; preserve Orca's existing one-key-event
+semantics.
+
+Paste handling rules:
 
 ```rust
-struct SystemTerminalDetector;
+if segment.is_first() {
+    self.paste = Some(Vec::new());
+}
+let bytes = self.paste.as_mut()?;
+bytes.extend_from_slice(segment.data());
+if segment.is_final() {
+    let bytes = self.paste.take()?;
+    return String::from_utf8(bytes).ok().map(Event::Paste);
+}
+None
 ```
 
-Background:
-
-```rust
-terminal_colorsaurus::background_color(QueryOptions {
-    timeout: Duration::from_millis(250),
-})
-.map(|color| {
-    if color.perceived_lightness() <= 0.5 {
-        TerminalBackground::Dark
-    } else {
-        TerminalBackground::Light
-    }
-})
-.unwrap_or(TerminalBackground::Unknown)
-```
-
-Color level:
-
-```rust
-supports_color::on(supports_color::Stream::Stdout)
-```
-
-map through the pure facts function. Add no output/logging.
-
-- [ ] **Step 5: Integrate before raw mode**
-
-At the first line of `run_tui_inner`:
-
-```rust
-let profile = detect_profile_then_enable_raw(
-    config.theme,
-    &mut SystemTerminalDetector,
-    terminal::enable_raw_mode,
-)?;
-let mut pending_terminal_cleanup = TerminalCleanup::raw_mode_enabled();
-let theme = Theme::resolve(config.theme, profile);
-```
-
-The helper computes the profile first, then invokes the fallible raw-mode
-closure, then returns the profile. Raw-mode errors propagate. Construct cleanup
-immediately after the helper returns. Remove the later
-`Theme::named(config.theme)`.
-
-After terminal setup creates stdout, wrap the production backend:
-
-```rust
-let backend = CapabilityBackend::new(
-    CrosstermBackend::new(stdout),
-    theme.color_level,
-);
-```
-
-Change:
-
-```rust
-type InlineTerminal =
-    Terminal<CapabilityBackend<CrosstermBackend<std::io::Stdout>>>;
-```
-
-In `clear_terminal_scrollback`, reach crossterm through:
-
-```rust
-let stdout = terminal.backend_mut().inner_mut();
-```
-
-Do not change cleanup, alternate-screen, cursor, or clear semantics.
-
-Ensure:
-
-- no OSC query in non-TUI CLI paths;
-- setup textarea and main textarea use the resolved theme;
-- syntax state receives theme syntax theme and color level;
-- the detector is dropped before event-loop reads.
-
-- [ ] **Step 6: Test background failure mapping**
-
-The injected detector returns Unknown for timeout/unsupported/error test cases.
-Assert Auto resolves to Dark and explicit Light remains Light.
-
-Do not call the real library in tests.
-
-- [ ] **Step 7: Run Task 6 GREEN**
+- [ ] **Step 6: Run adapter GREEN and commit**
 
 ```sh
+cargo test -p orca-tui input_adapter --lib
+cargo check -p orca-tui
+cargo fmt --all -- --check
+git diff --check
+git add Cargo.toml Cargo.lock crates/orca-tui/Cargo.toml \
+  crates/orca-tui/src/input_adapter.rs crates/orca-tui/src/lib.rs
+git commit -m "feat(tui): adapt qwertty terminal input" \
+  -m "Preserve existing crossterm event semantics while safely dropping unsupported terminal syntax." \
+  -m "Co-authored-by: TRAE CLI <noreply@bytedance.com>"
+```
+
+- [ ] **Step 7: Write failing profile/startup-order tests**
+
+In `terminal_capabilities.rs`, add pure helpers:
+
+```rust
+pub(crate) fn terminal_background_from_rgb(
+    requested: ThemeName,
+    background: Option<qwertty::Rgb>,
+) -> TerminalBackground;
+
+pub(crate) fn system_color_level() -> TerminalColorLevel;
+```
+
+The real driver extracts `Capabilities::background_color.value_copied()` and
+passes the resulting `Option<qwertty::Rgb>` into the pure helper.
+Assert explicit themes ignore background; Auto maps lightness `> 0.5` to Light,
+the boundary and darker values to Dark, and no result to Unknown. Keep existing
+supports-color fact tests.
+
+In `input_runtime.rs`, introduce a private async `TerminalDriver` trait
+implemented by a fake. Test this ordered contract:
+
+```text
+open
+probe (Auto only)
+enter alternate screen
+enable ButtonEvent mouse
+enable bracketed paste
+push the three existing kitty flags
+ready(profile)
+read until stop
+leave
+```
+
+Explicit themes skip `probe` but still perform every mode transition.
+
+- [ ] **Step 8: Run runtime RED**
+
+```sh
+cargo test -p orca-tui input_runtime --lib
+cargo test -p orca-tui terminal_capabilities --lib
+```
+
+Expected: runtime and qwertty profile APIs are missing.
+
+- [ ] **Step 9: Implement the supervised input runtime**
+
+Create:
+
+```rust
+pub(crate) struct InputRuntime {
+    profile: TerminalProfile,
+    events: crossbeam_channel::Receiver<crossterm::event::Event>,
+    stop_tx: Option<tokio::sync::watch::Sender<bool>>,
+    join: Option<std::thread::JoinHandle<io::Result<()>>>,
+}
+```
+
+`InputRuntime::start(ThemeName)` creates:
+
+- a bounded event channel;
+- a bounded one-shot startup channel;
+- a Tokio watch shutdown channel;
+- an `orca-tui-input` OS thread;
+- a current-thread Tokio runtime on that thread;
+- one persistent `TokioTerminalSession::open()`.
+
+Inside the async owner:
+
+```rust
+let capabilities = if requested == ThemeName::Auto {
+    Some(session.probe_capabilities(Duration::from_millis(250)).await?)
+} else {
+    None
+};
+session.enter_alternate_screen().await?;
+session.enable_mouse(MouseMode::ButtonEvent).await?;
+session.enable_bracketed_paste().await?;
+session.push_kitty_keyboard(
+    KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES
+        .union(KittyKeyboardFlags::REPORT_EVENT_TYPES)
+        .union(KittyKeyboardFlags::REPORT_ALTERNATE_KEYS),
+).await?;
+```
+
+Send Ready only after all mode operations succeed. Install a cloned
+`RestoreHandle` into a process-wide panic-hook registry before Ready. Install
+the hook once with `OnceLock`; it restores the currently registered handle and
+then calls the hook that was active at installation time. Normal shutdown
+clears only its own registered handle. Serialize TUI ownership so concurrent
+runs cannot overwrite the active restore slot, and ensure repeated sequential
+runs do not accumulate hooks.
+
+The read loop selects between shutdown and `next_event()`. On Unix it also
+selects `ResizeStream::next_resize()` and converts the returned `TerminalSize`
+to `Event::Resize`; on Windows resize remains in `next_event()`. Do not enable
+in-band resize. On both platforms, also select qwertty `SignalStream`:
+`Suspend`/`Continue` call `suspend()`/`resume(false)`, while
+`Terminate`/`Interrupt` leave through the normal cleanup path. Unknown future
+signals are ignored.
+
+Route suspend through a bounded main-thread control channel. The frame loop
+acknowledges before qwertty writes suspend cleanup and waits for a Resumed
+control before drawing again. On Resumed, clear ratatui's retained terminal
+buffer before marking the frame dirty, so the alternate-screen clear is fully
+repainted. Make control sends and acknowledgement waits
+shutdown-aware so a full or abandoned mailbox cannot block `leave()`.
+
+Forward adapted events with a shutdown-aware bounded send. Never block forever
+on a full mailbox: select/retry against shutdown. On every exit path consume
+the session with `leave().await`; preserve the first operational error while
+still attempting leave.
+
+`finish()` and `Drop` share one idempotent stop/join implementation. Tests use a
+fake driver and tiny mailbox to prove blocked `next_event`, full mailbox,
+startup failure, normal stop, and Drop all reach leave and join.
+
+Represent global terminal ownership with a once-released RAII lease rather than
+an unconditional atomic clear. Scope the panic restore registry to the TUI
+owner thread and qwertty input thread so caught worker panics cannot dismantle
+the active terminal.
+
+- [ ] **Step 10: Run runtime GREEN and commit**
+
+```sh
+cargo test -p orca-tui input_runtime --lib
+cargo test -p orca-tui terminal_capabilities --lib
+cargo check -p orca-tui
+cargo fmt --all -- --check
+git diff --check
+git add crates/orca-tui/src/input_runtime.rs \
+  crates/orca-tui/src/terminal_capabilities.rs crates/orca-tui/src/lib.rs
+git commit -m "feat(tui): own terminal input with qwertty" \
+  -m "Keep probing, decoding, input modes, and restoration under one persistent terminal session." \
+  -m "Co-authored-by: TRAE CLI <noreply@bytedance.com>"
+```
+
+- [ ] **Step 11: Write failing application integration tests**
+
+Extract a pure batch receiver:
+
+```rust
+fn receive_input_batch(
+    receiver: &crossbeam_channel::Receiver<Event>,
+    timeout: Duration,
+    limit: usize,
+) -> Result<Vec<Event>, crossbeam_channel::RecvTimeoutError>;
+```
+
+Test that it waits for the first event, drains only immediately available
+events, caps at 64, and reports timeout/disconnect without polling crossterm.
+
+Add source/ownership tests or injected lifecycle tests proving:
+
+- `run_tui_inner` starts `InputRuntime` before constructing `Terminal`;
+- app production code contains no `crossterm::event::poll/read/EventStream`;
+- app production code contains no crossterm raw/alternate/mouse/paste/kitty
+  mode setup;
+- the ratatui terminal drops before `InputRuntime::finish`;
+- non-TUI modes do not construct the runtime.
+
+- [ ] **Step 12: Run integration RED**
+
+```sh
+cargo test -p orca-tui receive_input_batch --lib
+cargo test -p orca-tui terminal_input_ownership --lib
+```
+
+Expected: helper and qwertty ownership integration are missing.
+
+- [ ] **Step 13: Integrate qwertty into `app.rs`**
+
+At startup:
+
+```rust
+let pending_input_runtime = InputRuntime::start(config.theme)?;
+let theme = Theme::resolve(config.theme, pending_input_runtime.profile());
+let input_rx = pending_input_runtime.events().clone();
+```
+
+Then construct:
+
+```rust
+CapabilityBackend::new(CrosstermBackend::new(io::stdout()), theme.color_level)
+```
+
+Remove `TerminalCleanup`, `terminal::enable_raw_mode`, alternate-screen entry,
+mouse capture, bracketed-paste setup, kitty push, and crossterm `poll/read`.
+Replace the poll block with `receive_input_batch(&input_rx,
+scheduler.poll_timeout(...), 64)`, treating timeout as an empty batch and
+disconnect as an `UnexpectedEof` runtime error.
+
+On exit:
+
+```rust
+drop(terminal);
+terminal_input.finish()?;
+```
+
+Move `pending_input_runtime` into a `terminal_input` binding declared after the
+agent runtime, so Rust's reverse declaration-order drop guarantees every early
+return drops ratatui, restores/joins qwertty, and only then joins the agent
+runtime. Only after explicit finish shut down mention search and supervised
+agent runtimes. Keep
+`clear_terminal_scrollback` routed through `CapabilityBackend::inner_mut()`;
+qwertty performs no steady-state writes, so this output-only operation remains
+safe.
+
+- [ ] **Step 14: Run Task 6 GREEN**
+
+```sh
+cargo test -p orca-tui input_adapter --lib
+cargo test -p orca-tui input_runtime --lib
 cargo test -p orca-tui terminal_capabilities --lib
 cargo test -p orca-tui capability_backend --lib
 cargo test -p orca-tui app::tests --lib
@@ -1202,16 +1374,19 @@ cargo fmt --all -- --check
 git diff --check
 ```
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 15: Commit Task 6 application integration and docs**
 
 ```sh
 git add Cargo.toml Cargo.lock crates/orca-tui/Cargo.toml \
+  crates/orca-tui/src/input_adapter.rs \
+  crates/orca-tui/src/input_runtime.rs \
   crates/orca-tui/src/terminal_capabilities.rs \
-  crates/orca-tui/src/capability_backend.rs \
   crates/orca-tui/src/app.rs \
-  crates/orca-tui/src/lib.rs
-git commit -m "feat(tui): detect terminal capabilities at startup" \
-  -m "Resolve automatic background and color depth before Orca owns raw-mode input." \
+  crates/orca-tui/src/lib.rs \
+  docs/superpowers/specs/2026-07-28-tui-terminal-capabilities-design.md \
+  docs/superpowers/plans/2026-07-28-tui-terminal-capabilities.md
+git commit -m "feat(tui): integrate terminal capability runtime" \
+  -m "Route application input through the persistent qwertty owner and restore it before supervised runtime shutdown." \
   -m "Co-authored-by: TRAE CLI <noreply@bytedance.com>"
 ```
 
@@ -1250,7 +1425,7 @@ cargo test --workspace --all-targets -- --test-threads=1
 | Requirement | Direct evidence |
 |---|---|
 | COLORTERM/TTY color-depth detection | supports-color mapping and injected detector tests |
-| OSC 11 background query | production SystemTerminalDetector source inspection |
+| OSC 11 background query | qwertty probe profile mapping and startup-order tests |
 | Auto chooses light/dark | pure resolution matrix |
 | Explicit themes are preserved | detector call-count and resolution tests |
 | Truecolor remains RGB | identity tests |
@@ -1259,12 +1434,12 @@ cargo test --workspace --all-targets -- --test-threads=1
 | Monochrome preserves semantics | selection/cursor/diff/heading tests |
 | Capabilities degrade independently | profile matrix |
 | No per-frame detection | startup source inspection |
-| No input race | detection-before-raw-mode test/source inspection |
+| No input race | one-session probe/typeahead/Syntax-drop/runtime ownership tests |
 | Fenced and parsed diff styles degrade | completed style tests |
 | Background refinement cannot go stale | job identity/stale-result tests |
 | Cache identity includes color level | cache rebuild test |
 | Existing explicit configs remain valid | core serde/file tests |
-| Failure does not block startup | injected Unknown/error tests |
+| Detection ownership is safe | persistent session, bounded shutdown, leave/join, and panic restore tests |
 
 Treat any missing evidence as incomplete.
 

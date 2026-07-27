@@ -12,26 +12,70 @@ use qwertty::{
 #[derive(Default)]
 pub(crate) struct InputAdapter {
     paste: Option<Vec<u8>>,
+    legacy_alt_prefix: bool,
 }
 
 impl InputAdapter {
     pub(crate) fn adapt(&mut self, event: QwerttyEvent) -> Option<Event> {
         match event {
-            QwerttyEvent::Key(key) => adapt_key(key).map(Event::Key),
-            QwerttyEvent::Mouse(mouse) => adapt_mouse(mouse).map(Event::Mouse),
+            QwerttyEvent::Key(key) => {
+                let legacy_alt = std::mem::take(&mut self.legacy_alt_prefix);
+                let mut key = adapt_key(key)?;
+                if legacy_alt {
+                    key.modifiers.insert(KeyModifiers::ALT);
+                }
+                Some(Event::Key(key))
+            }
+            QwerttyEvent::Mouse(mouse) => {
+                self.legacy_alt_prefix = false;
+                adapt_mouse(mouse).map(Event::Mouse)
+            }
             QwerttyEvent::Focus(focus) => match focus.state() {
-                FocusState::Gained => Some(Event::FocusGained),
-                FocusState::Lost => Some(Event::FocusLost),
+                FocusState::Gained => {
+                    self.legacy_alt_prefix = false;
+                    Some(Event::FocusGained)
+                }
+                FocusState::Lost => {
+                    self.legacy_alt_prefix = false;
+                    Some(Event::FocusLost)
+                }
                 _ => None,
             },
             QwerttyEvent::Resize(resize) => {
+                self.legacy_alt_prefix = false;
                 let cells = resize.cells();
                 Some(Event::Resize(cells.columns(), cells.rows()))
             }
-            QwerttyEvent::Paste(paste) => self.adapt_paste(paste),
-            QwerttyEvent::Syntax(_) => None,
-            _ => None,
+            QwerttyEvent::Paste(paste) => {
+                self.legacy_alt_prefix = false;
+                self.adapt_paste(paste)
+            }
+            QwerttyEvent::Syntax(syntax) => self.adapt_syntax(syntax),
+            _ => {
+                self.legacy_alt_prefix = false;
+                None
+            }
         }
+    }
+
+    fn adapt_syntax(&mut self, syntax: qwertty::SyntaxToken) -> Option<Event> {
+        let bytes = syntax.as_bytes();
+        if bytes == [0x1b] {
+            self.legacy_alt_prefix = true;
+            return None;
+        }
+        self.legacy_alt_prefix = false;
+        let [0x1b, byte] = bytes else {
+            return None;
+        };
+        let code = match *byte {
+            b'\r' => KeyCode::Enter,
+            b'\t' => KeyCode::Tab,
+            0x08 | 0x7f => KeyCode::Backspace,
+            0x20..=0x7e => KeyCode::Char(char::from(*byte)),
+            _ => return None,
+        };
+        Some(Event::Key(KeyEvent::new(code, KeyModifiers::ALT)))
     }
 
     fn adapt_paste(&mut self, segment: PasteEvent) -> Option<Event> {
@@ -50,7 +94,7 @@ impl InputAdapter {
 
 fn adapt_key(key: QwerttyKeyEvent) -> Option<KeyEvent> {
     let mut modifiers = adapt_modifiers(key.modifiers());
-    let code = match key.key() {
+    let mut code = match key.key() {
         Key::Char(character) => KeyCode::Char(character),
         Key::Up => KeyCode::Up,
         Key::Down => KeyCode::Down,
@@ -74,6 +118,12 @@ fn adapt_key(key: QwerttyKeyEvent) -> Option<KeyEvent> {
         }
         _ => return None,
     };
+    if modifiers.contains(KeyModifiers::SHIFT)
+        && let Some(shifted) = key.shifted_key()
+    {
+        code = KeyCode::Char(shifted);
+        modifiers.remove(KeyModifiers::SHIFT);
+    }
     let kind = match key.kind() {
         QwerttyKeyEventKind::Press => KeyEventKind::Press,
         QwerttyKeyEventKind::Repeat => KeyEventKind::Repeat,
@@ -250,6 +300,81 @@ mod tests {
             adapt_key(QwerttyKeyEvent::new(Key::Char('x')).with_kind(QwerttyKeyEventKind::Repeat))
                 .kind,
             KeyEventKind::Repeat
+        );
+    }
+
+    #[test]
+    fn maps_reported_shifted_character_like_crossterm() {
+        let key = adapt_key(
+            QwerttyKeyEvent::new(Key::Char('9'))
+                .with_shifted_key('(')
+                .with_modifiers(Modifiers::SHIFT.union(Modifiers::ALT)),
+        );
+
+        assert_eq!(key.code, KeyCode::Char('('));
+        assert_eq!(key.modifiers, KeyModifiers::ALT);
+    }
+
+    #[test]
+    fn preserves_legacy_alt_enter_and_alt_character_sequences() {
+        let mut adapter = InputAdapter::default();
+        let alt_enter = decode(b"\x1b\r")
+            .into_iter()
+            .filter_map(|event| adapter.adapt(event))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            alt_enter,
+            [Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))]
+        );
+
+        let alt_character = decode(b"\x1bx")
+            .into_iter()
+            .filter_map(|event| adapter.adapt(event))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            alt_character,
+            [Event::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::ALT
+            ))]
+        );
+    }
+
+    #[test]
+    fn unknown_syntax_does_not_prime_the_next_key_as_alt() {
+        let mut adapter = InputAdapter::default();
+        let adapted = decode(b"\x1b]777;late\x07\r")
+            .into_iter()
+            .filter_map(|event| adapter.adapt(event))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            adapted,
+            [Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ))]
+        );
+    }
+
+    #[test]
+    fn unsupported_key_consumes_legacy_alt_prefix() {
+        let mut adapter = InputAdapter::default();
+        let mut events = decode(b"\x1b\r");
+        let enter = events.pop().expect("enter event");
+        let prefix = events.pop().expect("legacy alt prefix");
+
+        assert_eq!(adapter.adapt(prefix), None);
+        assert_eq!(
+            adapter.adapt(QwerttyEvent::Key(QwerttyKeyEvent::new(Key::Function(0)))),
+            None
+        );
+        assert_eq!(
+            adapter.adapt(enter),
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            )))
         );
     }
 
