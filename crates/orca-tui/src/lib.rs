@@ -7,6 +7,7 @@ mod approval_mode_actions;
 mod background_approval;
 mod background_tasks;
 pub mod bridge;
+mod capability_backend;
 mod channels;
 mod clipboard;
 pub mod commands;
