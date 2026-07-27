@@ -23,7 +23,7 @@ use crate::shortcuts::{self, ShortcutScope};
 use crate::syntax_highlight::highlight_code;
 use crate::theme::Theme;
 use crate::transcript_view::{TranscriptRenderContext, viewport_paragraph};
-use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, PanelMode};
+use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, CopyNotice, PanelMode};
 
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
     // Recomputed below when the widgets are actually shown; cleared here so
@@ -40,6 +40,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         return;
     }
 
+    let show_composer_hardware_cursor = main_composer_hardware_cursor_visible(state);
     let composer_layout =
         composer_visible(state).then(|| composer_visual_layout(frame.area().width, textarea));
     let input_height = composer_layout
@@ -93,6 +94,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
             composer_layout.as_ref().expect("visible composer layout"),
             state,
             theme,
+            show_composer_hardware_cursor,
         );
     }
     render_status(frame, chunks[5], state, theme);
@@ -163,6 +165,10 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 
 fn composer_visible(state: &AppState) -> bool {
     !matches!(state.status, AppStatus::WaitingApproval)
+}
+
+fn main_composer_hardware_cursor_visible(state: &AppState) -> bool {
+    composer_visible(state) && !state.show_shortcuts
 }
 
 fn render_goal_banner(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -1838,7 +1844,61 @@ fn render_input(
     layout: &TextareaVisualLayout,
     state: &AppState,
     theme: &Theme,
+    show_hardware_cursor: bool,
 ) {
+    render_textarea_surface(
+        frame,
+        area,
+        textarea,
+        Some(layout),
+        state.copy_notice_at(std::time::Instant::now()),
+        theme,
+        show_hardware_cursor,
+    );
+}
+
+fn render_textarea_surface(
+    frame: &mut Frame,
+    area: Rect,
+    textarea: &TextArea,
+    precomputed_layout: Option<&TextareaVisualLayout>,
+    notice: Option<CopyNotice>,
+    theme: &Theme,
+    show_hardware_cursor: bool,
+) {
+    let inner = render_textarea_block_and_notice(frame, area, textarea, notice, theme);
+    if inner.is_empty() {
+        return;
+    }
+
+    let computed_layout;
+    let layout = if let Some(layout) = precomputed_layout {
+        layout
+    } else {
+        computed_layout = textarea_visual_layout(textarea, inner.width as usize);
+        &computed_layout
+    };
+    let visible_height = inner.height as usize;
+    let start = textarea_visible_start(layout, visible_height);
+    let end = (start + visible_height).min(layout.lines.len());
+    let visible = layout.lines[start..end].to_vec();
+    let paragraph = Paragraph::new(visible)
+        .style(textarea.style())
+        .alignment(layout.alignment);
+    frame.render_widget(paragraph, inner);
+
+    if show_hardware_cursor && let Some(position) = visible_textarea_cursor(layout, inner) {
+        frame.set_cursor_position(position);
+    }
+}
+
+fn render_textarea_block_and_notice(
+    frame: &mut Frame,
+    area: Rect,
+    textarea: &TextArea,
+    notice: Option<CopyNotice>,
+    theme: &Theme,
+) -> Rect {
     let inner = if let Some(block) = textarea.block() {
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -1849,7 +1909,7 @@ fn render_input(
 
     // Transient "copied N chars" feedback overlays the right end of the top
     // border, mirroring the " Input " title on the left.
-    if let Some(notice) = state.copy_notice_at(std::time::Instant::now()) {
+    if let Some(notice) = notice {
         let text = if notice.local_only {
             format!(" copied {} chars (local clipboard only) ", notice.chars)
         } else {
@@ -1866,18 +1926,7 @@ fn render_input(
         }
     }
 
-    if inner.is_empty() {
-        return;
-    }
-
-    let visible_height = inner.height as usize;
-    let start = textarea_visible_start(layout, visible_height);
-    let end = (start + visible_height).min(layout.lines.len());
-    let visible = layout.lines[start..end].to_vec();
-    let paragraph = Paragraph::new(visible)
-        .style(textarea.style())
-        .alignment(layout.alignment);
-    frame.render_widget(paragraph, inner);
+    inner
 }
 
 fn composer_input_height(
@@ -2615,12 +2664,11 @@ fn active_shortcut_scopes(state: &AppState) -> Vec<ShortcutScope> {
     }
 }
 
-/// The scrolled 12-item window both popup menus (slash, mention) use: the
+/// The scrolled item window both popup menus (slash, mention) use: the
 /// selected row stays visible, pinned to the window's bottom while moving
-/// down. Shared by the renderers and the mouse hit-tests so they can never
-/// disagree.
-fn popup_window(len: usize, selected: usize) -> (usize, usize) {
-    let visible_count = len.min(12);
+/// down.
+fn popup_window(len: usize, selected: usize, max_visible: usize) -> (usize, usize) {
+    let visible_count = len.min(12).min(max_visible);
     let max_start = len.saturating_sub(visible_count);
     let start = selected
         .saturating_sub(visible_count.saturating_sub(1))
@@ -2628,26 +2676,61 @@ fn popup_window(len: usize, selected: usize) -> (usize, usize) {
     (start, (start + visible_count).min(len))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PopupGeometry {
+    area: Rect,
+    start: usize,
+    end: usize,
+    show_status: bool,
+}
+
+fn popup_geometry(
+    frame_area: Rect,
+    input_area: Rect,
+    len: usize,
+    selected: usize,
+    wants_status: bool,
+) -> Option<PopupGeometry> {
+    let left = input_area.x.max(frame_area.x);
+    let right = input_area.right().min(frame_area.right());
+    let width = right.checked_sub(left)?;
+    let bottom = input_area.y.clamp(frame_area.y, frame_area.bottom());
+    let available_height = bottom.saturating_sub(frame_area.y);
+    if width == 0 || available_height < 2 {
+        return None;
+    }
+
+    let max_content_rows = available_height.saturating_sub(2) as usize;
+    let show_status = wants_status && max_content_rows > 0 && (len == 0 || max_content_rows >= 2);
+    let max_items = max_content_rows.saturating_sub(usize::from(show_status));
+    let (start, end) = popup_window(len, selected, max_items);
+    let height = (end - start)
+        .saturating_add(usize::from(show_status))
+        .saturating_add(2)
+        .min(available_height as usize) as u16;
+
+    Some(PopupGeometry {
+        area: Rect::new(left, bottom - height, width, height),
+        start,
+        end,
+        show_status,
+    })
+}
+
 /// Which slash-menu item (of the active list — sub-menu when open) a click
-/// lands on, replicating `render_slash_menu` geometry.
+/// lands on.
 pub(crate) fn slash_menu_hit_index(state: &AppState, column: u16, row: u16) -> Option<usize> {
     let menu = state.slash_menu.as_ref()?;
+    let frame_area = state.frame_area?;
     let input_area = state.input_area?;
     let (len, selected) = match &menu.sub_menu {
         Some(sub) => (sub.items.len(), sub.selected),
         None => (menu.items.len(), menu.selected),
     };
-    let (start, end) = popup_window(len, selected);
-    let height = ((end - start) as u16 + 2).min(14);
-    let popup = Rect::new(
-        input_area.x,
-        input_area.y.saturating_sub(height),
-        input_area.width,
-        height,
-    );
-    hit_bordered_list_row(popup, column, row).and_then(|offset| {
-        let index = start + offset;
-        (index < end).then_some(index)
+    let geometry = popup_geometry(frame_area, input_area, len, selected, false)?;
+    hit_bordered_list_row(geometry.area, column, row).and_then(|offset| {
+        let index = geometry.start + offset;
+        (index < geometry.end).then_some(index)
     })
 }
 
@@ -2661,24 +2744,24 @@ pub(crate) fn mention_menu_hit_index(state: &AppState, column: u16, row: u16) ->
         return None;
     }
     let phase = state.mention.phase.as_ref()?;
+    let frame_area = state.frame_area?;
     let input_area = state.input_area?;
     let candidates = &state.mention.candidates;
-    let (start, end) = popup_window(candidates.len(), state.mention.selected);
     let status = mention_status_text(
         phase,
         state.mention.progress.scanned_paths,
         candidates.is_empty(),
     );
-    let height = (end - start) as u16 + u16::from(status.is_some()) + 2;
-    let popup = Rect::new(
-        input_area.x,
-        input_area.y.saturating_sub(height),
-        input_area.width,
-        height,
-    );
-    hit_bordered_list_row(popup, column, row).and_then(|offset| {
-        let index = start + offset;
-        (index < end).then_some(index)
+    let geometry = popup_geometry(
+        frame_area,
+        input_area,
+        candidates.len(),
+        state.mention.selected,
+        status.is_some(),
+    )?;
+    hit_bordered_list_row(geometry.area, column, row).and_then(|offset| {
+        let index = geometry.start + offset;
+        (index < geometry.end).then_some(index)
     })
 }
 
@@ -2716,19 +2799,16 @@ fn render_slash_menu(frame: &mut Frame, input_area: Rect, state: &AppState, them
             (items, menu.selected, " Commands ")
         };
 
-    let (start, end) = popup_window(items.len(), selected);
-    let visible_count = end - start;
-    let item_count = visible_count as u16;
-    let height = (item_count + 2).min(14); // +2 for border
-    let width = input_area.width;
-    let y = input_area.y.saturating_sub(height);
-    let popup_area = Rect::new(input_area.x, y, width, height);
+    let Some(geometry) = popup_geometry(frame.area(), input_area, items.len(), selected, false)
+    else {
+        return;
+    };
 
-    frame.render_widget(Clear, popup_area);
+    frame.render_widget(Clear, geometry.area);
 
     let mut lines: Vec<Line> = Vec::new();
-    for (i, (cmd, desc)) in items[start..end].iter().enumerate() {
-        let item_index = start + i;
+    for (i, (cmd, desc)) in items[geometry.start..geometry.end].iter().enumerate() {
+        let item_index = geometry.start + i;
         let prefix = if item_index == selected { "▸ " } else { "  " };
         let style = if item_index == selected {
             Style::default()
@@ -2755,7 +2835,7 @@ fn render_slash_menu(frame: &mut Frame, input_area: Rect, state: &AppState, them
         .border_style(Style::default().fg(theme.border));
 
     let paragraph = Paragraph::new(lines).block(block);
-    frame.render_widget(paragraph, popup_area);
+    frame.render_widget(paragraph, geometry.area);
 }
 
 fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppState, theme: &Theme) {
@@ -2764,26 +2844,28 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
         return;
     };
 
-    let (start, end) = popup_window(candidates.len(), state.mention.selected);
-    let visible_count = end - start;
     let status = mention_status_text(
         phase,
         state.mention.progress.scanned_paths,
         candidates.is_empty(),
     );
-    let item_count = visible_count as u16 + u16::from(status.is_some());
-    let height = item_count + 2;
-    let width = input_area.width;
-    let y = input_area.y.saturating_sub(height);
-    let popup_area = Rect::new(input_area.x, y, width, height);
+    let Some(geometry) = popup_geometry(
+        frame.area(),
+        input_area,
+        candidates.len(),
+        state.mention.selected,
+        status.is_some(),
+    ) else {
+        return;
+    };
 
-    frame.render_widget(Clear, popup_area);
+    frame.render_widget(Clear, geometry.area);
 
     let mut lines: Vec<Line> = candidates
         .iter()
         .enumerate()
-        .skip(start)
-        .take(end.saturating_sub(start))
+        .skip(geometry.start)
+        .take(geometry.end.saturating_sub(geometry.start))
         .map(|(i, candidate)| {
             let prefix = if i == state.mention.selected {
                 "▸ "
@@ -2816,7 +2898,9 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
             Line::from(spans)
         })
         .collect();
-    if let Some((text, color)) = status {
+    if geometry.show_status
+        && let Some((text, color)) = status
+    {
         lines.push(Line::from(Span::styled(
             format!("  {text}"),
             Style::default().fg(color),
@@ -2830,7 +2914,7 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
         .border_style(Style::default().fg(theme.border));
 
     let paragraph = Paragraph::new(lines).block(block);
-    frame.render_widget(paragraph, popup_area);
+    frame.render_widget(paragraph, geometry.area);
 }
 
 fn mention_status_text(
@@ -3753,8 +3837,107 @@ mod tests {
     use orca_core::goal_types::{ThreadGoal, ThreadGoalStatus};
     use orca_core::plan_types::{PlanItem, PlanStatus};
     use orca_runtime::history::SessionSummary;
+    use ratatui::backend::Backend;
     use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CursorEvent {
+        Show,
+        Hide,
+        Move(Position),
+    }
+
+    struct RecordingBackend {
+        inner: ratatui::backend::TestBackend,
+        events: Arc<Mutex<Vec<CursorEvent>>>,
+    }
+
+    impl RecordingBackend {
+        fn new(width: u16, height: u16) -> (Self, Arc<Mutex<Vec<CursorEvent>>>) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    inner: ratatui::backend::TestBackend::new(width, height),
+                    events: Arc::clone(&events),
+                },
+                events,
+            )
+        }
+    }
+
+    impl Backend for RecordingBackend {
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content)
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.events.lock().unwrap().push(CursorEvent::Hide);
+            self.inner.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.events.lock().unwrap().push(CursorEvent::Show);
+            self.inner.show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> std::io::Result<Position> {
+            self.inner.get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> std::io::Result<()> {
+            let position = position.into();
+            self.events
+                .lock()
+                .unwrap()
+                .push(CursorEvent::Move(position));
+            self.inner.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.inner.clear()
+        }
+
+        fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+            self.inner.clear_region(clear_type)
+        }
+
+        fn append_lines(&mut self, line_count: u16) -> std::io::Result<()> {
+            self.inner.append_lines(line_count)
+        }
+
+        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+            self.inner.size()
+        }
+
+        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+            self.inner.window_size()
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+
+        fn scroll_region_up(&mut self, region: Range<u16>, line_count: u16) -> std::io::Result<()> {
+            self.inner.scroll_region_up(region, line_count)
+        }
+
+        fn scroll_region_down(
+            &mut self,
+            region: Range<u16>,
+            line_count: u16,
+        ) -> std::io::Result<()> {
+            self.inner.scroll_region_down(region, line_count)
+        }
+    }
+
+    fn take_cursor_events(events: &Arc<Mutex<Vec<CursorEvent>>>) -> Vec<CursorEvent> {
+        std::mem::take(&mut *events.lock().unwrap())
+    }
 
     fn foregrounds(line: &Line<'static>) -> HashSet<Color> {
         line.spans.iter().filter_map(|span| span.style.fg).collect()
@@ -4424,6 +4607,7 @@ mod tests {
             })
             .expect("draw");
         let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("/command-08"));
         assert!(rendered.contains("▸ /command-19"));
         assert!(!rendered.contains("/command-00"));
 
@@ -4449,8 +4633,66 @@ mod tests {
             })
             .expect("draw");
         let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("@file-08.rs"));
         assert!(rendered.contains("▸ @file-19.rs"));
         assert!(!rendered.contains("@file-00.rs"));
+    }
+
+    #[test]
+    fn compact_popup_hit_testing_matches_constrained_render_geometry() {
+        let mut state = test_state();
+        state.frame_area = Some(Rect::new(0, 0, 40, 16));
+        state.input_area = Some(Rect::new(0, 12, 40, 3));
+        state.slash_menu = Some(SlashMenu {
+            items: (0..12)
+                .map(|index| SlashMenuItem {
+                    command: format!("/command-{index:02}"),
+                    description: format!("command {index}"),
+                })
+                .collect(),
+            selected: 11,
+            sub_menu: None,
+        });
+
+        assert_eq!(slash_menu_hit_index(&state, 5, 10), Some(11));
+        assert_eq!(slash_menu_hit_index(&state, 5, 12), None);
+
+        state.slash_menu = None;
+        state.mention.candidates = (0..12)
+            .map(|index| {
+                orca_runtime::mentions::MentionCandidate::from_file_match(
+                    &orca_file_search::SearchMatch {
+                        root: std::path::PathBuf::from("/workspace"),
+                        path: format!("file-{index:02}.rs"),
+                        kind: orca_file_search::MatchKind::File,
+                        score: 1,
+                        indices: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        state.mention.selected = 11;
+        state.mention.phase = Some(SearchPhase::Scanning);
+
+        assert_eq!(mention_menu_hit_index(&state, 5, 9), Some(11));
+        assert_eq!(mention_menu_hit_index(&state, 5, 10), None);
+        assert_eq!(mention_menu_hit_index(&state, 5, 12), None);
+    }
+
+    #[test]
+    fn popup_geometry_stays_in_frame_and_omits_unrenderable_status() {
+        let frame = Rect::new(5, 7, 10, 2);
+        let input = Rect::new(0, 9, 40, 3);
+
+        let geometry = popup_geometry(frame, input, 0, 0, true).expect("border-only popup");
+
+        assert_eq!(geometry.area, frame);
+        assert!(!geometry.show_status);
+        assert_eq!(geometry.start, geometry.end);
+        assert_eq!(
+            popup_geometry(frame, Rect::new(0, 7, 40, 3), 12, 11, false),
+            None
+        );
     }
 
     #[test]
@@ -6278,6 +6520,299 @@ mod tests {
             .unwrap();
 
         assert_eq!(textarea_grapheme_tokenization_count(), 1);
+    }
+
+    #[test]
+    fn hardware_cursor_matches_idle_composer_software_cursor() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+        textarea.insert_str("ab界");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(5, 7));
+        assert!(
+            terminal.backend().buffer()[(5, 7)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn hardware_cursor_matches_wrapped_cjk_composer_software_cursor() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+        textarea.insert_str("界界界界");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(8, 10)).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(3, 7));
+        assert!(
+            terminal.backend().buffer()[(3, 7)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn editable_conversation_states_expose_the_hardware_cursor() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+
+        for status in [
+            AppStatus::Idle,
+            AppStatus::Running,
+            AppStatus::Compacting,
+            AppStatus::WaitingUserInput,
+        ] {
+            let mut state = test_state();
+            state.status = status.clone();
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+
+            terminal
+                .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                .unwrap();
+
+            terminal
+                .backend_mut()
+                .assert_cursor_position(Position::new(1, 7));
+            assert!(
+                terminal.backend().buffer()[(1, 7)]
+                    .modifier
+                    .contains(Modifier::REVERSED),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_popups_keep_the_hardware_cursor() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+
+        for popup in ["slash", "mention"] {
+            let mut state = test_state();
+            match popup {
+                "slash" => {
+                    state.slash_menu = Some(SlashMenu {
+                        items: vec![SlashMenuItem {
+                            command: "/help".to_string(),
+                            description: "show help".to_string(),
+                        }],
+                        selected: 0,
+                        sub_menu: None,
+                    });
+                }
+                "mention" => {
+                    state.mention.phase = Some(SearchPhase::Scanning);
+                }
+                _ => unreachable!(),
+            }
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+
+            terminal
+                .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                .unwrap();
+
+            terminal
+                .backend_mut()
+                .assert_cursor_position(Position::new(1, 7));
+        }
+    }
+
+    #[test]
+    fn compact_tall_slash_menu_keeps_cursor_on_reversed_composer_cell() {
+        let mut state = test_state();
+        state.slash_menu = Some(SlashMenu {
+            items: (0..12)
+                .map(|index| SlashMenuItem {
+                    command: format!("/command-{index:02}"),
+                    description: format!("command {index}"),
+                })
+                .collect(),
+            selected: 11,
+            sub_menu: None,
+        });
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 16)).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+
+        let cursor = Position::new(1, 13);
+        terminal.backend_mut().assert_cursor_position(cursor);
+        let cursor_cell = &terminal.backend().buffer()[cursor];
+        assert_eq!(cursor_cell.symbol(), " ");
+        assert!(cursor_cell.modifier.contains(Modifier::REVERSED));
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Commands"));
+        assert!(rendered.contains("/command-02"));
+        assert!(rendered.contains("▸ /command-11"));
+        assert!(!rendered.contains("/command-01"));
+    }
+
+    #[test]
+    fn compact_tall_mention_menu_keeps_cursor_on_reversed_composer_cell() {
+        let mut state = test_state();
+        state.mention.candidates = (0..12)
+            .map(|index| {
+                orca_runtime::mentions::MentionCandidate::from_file_match(
+                    &orca_file_search::SearchMatch {
+                        root: std::path::PathBuf::from("/workspace"),
+                        path: format!("file-{index:02}.rs"),
+                        kind: orca_file_search::MatchKind::File,
+                        score: 1,
+                        indices: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        state.mention.selected = 11;
+        state.mention.phase = Some(SearchPhase::Scanning);
+        state.mention.progress.scanned_paths = 42;
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 16)).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+
+        let cursor = Position::new(1, 13);
+        terminal.backend_mut().assert_cursor_position(cursor);
+        let cursor_cell = &terminal.backend().buffer()[cursor];
+        assert_eq!(cursor_cell.symbol(), " ");
+        assert!(cursor_cell.modifier.contains(Modifier::REVERSED));
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Mentions"));
+        assert!(rendered.contains("@file-03.rs"));
+        assert!(rendered.contains("▸ @file-11.rs"));
+        assert!(!rendered.contains("@file-02.rs"));
+        assert!(rendered.contains("Scanning… 42 paths"));
+    }
+
+    #[test]
+    fn vim_modes_keep_the_hardware_cursor_on_the_software_cursor() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        for mode in [
+            crate::vim::VimMode::Insert,
+            crate::vim::VimMode::Normal,
+            crate::vim::VimMode::Visual,
+        ] {
+            let mut state = test_state();
+            let vim = crate::vim::VimState {
+                enabled: true,
+                mode,
+            };
+            let textarea = crate::composer_textarea::make_textarea(&vim, &theme);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+
+            terminal
+                .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                .unwrap();
+
+            terminal
+                .backend_mut()
+                .assert_cursor_position(Position::new(1, 7));
+            assert!(
+                terminal.backend().buffer()[(1, 7)]
+                    .modifier
+                    .contains(Modifier::REVERSED),
+                "{mode:?}"
+            );
+        }
+    }
+
+    fn assert_hidden_frame_does_not_move_composer_cursor(mut configure: impl FnMut(&mut AppState)) {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+        let (backend, events) = RecordingBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = test_state();
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+        let editable_events = take_cursor_events(&events);
+        assert!(editable_events.contains(&CursorEvent::Show));
+        assert!(
+            editable_events
+                .iter()
+                .any(|event| matches!(event, CursorEvent::Move(_))),
+            "{editable_events:?}"
+        );
+
+        configure(&mut state);
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+        let hidden_events = take_cursor_events(&events);
+
+        assert!(
+            hidden_events.contains(&CursorEvent::Hide),
+            "{hidden_events:?}"
+        );
+        assert!(
+            !hidden_events
+                .iter()
+                .any(|event| matches!(event, CursorEvent::Move(_))),
+            "{hidden_events:?}"
+        );
+    }
+
+    #[test]
+    fn waiting_approval_frame_hides_the_hardware_cursor_without_moving_it() {
+        assert_hidden_frame_does_not_move_composer_cursor(|state| {
+            state.update(TuiEvent::ApprovalNeeded {
+                key: interaction_key(TuiInteractionKind::Approval, "approval-1"),
+                tool: "web_search".to_string(),
+                target: Some("query".to_string()),
+                preview: None,
+            });
+        });
+    }
+
+    #[test]
+    fn session_picker_frame_hides_the_hardware_cursor_without_moving_it() {
+        assert_hidden_frame_does_not_move_composer_cursor(|state| {
+            state.status = AppStatus::SessionPicker;
+        });
+    }
+
+    #[test]
+    fn shortcuts_frame_hides_the_hardware_cursor_without_moving_it() {
+        assert_hidden_frame_does_not_move_composer_cursor(|state| {
+            state.show_shortcuts = true;
+        });
     }
 
     #[test]

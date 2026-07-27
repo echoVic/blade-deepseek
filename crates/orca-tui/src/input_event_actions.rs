@@ -1134,6 +1134,7 @@ mod tests {
     #[test]
     fn slash_menu_click_selects_then_accepts() {
         let mut state = state_with_transcript();
+        state.frame_area = Some(Rect::new(0, 0, 60, 24));
         state.input_area = Some(Rect::new(0, 20, 60, 3));
         state.slash_menu = Some(crate::types::SlashMenu {
             items: vec![
