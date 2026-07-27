@@ -20,6 +20,9 @@ serde_json = { workspace = true }
 ratatui = { workspace = true, features = ["scrolling-regions", "unstable-rendered-line-info"] }
 crossterm = { workspace = true }
 tui-textarea = { workspace = true }
+qwertty = { workspace = true }
+supports-color = { workspace = true }
+tokio = { workspace = true }
 pulldown-cmark = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
