@@ -1,17 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-const FORBIDDEN_SERVER_RUNTIME: &[&str] = &[
-    "RuntimeHost",
-    "RuntimeThreadHandle",
-    "OperationHandle",
-    "HostedTurnRequest",
-    "SessionStore",
-    "ThreadStore",
-    "start_turn_with_config",
-    "start_turn_with_config_and_output",
-];
-
 #[test]
 fn jsonl_runtime_routes_host_thread_reads_and_turns_through_the_surface_adapter() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -32,27 +21,13 @@ fn jsonl_runtime_routes_host_thread_reads_and_turns_through_the_surface_adapter(
         );
     }
 
-    let runtime_path = root.join("src/server_runtime.rs");
-    let runtime_file = fs::read_to_string(&runtime_path)
-        .unwrap_or_else(|error| panic!("read {}: {error}", runtime_path.display()));
-    let runtime_source = production_source(&runtime_file);
-    let violations = FORBIDDEN_SERVER_RUNTIME
-        .iter()
-        .filter(|forbidden| runtime_source.contains(**forbidden))
-        .map(|forbidden| forbidden.to_string())
-        .collect::<Vec<_>>();
     assert!(
-        violations.is_empty(),
-        "ServerThreadRuntime still owns raw runtime state: {}",
-        violations.join(", ")
+        !root.join("src/server_runtime.rs").exists(),
+        "JSONL must not retain a second runtime ownership wrapper"
     );
     assert!(
-        runtime_source.contains("adapter: JsonlSurfaceAdapter"),
-        "ServerThreadRuntime must delegate JSONL ownership to the typed surface adapter"
-    );
-    assert!(
-        !runtime_source.contains("active_turns: HashMap"),
-        "ServerThreadRuntime must retain transport workers, not an active/completed turn registry"
+        adapter_source.contains("transport_turns: Vec<JsonlTransportTurn>"),
+        "the typed surface adapter must retain its projection workers"
     );
     assert!(
         adapter_source.contains("project_surface_batch"),

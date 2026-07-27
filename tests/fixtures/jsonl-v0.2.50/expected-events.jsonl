@@ -1,0 +1,10 @@
+{"event":"turn_started","id":"fixture-submit","task":{"kind":"agent","status":"running","task_id":"<task>","turn":1},"turn":1,"turnId":"<turn>"}
+{"event":"item_started","id":"fixture-submit","item":{"content":"","id":"<reasoning-item>","summary":"","type":"reasoning"},"threadId":"<thread>","turnId":"<turn>"}
+{"delta":"Mock runtime is preserving the DeepSeek reasoning channel.","event":"item_reasoning_delta","id":"fixture-submit","itemId":"<reasoning-item>"}
+{"event":"reasoning_delta","id":"fixture-submit","text":"Mock runtime is preserving the DeepSeek reasoning channel."}
+{"event":"item_started","id":"fixture-submit","item":{"id":"<message-item>","text":"","type":"agent_message"},"threadId":"<thread>","turnId":"<turn>"}
+{"delta":"Mock runtime completed the headless harness contract.","event":"item_message_delta","id":"fixture-submit","itemId":"<message-item>"}
+{"event":"message_delta","id":"fixture-submit","text":"Mock runtime completed the headless harness contract."}
+{"event":"item_completed","id":"fixture-submit","item":{"id":"<message-item>","text":"Mock runtime completed the headless harness contract.","type":"agent_message"},"threadId":"<thread>","turnId":"<turn>"}
+{"event":"item_completed","id":"fixture-submit","item":{"content":"","id":"<reasoning-item>","summary":"Mock runtime is preserving the DeepSeek reasoning channel.","type":"reasoning"},"threadId":"<thread>","turnId":"<turn>"}
+{"event":"turn_completed","id":"fixture-submit","status":"success"}

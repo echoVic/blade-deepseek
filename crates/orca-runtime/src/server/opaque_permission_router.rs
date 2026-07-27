@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -8,7 +9,8 @@ use sha2::{Digest, Sha256};
 
 use crate::unstable_surface::{
     DeferredMutation, JSONL_LIVE_REQUEST_LIMIT, JSONL_REPAIR_AUTHORITY_LIMIT,
-    JSONL_REQUEST_TOMBSTONE_LIMIT, JSONL_REQUEST_TOMBSTONE_TTL_MS, SurfaceConnectionId,
+    JSONL_REQUEST_TOMBSTONE_LIMIT, JSONL_REQUEST_TOMBSTONE_TTL_MS, RuntimeSurfaceClientHandle,
+    SurfaceConnectionId, SurfaceInteractionId, SurfaceInteractionKind,
 };
 
 use super::lock_error;
@@ -69,6 +71,52 @@ pub(super) enum JsonlOwnerSettlement {
     InteractionDeferredToRuntime,
     InteractionRecoveryRetained,
     CommandExecFailedBeforeExecution,
+}
+
+#[derive(Clone)]
+pub(super) struct JsonlCommandExecPermissionRequest {
+    pub(super) thread_id: String,
+    pub(super) runtime_workspace_roots: Vec<PathBuf>,
+    pub(super) command: Vec<String>,
+    pub(super) process_id: Option<String>,
+    pub(super) cwd: Option<PathBuf>,
+    pub(super) env: crate::protocol::CommandEnvOverrides,
+    pub(super) options: crate::protocol::CommandExecOptions,
+    pub(super) terminal: crate::shell_session::ShellTerminalMode,
+    pub(super) event_id: serde_json::Value,
+}
+
+#[derive(Clone)]
+pub(super) enum JsonlPermissionRoute {
+    Surface {
+        client: RuntimeSurfaceClientHandle,
+        interaction_id: SurfaceInteractionId,
+        target: SurfaceInteractionKind,
+        thread_id: String,
+        runtime_workspace_roots: Vec<PathBuf>,
+    },
+    CommandExec {
+        request: Box<JsonlCommandExecPermissionRequest>,
+    },
+}
+
+impl JsonlPermissionRoute {
+    pub(super) fn thread_id(&self) -> &str {
+        match self {
+            Self::Surface { thread_id, .. } => thread_id,
+            Self::CommandExec { request } => &request.thread_id,
+        }
+    }
+
+    pub(super) fn runtime_workspace_roots(&self) -> &[PathBuf] {
+        match self {
+            Self::Surface {
+                runtime_workspace_roots,
+                ..
+            } => runtime_workspace_roots,
+            Self::CommandExec { request } => &request.runtime_workspace_roots,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

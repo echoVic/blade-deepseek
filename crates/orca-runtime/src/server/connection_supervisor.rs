@@ -6,20 +6,18 @@ use crate::unstable_surface::{
     JSONL_COMMITTED_REPAIR_DRAIN_DEADLINE_MS, JSONL_SUPERVISOR_JOIN_DEADLINE_MS,
 };
 
+use super::JsonlSurfaceAdapter;
 use super::command_exec_manager::CommandExecManager;
 use super::direct_interaction_adapter::{
     JsonlDirectInteractionAdapter, JsonlDirectInteractionRoute,
 };
 use super::fuzzy_file_search_manager::FuzzyFileSearchManager;
-use super::mcp_elicitation_manager::PendingMcpElicitationManager;
 use super::mention_search_manager::MentionSearchManager;
 use super::opaque_permission_router::{
     JsonlConnectionAdmission, JsonlOpaquePermissionRouter, JsonlOwnerSettlement,
+    JsonlPermissionRoute,
 };
-use super::permission_manager::{PendingPermissionManager, PendingPermissionRequest};
 use super::shell_manager::ServerShellManager;
-use super::user_input_manager::PendingUserInputManager;
-use crate::server_runtime::ServerThreadRuntime;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum JsonlNonIoCloseTrigger {
@@ -126,17 +124,14 @@ enum JsonlSupervisorState {
 pub(super) struct JsonlConnectionSupervisor {
     state: JsonlSupervisorState,
     admission: JsonlConnectionAdmission,
-    permission_routes: JsonlOpaquePermissionRouter<PendingPermissionRequest>,
+    permission_routes: JsonlOpaquePermissionRouter<JsonlPermissionRoute>,
     direct_routes: JsonlDirectInteractionAdapter<JsonlDirectInteractionRoute>,
 }
 
 pub(super) struct JsonlConnectionServices {
-    pub(super) threads: ServerThreadRuntime,
+    pub(super) threads: JsonlSurfaceAdapter,
     pub(super) shells: ServerShellManager,
     pub(super) command_exec: CommandExecManager,
-    pub(super) pending_permissions: PendingPermissionManager,
-    pub(super) pending_user_inputs: PendingUserInputManager,
-    pub(super) pending_mcp_elicitations: PendingMcpElicitationManager,
     pub(super) fuzzy_file_searches: FuzzyFileSearchManager,
     pub(super) mention_searches: MentionSearchManager,
 }
@@ -144,7 +139,7 @@ pub(super) struct JsonlConnectionServices {
 impl JsonlConnectionSupervisor {
     pub(super) fn new(
         admission: JsonlConnectionAdmission,
-        permission_routes: JsonlOpaquePermissionRouter<PendingPermissionRequest>,
+        permission_routes: JsonlOpaquePermissionRouter<JsonlPermissionRoute>,
         direct_routes: JsonlDirectInteractionAdapter<JsonlDirectInteractionRoute>,
     ) -> Self {
         Self {
@@ -170,22 +165,10 @@ impl JsonlConnectionSupervisor {
             mut threads,
             shells,
             command_exec,
-            pending_permissions,
-            pending_user_inputs,
-            pending_mcp_elicitations,
             fuzzy_file_searches,
             mention_searches,
         } = services;
 
-        if let Err(error) = pending_permissions.seal_legacy() {
-            cleanup_errors.push(format!("seal legacy permission requests: {error}"));
-        }
-        if let Err(error) = pending_user_inputs.close() {
-            cleanup_errors.push(format!("close user-input requests: {error}"));
-        }
-        if let Err(error) = pending_mcp_elicitations.close() {
-            cleanup_errors.push(format!("close MCP elicitation requests: {error}"));
-        }
         if let Err(error) = self.permission_routes.close_routes_by_owner() {
             cleanup_errors.push(format!("retire permission routes: {error}"));
         }
@@ -288,7 +271,7 @@ fn settle_services(
 }
 
 fn settle_committed_repairs_until(
-    permission_routes: JsonlOpaquePermissionRouter<PendingPermissionRequest>,
+    permission_routes: JsonlOpaquePermissionRouter<JsonlPermissionRoute>,
     direct_routes: JsonlDirectInteractionAdapter<JsonlDirectInteractionRoute>,
     deadline: Instant,
 ) -> JsonlCommittedRepairSettlements {

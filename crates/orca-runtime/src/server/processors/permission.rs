@@ -54,10 +54,10 @@ fn run_permission_respond<W: Write>(
         "permissions": &permissions,
         "strictAutoReview": strict_auto_review,
     }))?;
-    let pending = state.pending_permissions.published_route(request_id)?;
+    let pending = state.permission_routes.published_route(request_id)?;
     let Some(pending) = pending else {
         return match state
-            .pending_permissions
+            .permission_routes
             .committed_replay(request_id, response_digest)?
         {
             JsonlCommittedReplay::SameResponse => protocol::write_server_event(
@@ -84,24 +84,12 @@ fn run_permission_respond<W: Write>(
             ),
         };
     };
-    if let Some((pending_thread_id, pending_turn_id, generation)) = pending.runtime_generation()
-        && !state
-            .threads
-            .accepts_generation(pending_turn_id, pending_thread_id, generation)
-    {
-        return protocol::write_server_event(
-            writer,
-            &id,
-            ServerEvent::error(format!(
-                "permission request is no longer active: {request_id}"
-            )),
-        );
-    }
     if decision == protocol::PermissionResponseDecision::Allow
         && scope == protocol::PermissionGrantScope::Session
-        && !matches!(pending, PendingPermissionRequest::Surface { .. })
+        && matches!(pending, JsonlPermissionRoute::CommandExec { .. })
     {
-        let session_grants = persist_session_permission_grant(
+        let session_grants = materialize_session_permission_grant(
+            &state.threads,
             pending.thread_id(),
             pending.runtime_workspace_roots(),
             &permissions,
@@ -119,7 +107,7 @@ fn run_permission_respond<W: Write>(
             },
         );
     }
-    if let PendingPermissionRequest::Surface {
+    if let JsonlPermissionRoute::Surface {
         client,
         interaction_id,
         target,
@@ -203,7 +191,7 @@ fn run_permission_respond<W: Write>(
         {
             Ok(crate::unstable_surface::MutationReply::Committed { .. }) => {}
             Ok(crate::unstable_surface::MutationReply::Deferred { mutation, .. }) => {
-                state.pending_permissions.mark_committed_pending(
+                state.permission_routes.mark_committed_pending(
                     request_id,
                     &mutation,
                     response_digest,
@@ -235,9 +223,10 @@ fn run_permission_respond<W: Write>(
                 );
             }
         }
-        state
-            .pending_permissions
-            .settle(request_id, response_digest)?;
+        state.permission_routes.settle(
+            request_id,
+            JsonlRetiredRequestSettlement::PermissionCommitted { response_digest },
+        )?;
         return protocol::write_server_event(
             writer,
             &id,
@@ -259,32 +248,13 @@ fn run_permission_respond<W: Write>(
             strict_auto_review: json!(strict_auto_review),
         },
     )?;
-    state
-        .pending_permissions
-        .settle(request_id, response_digest)?;
+    state.permission_routes.settle(
+        request_id,
+        JsonlRetiredRequestSettlement::PermissionCommitted { response_digest },
+    )?;
     match pending {
-        PendingPermissionRequest::Runtime { sender, .. } => {
-            if sender
-                .send(RuntimePermissionResponse {
-                    decision,
-                    scope,
-                    permissions,
-                    strict_auto_review,
-                })
-                .is_err()
-            {
-                return protocol::write_server_event(
-                    writer,
-                    &id,
-                    ServerEvent::error(format!(
-                        "permission request is no longer active: {request_id}"
-                    )),
-                );
-            }
-            Ok(())
-        }
-        PendingPermissionRequest::Surface { .. } => unreachable!("surface response returned above"),
-        PendingPermissionRequest::CommandExec { mut request } => {
+        JsonlPermissionRoute::Surface { .. } => unreachable!("surface response returned above"),
+        JsonlPermissionRoute::CommandExec { mut request } => {
             if decision != protocol::PermissionResponseDecision::Allow {
                 return protocol::write_server_event(
                     writer,

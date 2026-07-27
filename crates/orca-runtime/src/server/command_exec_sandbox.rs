@@ -7,8 +7,8 @@ use orca_core::config::{DEFAULT_PERMISSION_PROFILE_GLOB_SCAN_MAX_DEPTH, RunConfi
 use walkdir::WalkDir;
 
 use crate::protocol;
-use crate::server_runtime::ActivePermissionProfile;
 use crate::shell_session::ShellSandboxMode;
+use orca_core::config::ActivePermissionProfile;
 
 fn shell_sandbox_mode_from_command_policy(
     policy: &protocol::CommandSandboxPolicy,

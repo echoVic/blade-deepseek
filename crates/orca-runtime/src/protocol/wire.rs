@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::server_runtime::{
+use crate::server::{
     ActivePermissionProfile, AdditionalWorkingDirectory, PermissionProfileOverride,
     PermissionRuleValue, PermissionUpdate,
 };
@@ -1446,7 +1446,7 @@ mod tests {
                 );
                 assert_eq!(
                     permissions.active_permission_profile,
-                    Some(crate::server_runtime::ActivePermissionProfile::new(
+                    Some(crate::server::ActivePermissionProfile::new(
                         "locked-down",
                         Some(":workspace")
                     ))
@@ -1471,17 +1471,17 @@ mod tests {
                 assert_eq!(permissions.permission_updates.len(), 6);
                 assert_eq!(
                     permissions.permission_updates[0],
-                    crate::server_runtime::PermissionUpdate::SetMode {
+                    crate::server::PermissionUpdate::SetMode {
                         destination: "session".to_string(),
                         mode: orca_core::approval_types::ApprovalMode::FullAuto
                     }
                 );
                 assert_eq!(
                     permissions.permission_updates[1],
-                    crate::server_runtime::PermissionUpdate::AddRules {
+                    crate::server::PermissionUpdate::AddRules {
                         destination: "session".to_string(),
                         behavior: orca_core::approval_types::Decision::Allow,
-                        rules: vec![crate::server_runtime::PermissionRuleValue::new(
+                        rules: vec![crate::server::PermissionRuleValue::new(
                             "bash",
                             Some("cargo test *")
                         )]
@@ -1489,10 +1489,10 @@ mod tests {
                 );
                 assert_eq!(
                     permissions.permission_updates[3],
-                    crate::server_runtime::PermissionUpdate::ReplaceRules {
+                    crate::server::PermissionUpdate::ReplaceRules {
                         destination: "session".to_string(),
                         behavior: orca_core::approval_types::Decision::Prompt,
-                        rules: vec![crate::server_runtime::PermissionRuleValue::new(
+                        rules: vec![crate::server::PermissionRuleValue::new(
                             "write_file",
                             Some("/workspace/**")
                         )]
@@ -1500,8 +1500,8 @@ mod tests {
                 );
                 assert_eq!(
                     permissions.permission_updates[4],
-                    crate::server_runtime::PermissionUpdate::AddDirectories {
-                        directories: vec![crate::server_runtime::AdditionalWorkingDirectory::new(
+                    crate::server::PermissionUpdate::AddDirectories {
+                        directories: vec![crate::server::AdditionalWorkingDirectory::new(
                             "/tmp/extra",
                             "projectSettings"
                         )]
@@ -1509,7 +1509,7 @@ mod tests {
                 );
                 assert_eq!(
                     permissions.permission_updates[5],
-                    crate::server_runtime::PermissionUpdate::RemoveDirectories {
+                    crate::server::PermissionUpdate::RemoveDirectories {
                         destination: "session".to_string(),
                         directories: vec![std::path::PathBuf::from("/tmp/old")]
                     }

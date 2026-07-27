@@ -1,6 +1,5 @@
 use std::io::{self, Write};
 
-use orca_mcp::McpElicitationResponse;
 use serde_json::{Value, json};
 
 use super::super::*;
@@ -46,48 +45,6 @@ fn run_mcp_elicitation_respond<W: Write>(
         "accepted": accepted,
         "content": &content_json,
     }))?;
-    let pending = state.pending_mcp_elicitations.route_legacy(request_id)?;
-    if let Some(pending) = pending {
-        let (pending_thread_id, pending_turn_id, generation) = pending.generation_scope();
-        if !state
-            .threads
-            .accepts_generation(pending_turn_id, pending_thread_id, generation)
-        {
-            state.pending_mcp_elicitations.settle_legacy(request_id)?;
-            return protocol::write_server_event(
-                writer,
-                &id,
-                ServerEvent::error(format!(
-                    "MCP elicitation request is no longer active: {request_id}"
-                )),
-            );
-        }
-        protocol::write_server_event(
-            writer,
-            &id,
-            ServerEvent::McpElicitationResolved {
-                request_id: json!(request_id),
-                accepted: json!(accepted),
-            },
-        )?;
-        let response = if accepted {
-            McpElicitationResponse::accept(content_json.unwrap_or_else(|| json!({})))
-        } else {
-            McpElicitationResponse::decline()
-        };
-        if pending.sender.send(response).is_err() {
-            state.pending_mcp_elicitations.settle_legacy(request_id)?;
-            return protocol::write_server_event(
-                writer,
-                &id,
-                ServerEvent::error(format!(
-                    "MCP elicitation request is no longer active: {request_id}"
-                )),
-            );
-        }
-        state.pending_mcp_elicitations.settle_legacy(request_id)?;
-        return Ok(());
-    }
     let decision = if accepted {
         crate::unstable_surface::SurfaceMcpElicitationDecision::Accept {
             content: json_to_surface_data(content_json.unwrap_or_else(|| json!({})))?,
@@ -95,11 +52,23 @@ fn run_mcp_elicitation_respond<W: Write>(
     } else {
         crate::unstable_surface::SurfaceMcpElicitationDecision::Decline
     };
-    let pending = state.pending_mcp_elicitations.surface_route(request_id)?;
+    let pending = state.direct_interactions.published_route(
+        request_id,
+        direct_interaction_adapter::JsonlDirectInteractionKind::McpElicitation,
+    )?;
+    let pending = match pending {
+        Some(direct_interaction_adapter::JsonlDirectInteractionRoute::McpElicitation {
+            client,
+            interaction_id,
+        }) => Some((client, interaction_id)),
+        Some(direct_interaction_adapter::JsonlDirectInteractionRoute::UserInput { .. }) | None => {
+            None
+        }
+    };
     let Some(pending) = pending else {
         return match state
-            .pending_mcp_elicitations
-            .surface_committed_replay(request_id, response_digest)?
+            .direct_interactions
+            .committed_replay(request_id, response_digest)?
         {
             JsonlCommittedReplay::SameResponse => protocol::write_server_event(
                 writer,
@@ -124,16 +93,18 @@ fn run_mcp_elicitation_respond<W: Write>(
         };
     };
     let response_request_id = crate::unstable_surface::SurfaceRequestId::new();
-    match pending.client.respond_interaction_by_id(
+    match pending.0.respond_interaction_by_id(
         response_request_id,
-        pending.interaction_id.clone(),
+        pending.1,
         crate::unstable_surface::SurfaceClientInteractionAnswer::McpElicitation { decision },
     ) {
         Ok(crate::unstable_surface::MutationReply::Committed { .. }) => {}
         Ok(crate::unstable_surface::MutationReply::Deferred { mutation, .. }) => {
-            state
-                .pending_mcp_elicitations
-                .mark_surface_committed_pending(request_id, &mutation, response_digest)?;
+            state.direct_interactions.mark_committed_pending(
+                request_id,
+                &mutation,
+                response_digest,
+            )?;
             return protocol::write_server_event(
                 writer,
                 &id,
@@ -153,8 +124,8 @@ fn run_mcp_elicitation_respond<W: Write>(
         }
     }
     state
-        .pending_mcp_elicitations
-        .settle_surface(request_id, response_digest)?;
+        .direct_interactions
+        .settle_committed(request_id, response_digest)?;
     protocol::write_server_event(
         writer,
         &id,

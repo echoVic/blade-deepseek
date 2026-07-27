@@ -18,9 +18,9 @@ use orca_runtime::history::{
 };
 use orca_runtime::lifecycle::ThreadSteerHandle;
 use orca_runtime::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind};
-use orca_runtime::server_runtime::{
-    ActivePermissionProfile, AdditionalWorkingDirectory, PermissionProfileOverride,
-    PermissionRuleValue, PermissionUpdate, ServerThreadRuntime, ServerThreadTurn,
+use orca_runtime::server::{
+    ActivePermissionProfile, AdditionalWorkingDirectory, JsonlSurfaceAdapter,
+    PermissionProfileOverride, PermissionRuleValue, PermissionUpdate, ServerThreadTurn,
 };
 use orca_runtime::session::InteractiveSession;
 use serde_json::Value;
@@ -1322,12 +1322,12 @@ fn server_thread_runtime_runs_turn_and_preserves_conversation() {
     });
 }
 
-fn start_server_runtime() -> ServerThreadRuntime {
-    ServerThreadRuntime::start().expect("start server runtime")
+fn start_server_runtime() -> JsonlSurfaceAdapter {
+    JsonlSurfaceAdapter::start().expect("start server runtime")
 }
 
 fn request_writer<'a>(output: &'a mut Vec<u8>) -> impl Write + 'a {
-    orca_runtime::server_runtime::ServerRequestWriter::new(Value::from("turn"), output)
+    orca_runtime::server::ServerRequestWriter::new(Value::from("turn"), output)
 }
 
 fn test_run_config(cwd: &std::path::Path) -> RunConfig {

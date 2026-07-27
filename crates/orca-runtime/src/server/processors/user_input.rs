@@ -30,48 +30,24 @@ fn run_user_input_respond<W: Write>(
     writer: &mut W,
 ) -> io::Result<()> {
     let response_digest = jsonl_response_digest(&json!({ "answer": &answer }))?;
-    let pending = state.pending_user_inputs.route_legacy(request_id)?;
-    if let Some(pending) = pending {
-        let (pending_thread_id, pending_turn_id, generation) = pending.generation_scope();
-        if !state
-            .threads
-            .accepts_generation(pending_turn_id, pending_thread_id, generation)
-        {
-            state.pending_user_inputs.settle_legacy(request_id)?;
-            return protocol::write_server_event(
-                writer,
-                &id,
-                ServerEvent::error(format!(
-                    "user input request is no longer active: {request_id}"
-                )),
-            );
-        }
-        protocol::write_server_event(
-            writer,
-            &id,
-            ServerEvent::UserInputResolved {
-                request_id: json!(request_id),
-                answered: json!(answer.is_some()),
-            },
-        )?;
-        if pending.sender.send(answer).is_err() {
-            state.pending_user_inputs.settle_legacy(request_id)?;
-            return protocol::write_server_event(
-                writer,
-                &id,
-                ServerEvent::error(format!(
-                    "user input request is no longer active: {request_id}"
-                )),
-            );
-        }
-        state.pending_user_inputs.settle_legacy(request_id)?;
-        return Ok(());
-    }
-    let pending = state.pending_user_inputs.surface_route(request_id)?;
+    let pending = state.direct_interactions.published_route(
+        request_id,
+        direct_interaction_adapter::JsonlDirectInteractionKind::UserInput,
+    )?;
+    let pending = match pending {
+        Some(direct_interaction_adapter::JsonlDirectInteractionRoute::UserInput {
+            client,
+            interaction_id,
+        }) => Some((client, interaction_id)),
+        Some(direct_interaction_adapter::JsonlDirectInteractionRoute::McpElicitation {
+            ..
+        })
+        | None => None,
+    };
     let Some(pending) = pending else {
         return match state
-            .pending_user_inputs
-            .surface_committed_replay(request_id, response_digest)?
+            .direct_interactions
+            .committed_replay(request_id, response_digest)?
         {
             JsonlCommittedReplay::SameResponse => protocol::write_server_event(
                 writer,
@@ -103,14 +79,14 @@ fn run_user_input_respond<W: Write>(
         None => crate::unstable_surface::SurfaceUserInputDecision::Cancel,
     };
     let response_request_id = crate::unstable_surface::SurfaceRequestId::new();
-    match pending.client.respond_interaction_by_id(
+    match pending.0.respond_interaction_by_id(
         response_request_id,
-        pending.interaction_id.clone(),
+        pending.1,
         crate::unstable_surface::SurfaceClientInteractionAnswer::UserInput { decision },
     ) {
         Ok(crate::unstable_surface::MutationReply::Committed { .. }) => {}
         Ok(crate::unstable_surface::MutationReply::Deferred { mutation, .. }) => {
-            state.pending_user_inputs.mark_surface_committed_pending(
+            state.direct_interactions.mark_committed_pending(
                 request_id,
                 &mutation,
                 response_digest,
@@ -134,8 +110,8 @@ fn run_user_input_respond<W: Write>(
         }
     }
     state
-        .pending_user_inputs
-        .settle_surface(request_id, response_digest)?;
+        .direct_interactions
+        .settle_committed(request_id, response_digest)?;
     protocol::write_server_event(
         writer,
         &id,

@@ -9,35 +9,35 @@ mod command_exec_sandbox;
 mod connection_supervisor;
 mod direct_interaction_adapter;
 mod fuzzy_file_search_manager;
-mod mcp_elicitation_manager;
 mod mention_search_manager;
 mod opaque_permission_router;
-mod permission_manager;
 mod router;
 mod shell_manager;
-pub(crate) mod surface_adapter;
-mod user_input_manager;
+mod surface_adapter;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
 
-use crate::lifecycle::RuntimePermissionResponse;
+use orca_core::approval_rules::{PermissionRule, PermissionRules};
+use orca_core::approval_types::{ApprovalMode, Decision};
+pub use orca_core::config::{
+    ActivePermissionProfile, AdditionalWorkingDirectory, PermissionProfileNetworkAccess,
+};
+use orca_mcp::McpRegistry;
+
 use crate::network_proxy::{
     RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy,
     runtime_network_block_channel,
 };
 use crate::protocol::{self, ClientOp, ServerEvent, Submission};
+use crate::runtime_event_projector::RuntimeEventProjector;
 use crate::runtime_host::HostedOperationWriter;
 use crate::sandbox_denial::{SandboxDenialDiagnostic, diagnose_sandbox_denial};
-use crate::server_runtime::{
-    PermissionProfileOverride, ServerRequestWriter, ServerThreadRuntime, thread_item_to_json,
-    thread_run_config, thread_turn_to_json,
-};
 use crate::shell_session::{ShellSandboxMode, ShellSessionCommand};
 use crate::thread_store::{
-    SessionStore, SortDirection, StoredThreadSummary, ThreadListFilters, ThreadMetadataPatch,
-    ThreadSortKey, ThreadStore, TurnItemsView,
+    SortDirection, StoredThreadItem, StoredThreadSummary, StoredThreadTurn, ThreadListFilters,
+    ThreadMetadataPatch, ThreadSortKey, TurnItemsView,
 };
 use command_exec_manager::{
     CommandExecDrainOutcome, CommandExecManager, CommandExecPermissionPolicy, CommandExecProcess,
@@ -51,22 +51,324 @@ use connection_supervisor::{
 };
 use direct_interaction_adapter::JsonlDirectInteractionAdapter;
 use fuzzy_file_search_manager::FuzzyFileSearchManager;
-use mcp_elicitation_manager::PendingMcpElicitationManager;
 use mention_search_manager::MentionSearchManager;
 use opaque_permission_router::{
-    JsonlCommittedReplay, JsonlConnectionAdmission, JsonlOpaquePermissionRouter,
-    jsonl_response_digest,
+    JsonlCommandExecPermissionRequest, JsonlCommittedReplay, JsonlConnectionAdmission,
+    JsonlOpaquePermissionRouter, JsonlPermissionRoute, JsonlRetiredRequestOwner,
+    JsonlRetiredRequestSettlement, jsonl_response_digest,
 };
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
-use permission_manager::{
-    PendingCommandExecPermissionRequest, PendingPermissionManager, PendingPermissionRequest,
-};
 use shell_manager::ServerShellManager;
-use user_input_manager::PendingUserInputManager;
+pub use surface_adapter::JsonlSurfaceAdapter;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub run_config: RunConfig,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PermissionProfileOverride {
+    pub active_permission_profile: Option<ActivePermissionProfile>,
+    pub approval_mode: Option<ApprovalMode>,
+    pub runtime_workspace_roots: Option<Vec<PathBuf>>,
+    pub permission_rules: Option<PermissionRules>,
+    pub permission_updates: Vec<PermissionUpdate>,
+}
+
+impl PermissionProfileOverride {
+    pub fn is_empty(&self) -> bool {
+        self.active_permission_profile.is_none()
+            && self.approval_mode.is_none()
+            && self.runtime_workspace_roots.is_none()
+            && self.permission_rules.is_none()
+            && self.permission_updates.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PermissionUpdate {
+    AddRules {
+        destination: String,
+        behavior: Decision,
+        rules: Vec<PermissionRuleValue>,
+    },
+    ReplaceRules {
+        destination: String,
+        behavior: Decision,
+        rules: Vec<PermissionRuleValue>,
+    },
+    RemoveRules {
+        destination: String,
+        behavior: Decision,
+        rules: Vec<PermissionRuleValue>,
+    },
+    SetMode {
+        destination: String,
+        mode: ApprovalMode,
+    },
+    AddDirectories {
+        directories: Vec<AdditionalWorkingDirectory>,
+    },
+    RemoveDirectories {
+        destination: String,
+        directories: Vec<PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PermissionRuleValue {
+    pub tool: String,
+    pub pattern: Option<String>,
+}
+
+impl PermissionRuleValue {
+    pub fn new(tool: impl Into<String>, pattern: Option<impl Into<String>>) -> Self {
+        Self {
+            tool: tool.into(),
+            pattern: pattern.map(Into::into),
+        }
+    }
+
+    fn into_rule(self, behavior: Decision) -> PermissionRule {
+        PermissionRule::new(
+            self.tool,
+            self.pattern.unwrap_or_else(|| "*".to_string()),
+            behavior,
+        )
+    }
+
+    fn matches_rule(&self, rule: &PermissionRule, behavior: Decision) -> bool {
+        rule.decision == behavior
+            && rule.tool == self.tool
+            && self
+                .pattern
+                .as_deref()
+                .map(|pattern| pattern == rule.pattern)
+                .unwrap_or(true)
+    }
+}
+
+pub(crate) struct ServerThreadSubmissionContext {
+    pub(crate) cwd: String,
+    pub(crate) runtime_workspace_roots: Vec<PathBuf>,
+    pub(crate) mcp_registry: McpRegistry,
+}
+
+pub struct ServerThreadView {
+    cwd: String,
+    runtime_workspace_roots: Vec<PathBuf>,
+    active_permission_profile: Option<ActivePermissionProfile>,
+    additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
+    mcp_registry: McpRegistry,
+}
+
+impl ServerThreadView {
+    pub fn additional_working_directories(&self) -> &[AdditionalWorkingDirectory] {
+        &self.additional_working_directories
+    }
+
+    pub fn active_permission_profile(&self) -> Option<&ActivePermissionProfile> {
+        self.active_permission_profile.as_ref()
+    }
+
+    pub fn runtime_workspace_roots(&self) -> &[PathBuf] {
+        &self.runtime_workspace_roots
+    }
+
+    pub fn network_domain_permissions(&self) -> &HashMap<String, PermissionProfileNetworkAccess> {
+        &self.network_domain_permissions
+    }
+
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    pub fn mcp_registry(&self) -> &McpRegistry {
+        &self.mcp_registry
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServerThreadTurn {
+    prompt: String,
+}
+
+impl ServerThreadTurn {
+    pub fn new(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+        }
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+}
+
+pub(crate) fn apply_permission_override(
+    config: &mut RunConfig,
+    permissions: PermissionProfileOverride,
+) {
+    if let Some(active_permission_profile) = permissions.active_permission_profile {
+        config.active_permission_profile = Some(active_permission_profile);
+    }
+    if let Some(approval_mode) = permissions.approval_mode {
+        config.approval_mode = approval_mode;
+    }
+    if let Some(runtime_workspace_roots) = permissions.runtime_workspace_roots {
+        config.runtime_workspace_roots = Some(runtime_workspace_roots);
+    }
+    if let Some(permission_rules) = permissions.permission_rules {
+        config.permission_rules = permission_rules;
+    }
+    apply_permission_updates(config, permissions.permission_updates);
+}
+
+fn apply_permission_updates(config: &mut RunConfig, updates: Vec<PermissionUpdate>) {
+    for update in updates {
+        match update {
+            PermissionUpdate::SetMode { mode, .. } => config.approval_mode = mode,
+            PermissionUpdate::AddRules {
+                behavior, rules, ..
+            } => config
+                .permission_rules
+                .rules
+                .extend(rules.into_iter().map(|rule| rule.into_rule(behavior))),
+            PermissionUpdate::ReplaceRules {
+                behavior, rules, ..
+            } => {
+                config
+                    .permission_rules
+                    .rules
+                    .retain(|rule| rule.decision != behavior);
+                config
+                    .permission_rules
+                    .rules
+                    .extend(rules.into_iter().map(|rule| rule.into_rule(behavior)));
+            }
+            PermissionUpdate::RemoveRules {
+                behavior, rules, ..
+            } => config.permission_rules.rules.retain(|rule| {
+                !rules
+                    .iter()
+                    .any(|remove| remove.matches_rule(rule, behavior))
+            }),
+            PermissionUpdate::AddDirectories { directories } => {
+                for directory in directories {
+                    if let Some(existing) = config
+                        .additional_working_directories
+                        .iter_mut()
+                        .find(|existing| existing.path == directory.path)
+                    {
+                        existing.source = directory.source;
+                    } else {
+                        config.additional_working_directories.push(directory);
+                    }
+                }
+            }
+            PermissionUpdate::RemoveDirectories {
+                destination,
+                directories,
+            } => config.additional_working_directories.retain(|directory| {
+                directory.source != destination
+                    || !directories.iter().any(|remove| remove == &directory.path)
+            }),
+        }
+    }
+}
+
+pub struct ServerRequestWriter<W: Write> {
+    id: Value,
+    inner: W,
+    buffer: Vec<u8>,
+    projector: RuntimeEventProjector,
+}
+
+impl<W: Write> ServerRequestWriter<W> {
+    pub fn new(id: Value, inner: W) -> Self {
+        Self {
+            id,
+            inner,
+            buffer: Vec::new(),
+            projector: RuntimeEventProjector::default(),
+        }
+    }
+
+    pub fn flush_remaining(&mut self) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            let line = String::from_utf8_lossy(&self.buffer).to_string();
+            self.buffer.clear();
+            self.write_runtime_line(&line)?;
+        }
+        Ok(())
+    }
+
+    fn write_runtime_line(&mut self, line: &str) -> io::Result<()> {
+        for event in self.projector.project_line(line) {
+            protocol::write_server_event(&mut self.inner, &self.id, event)?;
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for ServerRequestWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        while let Some(pos) = self.buffer.iter().position(|&byte| byte == b'\n') {
+            let line = String::from_utf8_lossy(&self.buffer[..pos]).to_string();
+            self.buffer.drain(..=pos);
+            self.write_runtime_line(&line)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+pub fn thread_run_config(config: &RunConfig) -> RunConfig {
+    let mut run_config = config.clone();
+    run_config.output_format = OutputFormat::Jsonl;
+    run_config.history_mode = match run_config.history_mode {
+        HistoryMode::Record => HistoryMode::Record,
+        HistoryMode::Disabled | HistoryMode::Resume(_) | HistoryMode::Fork(_) => {
+            HistoryMode::Disabled
+        }
+    };
+    run_config.show_session_picker = false;
+    run_config.desktop_notifications = false;
+    run_config
+}
+
+pub fn thread_turn_to_json(turn: StoredThreadTurn) -> Value {
+    json!({
+        "threadId": turn.thread_id,
+        "turnId": turn.turn_id,
+        "index": turn.index,
+        "role": turn.role,
+        "itemsView": turn_items_view_to_json(turn.items_view),
+        "items": turn.items,
+    })
+}
+
+pub fn thread_item_to_json(item: StoredThreadItem) -> Value {
+    json!({
+        "threadId": item.thread_id,
+        "turnId": item.turn_id,
+        "itemId": item.item_id,
+        "index": item.index,
+        "item": item.item,
+    })
+}
+
+fn turn_items_view_to_json(items_view: TurnItemsView) -> &'static str {
+    match items_view {
+        TurnItemsView::NotLoaded => "notLoaded",
+        TurnItemsView::Summary => "summary",
+        TurnItemsView::Full => "full",
+    }
 }
 
 pub fn run(config: ServerConfig) -> i32 {
@@ -121,19 +423,19 @@ fn run_with_io<R: BufRead, W: Write + Send + 'static>(
 
 struct ServerState {
     supervisor: JsonlConnectionSupervisor,
-    threads: ServerThreadRuntime,
+    threads: JsonlSurfaceAdapter,
     shells: ServerShellManager,
     command_exec: CommandExecManager,
-    pending_permissions: PendingPermissionManager,
-    pending_user_inputs: PendingUserInputManager,
-    pending_mcp_elicitations: PendingMcpElicitationManager,
+    permission_routes: JsonlOpaquePermissionRouter<JsonlPermissionRoute>,
+    direct_interactions:
+        JsonlDirectInteractionAdapter<direct_interaction_adapter::JsonlDirectInteractionRoute>,
     fuzzy_file_searches: FuzzyFileSearchManager,
     mention_searches: MentionSearchManager,
 }
 
 impl ServerState {
     fn start() -> io::Result<Self> {
-        let threads = ServerThreadRuntime::start()?;
+        let threads = JsonlSurfaceAdapter::start()?;
         let connection_id = threads
             .connection_id()
             .ok_or_else(|| io::Error::other("JSONL surface connection is not bound"))?;
@@ -150,9 +452,8 @@ impl ServerState {
             threads,
             shells: ServerShellManager::default(),
             command_exec: CommandExecManager::default(),
-            pending_permissions: PendingPermissionManager::new(permission_router),
-            pending_user_inputs: PendingUserInputManager::new(direct_interactions.clone()),
-            pending_mcp_elicitations: PendingMcpElicitationManager::new(direct_interactions),
+            permission_routes: permission_router,
+            direct_interactions,
             fuzzy_file_searches: FuzzyFileSearchManager::default(),
             mention_searches: MentionSearchManager::default(),
         })
@@ -164,9 +465,8 @@ impl ServerState {
             threads,
             shells,
             command_exec,
-            pending_permissions,
-            pending_user_inputs,
-            pending_mcp_elicitations,
+            permission_routes: _,
+            direct_interactions: _,
             fuzzy_file_searches,
             mention_searches,
         } = self;
@@ -177,9 +477,6 @@ impl ServerState {
                     threads,
                     shells,
                     command_exec,
-                    pending_permissions,
-                    pending_user_inputs,
-                    pending_mcp_elicitations,
                     fuzzy_file_searches,
                     mention_searches,
                 },
@@ -293,15 +590,6 @@ fn write_locked_event<W: Write>(
 
 fn lock_error<T>(_: std::sync::PoisonError<T>) -> io::Error {
     io::Error::other("server writer lock poisoned")
-}
-
-fn generation_scoped_id(base: String, generation: crate::runtime_host::GenerationFence) -> String {
-    let generation = generation.generation_id().as_u64();
-    if generation == 0 {
-        base
-    } else {
-        format!("{base}-generation-{generation}")
-    }
 }
 
 struct SharedServerRequestWriter<W: Write> {
@@ -441,7 +729,8 @@ struct PersistedSessionPermissionGrant {
     network_domain_permissions: HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
 }
 
-fn persist_session_permission_grant(
+fn materialize_session_permission_grant(
+    threads: &JsonlSurfaceAdapter,
     thread_id: &str,
     runtime_workspace_roots: &[PathBuf],
     permissions: &protocol::RequestPermissionProfile,
@@ -457,19 +746,15 @@ fn persist_session_permission_grant(
                 .chain(file_system.read.iter().flatten())
         })
         .filter(|path| !path.as_os_str().is_empty());
-    let store = SessionStore::new();
-    let mut transcript = store.load_session(thread_id)?;
+    let mut thread = threads.read_thread_result(thread_id, false, false)?;
     for root in roots {
-        for root in
-            materialize_workspace_roots_paths(&transcript.meta.cwd, runtime_workspace_roots, root)
-        {
-            if !transcript
-                .meta
+        for root in materialize_workspace_roots_paths(&thread.cwd, runtime_workspace_roots, root) {
+            if !thread
                 .additional_working_directories
                 .iter()
                 .any(|directory| directory.path == root)
             {
-                transcript.meta.additional_working_directories.push(
+                thread.additional_working_directories.push(
                     orca_core::config::AdditionalWorkingDirectory::new(root, "session"),
                 );
             }
@@ -477,28 +762,14 @@ fn persist_session_permission_grant(
     }
     if let Some(network) = permissions.network.as_ref() {
         for (domain, access) in &network.domains {
-            transcript
-                .meta
+            thread
                 .network_domain_permissions
                 .insert(domain.clone(), *access);
         }
     }
-    store.update_thread_metadata(
-        thread_id,
-        ThreadMetadataPatch {
-            title: None,
-            active_permission_profile: None,
-            approval_mode: transcript.meta.approval_mode,
-            runtime_workspace_roots: None,
-            permission_rules: Some(transcript.meta.permission_rules),
-            additional_working_directories: Some(transcript.meta.additional_working_directories),
-            network_domain_permissions: Some(transcript.meta.network_domain_permissions),
-        },
-    )?;
-    let updated = store.load_session(thread_id)?;
     Ok(PersistedSessionPermissionGrant {
-        additional_working_directories: updated.meta.additional_working_directories,
-        network_domain_permissions: updated.meta.network_domain_permissions,
+        additional_working_directories: thread.additional_working_directories,
+        network_domain_permissions: thread.network_domain_permissions,
     })
 }
 
@@ -992,18 +1263,17 @@ fn run_command_exec<W: Write>(
     }
     let mut retry_block_reporter = None;
     let mut retry_block_receiver = None;
-    let command_permission_request =
-        thread_id.map(|thread_id| PendingCommandExecPermissionRequest {
-            thread_id: thread_id.to_string(),
-            runtime_workspace_roots: runtime_workspace_roots.clone(),
-            command: command.to_vec(),
-            process_id: process_id.map(ToString::to_string),
-            cwd: Some(cwd.clone()),
-            env: env.clone(),
-            options: options.clone(),
-            terminal,
-            event_id: id.clone(),
-        });
+    let command_permission_request = thread_id.map(|thread_id| JsonlCommandExecPermissionRequest {
+        thread_id: thread_id.to_string(),
+        runtime_workspace_roots: runtime_workspace_roots.clone(),
+        command: command.to_vec(),
+        process_id: process_id.map(ToString::to_string),
+        cwd: Some(cwd.clone()),
+        env: env.clone(),
+        options: options.clone(),
+        terminal,
+        event_id: id.clone(),
+    });
     if options.permission_profile.is_some() {
         let (block_sender, block_receiver) = runtime_network_block_channel();
         retry_block_reporter = Some(block_sender);
@@ -1206,7 +1476,7 @@ fn run_command_exec<W: Write>(
 
 fn request_command_exec_network_permission<W: Write>(
     state: &mut ServerState,
-    request: PendingCommandExecPermissionRequest,
+    request: JsonlCommandExecPermissionRequest,
     block: RuntimeNetworkBlockReport,
     writer: &mut W,
 ) -> io::Result<()> {
@@ -1218,7 +1488,7 @@ fn request_command_exec_network_permission<W: Write>(
 
 fn request_command_exec_file_system_permission<W: Write>(
     state: &mut ServerState,
-    request: PendingCommandExecPermissionRequest,
+    request: JsonlCommandExecPermissionRequest,
     diagnostic: SandboxDenialDiagnostic,
     writer: &mut W,
 ) -> io::Result<()> {
@@ -1229,7 +1499,7 @@ fn request_command_exec_file_system_permission<W: Write>(
 
 fn request_command_exec_permission<W: Write>(
     state: &mut ServerState,
-    request: PendingCommandExecPermissionRequest,
+    request: JsonlCommandExecPermissionRequest,
     reason: String,
     permissions: protocol::RequestPermissionProfile,
     writer: &mut W,
@@ -1243,9 +1513,13 @@ fn request_command_exec_permission<W: Write>(
             .map(ToString::to_string)
             .unwrap_or_else(|| request.event_id.to_string())
     );
-    let request_id = state
-        .pending_permissions
-        .insert_command_exec(request_id.clone(), request)?;
+    let request_id = state.permission_routes.register(
+        request_id,
+        JsonlRetiredRequestOwner::CommandExecPermission,
+        JsonlPermissionRoute::CommandExec {
+            request: Box::new(request),
+        },
+    )?;
     let frame_digest = jsonl_response_digest(&json!({
         "id": &request_id,
         "event": "permission_request",
@@ -1256,7 +1530,7 @@ fn request_command_exec_permission<W: Write>(
         "permissions": &permissions,
     }))?;
     state
-        .pending_permissions
+        .permission_routes
         .mark_writing(&request_id, frame_digest)?;
     protocol::write_server_event(
         writer,
@@ -1271,7 +1545,7 @@ fn request_command_exec_permission<W: Write>(
     )?;
     writer.flush()?;
     state
-        .pending_permissions
+        .permission_routes
         .mark_published(&request_id, frame_digest)
 }
 
@@ -2023,9 +2297,8 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
         permissions,
         &id,
         surface_adapter::JsonlInteractionTransport::new(
-            state.pending_permissions.clone(),
-            state.pending_user_inputs.clone(),
-            state.pending_mcp_elicitations.clone(),
+            state.permission_routes.clone(),
+            state.direct_interactions.clone(),
         ),
     ) {
         Ok(prepared) => prepared,
@@ -2204,6 +2477,7 @@ fn run_submit<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thread_store::{SessionStore, ThreadStore};
     use orca_core::approval_rules::PermissionRules;
     use orca_core::approval_types::ApprovalMode;
     use orca_core::config::{

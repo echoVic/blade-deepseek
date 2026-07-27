@@ -9,7 +9,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::Value;
 
-use super::PendingCommandExecPermissionRequest;
+use super::JsonlCommandExecPermissionRequest;
 use super::cap_text;
 use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkProxy};
 use crate::protocol::{self, ServerEvent};
@@ -34,7 +34,7 @@ pub(super) struct CommandExecProcess {
     pub(super) stdout_cap_reached: bool,
     pub(super) stderr_cap_reached: bool,
     pub(super) network_permission_blocks: Option<mpsc::Receiver<RuntimeNetworkBlockReport>>,
-    pub(super) permission_request: Option<PendingCommandExecPermissionRequest>,
+    pub(super) permission_request: Option<JsonlCommandExecPermissionRequest>,
     pub(super) _network_proxy: Option<RuntimeNetworkProxy>,
 }
 
@@ -58,7 +58,7 @@ pub(super) struct CommandExecProcessSnapshot {
 pub(super) enum CommandExecDrainOutcome {
     Drained,
     NetworkPermissionRequired {
-        request: PendingCommandExecPermissionRequest,
+        request: JsonlCommandExecPermissionRequest,
         block: RuntimeNetworkBlockReport,
     },
     NetworkPermissionDenied {
@@ -66,7 +66,7 @@ pub(super) enum CommandExecDrainOutcome {
         reason: String,
     },
     FileSystemPermissionRequired {
-        request: PendingCommandExecPermissionRequest,
+        request: JsonlCommandExecPermissionRequest,
         diagnostic: SandboxDenialDiagnostic,
     },
 }

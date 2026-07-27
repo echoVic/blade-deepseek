@@ -1,17 +1,22 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 use orca_core::thread_identity::TurnId;
 use sha2::{Digest, Sha256};
 
-use super::mcp_elicitation_manager::{
-    PendingMcpElicitationManager, PendingSurfaceMcpElicitationRequest,
+use super::direct_interaction_adapter::{
+    JsonlDirectInteractionAdapter, JsonlDirectInteractionKind, JsonlDirectInteractionRoute,
 };
-use super::permission_manager::PendingPermissionManager;
-use super::user_input_manager::{PendingSurfaceUserInputRequest, PendingUserInputManager};
+use super::opaque_permission_router::{
+    JsonlOpaquePermissionRouter, JsonlPermissionRoute, JsonlRetiredRequestOwner,
+};
+use super::{
+    PermissionProfileOverride, ServerThreadSubmissionContext, ServerThreadView,
+    apply_permission_override,
+};
 use crate::runtime_host::{HostedOperationWriter, RuntimeHost, RuntimeHostError};
-use crate::server_runtime::{PermissionProfileOverride, apply_permission_override};
 use crate::thread_store::{
     SortDirection, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchPage,
     StoredThreadSummaryPage, StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch,
@@ -32,29 +37,27 @@ use crate::unstable_surface::{
 
 #[derive(Clone)]
 pub(crate) struct JsonlInteractionTransport {
-    permissions: PendingPermissionManager,
-    user_inputs: PendingUserInputManager,
-    mcp_elicitations: PendingMcpElicitationManager,
+    permissions: JsonlOpaquePermissionRouter<JsonlPermissionRoute>,
+    direct: JsonlDirectInteractionAdapter<JsonlDirectInteractionRoute>,
 }
 
 impl JsonlInteractionTransport {
     pub(super) fn new(
-        permissions: PendingPermissionManager,
-        user_inputs: PendingUserInputManager,
-        mcp_elicitations: PendingMcpElicitationManager,
+        permissions: JsonlOpaquePermissionRouter<JsonlPermissionRoute>,
+        direct: JsonlDirectInteractionAdapter<JsonlDirectInteractionRoute>,
     ) -> Self {
         Self {
             permissions,
-            user_inputs,
-            mcp_elicitations,
+            direct,
         }
     }
 }
 
-pub(crate) struct JsonlSurfaceAdapter {
+pub struct JsonlSurfaceAdapter {
     host: Option<RuntimeHost>,
     surface_host: RuntimeSurfaceHostHandle,
     threads: HashMap<String, JsonlThreadBinding>,
+    transport_turns: Vec<JsonlTransportTurn>,
 }
 
 struct JsonlThreadBinding {
@@ -80,34 +83,49 @@ pub(crate) struct JsonlTransportTurn {
 }
 
 impl JsonlSurfaceAdapter {
-    pub(crate) fn start() -> io::Result<Self> {
+    pub fn start() -> io::Result<Self> {
         let host = RuntimeHost::start().map_err(runtime_host_error)?;
         let surface_host = host.surface_handle().bind_new_connection();
         Ok(Self {
             host: Some(host),
             surface_host,
             threads: HashMap::new(),
+            transport_turns: Vec::new(),
         })
     }
 
-    pub(crate) fn shutdown(&mut self) -> io::Result<()> {
+    pub fn shutdown(&mut self) -> io::Result<()> {
         self.threads.clear();
-        let Some(host) = self.host.take() else {
-            return Ok(());
-        };
-        host.shutdown().map_err(runtime_host_error)
+        let result = self
+            .host
+            .take()
+            .map(|host| host.shutdown().map_err(runtime_host_error))
+            .unwrap_or(Ok(()));
+        for turn in &mut self.transport_turns {
+            let _ = turn.wait_terminal();
+        }
+        self.transport_turns.clear();
+        result
     }
 
     pub(crate) fn connection_id(&self) -> Option<crate::unstable_surface::SurfaceConnectionId> {
         self.surface_host.connection_id().cloned()
     }
 
-    pub(crate) fn start_thread(&mut self, config: &RunConfig) -> io::Result<String> {
+    pub fn start_thread(&mut self, config: &RunConfig) -> io::Result<String> {
         let config = jsonl_thread_config(config);
         self.start_record(config, "(empty prompt)")
     }
 
-    pub(crate) fn resume_thread(
+    pub fn resume_thread(&mut self, config: &RunConfig, thread_id: &str) -> io::Result<String> {
+        self.resume_thread_with_permissions(config, thread_id, PermissionProfileOverride::default())
+    }
+
+    pub fn fork_thread(&mut self, config: &RunConfig, thread_id: &str) -> io::Result<String> {
+        self.fork_thread_with_permissions(config, thread_id, PermissionProfileOverride::default())
+    }
+
+    pub fn resume_thread_with_permissions(
         &mut self,
         config: &RunConfig,
         thread_id: &str,
@@ -128,7 +146,7 @@ impl JsonlSurfaceAdapter {
         self.start_record(config, "(resumed prompt)")
     }
 
-    pub(crate) fn fork_thread(
+    pub fn fork_thread_with_permissions(
         &mut self,
         config: &RunConfig,
         thread_id: &str,
@@ -183,11 +201,11 @@ impl JsonlSurfaceAdapter {
         Ok(thread_id)
     }
 
-    pub(crate) fn has_thread(&self, thread_id: &str) -> bool {
+    pub fn has_thread(&self, thread_id: &str) -> bool {
         self.threads.contains_key(thread_id)
     }
 
-    pub(crate) fn task_registry(&self, thread_id: &str) -> Option<crate::tasks::TaskRegistry> {
+    pub fn task_registry(&self, thread_id: &str) -> Option<crate::tasks::TaskRegistry> {
         self.threads
             .get(thread_id)
             .map(|binding| binding.thread.task_registry())
@@ -364,7 +382,7 @@ impl JsonlSurfaceAdapter {
             .jsonl_update_session_metadata(thread_id, patch)
     }
 
-    pub(crate) fn control_turn(
+    fn control_turn_inner(
         &self,
         thread_id: Option<&str>,
         turn_id: &str,
@@ -472,7 +490,7 @@ impl JsonlSurfaceAdapter {
         })
     }
 
-    pub(crate) fn prepare_turn(
+    fn prepare_turn_inner(
         &self,
         config: &RunConfig,
         thread_id: &str,
@@ -872,6 +890,341 @@ fn apply_surface_settings_to_run_config(
     Ok(())
 }
 
+#[derive(Clone, Default)]
+struct SharedTurnOutput {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedTurnOutput {
+    fn bytes(&self) -> Vec<u8> {
+        self.bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl Write for SharedTurnOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl HostedOperationWriter for SharedTurnOutput {
+    fn finish_generation(&mut self, _commit_terminal: bool) -> io::Result<()> {
+        self.flush()
+    }
+}
+
+impl JsonlSurfaceAdapter {
+    pub fn additional_working_directories(
+        &self,
+        thread_id: &str,
+    ) -> Option<Vec<std::path::PathBuf>> {
+        self.read_session(thread_id, false, false)
+            .ok()
+            .map(|thread| {
+                thread
+                    .additional_working_directories
+                    .into_iter()
+                    .map(|directory| directory.path)
+                    .collect()
+            })
+    }
+
+    pub fn active_permission_profile(
+        &self,
+        thread_id: &str,
+    ) -> Option<orca_core::config::ActivePermissionProfile> {
+        self.read_session(thread_id, false, false)
+            .ok()
+            .and_then(|thread| thread.active_permission_profile)
+    }
+
+    pub fn thread(&self, thread_id: &str) -> Option<ServerThreadView> {
+        let thread = self.read_session(thread_id, false, false).ok()?;
+        Some(ServerThreadView {
+            cwd: thread.cwd,
+            runtime_workspace_roots: thread.runtime_workspace_roots,
+            active_permission_profile: thread.active_permission_profile,
+            additional_working_directories: thread.additional_working_directories,
+            network_domain_permissions: thread.network_domain_permissions,
+            mcp_registry: self.mcp_registry(thread_id)?,
+        })
+    }
+
+    pub fn run_turn<W: Write>(
+        &mut self,
+        config: &RunConfig,
+        thread_id: &str,
+        prompt: &str,
+        writer: W,
+    ) -> io::Result<()> {
+        self.run_turn_with_permissions(
+            config,
+            thread_id,
+            prompt,
+            PermissionProfileOverride::default(),
+            writer,
+        )
+    }
+
+    pub fn run_turn_with_permissions<W: Write>(
+        &mut self,
+        config: &RunConfig,
+        thread_id: &str,
+        prompt: &str,
+        permissions: PermissionProfileOverride,
+        mut writer: W,
+    ) -> io::Result<()> {
+        let prepared = self.prepare_turn(
+            config,
+            thread_id,
+            prompt,
+            permissions,
+            &serde_json::Value::from("synchronous-jsonl-turn"),
+        )?;
+        let output = SharedTurnOutput::default();
+        let mut operation = prepared.start_with_output(output.clone())?;
+        operation.wait_terminal()?;
+        writer.write_all(&output.bytes())
+    }
+
+    pub fn read_thread(
+        &self,
+        thread_id: &str,
+        include_messages: bool,
+        include_turns: bool,
+    ) -> Option<StoredThreadProjection> {
+        self.read_session(thread_id, include_messages, include_turns)
+            .ok()
+    }
+
+    pub fn list_thread_turns(
+        &self,
+        thread_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+        items_view: TurnItemsView,
+    ) -> Option<StoredThreadTurnPage> {
+        self.list_turns(thread_id, cursor, limit, sort_direction, items_view)
+            .ok()
+    }
+
+    pub fn list_thread_items(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+    ) -> Option<StoredThreadItemPage> {
+        self.list_items(thread_id, turn_id, cursor, limit, sort_direction)
+            .ok()
+    }
+
+    pub fn update_thread_metadata(&mut self, thread_id: &str, patch: ThreadMetadataPatch) -> bool {
+        self.update_metadata(thread_id, patch).is_ok()
+    }
+
+    pub fn has_completed_turn(&self, turn_id: &str) -> bool {
+        self.completed_turn_thread_id(turn_id).is_some()
+    }
+
+    pub fn completed_turn_thread_id(&self, turn_id: &str) -> Option<String> {
+        self.list_sessions(
+            None,
+            usize::MAX,
+            ThreadListFilters::active(),
+            ThreadSortKey::UpdatedAt,
+            SortDirection::Desc,
+            None,
+        )
+        .ok()?
+        .data
+        .into_iter()
+        .find_map(|thread| {
+            self.list_turns(
+                &thread.thread_id,
+                None,
+                usize::MAX,
+                SortDirection::Asc,
+                TurnItemsView::Full,
+            )
+            .ok()?
+            .data
+            .into_iter()
+            .any(|turn| turn.turn_id == turn_id)
+            .then_some(thread.thread_id)
+        })
+    }
+
+    pub(crate) fn submission_context(
+        &self,
+        thread_id: &str,
+        permissions: &PermissionProfileOverride,
+    ) -> Option<ServerThreadSubmissionContext> {
+        let thread = self.read_session(thread_id, false, false).ok()?;
+        Some(ServerThreadSubmissionContext {
+            cwd: thread.cwd,
+            runtime_workspace_roots: permissions
+                .runtime_workspace_roots
+                .clone()
+                .unwrap_or(thread.runtime_workspace_roots),
+            mcp_registry: self.mcp_registry(thread_id)?,
+        })
+    }
+
+    pub(crate) fn prepare_turn(
+        &self,
+        config: &RunConfig,
+        thread_id: &str,
+        prompt: &str,
+        permissions: PermissionProfileOverride,
+        rpc_id: &serde_json::Value,
+    ) -> io::Result<PreparedJsonlTurn> {
+        self.prepare_turn_inner(config, thread_id, prompt, permissions, rpc_id, None)
+    }
+
+    pub(crate) fn prepare_turn_with_interactions(
+        &self,
+        config: &RunConfig,
+        thread_id: &str,
+        prompt: &str,
+        permissions: PermissionProfileOverride,
+        rpc_id: &serde_json::Value,
+        interactions: JsonlInteractionTransport,
+    ) -> io::Result<PreparedJsonlTurn> {
+        self.prepare_turn_inner(
+            config,
+            thread_id,
+            prompt,
+            permissions,
+            rpc_id,
+            Some(interactions),
+        )
+    }
+
+    pub(crate) fn register_transport_turn(&mut self, turn: JsonlTransportTurn) {
+        self.transport_turns.push(turn);
+    }
+
+    pub(crate) fn prune_finished_turns(&mut self) {
+        let mut pending = Vec::with_capacity(self.transport_turns.len());
+        for mut turn in self.transport_turns.drain(..) {
+            if turn.is_finished() {
+                let _ = turn.wait_terminal();
+            } else {
+                pending.push(turn);
+            }
+        }
+        self.transport_turns = pending;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_active_turns(&mut self) {
+        for turn in &mut self.transport_turns {
+            let _ = turn.wait_terminal();
+        }
+        self.transport_turns.clear();
+    }
+
+    pub(crate) fn control_turn(
+        &self,
+        thread_id: Option<&str>,
+        turn_id: &str,
+        action: crate::unstable_surface::JsonlTurnControlAction,
+    ) -> io::Result<crate::unstable_surface::JsonlTurnControlResult> {
+        self.control_turn_inner(thread_id, turn_id, action, None)
+    }
+
+    pub fn list_threads(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        filters: ThreadListFilters,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+        search_term: Option<&str>,
+    ) -> io::Result<StoredThreadSummaryPage> {
+        self.list_sessions(
+            cursor,
+            limit,
+            filters,
+            sort_key,
+            sort_direction,
+            search_term,
+        )
+    }
+
+    pub fn search_threads(
+        &self,
+        query: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        include_archived: bool,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+    ) -> io::Result<StoredThreadSearchPage> {
+        self.search_sessions(
+            query,
+            cursor,
+            limit,
+            include_archived,
+            sort_key,
+            sort_direction,
+        )
+    }
+
+    pub fn read_thread_result(
+        &self,
+        thread_id: &str,
+        include_messages: bool,
+        include_turns: bool,
+    ) -> io::Result<StoredThreadProjection> {
+        self.read_session(thread_id, include_messages, include_turns)
+    }
+
+    pub fn list_thread_turns_result(
+        &self,
+        thread_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+        items_view: TurnItemsView,
+    ) -> io::Result<StoredThreadTurnPage> {
+        self.list_turns(thread_id, cursor, limit, sort_direction, items_view)
+    }
+
+    pub fn list_thread_items_result(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+    ) -> io::Result<StoredThreadItemPage> {
+        self.list_items(thread_id, turn_id, cursor, limit, sort_direction)
+    }
+
+    pub fn update_thread_metadata_result(
+        &self,
+        thread_id: &str,
+        patch: ThreadMetadataPatch,
+    ) -> io::Result<()> {
+        self.update_metadata(thread_id, patch)
+    }
+}
+
 impl PreparedJsonlTurn {
     pub(crate) fn thread_id(&self) -> &str {
         &self.thread_id
@@ -914,6 +1267,13 @@ impl PreparedJsonlTurn {
             turn_id,
             worker: Some(worker),
         })
+    }
+
+    pub(crate) fn start_with_output<W>(self, writer: W) -> io::Result<JsonlTransportTurn>
+    where
+        W: HostedOperationWriter + Send + 'static,
+    {
+        self.start(writer)
     }
 }
 
@@ -1305,13 +1665,16 @@ fn project_surface_event<W: Write>(
             match &interaction.request {
                 SurfaceInteractionRequest::ToolApproval { description, .. } => {
                     let Some(request_id) = register_or_settle_unavailable(
-                        transport.permissions.insert_surface(
+                        transport.permissions.register(
                             request_id.clone(),
-                            projector.client.clone(),
-                            interaction.interaction_id.clone(),
-                            interaction.kind,
-                            projector.thread_id.clone(),
-                            projector.runtime_workspace_roots.clone(),
+                            JsonlRetiredRequestOwner::ThreadPermission,
+                            JsonlPermissionRoute::Surface {
+                                client: projector.client.clone(),
+                                interaction_id: interaction.interaction_id.clone(),
+                                target: interaction.kind,
+                                thread_id: projector.thread_id.clone(),
+                                runtime_workspace_roots: projector.runtime_workspace_roots.clone(),
+                            },
                         ),
                         projector,
                         interaction,
@@ -1348,13 +1711,16 @@ fn project_surface_event<W: Write>(
                     ..
                 } => {
                     let Some(request_id) = register_or_settle_unavailable(
-                        transport.permissions.insert_surface(
+                        transport.permissions.register(
                             request_id.clone(),
-                            projector.client.clone(),
-                            interaction.interaction_id.clone(),
-                            interaction.kind,
-                            projector.thread_id.clone(),
-                            projector.runtime_workspace_roots.clone(),
+                            JsonlRetiredRequestOwner::ThreadPermission,
+                            JsonlPermissionRoute::Surface {
+                                client: projector.client.clone(),
+                                interaction_id: interaction.interaction_id.clone(),
+                                target: interaction.kind,
+                                thread_id: projector.thread_id.clone(),
+                                runtime_workspace_roots: projector.runtime_workspace_roots.clone(),
+                            },
                         ),
                         projector,
                         interaction,
@@ -1390,9 +1756,10 @@ fn project_surface_event<W: Write>(
                     suggestions,
                 } => {
                     let Some(request_id) = register_or_settle_unavailable(
-                        transport.user_inputs.insert_surface(
+                        transport.direct.register(
                             request_id.clone(),
-                            PendingSurfaceUserInputRequest {
+                            JsonlDirectInteractionKind::UserInput,
+                            JsonlDirectInteractionRoute::UserInput {
                                 client: projector.client.clone(),
                                 interaction_id: interaction.interaction_id.clone(),
                             },
@@ -1412,9 +1779,7 @@ fn project_surface_event<W: Write>(
                     });
                     let frame_digest =
                         super::opaque_permission_router::jsonl_response_digest(&payload)?;
-                    transport
-                        .user_inputs
-                        .mark_surface_writing(&request_id, frame_digest)?;
+                    transport.direct.mark_writing(&request_id, frame_digest)?;
                     write_runtime_event(
                         writer,
                         "surface.user_input.requested",
@@ -1422,9 +1787,7 @@ fn project_surface_event<W: Write>(
                         payload,
                     )?;
                     writer.flush()?;
-                    transport
-                        .user_inputs
-                        .mark_surface_published(&request_id, frame_digest)?;
+                    transport.direct.mark_published(&request_id, frame_digest)?;
                 }
                 SurfaceInteractionRequest::McpElicitation {
                     server_name,
@@ -1433,9 +1796,10 @@ fn project_surface_event<W: Write>(
                     ..
                 } => {
                     let Some(request_id) = register_or_settle_unavailable(
-                        transport.mcp_elicitations.insert_surface(
+                        transport.direct.register(
                             request_id.clone(),
-                            PendingSurfaceMcpElicitationRequest {
+                            JsonlDirectInteractionKind::McpElicitation,
+                            JsonlDirectInteractionRoute::McpElicitation {
                                 client: projector.client.clone(),
                                 interaction_id: interaction.interaction_id.clone(),
                             },
@@ -1485,9 +1849,7 @@ fn project_surface_event<W: Write>(
                     });
                     let frame_digest =
                         super::opaque_permission_router::jsonl_response_digest(&payload)?;
-                    transport
-                        .mcp_elicitations
-                        .mark_surface_writing(&request_id, frame_digest)?;
+                    transport.direct.mark_writing(&request_id, frame_digest)?;
                     write_runtime_event(
                         writer,
                         "surface.mcp_elicitation.requested",
@@ -1495,9 +1857,7 @@ fn project_surface_event<W: Write>(
                         payload,
                     )?;
                     writer.flush()?;
-                    transport
-                        .mcp_elicitations
-                        .mark_surface_published(&request_id, frame_digest)?;
+                    transport.direct.mark_published(&request_id, frame_digest)?;
                 }
                 _ => {}
             }

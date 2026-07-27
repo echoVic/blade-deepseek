@@ -117,7 +117,6 @@ pub(crate) mod runtime_user_input;
 pub mod sandbox_denial;
 pub mod schema_validation;
 pub mod server;
-pub mod server_runtime;
 pub mod session;
 pub mod shell_session;
 mod step_context;
@@ -1866,79 +1865,6 @@ mod tests {
                 "runtime_permission.rs must construct command exec permission request profiles with {request_constructor}"
             );
         }
-    }
-
-    #[test]
-    fn server_permission_manager_is_owned_by_permission_manager_module() {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let server_source =
-            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
-        let manager_source =
-            std::fs::read_to_string(manifest_dir.join("src/server/permission_manager.rs"))
-                .expect("server permission manager source");
-
-        assert!(
-            server_source.contains("mod permission_manager;"),
-            "server must declare the permission manager module"
-        );
-        for type_name in [
-            "struct PendingCommandExecPermissionRequest",
-            "enum PendingPermissionRequest",
-            "struct PendingPermissionManager",
-            "struct ServerPermissionRequestHandler",
-        ] {
-            assert!(
-                !server_source.contains(type_name),
-                "server.rs must not own {type_name}"
-            );
-            assert!(
-                manager_source.contains(type_name),
-                "server/permission_manager.rs must own {type_name}"
-            );
-        }
-        assert!(
-            manager_source.contains("RuntimePermissionRequestHandler")
-                && manager_source.contains("for ServerPermissionRequestHandler"),
-            "server/permission_manager.rs must own runtime permission request handling"
-        );
-        assert!(
-            manager_source.contains("fn insert_command_exec"),
-            "server/permission_manager.rs must own command/exec pending permission insertion"
-        );
-    }
-
-    #[test]
-    fn server_user_input_manager_is_owned_by_user_input_manager_module() {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let server_source =
-            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
-        let manager_source =
-            std::fs::read_to_string(manifest_dir.join("src/server/user_input_manager.rs"))
-                .expect("server user input manager source");
-
-        assert!(
-            server_source.contains("mod user_input_manager;"),
-            "server must declare the user input manager module"
-        );
-        for type_name in [
-            "struct PendingUserInputRequest",
-            "struct PendingUserInputManager",
-            "struct ServerUserInputRequestHandler",
-        ] {
-            assert!(
-                !server_source.contains(type_name),
-                "server.rs must not own {type_name}"
-            );
-            assert!(
-                manager_source.contains(type_name),
-                "server/user_input_manager.rs must own {type_name}"
-            );
-        }
-        assert!(
-            manager_source.contains("RuntimeUserInputHandler")
-                && manager_source.contains("for ServerUserInputRequestHandler"),
-            "server/user_input_manager.rs must own runtime user-input request handling"
-        );
     }
 
     #[test]
@@ -4382,7 +4308,7 @@ mod tests {
 
     #[test]
     fn tool_item_projection_helpers_are_owned_by_shared_projection_module() {
-        let server_runtime_source = include_str!("server_runtime.rs");
+        let jsonl_surface_source = include_str!("server/surface_adapter.rs");
         let thread_store_source = include_str!("thread_store.rs");
         let thread_projection_source = include_str!("thread_store/projection.rs");
         let projection_source = include_str!("tool_item_projection.rs");
@@ -4410,8 +4336,8 @@ mod tests {
         ] {
             let signature = format!("fn {function_name}(");
             assert!(
-                !server_runtime_source.contains(&signature),
-                "server_runtime must not own shared tool item projection helper {function_name}"
+                !jsonl_surface_source.contains(&signature),
+                "JSONL surface adapter must not own shared tool item projection helper {function_name}"
             );
             assert!(
                 !thread_store_source.contains(&signature)
