@@ -11,6 +11,7 @@ use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use crate::selection::{SelectionPos, TranscriptSelection, slice_row_by_columns};
+use crate::terminal_capabilities::TerminalColorLevel;
 use crate::theme::Theme;
 use crate::types::ChatMessage;
 
@@ -239,6 +240,7 @@ struct ThemeIdentity {
     markdown_h2: Color,
     markdown_h3: Color,
     markdown_inline_code: Color,
+    color_level: TerminalColorLevel,
 }
 
 impl From<&Theme> for ThemeIdentity {
@@ -258,6 +260,7 @@ impl From<&Theme> for ThemeIdentity {
             markdown_h2: theme.markdown_h2,
             markdown_h3: theme.markdown_h3,
             markdown_inline_code: theme.markdown_inline_code,
+            color_level: theme.color_level,
         }
     }
 }
@@ -1466,6 +1469,62 @@ mod tests {
 
         let mut changed = theme;
         changed.markdown_inline_code = Color::Rgb(1, 2, 3);
+        prepare_with_theme_and_counters(
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            &changed,
+            changed.syntax_theme_revision,
+            0,
+            RenderCounters::new(&builds, &parses),
+        );
+        assert_eq!(builds.get(), 1);
+        assert_eq!(parses.get(), 1);
+
+        builds.set(0);
+        parses.set(0);
+        prepare_with_theme_and_counters(
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            &changed,
+            changed.syntax_theme_revision,
+            0,
+            RenderCounters::new(&builds, &parses),
+        );
+        assert_eq!(builds.get(), 0);
+        assert_eq!(parses.get(), 0);
+        assert_eq!(cache.last_prepare_visited(), 0);
+    }
+
+    #[test]
+    fn color_level_identity_rebuilds_wrapped_lines_once() {
+        use crate::terminal_capabilities::TerminalColorLevel;
+
+        let messages = vec![ChatMessage::Assistant("cached body".to_string())];
+        let revisions = vec![1];
+        let builds = Cell::new(0);
+        let parses = Cell::new(0);
+        let mut cache = TranscriptRenderCache::default();
+        let theme = theme();
+
+        prepare_with_theme_and_counters(
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            &theme,
+            theme.syntax_theme_revision,
+            0,
+            RenderCounters::new(&builds, &parses),
+        );
+        builds.set(0);
+        parses.set(0);
+
+        let mut changed = theme;
+        changed.color_level = TerminalColorLevel::Ansi256;
         prepare_with_theme_and_counters(
             &mut cache,
             &messages,
