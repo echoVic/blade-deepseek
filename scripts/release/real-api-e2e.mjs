@@ -94,6 +94,21 @@ function run(command, args, options = {}) {
   }
 }
 
+function killProcessGroup(child) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // The child may exit between the status check and signal.
+    }
+  }
+}
+
 function runBuild(args) {
   if (args.skipBuild) {
     console.log("Build skipped");
@@ -804,6 +819,7 @@ function runServerSubmit(args) {
 async function runServerThread(args) {
   const child = spawn(args.orcaBin, ["--mode", "server"], {
     cwd: repoRoot,
+    detached: true,
     stdio: ["pipe", "pipe", "pipe"],
   });
 
@@ -816,7 +832,7 @@ async function runServerThread(args) {
   let timedOut = false;
   const timeout = setTimeout(() => {
     timedOut = true;
-    child.kill("SIGKILL");
+    killProcessGroup(child);
   }, args.timeoutMs);
 
   const closed = new Promise((resolve, reject) => {
