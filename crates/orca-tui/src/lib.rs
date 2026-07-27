@@ -25,6 +25,7 @@ mod idle_navigation_actions;
 mod idle_submit_actions;
 mod input_adapter;
 mod input_event_actions;
+mod input_runtime;
 mod interaction_broker;
 mod key_event_actions;
 mod mention_menu_actions;

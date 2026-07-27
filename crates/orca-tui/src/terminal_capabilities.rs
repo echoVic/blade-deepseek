@@ -33,6 +33,54 @@ struct ColorSupportFacts {
     has_16m: bool,
 }
 
+pub(crate) fn terminal_background_from_rgb(
+    requested: ThemeName,
+    background: Option<qwertty::Rgb>,
+) -> TerminalBackground {
+    if requested != ThemeName::Auto {
+        return TerminalBackground::Unknown;
+    }
+    let Some(background) = background else {
+        return TerminalBackground::Unknown;
+    };
+    if perceived_lightness(background) > 0.5 {
+        TerminalBackground::Light
+    } else {
+        TerminalBackground::Dark
+    }
+}
+
+fn perceived_lightness(color: qwertty::Rgb) -> f32 {
+    let luminance = 0.2126 * linear_channel(color.red())
+        + 0.7152 * linear_channel(color.green())
+        + 0.0722 * linear_channel(color.blue());
+    let lightness = if luminance <= 216.0 / 24389.0 {
+        luminance * (24389.0 / 27.0)
+    } else {
+        luminance.cbrt() * 116.0 - 16.0
+    };
+    lightness / 100.0
+}
+
+fn linear_channel(channel: u8) -> f32 {
+    let channel = f32::from(channel) / f32::from(u8::MAX);
+    if channel <= 0.04045 {
+        channel / 12.92
+    } else {
+        ((channel + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+pub(crate) fn system_color_level() -> TerminalColorLevel {
+    color_level_from_facts(
+        supports_color::on(supports_color::Stream::Stdout).map(|level| ColorSupportFacts {
+            has_basic: level.has_basic,
+            has_256: level.has_256,
+            has_16m: level.has_16m,
+        }),
+    )
+}
+
 pub(crate) const fn resolve_base_theme(
     requested: ThemeName,
     background: TerminalBackground,
@@ -189,8 +237,43 @@ mod tests {
 
     use super::{
         ColorSupportFacts, TerminalBackground, TerminalColorLevel, color_level_from_facts,
-        resolve_base_theme,
+        resolve_base_theme, terminal_background_from_rgb,
     };
+
+    #[test]
+    fn qwertty_background_rgb_maps_by_perceived_lightness() {
+        assert_eq!(
+            terminal_background_from_rgb(ThemeName::Auto, Some(qwertty::Rgb::new(0, 0, 0))),
+            TerminalBackground::Dark
+        );
+        assert_eq!(
+            terminal_background_from_rgb(ThemeName::Auto, Some(qwertty::Rgb::new(255, 255, 255))),
+            TerminalBackground::Light
+        );
+        assert_eq!(
+            terminal_background_from_rgb(ThemeName::Auto, Some(qwertty::Rgb::new(118, 118, 118))),
+            TerminalBackground::Dark
+        );
+        assert_eq!(
+            terminal_background_from_rgb(ThemeName::Auto, None),
+            TerminalBackground::Unknown
+        );
+    }
+
+    #[test]
+    fn explicit_theme_ignores_qwertty_background_rgb() {
+        for requested in [
+            ThemeName::Dark,
+            ThemeName::Light,
+            ThemeName::Solarized,
+            ThemeName::Catppuccin,
+        ] {
+            assert_eq!(
+                terminal_background_from_rgb(requested, Some(qwertty::Rgb::new(255, 255, 255))),
+                TerminalBackground::Unknown
+            );
+        }
+    }
 
     #[test]
     fn auto_uses_detected_background_and_explicit_themes_ignore_it() {
