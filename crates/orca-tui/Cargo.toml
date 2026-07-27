@@ -21,6 +21,7 @@ ratatui = { workspace = true, features = ["scrolling-regions", "unstable-rendere
 crossterm = { workspace = true }
 tui-textarea = { workspace = true }
 pulldown-cmark = { workspace = true }
+unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 dirs = { workspace = true }
 crossbeam-channel = { workspace = true }
