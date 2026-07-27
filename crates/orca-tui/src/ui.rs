@@ -3217,7 +3217,7 @@ pub(crate) fn composer_click_target(
     ))
 }
 
-fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, _theme: &Theme) {
+fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme: &Theme) {
     let area = frame.area();
 
     match state.setup_step {
@@ -3319,7 +3319,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, _theme
 
             let paragraph = Paragraph::new(content).block(block);
             frame.render_widget(paragraph, popup_area);
-            frame.render_widget(textarea, inner[1]);
+            render_textarea_surface(frame, inner[1], textarea, None, None, theme, true);
         }
         2 => {
             let width = 60u16.min(area.width.saturating_sub(4));
@@ -6813,6 +6813,219 @@ mod tests {
         assert_hidden_frame_does_not_move_composer_cursor(|state| {
             state.show_shortcuts = true;
         });
+    }
+
+    #[test]
+    fn setup_cursor_uses_masked_api_key_cell() {
+        let mut state = test_state();
+        state.status = AppStatus::Setup;
+        state.setup_step = 1;
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut textarea = crate::composer_textarea::make_setup_textarea(&theme);
+        textarea.insert_str("密钥abc");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 20)).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+
+        let cursor = Position::new(12, 14);
+        terminal.backend_mut().assert_cursor_position(cursor);
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("密钥abc"));
+        assert!(!rendered.contains("密钥"));
+        assert!(!rendered.contains('密'));
+        assert!(!rendered.contains('钥'));
+        assert!(!rendered.contains("abc"));
+        assert!(rendered.contains("*****"));
+        assert_eq!(buffer[cursor].symbol(), " ");
+        assert!(buffer[cursor].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn setup_cursor_events_match_the_active_setup_step() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut textarea = crate::composer_textarea::make_setup_textarea(&theme);
+        textarea.insert_str("密钥abc");
+
+        for setup_step in [0, 1, 2] {
+            let mut state = test_state();
+            state.status = AppStatus::Setup;
+            state.setup_step = setup_step;
+            let (backend, events) = RecordingBackend::new(70, 20);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+            terminal
+                .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                .unwrap();
+
+            let cursor_events = take_cursor_events(&events);
+            let moves = cursor_events
+                .iter()
+                .filter(|event| matches!(event, CursorEvent::Move(_)))
+                .copied()
+                .collect::<Vec<_>>();
+            if setup_step == 1 {
+                assert_eq!(
+                    cursor_events
+                        .iter()
+                        .filter(|event| **event == CursorEvent::Show)
+                        .count(),
+                    1,
+                    "{cursor_events:?}"
+                );
+                assert_eq!(
+                    cursor_events
+                        .iter()
+                        .filter(|event| **event == CursorEvent::Hide)
+                        .count(),
+                    0,
+                    "{cursor_events:?}"
+                );
+                assert_eq!(
+                    moves,
+                    [CursorEvent::Move(Position::new(12, 14))],
+                    "{cursor_events:?}"
+                );
+                let rendered = terminal
+                    .backend()
+                    .inner
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(!rendered.contains("密钥abc"));
+                assert!(!rendered.contains("密钥"));
+                assert!(!rendered.contains('密'));
+                assert!(!rendered.contains('钥'));
+                assert!(!rendered.contains("abc"));
+                assert!(rendered.contains("*****"));
+            } else {
+                assert_eq!(
+                    cursor_events
+                        .iter()
+                        .filter(|event| **event == CursorEvent::Hide)
+                        .count(),
+                    1,
+                    "{cursor_events:?}"
+                );
+                assert_eq!(
+                    cursor_events
+                        .iter()
+                        .filter(|event| **event == CursorEvent::Show)
+                        .count(),
+                    0,
+                    "{cursor_events:?}"
+                );
+                assert!(moves.is_empty(), "{cursor_events:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn composer_cursor_hides_and_restores_across_consecutive_frames() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+        let (backend, events) = RecordingBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = test_state();
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+        let first_idle_events = take_cursor_events(&events);
+        assert_eq!(
+            first_idle_events
+                .iter()
+                .filter(|event| **event == CursorEvent::Show)
+                .count(),
+            1,
+            "{first_idle_events:?}"
+        );
+        assert_eq!(
+            first_idle_events
+                .iter()
+                .filter(|event| **event == CursorEvent::Hide)
+                .count(),
+            0,
+            "{first_idle_events:?}"
+        );
+        assert_eq!(
+            first_idle_events
+                .iter()
+                .filter(|event| matches!(event, CursorEvent::Move(_)))
+                .copied()
+                .collect::<Vec<_>>(),
+            [CursorEvent::Move(Position::new(1, 7))],
+            "{first_idle_events:?}"
+        );
+
+        state.status = AppStatus::WaitingApproval;
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+        let waiting_events = take_cursor_events(&events);
+        assert_eq!(
+            waiting_events
+                .iter()
+                .filter(|event| **event == CursorEvent::Hide)
+                .count(),
+            1,
+            "{waiting_events:?}"
+        );
+        assert_eq!(
+            waiting_events
+                .iter()
+                .filter(|event| **event == CursorEvent::Show)
+                .count(),
+            0,
+            "{waiting_events:?}"
+        );
+        assert!(
+            !waiting_events
+                .iter()
+                .any(|event| matches!(event, CursorEvent::Move(_))),
+            "{waiting_events:?}"
+        );
+
+        state.status = AppStatus::Idle;
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+        let second_idle_events = take_cursor_events(&events);
+        assert_eq!(
+            second_idle_events
+                .iter()
+                .filter(|event| **event == CursorEvent::Show)
+                .count(),
+            1,
+            "{second_idle_events:?}"
+        );
+        assert_eq!(
+            second_idle_events
+                .iter()
+                .filter(|event| **event == CursorEvent::Hide)
+                .count(),
+            0,
+            "{second_idle_events:?}"
+        );
+        assert_eq!(
+            second_idle_events
+                .iter()
+                .filter(|event| matches!(event, CursorEvent::Move(_)))
+                .copied()
+                .collect::<Vec<_>>(),
+            [CursorEvent::Move(Position::new(1, 7))],
+            "{second_idle_events:?}"
+        );
     }
 
     #[test]
