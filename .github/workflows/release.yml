@@ -28,7 +28,7 @@ jobs:
       - name: Run tests
         env:
           RUST_BACKTRACE: "1"
-        run: cargo test -- --test-threads=1
+        run: cargo test --workspace --all-targets --locked -- --test-threads=1
 
   version:
     runs-on: ubuntu-latest
@@ -36,6 +36,11 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+      - name: Verify repository version sync
+        run: node scripts/release/verify-version-sync.mjs
       - id: version
         shell: bash
         env:
@@ -104,9 +109,25 @@ jobs:
             dist/orca-${{ matrix.target }}.tar.gz
             dist/orca-${{ matrix.target }}.tar.gz.sha256
 
+  npm-auth:
+    if: github.ref_type == 'tag'
+    needs: [version]
+    runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Require live npm credentials
+        run: |
+          test -n "$NODE_AUTH_TOKEN" || { echo "NPM_TOKEN is required" >&2; exit 1; }
+          npm whoami
+
   release:
     if: github.ref_type == 'tag'
-    needs: [build, version]
+    needs: [build, version, npm-auth]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -130,7 +151,7 @@ jobs:
 
   npm:
     if: github.ref_type == 'tag'
-    needs: [build, version, release]
+    needs: [build, version, release, npm-auth]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -165,39 +186,50 @@ jobs:
           name: npm-tarballs
           path: dist/npm/tarballs/*.tgz
       - name: Publish npm packages
-        id: publish
-        if: env.NODE_AUTH_TOKEN != ''
         shell: bash
         run: |
-          for package_dir in dist/npm/stage/orca-darwin-arm64 dist/npm/stage/orca-darwin-x64 dist/npm/stage/orca-linux-arm64 dist/npm/stage/orca-linux-x64 dist/npm/stage/orca; do
-            name="$(node -e "console.log(require('./${package_dir}/package.json').name)")"
-            version="$(node -e "console.log(require('./${package_dir}/package.json').version)")"
-            if npm view "${name}@${version}" version >/dev/null 2>&1; then
-              echo "${name}@${version} already published; skipping"
-            else
-              tag="latest"
-              if [[ "$version" == *-* ]]; then
-                tag="native"
+          version="${{ needs.version.outputs.version }}"
+          tarballs=(
+            "dist/npm/tarballs/blade-ai-orca-${version}-darwin-arm64.tgz" \
+            "dist/npm/tarballs/blade-ai-orca-${version}-darwin-x64.tgz" \
+            "dist/npm/tarballs/blade-ai-orca-${version}-linux-arm64.tgz" \
+            "dist/npm/tarballs/blade-ai-orca-${version}-linux-x64.tgz" \
+            "dist/npm/tarballs/blade-ai-orca-${version}.tgz"
+          )
+          declare -A existing
+          for tarball in "${tarballs[@]}"; do
+            test -f "$tarball"
+            package_version="$(tar -xOf "$tarball" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')"
+            local_integrity="sha512-$(node -e 'const fs=require("fs"),c=require("crypto");process.stdout.write(c.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"))' "$tarball")"
+            set +e
+            registry_output="$(npm view "@blade-ai/orca@${package_version}" dist.integrity --json 2>&1)"
+            registry_status=$?
+            set -e
+            if [[ $registry_status -eq 0 ]]; then
+              registry_integrity="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]))' "$registry_output")"
+              if [[ "$registry_integrity" != "$local_integrity" ]]; then
+                echo "@blade-ai/orca@${package_version} exists with different registry integrity" >&2
+                exit 1
               fi
-              npm publish "$package_dir" --access public --tag "$tag"
+              existing["$package_version"]=1
+            elif [[ "$registry_output" != *E404* ]]; then
+              echo "$registry_output" >&2
+              exit "$registry_status"
             fi
           done
-      - name: Skip npm publish without token
-        if: env.NODE_AUTH_TOKEN == ''
-        run: echo "NPM_TOKEN is not configured; npm publish skipped."
-      - name: Verify published release
-        if: env.NODE_AUTH_TOKEN != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          node scripts/release/verify-published.mjs \
-            --version "${{ needs.version.outputs.version }}" \
-            --repo "${{ github.repository }}" \
-            --package "@blade-ai/orca" \
-            --bin "orca"
+          for tarball in "${tarballs[@]}"; do
+            package_version="$(tar -xOf "$tarball" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')"
+            if [[ "${existing[$package_version]:-}" = 1 ]]; then
+              echo "@blade-ai/orca@${package_version} already published with identical integrity"
+              continue
+            fi
+            tag=latest
+            [[ "$package_version" == *-* ]] && tag=native
+            npm publish "$tarball" --access public --tag "$tag"
+          done
 
   npm-release-assets:
-    if: ${{ always() && github.ref_type == 'tag' && needs.npm.result != 'cancelled' && needs.npm.result != 'skipped' }}
+    if: ${{ always() && github.ref_type == 'tag' && needs.npm.result == 'success' }}
     needs: [npm]
     runs-on: ubuntu-latest
     permissions:
@@ -212,3 +244,34 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           files: dist/npm/tarballs/*.tgz
+
+  verify:
+    if: ${{ always() && github.ref_type == 'tag' }}
+    needs: [version, release, npm, npm-release-assets]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require every publication rail
+        env:
+          RELEASE_RESULT: ${{ needs.release.result }}
+          NPM_RESULT: ${{ needs.npm.result }}
+          ASSETS_RESULT: ${{ needs.npm-release-assets.result }}
+        run: |
+          test "$RELEASE_RESULT" = success
+          test "$NPM_RESULT" = success
+          test "$ASSETS_RESULT" = success
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Verify public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/release/verify-published.mjs \
+            --version "${{ needs.version.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --package "@blade-ai/orca" \
+            --bin "orca"

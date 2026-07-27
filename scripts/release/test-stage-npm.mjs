@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -39,6 +40,17 @@ function assertExists(filePath) {
 function writeFakeBinary(filePath) {
   mkdirSync(path.dirname(filePath), { recursive: true });
   writeFileSync(filePath, `#!/bin/sh\necho orca ${VERSION}\n`);
+  chmodSync(filePath, 0o755);
+}
+
+function writeArtifactSet(artifactsDir, triple) {
+  const packageDir = path.join(artifactsDir, `orca-${triple}`);
+  const binary = path.join(packageDir, "orca");
+  writeFakeBinary(binary);
+  const archive = path.join(artifactsDir, `orca-${triple}.tar.gz`);
+  execFileSync("tar", ["-C", packageDir, "-czf", archive, "orca"]);
+  const digest = createHash("sha256").update(readFileSync(archive)).digest("hex");
+  writeFileSync(`${archive}.sha256`, `${digest}  ${path.basename(archive)}\n`);
 }
 
 const tempDir = mkdtempSync(path.join(os.tmpdir(), "orca-stage-test-"));
@@ -47,7 +59,7 @@ try {
   const artifactsDir = path.join(tempDir, "artifacts");
   const outDir = path.join(tempDir, "npm");
   for (const [, triple] of TARGETS) {
-    writeFakeBinary(path.join(artifactsDir, `orca-${triple}`, "orca"));
+    writeArtifactSet(artifactsDir, triple);
   }
 
   execFileSync(
@@ -91,6 +103,28 @@ try {
   );
 
   assertExists(path.join(outDir, "tarballs", `blade-ai-orca-${VERSION}.tgz`));
+
+  const stageScript = path.join(repoRoot, "scripts", "release", "stage-npm.mjs");
+  const expectFailure = (label, mutate, expected) => {
+    const [, triple] = TARGETS[0];
+    writeArtifactSet(artifactsDir, triple);
+    mutate(triple);
+    try {
+      execFileSync("node", [stageScript, "--version", VERSION, "--artifacts-dir", artifactsDir, "--out-dir", path.join(tempDir, label)], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      throw new Error(`stage-npm accepted ${label}`);
+    } catch (error) {
+      if (error.message === `stage-npm accepted ${label}`) throw error;
+      const output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+      if (!output.includes(expected)) throw new Error(`${label} missing ${expected}: ${output}`);
+    }
+  };
+  expectFailure("missing-checksum", (triple) => rmSync(path.join(artifactsDir, `orca-${triple}.tar.gz.sha256`)), "Missing checksum artifact");
+  expectFailure("bad-checksum", (triple) => writeFileSync(path.join(artifactsDir, `orca-${triple}.tar.gz.sha256`), `${"0".repeat(64)}  bad\n`), "Checksum mismatch");
+  expectFailure("binary-mismatch", (triple) => writeFileSync(path.join(artifactsDir, `orca-${triple}`, "orca"), "different"), "Package/archive binary mismatch");
   console.log("stage-npm alias distribution ok");
 } finally {
   rmSync(tempDir, { recursive: true, force: true });

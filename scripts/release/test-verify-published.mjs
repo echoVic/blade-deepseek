@@ -1,149 +1,124 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 const repoRoot = path.resolve(import.meta.dirname, "..", "..");
 const script = path.join(repoRoot, "scripts", "release", "verify-published.mjs");
 const tempDir = mkdtempSync(path.join(os.tmpdir(), "orca-verify-published-test-"));
+const version = "9.8.7";
+const targets = [["darwin-arm64", "aarch64-apple-darwin"], ["darwin-x64", "x86_64-apple-darwin"], ["linux-arm64", "aarch64-unknown-linux-gnu"], ["linux-x64", "x86_64-unknown-linux-gnu"]];
 
-function writeExecutable(filePath, contents) {
-  writeFileSync(filePath, contents);
-  chmodSync(filePath, 0o755);
-}
+function executable(filePath, contents) { writeFileSync(filePath, contents); chmodSync(filePath, 0o755); }
+function sha(filePath, algorithm = "sha256", encoding = "hex") { return createHash(algorithm).update(readFileSync(filePath)).digest(encoding); }
+function tar(source, destination, entries = ["."]) { execFileSync("tar", ["-C", source, "-czf", destination, ...entries]); }
 
 try {
+  const fixture = path.join(tempDir, "fixture");
+  const releaseDir = path.join(fixture, "release");
+  const npmDir = path.join(fixture, "npm");
+  const metadataDir = path.join(fixture, "metadata");
   const binDir = path.join(tempDir, "bin");
-  mkdirSync(binDir, { recursive: true });
-  const logPath = path.join(tempDir, "calls.log");
-  const execAttemptsPath = path.join(tempDir, "npm-exec-attempts");
+  for (const dir of [releaseDir, npmDir, metadataDir, binDir]) mkdirSync(dir, { recursive: true });
+  const aliases = Object.fromEntries(targets.map(([suffix]) => [`@blade-ai/orca-${suffix}`, `npm:@blade-ai/orca@${version}-${suffix}`]));
 
-  writeExecutable(
-    path.join(binDir, "gh"),
-    `#!/bin/sh
-printf 'gh %s\\n' "$*" >> "${logPath}"
-case "$*" in
-  *"release view v9.8.7"*) printf '{"tagName":"v9.8.7","url":"https://example.test/releases/v9.8.7","isDraft":false}\\n' ;;
-  *) exit 42 ;;
-esac
-`,
-  );
+  for (const [suffix, triple] of targets) {
+    const binaryContent = `orca-binary-${triple}\n`;
+    const releaseStage = path.join(tempDir, `release-${suffix}`);
+    mkdirSync(releaseStage);
+    executable(path.join(releaseStage, "orca"), binaryContent);
+    const archive = path.join(releaseDir, `orca-${triple}.tar.gz`);
+    tar(releaseStage, archive, ["orca"]);
+    writeFileSync(`${archive}.sha256`, `${sha(archive)}  ${path.basename(archive)}\n`);
 
-  writeExecutable(
-    path.join(binDir, "npm"),
-    `#!/bin/sh
-printf 'npm %s\\n' "$*" >> "${logPath}"
-case "$1 $2" in
-  "view @blade-ai/orca@9.8.7") printf '"9.8.7"\\n' ;;
-  "exec --yes")
-    attempts=0
-    if [ -f "${execAttemptsPath}" ]; then
-      attempts="$(cat "${execAttemptsPath}")"
-    fi
-    attempts=$((attempts + 1))
-    printf '%s' "$attempts" > "${execAttemptsPath}"
-    if [ "$attempts" -lt 3 ]; then
-      printf 'npm error code ETARGET\\n' >&2
-      printf 'npm error notarget No matching version found for @blade-ai/orca@9.8.7\\n' >&2
-      exit 1
-    fi
-    printf 'orca 9.8.7\\n'
-    ;;
-  *) exit 43 ;;
-esac
-`,
-  );
-
-  const output = execFileSync(
-    "node",
-    [
-      script,
-      "--version",
-      "9.8.7",
-      "--repo",
-      "echoVic/blade-deepseek",
-      "--package",
-      "@blade-ai/orca",
-      "--bin",
-      "orca",
-      "--retry-delay-ms",
-      "1",
-    ],
-    {
-      cwd: repoRoot,
-      env: {
-        ...process.env,
-        PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
-      },
-      encoding: "utf8",
-    },
-  );
-
-  if (!output.includes("GitHub Release verified")) {
-    throw new Error(`missing GitHub verification output: ${output}`);
-  }
-  if (!output.includes("npm package verified")) {
-    throw new Error(`missing npm verification output: ${output}`);
-  }
-  if (!output.includes("npm exec smoke verified")) {
-    throw new Error(`missing npm smoke output: ${output}`);
+    const packageVersion = `${version}-${suffix}`;
+    const packageRoot = path.join(tempDir, `package-${suffix}`, "package");
+    mkdirSync(path.join(packageRoot, "vendor", triple, "bin"), { recursive: true });
+    writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ name: "@blade-ai/orca", version: packageVersion }));
+    executable(path.join(packageRoot, "vendor", triple, "bin", "orca"), binaryContent);
+    const tarball = path.join(npmDir, `blade-ai-orca-${packageVersion}.tgz`);
+    tar(path.dirname(packageRoot), tarball, ["package"]);
+    copyFileSync(tarball, path.join(releaseDir, path.basename(tarball)));
+    writeFileSync(path.join(metadataDir, `${packageVersion}.json`), JSON.stringify({ name: "@blade-ai/orca", version: packageVersion, dist: { integrity: `sha512-${sha(tarball, "sha512", "base64")}` } }));
   }
 
-  const log = readFileSync(logPath, "utf8");
-  for (const expected of [
-    "gh release view v9.8.7 --repo echoVic/blade-deepseek",
-    "npm view @blade-ai/orca@9.8.7 version --json",
-    "npm exec --yes --package @blade-ai/orca@9.8.7 -- orca --version",
-  ]) {
-    if (!log.includes(expected)) {
-      throw new Error(`missing command ${expected} in log:\n${log}`);
-    }
-  }
-  const execAttempts = log
-    .split("\n")
-    .filter((line) => line === "npm exec --yes --package @blade-ai/orca@9.8.7 -- orca --version").length;
-  if (execAttempts !== 3) {
-    throw new Error(`expected 3 npm exec attempts, saw ${execAttempts}:\n${log}`);
-  }
+  const mainRoot = path.join(tempDir, "package-main", "package");
+  mkdirSync(path.join(mainRoot, "bin"), { recursive: true });
+  writeFileSync(path.join(mainRoot, "package.json"), JSON.stringify({ name: "@blade-ai/orca", version, optionalDependencies: aliases }));
+  executable(path.join(mainRoot, "bin", "orca.js"), `#!/bin/sh\necho orca ${version}\n`);
+  const mainTarball = path.join(npmDir, `blade-ai-orca-${version}.tgz`);
+  tar(path.dirname(mainRoot), mainTarball, ["package"]);
+  copyFileSync(mainTarball, path.join(releaseDir, path.basename(mainTarball)));
+  writeFileSync(path.join(metadataDir, `${version}.json`), JSON.stringify({ name: "@blade-ai/orca", version, optionalDependencies: aliases, dist: { integrity: `sha512-${sha(mainTarball, "sha512", "base64")}` } }));
 
-  console.log("verify-published release checks ok");
+  executable(path.join(binDir, "gh"), `#!/usr/bin/env node
+import { appendFileSync, copyFileSync, readdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
+const a = process.argv.slice(2), fixture = process.env.ORCA_VERIFY_FIXTURE;
+if (a[0] === "release" && a[1] === "view") {
+  let assets = readdirSync(path.join(fixture, "release")).map(name => ({ name }));
+  if (process.env.ORCA_VERIFY_SCENARIO === "missing-asset") assets = assets.filter(a => !a.name.includes("linux-x64.tgz"));
+  console.log(JSON.stringify({ tagName: "v${version}", url: "https://example.test", isDraft: false, assets }));
+} else if (a[0] === "api") {
+  console.log(process.env.ORCA_VERIFY_SCENARIO === "wrong-target" && a[1].endsWith("/v${version}") ? "tag-sha" : "main-sha");
+} else if (a[0] === "release" && a[1] === "download") {
+  const out = a[a.indexOf("--dir") + 1];
+  for (const name of readdirSync(path.join(fixture, "release"))) copyFileSync(path.join(fixture, "release", name), path.join(out, name));
+  if (process.env.ORCA_VERIFY_SCENARIO === "checksum-failure") writeFileSync(path.join(out, "orca-aarch64-apple-darwin.tar.gz.sha256"), "0".repeat(64) + "  bad\\n");
+  if (process.env.ORCA_VERIFY_SCENARIO === "mismatched-npm-asset") appendFileSync(path.join(out, "blade-ai-orca-${version}.tgz"), "different");
+} else process.exit(42);
+`);
+  executable(path.join(binDir, "npm"), `#!/usr/bin/env node
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+const a = process.argv.slice(2), fixture = process.env.ORCA_VERIFY_FIXTURE;
+if (a[0] === "view") {
+  const version = a[1].slice(a[1].lastIndexOf("@") + 1);
+  const metadata = JSON.parse(readFileSync(path.join(fixture, "metadata", version + ".json")));
+  if (process.env.ORCA_VERIFY_SCENARIO === "bad-integrity") metadata.dist.integrity = "sha512-bad";
+  process.stdout.write(JSON.stringify(metadata));
+} else if (a[0] === "pack") {
+  const version = a[1].slice(a[1].lastIndexOf("@") + 1), out = a[a.indexOf("--pack-destination") + 1];
+  const name = "blade-ai-orca-" + version + ".tgz";
+  copyFileSync(path.join(fixture, "npm", name), path.join(out, name)); console.log(name);
+} else if (a[0] === "install") {
+  if (process.env.ORCA_VERIFY_SCENARIO === "install-failure") process.exit(44);
+  const spec = a.at(-1), version = spec.slice(spec.lastIndexOf("@") + 1), cwd = process.cwd();
+  const packageDir = path.join(cwd, "node_modules", "@blade-ai", "orca"), binDir = path.join(cwd, "node_modules", ".bin");
+  mkdirSync(packageDir, { recursive: true }); mkdirSync(binDir, { recursive: true });
+  writeFileSync(path.join(packageDir, "package.json"), JSON.stringify({ name: "@blade-ai/orca", version }));
+  const bin = path.join(binDir, "orca"); writeFileSync(bin, "#!/bin/sh\\necho orca " + version + "\\n"); chmodSync(bin, 0o755);
+} else process.exit(43);
+`);
 
-  try {
-    execFileSync(
-      "node",
-      [
-        script,
-        "--version",
-        "9.8.8",
-        "--repo",
-        "echoVic/blade-deepseek",
-        "--package",
-        "@blade-ai/orca",
-        "--bin",
-        "orca",
-        "--retry-delay-ms",
-        "1",
-      ],
-      {
+  function invoke(scenario = "ok") {
+    try {
+      const output = execFileSync(process.execPath, [script, "--version", version, "--repo", "echoVic/blade-deepseek", "--retries", "1", "--retry-delay-ms", "0"], {
         cwd: repoRoot,
-        env: {
-          ...process.env,
-          PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
-        },
+        env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, ORCA_VERIFY_FIXTURE: fixture, ORCA_VERIFY_SCENARIO: scenario },
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
-    throw new Error("verify-published should fail when the GitHub Release is missing");
-  } catch (error) {
-    if (error.message.includes("verify-published should fail")) {
-      throw error;
-    }
+      });
+      return { ok: true, output };
+    } catch (error) { return { ok: false, output: `${error.stdout ?? ""}${error.stderr ?? ""}` }; }
   }
-
-  console.log("verify-published failure checks ok");
+  const success = invoke();
+  if (!success.ok || !success.output.includes("Published release verified")) throw new Error(`positive verification failed: ${success.output}`);
+  for (const [scenario, expected] of [
+    ["missing-asset", "missing asset"],
+    ["wrong-target", "does not match main"],
+    ["checksum-failure", "Checksum failure"],
+    ["mismatched-npm-asset", "GitHub/npm tarball mismatch"],
+    ["bad-integrity", "registry integrity mismatch"],
+    ["install-failure", "Command failed"],
+  ]) {
+    const result = invoke(scenario);
+    if (result.ok || !result.output.includes(expected)) throw new Error(`${scenario} was not rejected: ${result.output}`);
+  }
+  console.log("verify-published release checks ok");
 } finally {
   rmSync(tempDir, { recursive: true, force: true });
 }

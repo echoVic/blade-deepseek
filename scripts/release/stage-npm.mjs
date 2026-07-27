@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, copyFileSync, chmodSync } from "node:fs";
 import { cp, readdir } from "node:fs/promises";
 import os from "node:os";
@@ -97,24 +98,39 @@ function ensureCleanDir(dir) {
   mkdirSync(dir, { recursive: true });
 }
 
+function sha256(filePath) {
+  return createHash("sha256").update(readFileSync(filePath)).digest("hex");
+}
+
 function findBinaryForTarget(artifactsDir, targetTriple) {
   const directBinary = path.join(artifactsDir, `orca-${targetTriple}`, "orca");
-  if (existsSync(directBinary)) {
-    return directBinary;
-  }
-
   const archive = path.join(artifactsDir, `orca-${targetTriple}.tar.gz`);
-  if (!existsSync(archive)) {
-    throw new Error(`Missing binary artifact for ${targetTriple}`);
+  const checksum = `${archive}.sha256`;
+  for (const [filePath, label] of [
+    [directBinary, "binary"],
+    [archive, "archive"],
+    [checksum, "checksum"],
+  ]) {
+    if (!existsSync(filePath)) throw new Error(`Missing ${label} artifact for ${targetTriple}: ${filePath}`);
   }
 
-  const tempDir = mkdtempSync(path.join(os.tmpdir(), `orca-${targetTriple}-`));
-  execFileSync("tar", ["-xzf", archive, "-C", tempDir], { stdio: "inherit" });
-  const extracted = path.join(tempDir, "orca");
-  if (!existsSync(extracted)) {
-    throw new Error(`Archive ${archive} did not contain orca`);
+  const expectedArchiveHash = readFileSync(checksum, "utf8").trim().split(/\s+/)[0];
+  const actualArchiveHash = sha256(archive);
+  if (!/^[0-9a-f]{64}$/i.test(expectedArchiveHash) || expectedArchiveHash.toLowerCase() !== actualArchiveHash) {
+    throw new Error(`Checksum mismatch for ${targetTriple}: expected ${expectedArchiveHash}, got ${actualArchiveHash}`);
   }
-  return extracted;
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), `orca-${targetTriple}-`));
+  try {
+    execFileSync("tar", ["-xzf", archive, "-C", tempDir], { stdio: "inherit" });
+    const extracted = path.join(tempDir, "orca");
+    if (!existsSync(extracted)) throw new Error(`Archive ${archive} did not contain orca`);
+    if (sha256(extracted) !== sha256(directBinary)) {
+      throw new Error(`Package/archive binary mismatch for ${targetTriple}`);
+    }
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+  return directBinary;
 }
 
 async function stagePlatformPackage(target, version, artifactsDir, stageRoot) {
