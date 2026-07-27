@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.55":
+        "ACP and the JSONL server now complete the runtime-owned typed-surface convergence begun in v0.2.54. ACP session admission, prompt binding, replay, terminal flush, cancellation, capability settlement and bounded transport supervision are owned by the runtime. JSONL thread, control, permission, user-input and MCP routes now use one surface adapter with durable request identity, EOF settlement and restart recovery. Release gates exercise TUI, ACP and server paths against the real binary, while publication verifies exact archives, npm tarballs, checksums, registry integrity, package aliases, binary identity and clean installation.",
       "v0.2.54":
         "The production TUI now completes its runtime-owned typed surface migration. The app loop, agent runtime and action dispatcher hold one typed surface control while RuntimeHost owns prompt admission, durable batches, operation and generation fences, interactions, cancellation, terminal finalization, workflow task state and restart recovery. Assistant and tool output is projected only after durable commit, interaction answers are persisted before waiters wake, manual compaction cannot report success before its terminal receipt, and restart restores the exact snapshot and pending ownership without redefining turn semantics in the renderer. ACP convergence follows this TUI release; JSONL compatibility remains later work.",
       "v0.2.53":
@@ -552,6 +554,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.55":
+        "ACP 与 JSONL server 已完成 v0.2.54 开始的 runtime-owned typed surface 收敛。ACP 的 session 准入、prompt 绑定、replay、terminal flush、取消、capability settlement 与有界 transport supervision 现在统一由 runtime 拥有；JSONL 的 thread、control、permission、user-input 和 MCP 路由则收敛到同一个 surface adapter，并保留 durable request identity、EOF settlement 与重启恢复。发布门禁会用真实二进制覆盖 TUI、ACP 和 server，同时校验 release archive、npm tarball、checksum、registry integrity、package alias、binary identity 与干净安装的一致性。",
       "v0.2.54":
         "生产 TUI 已完成 runtime-owned typed surface 迁移收口。App loop、agent runtime 与 action dispatcher 只持有一份 typed surface control；prompt 准入、durable batch、operation/generation fence、交互、取消、terminal finalization、workflow task 状态和重启恢复都由 RuntimeHost 统一拥有。Assistant 与 tool 输出只在持久化提交后投影，交互响应会先落盘再唤醒 waiter，manual compaction 不会在拿到 terminal receipt 前误报成功，重启则从精确 snapshot 恢复原有 owner，而不再由 renderer 重新定义 turn 语义。ACP convergence 将在本次 TUI 发布后继续，JSONL compatibility 更后置。",
       "v0.2.53":

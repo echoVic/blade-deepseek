@@ -625,7 +625,7 @@ fn redact_keyed_secret_values(value: &str) -> String {
         }
         let quote = (value_start < bytes.len()
             && (bytes[value_start] == b'"' || bytes[value_start] == b'\''))
-            .then_some(bytes[value_start]);
+            .then(|| bytes[value_start]);
         let content_start = if quote.is_some() {
             value_start + 1
         } else {
@@ -1686,6 +1686,15 @@ mod tests {
             "token=<redacted>"
         );
         assert_eq!(payload["raw_arguments"]["nested"][0], "api_key=<redacted>");
+    }
+
+    #[test]
+    fn sensitive_key_without_a_value_is_safe_during_streaming_redaction() {
+        assert_eq!(redact_sensitive_text("pending token:"), "pending token:");
+        assert_eq!(
+            redact_sensitive_text("pending api_key=   "),
+            "pending api_key=   "
+        );
     }
 
     #[test]
