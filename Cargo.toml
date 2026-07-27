@@ -28,6 +28,8 @@ crossbeam-channel = "0.5"
 crossterm = "0.28"
 ratatui = "0.29"
 tui-textarea = "0.7"
+qwertty = { version = "=0.1.6", features = ["tokio"] }
+supports-color = "3.0.2"
 pulldown-cmark = { version = "0.12", default-features = false }
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.0"
