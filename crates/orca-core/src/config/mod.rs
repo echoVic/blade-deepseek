@@ -20,10 +20,23 @@ pub mod folder_trust;
 #[serde(rename_all = "kebab-case")]
 pub enum ThemeName {
     #[default]
+    Auto,
     Dark,
     Light,
     Solarized,
     Catppuccin,
+}
+
+impl ThemeName {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Solarized => "solarized",
+            Self::Catppuccin => "catppuccin",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -534,7 +547,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "cwd = \"{}\"\n",
             "verifier = \"{}\"\n",
             "max_budget_usd = \"{}\"\n",
-            "theme = \"{:?}\"\n",
+            "theme = \"{}\"\n",
             "vim_mode = {}\n",
             "update_check = {}\n",
             "desktop_notifications = {}\n",
@@ -591,7 +604,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
         cwd,
         verifier,
         max_budget,
-        config.theme,
+        config.theme.as_str(),
         config.vim_mode,
         config.update_check,
         config.desktop_notifications,
@@ -697,6 +710,22 @@ mod tests {
     use crate::model::ModelSelection;
 
     #[test]
+    fn theme_name_defaults_to_auto_and_round_trips_all_values() {
+        assert_eq!(ThemeName::default(), ThemeName::Auto);
+
+        for (wire, theme) in [
+            ("\"auto\"", ThemeName::Auto),
+            ("\"dark\"", ThemeName::Dark),
+            ("\"light\"", ThemeName::Light),
+            ("\"solarized\"", ThemeName::Solarized),
+            ("\"catppuccin\"", ThemeName::Catppuccin),
+        ] {
+            assert_eq!(serde_json::from_str::<ThemeName>(wire).unwrap(), theme);
+            assert_eq!(serde_json::to_string(&theme).unwrap(), wire);
+        }
+    }
+
+    #[test]
     fn format_config_show_redacts_api_key_and_includes_effective_values() {
         let config = RunConfig {
             app_version: "0.0.0-test".to_string(),
@@ -729,7 +758,7 @@ mod tests {
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),
             workflows: WorkflowConfig::default(),
-            theme: ThemeName::Dark,
+            theme: ThemeName::Auto,
             vim_mode: true,
             update_check: false,
             desktop_notifications: true,
@@ -749,6 +778,7 @@ mod tests {
         assert!(shown.contains("network = \"allowed\""));
         assert!(shown.contains("approval = \"full-auto\""));
         assert!(shown.contains("history = \"disabled\""));
+        assert!(shown.contains("theme = \"auto\""));
         assert!(shown.contains("api_key = \"<redacted>\""));
         assert!(!shown.contains("sk-secret"));
     }

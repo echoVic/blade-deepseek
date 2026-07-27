@@ -447,6 +447,20 @@ mod tests {
     }
 
     #[test]
+    fn omitted_and_explicit_auto_theme_parse_as_auto() {
+        assert_eq!(
+            toml::from_str::<FileConfig>("").unwrap().theme,
+            ThemeName::Auto
+        );
+        assert_eq!(
+            toml::from_str::<FileConfig>("theme = \"auto\"")
+                .unwrap()
+                .theme,
+            ThemeName::Auto
+        );
+    }
+
+    #[test]
     fn parse_full_config() {
         let toml = r#"
 model = "deepseek-v4-flash"

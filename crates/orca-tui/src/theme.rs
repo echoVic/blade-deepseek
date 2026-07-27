@@ -30,7 +30,7 @@ pub struct Theme {
 impl Theme {
     pub fn named(name: ThemeName) -> Self {
         let syntax_theme = match name {
-            ThemeName::Dark => SyntaxTheme::OneHalfDark,
+            ThemeName::Auto | ThemeName::Dark => SyntaxTheme::OneHalfDark,
             ThemeName::Light => SyntaxTheme::OneHalfLight,
             ThemeName::Solarized => SyntaxTheme::SolarizedDark,
             ThemeName::Catppuccin => SyntaxTheme::CatppuccinMocha,
@@ -39,7 +39,7 @@ impl Theme {
         match name {
             // DeepSeek-blue truecolor palette. Brand accent #4D6BFE drives
             // borders, selection, and the user prompt.
-            ThemeName::Dark => Self {
+            ThemeName::Auto | ThemeName::Dark => Self {
                 border: Color::Rgb(77, 107, 254),
                 text: Color::Rgb(232, 236, 246),
                 muted: Color::Rgb(139, 147, 167),
@@ -133,6 +133,14 @@ mod tests {
 
     use super::Theme;
     use crate::syntax_highlight::SyntaxTheme;
+
+    #[test]
+    fn named_auto_uses_the_existing_dark_palette_without_terminal_context() {
+        let auto = Theme::named(ThemeName::Auto);
+        let dark = Theme::named(ThemeName::Dark);
+        assert_eq!(auto.text, dark.text);
+        assert_eq!(auto.syntax_theme, dark.syntax_theme);
+    }
 
     #[test]
     fn named_themes_map_to_matching_syntax_themes_and_revisions() {
