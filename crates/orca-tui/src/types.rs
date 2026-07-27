@@ -24,6 +24,7 @@ use crate::edit_highlight_worker::{
     EditHighlightJob, EditHighlightOutcome, EditHighlightResult, EditHighlightRuntime,
 };
 use crate::syntax_highlight::{SyntaxTheme, highlighter_for_path};
+use crate::terminal_capabilities::{TerminalColorLevel, syntax_style_revision};
 use crate::transcript_view::TranscriptRenderCache;
 #[cfg(test)]
 use crate::transcript_view::TranscriptRenderContext;
@@ -782,6 +783,7 @@ pub struct AppState {
     pub input_area: Option<ratatui::layout::Rect>,
     workspace_root: Option<PathBuf>,
     pub(crate) syntax_theme: SyntaxTheme,
+    pub(crate) syntax_color_level: TerminalColorLevel,
     edit_highlight_runtime: Option<EditHighlightRuntime>,
     pub(crate) applied_diff_highlights: HashMap<u64, AppliedDiffHighlight>,
     #[cfg(test)]
@@ -903,6 +905,7 @@ impl AppState {
             input_area: None,
             workspace_root: None,
             syntax_theme: SyntaxTheme::OneHalfDark,
+            syntax_color_level: TerminalColorLevel::TrueColor,
             edit_highlight_runtime: None,
             applied_diff_highlights: HashMap::new(),
             #[cfg(test)]
@@ -918,9 +921,11 @@ impl AppState {
         &mut self,
         workspace_root: PathBuf,
         syntax_theme: SyntaxTheme,
+        syntax_color_level: TerminalColorLevel,
     ) {
         self.workspace_root = Some(workspace_root);
         self.syntax_theme = syntax_theme;
+        self.syntax_color_level = syntax_color_level;
         self.edit_highlight_runtime = None;
         self.applied_diff_highlights.clear();
     }
@@ -1066,7 +1071,12 @@ impl AppState {
         if !parsed_diff_structure_matches_target(&parsed, diff, Path::new(&display_path))
             || normalized_destination != Path::new(&display_path)
             || !parsed_diff_has_valid_new_side(&parsed)
-            || highlighter_for_path(&normalized_destination, self.syntax_theme).is_none()
+            || highlighter_for_path(
+                &normalized_destination,
+                self.syntax_theme,
+                self.syntax_color_level,
+            )
+            .is_none()
         {
             return;
         }
@@ -1091,8 +1101,12 @@ impl AppState {
             tool_id,
             message_index,
             message_revision,
-            syntax_theme_revision: self.syntax_theme.revision(),
+            syntax_theme_revision: syntax_style_revision(
+                self.syntax_theme,
+                self.syntax_color_level,
+            ),
             syntax_theme: self.syntax_theme,
+            syntax_color_level: self.syntax_color_level,
             absolute_path,
             display_path,
             parsed,
@@ -1116,7 +1130,9 @@ impl AppState {
 
         let job = result.job;
         if self.syntax_theme != job.syntax_theme
-            || self.syntax_theme.revision() != job.syntax_theme_revision
+            || self.syntax_color_level != job.syntax_color_level
+            || syntax_style_revision(self.syntax_theme, self.syntax_color_level)
+                != job.syntax_theme_revision
             || self.message_revisions.get(job.message_index).copied() != Some(job.message_revision)
         {
             return false;
@@ -1233,6 +1249,11 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn syntax_theme_for_test(&self) -> SyntaxTheme {
         self.syntax_theme
+    }
+
+    #[cfg(test)]
+    pub(crate) fn syntax_color_level_for_test(&self) -> TerminalColorLevel {
+        self.syntax_color_level
     }
 
     #[cfg(test)]
@@ -2860,6 +2881,10 @@ mod tests {
         assert_eq!(
             state.syntax_theme,
             crate::syntax_highlight::SyntaxTheme::OneHalfDark
+        );
+        assert_eq!(
+            state.syntax_color_level,
+            crate::terminal_capabilities::TerminalColorLevel::TrueColor
         );
         assert!(state.edit_highlight_runtime.is_none());
         assert!(state.applied_diff_highlights.is_empty());
@@ -5071,6 +5096,7 @@ mod tests {
         state.configure_syntax_highlighting(
             directory.path().to_path_buf(),
             crate::syntax_highlight::SyntaxTheme::OneHalfDark,
+            crate::terminal_capabilities::TerminalColorLevel::TrueColor,
         );
         (directory, state)
     }
@@ -5419,11 +5445,18 @@ arbitrary metadata
         assert_eq!(job.message_revision, state.message_revisions[0]);
         assert_eq!(
             job.syntax_theme_revision,
-            crate::syntax_highlight::SyntaxTheme::OneHalfDark.revision()
+            crate::terminal_capabilities::syntax_style_revision(
+                crate::syntax_highlight::SyntaxTheme::OneHalfDark,
+                crate::terminal_capabilities::TerminalColorLevel::TrueColor,
+            )
         );
         assert_eq!(
             job.syntax_theme,
             crate::syntax_highlight::SyntaxTheme::OneHalfDark
+        );
+        assert_eq!(
+            job.syntax_color_level,
+            crate::terminal_capabilities::TerminalColorLevel::TrueColor
         );
         assert_eq!(
             job.absolute_path,
@@ -6299,6 +6332,7 @@ arbitrary metadata
             state.configure_syntax_highlighting(
                 workspace_alias,
                 crate::syntax_highlight::SyntaxTheme::OneHalfDark,
+                crate::terminal_capabilities::TerminalColorLevel::TrueColor,
             );
             let outside = tempfile::tempdir().expect("outside directory");
             std::fs::write(outside.path().join("escaped.py"), "value = 2\n").expect("outside file");
@@ -6597,6 +6631,7 @@ class Item:
         state.configure_syntax_highlighting(
             directory.path().to_path_buf(),
             crate::syntax_highlight::SyntaxTheme::OneHalfDark,
+            crate::terminal_capabilities::TerminalColorLevel::TrueColor,
         );
         submit_live_edit(&mut state, "scoped-edit", "item.py", SCOPED_DIFF);
         let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
@@ -6686,8 +6721,10 @@ class Item:
                 state.syntax_theme = crate::syntax_highlight::SyntaxTheme::OneHalfLight;
             }),
             Box::new(|_, job| {
-                job.syntax_theme_revision =
-                    crate::syntax_highlight::SyntaxTheme::OneHalfLight.revision();
+                job.syntax_theme_revision = crate::terminal_capabilities::syntax_style_revision(
+                    crate::syntax_highlight::SyntaxTheme::OneHalfLight,
+                    job.syntax_color_level,
+                );
             }),
             Box::new(|state, job| {
                 let ChatMessage::ToolCall { diff, .. } = &mut state.messages[job.message_index]
@@ -6718,6 +6755,31 @@ class Item:
             );
             assert_eq!(state.message_revisions, revisions_before);
         }
+    }
+
+    #[test]
+    fn stale_edit_highlight_is_rejected_when_only_syntax_color_level_changes() {
+        let (_directory, mut state, job) = state_with_submitted_edit_job();
+        let syntax_theme = state.syntax_theme;
+        state.syntax_color_level = crate::terminal_capabilities::TerminalColorLevel::Ansi256;
+        let revisions_before = state.message_revisions.clone();
+
+        assert_eq!(state.syntax_theme, syntax_theme);
+        assert_ne!(state.syntax_color_level, job.syntax_color_level);
+        assert_ne!(
+            crate::terminal_capabilities::syntax_style_revision(
+                state.syntax_theme,
+                state.syntax_color_level,
+            ),
+            job.syntax_theme_revision
+        );
+        assert!(!state.apply_edit_highlight_result(ready_result(job.clone())));
+        assert!(
+            state
+                .refined_diff_styles(job.message_index, &job.tool_id)
+                .is_none()
+        );
+        assert_eq!(state.message_revisions, revisions_before);
     }
 
     #[test]

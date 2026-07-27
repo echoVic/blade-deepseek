@@ -175,6 +175,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         &mut state,
         workspace_root.clone(),
         theme.syntax_theme,
+        theme.color_level,
         replay_messages,
     );
     if let Some(transcript) = &startup_preloaded_transcript {
@@ -479,17 +480,19 @@ fn configure_tui_syntax_state(
     state: &mut AppState,
     workspace_root: PathBuf,
     syntax_theme: crate::syntax_highlight::SyntaxTheme,
+    syntax_color_level: crate::terminal_capabilities::TerminalColorLevel,
 ) {
-    state.configure_syntax_highlighting(workspace_root, syntax_theme);
+    state.configure_syntax_highlighting(workspace_root, syntax_theme, syntax_color_level);
 }
 
 fn configure_and_preload_tui_state(
     state: &mut AppState,
     workspace_root: PathBuf,
     syntax_theme: crate::syntax_highlight::SyntaxTheme,
+    syntax_color_level: crate::terminal_capabilities::TerminalColorLevel,
     messages: impl IntoIterator<Item = ChatMessage>,
 ) {
-    configure_tui_syntax_state(state, workspace_root, syntax_theme);
+    configure_tui_syntax_state(state, workspace_root, syntax_theme, syntax_color_level);
     for message in messages {
         state.push_message(message);
     }
@@ -703,6 +706,7 @@ mod tests {
         state.configure_syntax_highlighting(
             directory.path().to_path_buf(),
             crate::syntax_highlight::SyntaxTheme::OneHalfDark,
+            crate::terminal_capabilities::TerminalColorLevel::TrueColor,
         );
         state.update(TuiEvent::ToolRequested {
             id: "edit-1".to_string(),
@@ -972,6 +976,7 @@ mod tests {
             &mut state,
             directory.path().to_path_buf(),
             theme.syntax_theme,
+            theme.color_level,
             [historical],
         );
 
@@ -982,6 +987,10 @@ mod tests {
         assert_eq!(
             state.syntax_theme_for_test(),
             crate::syntax_highlight::SyntaxTheme::OneHalfLight
+        );
+        assert_eq!(
+            state.syntax_color_level_for_test(),
+            crate::terminal_capabilities::TerminalColorLevel::TrueColor
         );
         assert_eq!(state.messages.len(), 1);
         assert!(!state.edit_highlight_runtime_started_for_test());
@@ -1011,7 +1020,12 @@ mod tests {
         let theme = Theme::named(ThemeName::Catppuccin);
         let (mut state, _rx) = test_state();
 
-        configure_tui_syntax_state(&mut state, captured_workspace.clone(), theme.syntax_theme);
+        configure_tui_syntax_state(
+            &mut state,
+            captured_workspace.clone(),
+            theme.syntax_theme,
+            theme.color_level,
+        );
 
         assert_eq!(
             state.syntax_workspace_root_for_test(),
@@ -1051,7 +1065,12 @@ mod tests {
                 .canonicalize()
                 .expect("canonical fallback workspace")
         );
-        configure_tui_syntax_state(&mut state, expected_workspace.clone(), theme.syntax_theme);
+        configure_tui_syntax_state(
+            &mut state,
+            expected_workspace.clone(),
+            theme.syntax_theme,
+            theme.color_level,
+        );
         assert_eq!(
             state.syntax_workspace_root_for_test(),
             Some(expected_workspace.as_path())

@@ -3408,10 +3408,14 @@ struct PendingCodeBlock {
 }
 
 fn append_code_block(lines: &mut Vec<Line<'static>>, pending: PendingCodeBlock, theme: &Theme) {
-    let highlighted = pending
-        .language
-        .as_deref()
-        .and_then(|language| highlight_code(&pending.source, language, theme.syntax_theme));
+    let highlighted = pending.language.as_deref().and_then(|language| {
+        highlight_code(
+            &pending.source,
+            language,
+            theme.syntax_theme,
+            theme.color_level,
+        )
+    });
 
     if let Some(highlighted) = highlighted {
         for mut source_line in highlighted {
