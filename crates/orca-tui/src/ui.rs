@@ -1962,6 +1962,7 @@ struct TextareaVisualLayout {
     cursor_visual_row: usize,
     #[cfg_attr(not(test), allow(dead_code))]
     cursor_display_col: usize,
+    cursor_cell_width: usize,
     alignment: Alignment,
     rows: Vec<TextareaVisualRow>,
 }
@@ -1979,8 +1980,24 @@ struct TextareaHitGrapheme {
 
 #[derive(Clone, Copy)]
 enum TextareaCursorCell {
-    Occupied(usize),
+    Occupied { display_col: usize, width: usize },
     Space,
+}
+
+impl TextareaCursorCell {
+    fn display_col(self, raw_display_col: usize) -> usize {
+        match self {
+            Self::Occupied { display_col, .. } => display_col,
+            Self::Space => raw_display_col,
+        }
+    }
+
+    fn width(self) -> usize {
+        match self {
+            Self::Occupied { width, .. } => width,
+            Self::Space => 1,
+        }
+    }
 }
 
 fn textarea_visual_layout(textarea: &TextArea, width: usize) -> TextareaVisualLayout {
@@ -1993,6 +2010,7 @@ fn textarea_visual_layout(textarea: &TextArea, width: usize) -> TextareaVisualLa
             lines: vec![Line::from(spans)],
             cursor_visual_row: 0,
             cursor_display_col: 0,
+            cursor_cell_width: 1,
             alignment: textarea.alignment(),
             rows: vec![TextareaVisualRow {
                 logical_row: 0,
@@ -2008,6 +2026,7 @@ fn textarea_visual_layout(textarea: &TextArea, width: usize) -> TextareaVisualLa
     let mut visual_rows = Vec::new();
     let mut cursor_visual_line = 0usize;
     let mut cursor_display_col = 0usize;
+    let mut cursor_cell_width = 0usize;
 
     for (row, original_line) in textarea.lines().iter().enumerate() {
         let display_line = textarea_display_line(textarea, original_line);
@@ -2017,33 +2036,35 @@ fn textarea_visual_layout(textarea: &TextArea, width: usize) -> TextareaVisualLa
             let range_graphemes = textarea_graphemes_in_range(&graphemes, range);
             let visual_index = visual_lines.len();
             let is_last_range = range_index + 1 == ranges.len();
-            let cursor_cell = if row == cursor_row
+            let contains_cursor = row == cursor_row
                 && cursor_in_visual_range(
                     cursor_col,
                     range,
                     is_last_range,
                     original_line.chars().count(),
-                ) {
-                let display_col = textarea_display_width(&display_line, range.start, cursor_col);
-                if width > 0 && display_col >= width {
+                );
+            let raw_cursor_display_col = contains_cursor
+                .then(|| textarea_display_width(&display_line, range.start, cursor_col));
+            let cursor_inside_grapheme = contains_cursor
+                && range_graphemes.iter().any(|grapheme| {
+                    grapheme.logical_range.start < cursor_col
+                        && cursor_col < grapheme.logical_range.end
+                });
+            let needs_synthetic_cursor = raw_cursor_display_col
+                .is_some_and(|display_col| width > 0 && display_col >= width)
+                && !cursor_inside_grapheme;
+            let cursor_cell = raw_cursor_display_col.and_then(|raw_display_col| {
+                if needs_synthetic_cursor || width == 0 {
                     None
                 } else {
+                    let cursor_cell =
+                        textarea_cursor_cell(range_graphemes, cursor_col, raw_display_col);
                     cursor_visual_line = visual_index;
-                    cursor_display_col = display_col;
-                    Some(textarea_cursor_cell(range_graphemes, display_col))
+                    cursor_display_col = cursor_cell.display_col(raw_display_col);
+                    cursor_cell_width = cursor_cell.width();
+                    Some(cursor_cell)
                 }
-            } else {
-                None
-            };
-            let needs_synthetic_cursor = row == cursor_row
-                && cursor_in_visual_range(
-                    cursor_col,
-                    range,
-                    is_last_range,
-                    original_line.chars().count(),
-                )
-                && width > 0
-                && textarea_display_width(&display_line, range.start, cursor_col) >= width;
+            });
             visual_lines.push(render_textarea_visual_line(
                 original_line,
                 row,
@@ -2067,6 +2088,7 @@ fn textarea_visual_layout(textarea: &TextArea, width: usize) -> TextareaVisualLa
             if needs_synthetic_cursor {
                 cursor_visual_line = visual_lines.len();
                 cursor_display_col = 0;
+                cursor_cell_width = 1;
                 visual_lines.push(Line::from(Span::styled(" ", textarea.cursor_style())));
                 visual_rows.push(TextareaVisualRow {
                     logical_row: row,
@@ -2090,6 +2112,7 @@ fn textarea_visual_layout(textarea: &TextArea, width: usize) -> TextareaVisualLa
         lines: visual_lines,
         cursor_visual_row: cursor_visual_line,
         cursor_display_col,
+        cursor_cell_width,
         alignment: textarea.alignment(),
         rows: visual_rows,
     }
@@ -2180,13 +2203,23 @@ fn textarea_char_byte_index(text: &str, char_index: usize) -> usize {
 
 fn textarea_cursor_cell(
     graphemes: &[TextareaGrapheme<'_>],
-    cursor_display_col: usize,
+    cursor_col: usize,
+    raw_display_col: usize,
 ) -> TextareaCursorCell {
     let mut display_col = 0usize;
+    let mut cursor_in_zero_width_grapheme = false;
     for grapheme in graphemes {
         let next_display_col = display_col + grapheme.width;
-        if grapheme.width > 0 && cursor_display_col < next_display_col {
-            return TextareaCursorCell::Occupied(cursor_display_col);
+        if grapheme.width == 0 {
+            cursor_in_zero_width_grapheme |= grapheme.logical_range.contains(&cursor_col);
+        } else if grapheme.logical_range.contains(&cursor_col)
+            || cursor_in_zero_width_grapheme
+            || raw_display_col < next_display_col
+        {
+            return TextareaCursorCell::Occupied {
+                display_col,
+                width: grapheme.width,
+            };
         }
         display_col = next_display_col;
     }
@@ -2208,7 +2241,10 @@ fn visible_textarea_cursor(layout: &TextareaVisualLayout, inner: Rect) -> Option
     if inner.is_empty()
         || layout.alignment != Alignment::Left
         || layout.cursor_visual_row >= layout.lines.len()
-        || layout.cursor_display_col >= inner.width as usize
+        || layout
+            .cursor_display_col
+            .checked_add(layout.cursor_cell_width)?
+            > inner.width as usize
     {
         return None;
     }
@@ -2259,8 +2295,10 @@ fn render_textarea_visual_line(
         let next_display_col = display_col + grapheme.width;
         let style = if matches!(
             cursor_cell,
-            Some(TextareaCursorCell::Occupied(cursor_col))
-                if display_col <= cursor_col && cursor_col < next_display_col
+            Some(TextareaCursorCell::Occupied {
+                display_col: cursor_col,
+                ..
+            }) if display_col == cursor_col
         ) {
             cursor_style
         } else if logical_range
@@ -6242,8 +6280,8 @@ mod tests {
     }
 
     #[test]
-    fn composer_internal_grapheme_cursor_uses_character_prefix_width() {
-        for (grapheme, expected_col) in [("e\u{301}", 1), ("👍🏽", 2), ("1️⃣", 1)] {
+    fn composer_internal_grapheme_cursor_uses_rendered_lead_column() {
+        for grapheme in ["e\u{301}", "👍🏽", "1️⃣"] {
             let mut textarea = TextArea::from([grapheme]);
             textarea.move_cursor(tui_textarea::CursorMove::Forward);
 
@@ -6251,14 +6289,13 @@ mod tests {
 
             assert_eq!(textarea.cursor(), (0, 1), "{grapheme:?}");
             assert_eq!(layout.cursor_visual_row, 0, "{grapheme:?}");
-            assert_eq!(layout.cursor_display_col, expected_col, "{grapheme:?}");
+            assert_eq!(layout.cursor_display_col, 0, "{grapheme:?}");
         }
     }
 
     #[test]
     fn composer_internal_grapheme_keeps_intact_width_and_cursor_cell() {
-        for (text, width, expected_cursor_col, expected_cursor_text) in
-            [("e\u{301}x", 2, 1, "x"), ("👍🏽x", 3, 2, "x")]
+        for (text, width, cursor_grapheme) in [("e\u{301}x", 2, "e\u{301}"), ("👍🏽x", 3, "👍🏽")]
         {
             let mut textarea = TextArea::from([text]);
             textarea.move_cursor(tui_textarea::CursorMove::Forward);
@@ -6275,14 +6312,10 @@ mod tests {
             assert_eq!(layout.lines.len(), 1, "{text:?}");
             assert_eq!(layout.lines[0].to_string(), text, "{text:?}");
             assert_eq!(layout.lines[0].width(), width, "{text:?}");
-            assert_eq!(layout.cursor_display_col, expected_cursor_col, "{text:?}");
-            assert_eq!(
-                buffer[(expected_cursor_col as u16, 0)].symbol(),
-                expected_cursor_text,
-                "{text:?}"
-            );
+            assert_eq!(layout.cursor_display_col, 0, "{text:?}");
+            assert_eq!(buffer[(0, 0)].symbol(), cursor_grapheme, "{text:?}");
             assert!(
-                buffer[(expected_cursor_col as u16, 0)]
+                buffer[(0, 0)]
                     .style()
                     .add_modifier
                     .contains(Modifier::REVERSED),
@@ -6292,79 +6325,42 @@ mod tests {
     }
 
     #[test]
-    fn composer_internal_grapheme_exact_width_uses_visible_synthetic_cursor_row() {
-        for (grapheme, width) in [("e\u{301}", 1), ("👍🏽", 2)] {
+    fn composer_internal_grapheme_exact_width_uses_rendered_lead_cell() {
+        for (grapheme, width) in [("e\u{301}", 1), ("👍🏽", 2), ("1️⃣", 2)] {
             let mut textarea = TextArea::from([grapheme]);
             textarea.move_cursor(tui_textarea::CursorMove::Forward);
 
             let layout = textarea_visual_layout(&textarea, width);
-            let inner = Rect::new(7, 9, width as u16, 2);
+            let inner = Rect::new(7, 9, width as u16, 1);
 
-            assert_eq!(layout.lines.len(), 2, "{grapheme:?}");
+            assert_eq!(layout.lines.len(), 1, "{grapheme:?}");
             assert_eq!(layout.lines[0].to_string(), grapheme, "{grapheme:?}");
             assert_eq!(layout.lines[0].width(), width, "{grapheme:?}");
             assert_eq!(layout.lines[0].spans.len(), 1, "{grapheme:?}");
             assert_eq!(layout.lines[0].spans[0].content.as_ref(), grapheme);
-            assert_eq!(layout.cursor_visual_row, 1, "{grapheme:?}");
+            assert_eq!(layout.lines[0].spans[0].style, textarea.cursor_style());
+            assert_eq!(layout.cursor_visual_row, 0, "{grapheme:?}");
             assert_eq!(layout.cursor_display_col, 0, "{grapheme:?}");
             assert_eq!(
-                layout.lines[1].spans[0].style,
-                textarea.cursor_style(),
-                "{grapheme:?}"
-            );
-            assert_eq!(
                 visible_textarea_cursor(&layout, inner),
-                Some(Position::new(inner.x, inner.y + 1)),
+                Some(Position::new(inner.x, inner.y)),
                 "{grapheme:?}"
             );
         }
-
-        let mut keycap = TextArea::from(["1️⃣"]);
-        keycap.move_cursor(tui_textarea::CursorMove::Forward);
-        let layout = textarea_visual_layout(&keycap, 2);
-        let inner = Rect::new(7, 9, 2, 1);
-
-        assert_eq!(layout.lines.len(), 1);
-        assert_eq!(layout.lines[0].to_string(), "1️⃣");
-        assert_eq!(layout.lines[0].width(), 2);
-        assert_eq!(layout.lines[0].spans.len(), 1);
-        assert_eq!(layout.lines[0].spans[0].content.as_ref(), "1️⃣");
-        assert_eq!(layout.lines[0].spans[0].style, keycap.cursor_style());
-        assert_eq!(layout.cursor_visual_row, 0);
-        assert_eq!(layout.cursor_display_col, 1);
-        assert_eq!(
-            visible_textarea_cursor(&layout, inner),
-            Some(Position::new(inner.x + 1, inner.y))
-        );
     }
 
     #[test]
     fn composer_click_on_internal_grapheme_cursor_cell_preserves_logical_index() {
-        for (grapheme, width, cursor_col) in [("e\u{301}", 4, 1), ("👍🏽", 4, 2), ("1️⃣", 4, 1)]
-        {
+        for grapheme in ["e\u{301}", "👍🏽", "1️⃣"] {
+            let width = 4;
             let mut textarea = TextArea::from([grapheme]);
             textarea.move_cursor(tui_textarea::CursorMove::Forward);
             let layout = textarea_visual_layout(&textarea, width);
             let area = Rect::new(10, 5, width as u16, 1);
 
-            assert_eq!(layout.cursor_display_col, cursor_col, "{grapheme:?}");
+            assert_eq!(layout.cursor_display_col, 0, "{grapheme:?}");
             assert_eq!(
-                composer_click_target(&textarea, area, area.x + cursor_col as u16, area.y,),
-                Some((0, 1)),
-                "{grapheme:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn composer_click_on_internal_synthetic_cursor_row_preserves_logical_index() {
-        for (grapheme, width) in [("e\u{301}", 1), ("👍🏽", 2)] {
-            let mut textarea = TextArea::from([grapheme]);
-            textarea.move_cursor(tui_textarea::CursorMove::Forward);
-            let area = Rect::new(10, 5, width as u16, 2);
-
-            assert_eq!(
-                composer_click_target(&textarea, area, area.x, area.y + 1),
+                composer_click_target(&textarea, area, area.x, area.y),
                 Some((0, 1)),
                 "{grapheme:?}"
             );
@@ -6571,6 +6567,112 @@ mod tests {
     }
 
     #[test]
+    fn main_composer_internal_grapheme_cursor_uses_rendered_lead_cell() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        for grapheme in ["1️⃣", "👍🏽", "e\u{301}"] {
+            let mut state = test_state();
+            let mut textarea =
+                crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+            textarea.insert_str(grapheme);
+            textarea.move_cursor(tui_textarea::CursorMove::Head);
+            textarea.move_cursor(tui_textarea::CursorMove::Forward);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+
+            terminal
+                .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                .unwrap();
+
+            let cursor = Position::new(1, 7);
+            assert_eq!(textarea.cursor(), (0, 1), "{grapheme:?}");
+            assert_eq!(textarea.lines(), &[grapheme.to_string()], "{grapheme:?}");
+            terminal.backend_mut().assert_cursor_position(cursor);
+            let buffer = terminal.backend().buffer();
+            assert!(
+                buffer[cursor].modifier.contains(Modifier::REVERSED),
+                "{grapheme:?}: {:?}",
+                buffer[cursor]
+            );
+            assert!(
+                buffer
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .contains(grapheme),
+                "{grapheme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrenderable_wide_cursor_grapheme_hides_hardware_cursor() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let visible = TextArea::from(["a"]);
+        let unrenderable = TextArea::from(["界"]);
+        let (backend, events) = RecordingBackend::new(1, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_textarea_surface(frame, frame.area(), &visible, None, None, &theme, true);
+            })
+            .unwrap();
+        assert_eq!(
+            take_cursor_events(&events),
+            [CursorEvent::Show, CursorEvent::Move(Position::new(0, 0))]
+        );
+
+        terminal
+            .draw(|frame| {
+                render_textarea_surface(
+                    frame,
+                    frame.area(),
+                    &unrenderable,
+                    None,
+                    None,
+                    &theme,
+                    true,
+                );
+            })
+            .unwrap();
+
+        let cursor_events = take_cursor_events(&events);
+        assert_eq!(cursor_events, [CursorEvent::Hide]);
+        assert!(
+            terminal
+                .backend()
+                .inner
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| !cell.modifier.contains(Modifier::REVERSED))
+        );
+    }
+
+    #[test]
+    fn exact_width_synthetic_row_completed_draw_uses_next_row_first_cell() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut textarea = TextArea::from(["界"]);
+        textarea.move_cursor(tui_textarea::CursorMove::End);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(2, 2)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_textarea_surface(frame, frame.area(), &textarea, None, None, &theme, true);
+            })
+            .unwrap();
+
+        let cursor = Position::new(0, 1);
+        terminal.backend_mut().assert_cursor_position(cursor);
+        let cursor_cell = &terminal.backend().buffer()[cursor];
+        assert_eq!(cursor_cell.symbol(), " ");
+        assert!(cursor_cell.modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
     fn editable_conversation_states_expose_the_hardware_cursor() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea =
@@ -6721,10 +6823,10 @@ mod tests {
     fn vim_modes_keep_the_hardware_cursor_on_the_software_cursor() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
-        for mode in [
-            crate::vim::VimMode::Insert,
-            crate::vim::VimMode::Normal,
-            crate::vim::VimMode::Visual,
+        for (mode, cursor_color) in [
+            (crate::vim::VimMode::Insert, theme.border),
+            (crate::vim::VimMode::Normal, theme.warning),
+            (crate::vim::VimMode::Visual, theme.approval),
         ] {
             let mut state = test_state();
             let vim = crate::vim::VimState {
@@ -6742,12 +6844,13 @@ mod tests {
             terminal
                 .backend_mut()
                 .assert_cursor_position(Position::new(1, 7));
-            assert!(
-                terminal.backend().buffer()[(1, 7)]
-                    .modifier
-                    .contains(Modifier::REVERSED),
-                "{mode:?}"
-            );
+            let cursor_cell = &terminal.backend().buffer()[(1, 7)];
+            let cursor_style = cursor_cell.style();
+            assert_eq!(cursor_style.fg, Some(cursor_color), "{mode:?}");
+            assert_eq!(cursor_style.bg, Some(Color::Reset), "{mode:?}");
+            assert_eq!(cursor_style.underline_color, Some(Color::Reset), "{mode:?}");
+            assert_eq!(cursor_style.add_modifier, Modifier::REVERSED, "{mode:?}");
+            assert_eq!(cursor_style.sub_modifier, Modifier::empty(), "{mode:?}");
         }
     }
 
