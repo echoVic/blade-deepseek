@@ -1,12 +1,13 @@
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Wrap};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use tui_textarea::TextArea;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use orca_core::approval_types::ApprovalMode;
@@ -39,11 +40,12 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         return;
     }
 
-    let input_height = if composer_visible(state) {
-        composer_input_height(frame.area().width, textarea)
-    } else {
-        0
-    };
+    let composer_layout =
+        composer_visible(state).then(|| composer_visual_layout(frame.area().width, textarea));
+    let input_height = composer_layout
+        .as_ref()
+        .map(|layout| composer_input_height(frame.area().width, textarea, layout))
+        .unwrap_or(0);
 
     let plan_height = plan_panel_height(state);
     let goal_height: u16 = if state.current_goal.is_some() { 3 } else { 0 };
@@ -84,7 +86,14 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     }
     if composer_visible(state) {
         state.input_area = Some(chunks[4]);
-        render_input(frame, chunks[4], textarea, state, theme);
+        render_input(
+            frame,
+            chunks[4],
+            textarea,
+            composer_layout.as_ref().expect("visible composer layout"),
+            state,
+            theme,
+        );
     }
     render_status(frame, chunks[5], state, theme);
 
@@ -1826,6 +1835,7 @@ fn render_input(
     frame: &mut Frame,
     area: Rect,
     textarea: &TextArea,
+    layout: &TextareaVisualLayout,
     state: &AppState,
     theme: &Theme,
 ) {
@@ -1860,25 +1870,22 @@ fn render_input(
         return;
     }
 
-    let (lines, cursor_line) = composer_visual_lines(textarea, inner.width as usize);
     let visible_height = inner.height as usize;
-    let start = if lines.len() <= visible_height {
-        0
-    } else if cursor_line >= visible_height {
-        cursor_line + 1 - visible_height
-    } else {
-        0
-    };
-    let end = (start + visible_height).min(lines.len());
-    let visible = lines[start..end].to_vec();
+    let start = textarea_visible_start(layout, visible_height);
+    let end = (start + visible_height).min(layout.lines.len());
+    let visible = layout.lines[start..end].to_vec();
     let paragraph = Paragraph::new(visible)
         .style(textarea.style())
-        .alignment(textarea.alignment());
+        .alignment(layout.alignment);
     frame.render_widget(paragraph, inner);
 }
 
-fn composer_input_height(area_width: u16, textarea: &TextArea) -> u16 {
-    let input_lines = composer_visual_line_count(area_width, textarea).max(1) as u16;
+fn composer_input_height(
+    area_width: u16,
+    textarea: &TextArea,
+    layout: &TextareaVisualLayout,
+) -> u16 {
+    let input_lines = layout.lines.len().max(1) as u16;
     let block_extra = textarea
         .block()
         .map(|block| {
@@ -1889,17 +1896,9 @@ fn composer_input_height(area_width: u16, textarea: &TextArea) -> u16 {
     input_lines.saturating_add(block_extra)
 }
 
-fn composer_visual_line_count(area_width: u16, textarea: &TextArea) -> usize {
+fn composer_visual_layout(area_width: u16, textarea: &TextArea) -> TextareaVisualLayout {
     let inner_width = textarea_inner_width(area_width, textarea) as usize;
-    if textarea.is_empty() {
-        return 1;
-    }
-    textarea
-        .lines()
-        .iter()
-        .map(|line| textarea_wrap_ranges(line, inner_width).len())
-        .sum::<usize>()
-        .max(1)
+    textarea_visual_layout(textarea, inner_width)
 }
 
 fn textarea_inner_width(area_width: u16, textarea: &TextArea) -> u16 {
@@ -1909,59 +1908,283 @@ fn textarea_inner_width(area_width: u16, textarea: &TextArea) -> u16 {
         .unwrap_or(area_width)
 }
 
-fn composer_visual_lines(textarea: &TextArea, width: usize) -> (Vec<Line<'static>>, usize) {
+struct TextareaVisualLayout {
+    lines: Vec<Line<'static>>,
+    cursor_visual_row: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    cursor_display_col: usize,
+    alignment: Alignment,
+    rows: Vec<TextareaVisualRow>,
+}
+
+struct TextareaVisualRow {
+    logical_row: usize,
+    logical_range: Range<usize>,
+    graphemes: Vec<TextareaHitGrapheme>,
+}
+
+struct TextareaHitGrapheme {
+    logical_range: Range<usize>,
+    width: usize,
+}
+
+#[derive(Clone, Copy)]
+enum TextareaCursorCell {
+    Occupied(usize),
+    Space,
+}
+
+fn textarea_visual_layout(textarea: &TextArea, width: usize) -> TextareaVisualLayout {
     if textarea.is_empty() {
         let mut spans = vec![Span::styled(" ", textarea.cursor_style())];
         if let Some(style) = textarea.placeholder_style() {
             spans.push(Span::styled(textarea.placeholder_text().to_string(), style));
         }
-        return (vec![Line::from(spans)], 0);
+        return TextareaVisualLayout {
+            lines: vec![Line::from(spans)],
+            cursor_visual_row: 0,
+            cursor_display_col: 0,
+            alignment: textarea.alignment(),
+            rows: vec![TextareaVisualRow {
+                logical_row: 0,
+                logical_range: 0..0,
+                graphemes: Vec::new(),
+            }],
+        };
     }
 
     let (cursor_row, cursor_col) = textarea.cursor();
     let selection = textarea.selection_range();
     let mut visual_lines = Vec::new();
+    let mut visual_rows = Vec::new();
     let mut cursor_visual_line = 0usize;
+    let mut cursor_display_col = 0usize;
 
-    for (row, logical_line) in textarea.lines().iter().enumerate() {
-        let ranges = textarea_wrap_ranges(logical_line, width);
-        for range in ranges {
+    for (row, original_line) in textarea.lines().iter().enumerate() {
+        let display_line = textarea_display_line(textarea, original_line);
+        let graphemes = textarea_graphemes(&display_line);
+        let ranges = textarea_wrap_ranges(&graphemes, display_line.chars().count(), width);
+        for (range_index, range) in ranges.iter().enumerate() {
+            let range_graphemes = textarea_graphemes_in_range(&graphemes, range);
             let visual_index = visual_lines.len();
-            if row == cursor_row && cursor_in_visual_range(cursor_col, &range, logical_line) {
-                cursor_visual_line = visual_index;
-            }
+            let is_last_range = range_index + 1 == ranges.len();
+            let cursor_cell = if row == cursor_row
+                && cursor_in_visual_range(
+                    cursor_col,
+                    range,
+                    is_last_range,
+                    original_line.chars().count(),
+                ) {
+                let display_col = textarea_display_width(&display_line, range.start, cursor_col);
+                if width > 0 && display_col >= width {
+                    None
+                } else {
+                    cursor_visual_line = visual_index;
+                    cursor_display_col = display_col;
+                    Some(textarea_cursor_cell(range_graphemes, display_col))
+                }
+            } else {
+                None
+            };
+            let needs_synthetic_cursor = row == cursor_row
+                && cursor_in_visual_range(
+                    cursor_col,
+                    range,
+                    is_last_range,
+                    original_line.chars().count(),
+                )
+                && width > 0
+                && textarea_display_width(&display_line, range.start, cursor_col) >= width;
             visual_lines.push(render_textarea_visual_line(
-                logical_line,
+                original_line,
                 row,
-                range,
+                range.clone(),
                 textarea,
                 selection,
+                cursor_cell,
+                range_graphemes,
             ));
+            visual_rows.push(TextareaVisualRow {
+                logical_row: row,
+                logical_range: range.clone(),
+                graphemes: range_graphemes
+                    .iter()
+                    .map(|grapheme| TextareaHitGrapheme {
+                        logical_range: grapheme.logical_range.clone(),
+                        width: grapheme.width,
+                    })
+                    .collect(),
+            });
+            if needs_synthetic_cursor {
+                cursor_visual_line = visual_lines.len();
+                cursor_display_col = 0;
+                visual_lines.push(Line::from(Span::styled(" ", textarea.cursor_style())));
+                visual_rows.push(TextareaVisualRow {
+                    logical_row: row,
+                    logical_range: cursor_col..cursor_col,
+                    graphemes: Vec::new(),
+                });
+            }
         }
     }
 
     if visual_lines.is_empty() {
         visual_lines.push(Line::from(Span::styled(" ", textarea.cursor_style())));
+        visual_rows.push(TextareaVisualRow {
+            logical_row: 0,
+            logical_range: 0..0,
+            graphemes: Vec::new(),
+        });
     }
 
-    (visual_lines, cursor_visual_line)
+    TextareaVisualLayout {
+        lines: visual_lines,
+        cursor_visual_row: cursor_visual_line,
+        cursor_display_col,
+        alignment: textarea.alignment(),
+        rows: visual_rows,
+    }
 }
 
-fn cursor_in_visual_range(cursor_col: usize, range: &Range<usize>, logical_line: &str) -> bool {
-    let line_len = logical_line.chars().count();
-    (range.start <= cursor_col && cursor_col < range.end)
-        || (cursor_col == line_len && range.end == line_len)
-        || (range.is_empty() && cursor_col == range.start)
+fn textarea_display_line(textarea: &TextArea, logical_line: &str) -> String {
+    match textarea.mask_char() {
+        Some(mask) => std::iter::repeat(mask)
+            .take(logical_line.chars().count())
+            .collect(),
+        None => logical_line.to_string(),
+    }
+}
+
+struct TextareaGrapheme<'a> {
+    text: &'a str,
+    logical_range: Range<usize>,
+    width: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEXTAREA_GRAPHEME_TOKENIZATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_textarea_grapheme_tokenization_count() {
+    TEXTAREA_GRAPHEME_TOKENIZATIONS.set(0);
+}
+
+#[cfg(test)]
+fn textarea_grapheme_tokenization_count() -> usize {
+    TEXTAREA_GRAPHEME_TOKENIZATIONS.get()
+}
+
+fn textarea_graphemes(line: &str) -> Vec<TextareaGrapheme<'_>> {
+    #[cfg(test)]
+    TEXTAREA_GRAPHEME_TOKENIZATIONS.with(|count| count.set(count.get() + 1));
+    let mut logical_start = 0usize;
+    line.graphemes(true)
+        .map(|text| {
+            let logical_end = logical_start + text.chars().count();
+            let grapheme = TextareaGrapheme {
+                text,
+                logical_range: logical_start..logical_end,
+                width: UnicodeWidthStr::width(text),
+            };
+            logical_start = logical_end;
+            grapheme
+        })
+        .collect()
+}
+
+fn textarea_graphemes_in_range<'a>(
+    graphemes: &'a [TextareaGrapheme<'a>],
+    range: &Range<usize>,
+) -> &'a [TextareaGrapheme<'a>] {
+    let start = graphemes.partition_point(|grapheme| grapheme.logical_range.end <= range.start);
+    let end = graphemes.partition_point(|grapheme| grapheme.logical_range.start < range.end);
+    &graphemes[start.min(end)..end]
+}
+
+fn cursor_in_visual_range(
+    cursor_col: usize,
+    range: &Range<usize>,
+    is_last_range: bool,
+    line_len: usize,
+) -> bool {
+    range.contains(&cursor_col) || (is_last_range && cursor_col == line_len)
+}
+
+fn textarea_display_width(display_line: &str, start: usize, end: usize) -> usize {
+    UnicodeWidthStr::width(textarea_char_slice(display_line, start, end))
+}
+
+fn textarea_char_slice(text: &str, start: usize, end: usize) -> &str {
+    let start = textarea_char_byte_index(text, start);
+    let end = textarea_char_byte_index(text, end);
+    &text[start.min(end)..end]
+}
+
+fn textarea_char_byte_index(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(byte_index, _)| byte_index)
+}
+
+fn textarea_cursor_cell(
+    graphemes: &[TextareaGrapheme<'_>],
+    cursor_display_col: usize,
+) -> TextareaCursorCell {
+    let mut display_col = 0usize;
+    for grapheme in graphemes {
+        let next_display_col = display_col + grapheme.width;
+        if grapheme.width > 0 && cursor_display_col < next_display_col {
+            return TextareaCursorCell::Occupied(cursor_display_col);
+        }
+        display_col = next_display_col;
+    }
+    TextareaCursorCell::Space
+}
+
+fn textarea_visible_start(layout: &TextareaVisualLayout, visible_height: usize) -> usize {
+    if layout.lines.len() <= visible_height {
+        0
+    } else if layout.cursor_visual_row >= visible_height {
+        layout.cursor_visual_row + 1 - visible_height
+    } else {
+        0
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn visible_textarea_cursor(layout: &TextareaVisualLayout, inner: Rect) -> Option<Position> {
+    if inner.is_empty()
+        || layout.alignment != Alignment::Left
+        || layout.cursor_visual_row >= layout.lines.len()
+        || layout.cursor_display_col >= inner.width as usize
+    {
+        return None;
+    }
+    let start = textarea_visible_start(layout, inner.height as usize);
+    let row = layout.cursor_visual_row.checked_sub(start)?;
+    if row >= inner.height as usize {
+        return None;
+    }
+    Some(Position::new(
+        inner
+            .x
+            .checked_add(layout.cursor_display_col.try_into().ok()?)?,
+        inner.y.checked_add(row.try_into().ok()?)?,
+    ))
 }
 
 fn render_textarea_visual_line(
-    logical_line: &str,
+    original_line: &str,
     row: usize,
     range: Range<usize>,
     textarea: &TextArea,
     selection: Option<((usize, usize), (usize, usize))>,
+    cursor_cell: Option<TextareaCursorCell>,
+    graphemes: &[TextareaGrapheme<'_>],
 ) -> Line<'static> {
-    let (cursor_row, cursor_col) = textarea.cursor();
     let base_style = textarea.style();
     let cursor_style = textarea.cursor_style();
     let cursor_line_style = textarea.cursor_line_style();
@@ -1969,31 +2192,86 @@ fn render_textarea_visual_line(
     let mut spans = Vec::new();
     let mut pending = String::new();
     let mut pending_style = base_style;
+    let mut attached_zero_width = String::new();
+    let mut attached_logical_start = None;
+    let mut rendered_visible_grapheme = false;
+    let mut display_col = 0usize;
 
-    for (col, ch) in logical_line
-        .chars()
-        .enumerate()
-        .skip(range.start)
-        .take(range.end.saturating_sub(range.start))
-    {
-        let style = if row == cursor_row && col == cursor_col {
+    for grapheme in graphemes {
+        if grapheme.width == 0 {
+            attached_logical_start.get_or_insert(grapheme.logical_range.start);
+            attached_zero_width.push_str(grapheme.text);
+            continue;
+        }
+        let logical_range = attached_logical_start
+            .take()
+            .unwrap_or(grapheme.logical_range.start)
+            ..grapheme.logical_range.end;
+        let next_display_col = display_col + grapheme.width;
+        let style = if matches!(
+            cursor_cell,
+            Some(TextareaCursorCell::Occupied(cursor_col))
+                if display_col <= cursor_col && cursor_col < next_display_col
+        ) {
             cursor_style
-        } else if selection_contains(selection, row, col) {
+        } else if logical_range
+            .clone()
+            .any(|col| selection_contains(selection, row, col))
+        {
             selection_style
-        } else if row == cursor_row {
+        } else if row == textarea.cursor().0 {
             cursor_line_style
         } else {
             base_style
         };
-        push_styled_char(&mut spans, &mut pending, &mut pending_style, ch, style);
+        let mut rendered_grapheme = std::mem::take(&mut attached_zero_width);
+        rendered_grapheme.push_str(grapheme.text);
+        attached_zero_width.clear();
+        push_styled_text(
+            &mut spans,
+            &mut pending,
+            &mut pending_style,
+            &rendered_grapheme,
+            style,
+        );
+        rendered_visible_grapheme = true;
+        display_col = next_display_col;
     }
 
+    let zero_width_cursor_cell = !attached_zero_width.is_empty() && !rendered_visible_grapheme;
+    if zero_width_cursor_cell {
+        let logical_start = attached_logical_start.unwrap_or(range.end);
+        let logical_range = logical_start..range.end;
+        let style = if cursor_cell.is_some() {
+            cursor_style
+        } else if logical_range
+            .clone()
+            .any(|col| selection_contains(selection, row, col))
+        {
+            selection_style
+        } else if row == textarea.cursor().0 {
+            cursor_line_style
+        } else {
+            base_style
+        };
+        let mut cursor_cell = String::from(" ");
+        cursor_cell.push_str(&attached_zero_width);
+        push_styled_text(
+            &mut spans,
+            &mut pending,
+            &mut pending_style,
+            &cursor_cell,
+            style,
+        );
+    } else if !attached_zero_width.is_empty() {
+        pending.push_str(&attached_zero_width);
+    }
     flush_pending_span(&mut spans, &mut pending, pending_style);
 
-    if row == cursor_row && cursor_col == range.end && cursor_col == logical_line.chars().count() {
+    if matches!(cursor_cell, Some(TextareaCursorCell::Space)) && !zero_width_cursor_cell {
         spans.push(Span::styled(" ", cursor_style));
     } else if selection_contains(selection, row, range.end)
-        && range.end == logical_line.chars().count()
+        && range.end == original_line.chars().count()
     {
         spans.push(Span::styled(" ", selection_style));
     }
@@ -2013,11 +2291,11 @@ fn selection_contains(
         && (row < end_row || (row == end_row && col < end_col))
 }
 
-fn push_styled_char(
+fn push_styled_text(
     spans: &mut Vec<Span<'static>>,
     pending: &mut String,
     pending_style: &mut Style,
-    ch: char,
+    text: &str,
     style: Style,
 ) {
     if pending.is_empty() {
@@ -2026,7 +2304,7 @@ fn push_styled_char(
         flush_pending_span(spans, pending, *pending_style);
         *pending_style = style;
     }
-    pending.push(ch);
+    pending.push_str(text);
 }
 
 fn flush_pending_span(spans: &mut Vec<Span<'static>>, pending: &mut String, pending_style: Style) {
@@ -2035,76 +2313,96 @@ fn flush_pending_span(spans: &mut Vec<Span<'static>>, pending: &mut String, pend
     }
 }
 
-fn textarea_wrap_ranges(line: &str, width: usize) -> Vec<Range<usize>> {
-    if line.is_empty() || width == 0 {
-        return vec![0..line.chars().count()];
+fn textarea_wrap_ranges(
+    graphemes: &[TextareaGrapheme<'_>],
+    line_len: usize,
+    width: usize,
+) -> Vec<Range<usize>> {
+    if graphemes.is_empty() || width == 0 {
+        return vec![0..line_len];
     }
 
     let mut ranges = Vec::new();
-    let mut current_start = 0usize;
+    let mut current_start = None;
     let mut current_end = 0usize;
     let mut current_width = 0usize;
-    let mut segment_start = 0usize;
+    let mut segment_start = 0;
 
-    for segment in line.split_inclusive(|c: char| c.is_whitespace() || c == '/' || c == '-') {
-        let segment_cols = segment.chars().count();
-        let segment_width = UnicodeWidthStr::width(segment);
-        if segment_width == 0 {
-            segment_start += segment_cols;
+    for segment_end in 1..=graphemes.len() {
+        let final_grapheme = &graphemes[segment_end - 1];
+        if segment_end < graphemes.len() && !textarea_grapheme_ends_segment(final_grapheme) {
             continue;
         }
+        let segment = &graphemes[segment_start..segment_end];
+        let segment_logical_start = segment[0].logical_range.start;
+        let segment_logical_end = segment
+            .last()
+            .map(|grapheme| grapheme.logical_range.end)
+            .unwrap_or(segment_logical_start);
+        let segment_width = segment.iter().map(|grapheme| grapheme.width).sum::<usize>();
 
         if segment_width > width {
-            if current_width > 0 {
-                ranges.push(current_start..current_end);
+            if let Some(start) = current_start.take() {
+                ranges.push(start..current_end);
             }
             let (start, end, display_width) =
-                push_hard_wrapped_segment(&mut ranges, segment, segment_start, width);
-            current_start = start;
+                push_hard_wrapped_segment(&mut ranges, segment, width);
+            current_start = Some(start);
             current_end = end;
             current_width = display_width;
-        } else if current_width == 0 {
-            current_start = segment_start;
-            current_end = segment_start + segment_cols;
+        } else if current_start.is_none() {
+            current_start = Some(segment_logical_start);
+            current_end = segment_logical_end;
             current_width = segment_width;
         } else if current_width + segment_width <= width {
-            current_end = segment_start + segment_cols;
+            current_end = segment_logical_end;
             current_width += segment_width;
         } else {
-            ranges.push(current_start..current_end);
-            current_start = segment_start;
-            current_end = segment_start + segment_cols;
+            ranges.push(current_start.unwrap_or(segment_logical_start)..current_end);
+            current_start = Some(segment_logical_start);
+            current_end = segment_logical_end;
             current_width = segment_width;
         }
 
-        segment_start += segment_cols;
+        segment_start = segment_end;
     }
 
-    if current_width > 0 || ranges.is_empty() {
-        ranges.push(current_start..current_end);
+    if let Some(start) = current_start {
+        ranges.push(start..current_end);
+    } else if ranges.is_empty() {
+        ranges.push(0..line_len);
     }
     ranges
 }
 
+fn textarea_grapheme_ends_segment(grapheme: &TextareaGrapheme<'_>) -> bool {
+    grapheme
+        .text
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_whitespace() || ch == '/' || ch == '-')
+}
+
 fn push_hard_wrapped_segment(
     ranges: &mut Vec<Range<usize>>,
-    segment: &str,
-    segment_start: usize,
+    segment: &[TextareaGrapheme<'_>],
     width: usize,
 ) -> (usize, usize, usize) {
-    let mut chunk_start = segment_start;
-    let mut current_col = segment_start;
+    let mut chunk_start = segment
+        .first()
+        .map(|grapheme| grapheme.logical_range.start)
+        .unwrap_or(0);
+    let mut current_col = chunk_start;
     let mut current_width = 0usize;
 
-    for ch in segment.chars() {
-        let ch_width = UnicodeWidthStr::width(ch.to_string().as_str()).max(1);
-        if current_width > 0 && current_width + ch_width > width {
+    for grapheme in segment {
+        if current_width > 0 && grapheme.width > 0 && current_width + grapheme.width > width {
             ranges.push(chunk_start..current_col);
-            chunk_start = current_col;
+            chunk_start = grapheme.logical_range.start;
             current_width = 0;
         }
-        current_col += 1;
-        current_width += ch_width;
+        current_col = grapheme.logical_range.end;
+        current_width += grapheme.width;
     }
 
     (chunk_start, current_col, current_width)
@@ -2789,50 +3087,45 @@ pub(crate) fn composer_click_target(
     }
 
     let width = inner.width as usize;
-    let (cursor_row, cursor_col) = textarea.cursor();
-    let mut visual: Vec<(usize, Range<usize>)> = Vec::new();
-    let mut cursor_visual_line = 0usize;
-    for (logical_row, logical_line) in textarea.lines().iter().enumerate() {
-        for range in textarea_wrap_ranges(logical_line, width) {
-            if logical_row == cursor_row && cursor_in_visual_range(cursor_col, &range, logical_line)
-            {
-                cursor_visual_line = visual.len();
-            }
-            visual.push((logical_row, range));
-        }
-    }
-    if visual.is_empty() {
+    let layout = textarea_visual_layout(textarea, width);
+    if layout.rows.is_empty() {
         return Some((0, 0));
     }
 
     // Same scroll-to-cursor behavior as render_input.
-    let visible_height = inner.height as usize;
-    let start = if visual.len() <= visible_height {
-        0
-    } else if cursor_visual_line >= visible_height {
-        cursor_visual_line + 1 - visible_height
-    } else {
-        0
-    };
-    let clicked = (start + (row - inner.y) as usize).min(visual.len() - 1);
-    let (logical_row, range) = visual[clicked].clone();
-    let logical_line = textarea.lines()[logical_row].as_str();
+    let start = textarea_visible_start(&layout, inner.height as usize);
+    let clicked = (start + (row - inner.y) as usize).min(layout.rows.len() - 1);
+    let target = (column - inner.x) as usize;
+    if clicked == layout.cursor_visual_row && target == layout.cursor_display_col {
+        let (cursor_row, cursor_col) = textarea.cursor();
+        return Some((
+            cursor_row.min(u16::MAX as usize) as u16,
+            cursor_col.min(u16::MAX as usize) as u16,
+        ));
+    }
+
+    let visual_row = &layout.rows[clicked];
+    let logical_row = visual_row.logical_row;
 
     // Walk display widths to find the character cell under the pointer.
-    let target = (column - inner.x) as usize;
     let mut acc = 0usize;
-    let mut char_col = range.start;
-    for ch in logical_line
-        .chars()
-        .skip(range.start)
-        .take(range.end.saturating_sub(range.start))
-    {
-        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if ch_width > 0 && target < acc + ch_width {
+    let mut char_col = visual_row.logical_range.start;
+    let mut leading_zero_width_start = None;
+    for grapheme in &visual_row.graphemes {
+        if grapheme.width == 0 {
+            if acc == 0 {
+                leading_zero_width_start.get_or_insert(grapheme.logical_range.start);
+            }
+            char_col = grapheme.logical_range.end;
+            continue;
+        }
+        if grapheme.width > 0 && target < acc + grapheme.width {
+            char_col = leading_zero_width_start.unwrap_or(grapheme.logical_range.start);
             break;
         }
-        acc += ch_width;
-        char_col += 1;
+        leading_zero_width_start = None;
+        acc += grapheme.width;
+        char_col = grapheme.logical_range.end;
     }
     Some((
         logical_row.min(u16::MAX as usize) as u16,
@@ -5655,7 +5948,600 @@ mod tests {
         let mut textarea = TextArea::from(vec!["alpha bravo charlie".to_string()]);
         textarea.set_block(Block::default().borders(Borders::ALL));
 
-        assert_eq!(composer_input_height(12, &textarea), 5);
+        let layout = composer_visual_layout(12, &textarea);
+        assert_eq!(composer_input_height(12, &textarea, &layout), 5);
+    }
+
+    #[test]
+    fn composer_cursor_layout_tracks_ascii_and_cjk_display_columns() {
+        let mut textarea = TextArea::from(["ab界c"]);
+        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 3));
+
+        let layout = textarea_visual_layout(&textarea, 20);
+
+        assert_eq!(layout.cursor_visual_row, 0);
+        assert_eq!(layout.cursor_display_col, 4);
+        assert_eq!(layout.lines[0].to_string(), "ab界c");
+    }
+
+    #[test]
+    fn composer_cursor_layout_tracks_combining_and_emoji_widths() {
+        let mut textarea = TextArea::from(["e\u{301}🙂x"]);
+        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 3));
+
+        let layout = textarea_visual_layout(&textarea, 20);
+
+        assert_eq!(
+            layout.cursor_display_col,
+            UnicodeWidthStr::width("e\u{301}🙂")
+        );
+    }
+
+    #[test]
+    fn composer_grapheme_layout_tracks_extended_emoji_widths() {
+        for grapheme in ["👍🏽", "👨‍👩‍👧‍👦", "1️⃣"] {
+            let text = format!("a{grapheme}b");
+            let mut textarea = TextArea::from([text.as_str()]);
+            textarea.move_cursor(tui_textarea::CursorMove::Jump(
+                0,
+                (1 + grapheme.chars().count()) as u16,
+            ));
+
+            let layout = textarea_visual_layout(&textarea, 20);
+
+            assert_eq!(layout.cursor_visual_row, 0, "{grapheme:?}");
+            assert_eq!(
+                layout.cursor_display_col,
+                1 + UnicodeWidthStr::width(grapheme),
+                "{grapheme:?}"
+            );
+            assert_eq!(layout.lines[0].to_string(), text, "{grapheme:?}");
+        }
+    }
+
+    #[test]
+    fn composer_internal_grapheme_cursor_uses_character_prefix_width() {
+        for (grapheme, expected_col) in [("e\u{301}", 1), ("👍🏽", 2), ("1️⃣", 1)] {
+            let mut textarea = TextArea::from([grapheme]);
+            textarea.move_cursor(tui_textarea::CursorMove::Forward);
+
+            let layout = textarea_visual_layout(&textarea, 20);
+
+            assert_eq!(textarea.cursor(), (0, 1), "{grapheme:?}");
+            assert_eq!(layout.cursor_visual_row, 0, "{grapheme:?}");
+            assert_eq!(layout.cursor_display_col, expected_col, "{grapheme:?}");
+        }
+    }
+
+    #[test]
+    fn composer_internal_grapheme_keeps_intact_width_and_cursor_cell() {
+        for (text, width, expected_cursor_col, expected_cursor_text) in
+            [("e\u{301}x", 2, 1, "x"), ("👍🏽x", 3, 2, "x")]
+        {
+            let mut textarea = TextArea::from([text]);
+            textarea.move_cursor(tui_textarea::CursorMove::Forward);
+
+            let layout = textarea_visual_layout(&textarea, width);
+            let area = Rect::new(0, 0, width as u16, 1);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            ratatui::widgets::Widget::render(
+                Paragraph::new(layout.lines.clone()),
+                area,
+                &mut buffer,
+            );
+
+            assert_eq!(layout.lines.len(), 1, "{text:?}");
+            assert_eq!(layout.lines[0].to_string(), text, "{text:?}");
+            assert_eq!(layout.lines[0].width(), width, "{text:?}");
+            assert_eq!(layout.cursor_display_col, expected_cursor_col, "{text:?}");
+            assert_eq!(
+                buffer[(expected_cursor_col as u16, 0)].symbol(),
+                expected_cursor_text,
+                "{text:?}"
+            );
+            assert!(
+                buffer[(expected_cursor_col as u16, 0)]
+                    .style()
+                    .add_modifier
+                    .contains(Modifier::REVERSED),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_internal_grapheme_exact_width_uses_visible_synthetic_cursor_row() {
+        for (grapheme, width) in [("e\u{301}", 1), ("👍🏽", 2)] {
+            let mut textarea = TextArea::from([grapheme]);
+            textarea.move_cursor(tui_textarea::CursorMove::Forward);
+
+            let layout = textarea_visual_layout(&textarea, width);
+            let inner = Rect::new(7, 9, width as u16, 2);
+
+            assert_eq!(layout.lines.len(), 2, "{grapheme:?}");
+            assert_eq!(layout.lines[0].to_string(), grapheme, "{grapheme:?}");
+            assert_eq!(layout.lines[0].width(), width, "{grapheme:?}");
+            assert_eq!(layout.lines[0].spans.len(), 1, "{grapheme:?}");
+            assert_eq!(layout.lines[0].spans[0].content.as_ref(), grapheme);
+            assert_eq!(layout.cursor_visual_row, 1, "{grapheme:?}");
+            assert_eq!(layout.cursor_display_col, 0, "{grapheme:?}");
+            assert_eq!(
+                layout.lines[1].spans[0].style,
+                textarea.cursor_style(),
+                "{grapheme:?}"
+            );
+            assert_eq!(
+                visible_textarea_cursor(&layout, inner),
+                Some(Position::new(inner.x, inner.y + 1)),
+                "{grapheme:?}"
+            );
+        }
+
+        let mut keycap = TextArea::from(["1️⃣"]);
+        keycap.move_cursor(tui_textarea::CursorMove::Forward);
+        let layout = textarea_visual_layout(&keycap, 2);
+        let inner = Rect::new(7, 9, 2, 1);
+
+        assert_eq!(layout.lines.len(), 1);
+        assert_eq!(layout.lines[0].to_string(), "1️⃣");
+        assert_eq!(layout.lines[0].width(), 2);
+        assert_eq!(layout.lines[0].spans.len(), 1);
+        assert_eq!(layout.lines[0].spans[0].content.as_ref(), "1️⃣");
+        assert_eq!(layout.lines[0].spans[0].style, keycap.cursor_style());
+        assert_eq!(layout.cursor_visual_row, 0);
+        assert_eq!(layout.cursor_display_col, 1);
+        assert_eq!(
+            visible_textarea_cursor(&layout, inner),
+            Some(Position::new(inner.x + 1, inner.y))
+        );
+    }
+
+    #[test]
+    fn composer_click_on_internal_grapheme_cursor_cell_preserves_logical_index() {
+        for (grapheme, width, cursor_col) in [("e\u{301}", 4, 1), ("👍🏽", 4, 2), ("1️⃣", 4, 1)]
+        {
+            let mut textarea = TextArea::from([grapheme]);
+            textarea.move_cursor(tui_textarea::CursorMove::Forward);
+            let layout = textarea_visual_layout(&textarea, width);
+            let area = Rect::new(10, 5, width as u16, 1);
+
+            assert_eq!(layout.cursor_display_col, cursor_col, "{grapheme:?}");
+            assert_eq!(
+                composer_click_target(&textarea, area, area.x + cursor_col as u16, area.y,),
+                Some((0, 1)),
+                "{grapheme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_click_on_internal_synthetic_cursor_row_preserves_logical_index() {
+        for (grapheme, width) in [("e\u{301}", 1), ("👍🏽", 2)] {
+            let mut textarea = TextArea::from([grapheme]);
+            textarea.move_cursor(tui_textarea::CursorMove::Forward);
+            let area = Rect::new(10, 5, width as u16, 2);
+
+            assert_eq!(
+                composer_click_target(&textarea, area, area.x, area.y + 1),
+                Some((0, 1)),
+                "{grapheme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_grapheme_wrap_keeps_extended_emoji_clusters_intact() {
+        for grapheme in ["👍🏽", "👨‍👩‍👧‍👦", "1️⃣"] {
+            let text = grapheme.repeat(2);
+            let mut textarea = TextArea::from([text.as_str()]);
+            textarea.move_cursor(tui_textarea::CursorMove::Jump(
+                0,
+                grapheme.chars().count() as u16,
+            ));
+
+            let layout = textarea_visual_layout(&textarea, 2);
+
+            assert_eq!(
+                rendered_text(&layout.lines),
+                [grapheme, grapheme],
+                "{grapheme:?}"
+            );
+            assert_eq!(layout.cursor_visual_row, 1, "{grapheme:?}");
+            assert_eq!(layout.cursor_display_col, 0, "{grapheme:?}");
+        }
+    }
+
+    #[test]
+    fn composer_grapheme_exact_width_end_uses_styled_synthetic_row() {
+        for grapheme in ["👍🏽", "👨‍👩‍👧‍👦", "1️⃣"] {
+            let mut textarea = TextArea::from([grapheme]);
+            textarea.move_cursor(tui_textarea::CursorMove::End);
+
+            let layout = textarea_visual_layout(&textarea, UnicodeWidthStr::width(grapheme));
+
+            assert_eq!(layout.lines.len(), 2, "{grapheme:?}");
+            assert_eq!(layout.lines[0].to_string(), grapheme, "{grapheme:?}");
+            assert_eq!(layout.cursor_visual_row, 1, "{grapheme:?}");
+            assert_eq!(layout.cursor_display_col, 0, "{grapheme:?}");
+            assert_eq!(layout.lines[1].to_string(), " ", "{grapheme:?}");
+            assert_eq!(
+                layout.lines[1].spans[0].style,
+                textarea.cursor_style(),
+                "{grapheme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_combining_only_grapheme_keeps_cursor_and_click_target() {
+        let text = "\u{301}";
+        let mut textarea = TextArea::from([text]);
+        textarea.move_cursor(tui_textarea::CursorMove::End);
+
+        let layout = textarea_visual_layout(&textarea, 4);
+
+        assert_eq!(textarea.cursor(), (0, 1));
+        assert_eq!(layout.lines[0].to_string(), format!(" {text}"));
+        assert_eq!(layout.cursor_visual_row, 0);
+        assert_eq!(layout.cursor_display_col, 0);
+        assert_eq!(
+            layout.lines[0].spans.last().unwrap().style,
+            textarea.cursor_style()
+        );
+        assert_eq!(
+            composer_click_target(&textarea, Rect::new(0, 0, 4, 1), 0, 0),
+            Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn composer_combining_only_grapheme_survives_buffer_render_with_cursor() {
+        let text = "\u{301}";
+        let mut textarea = TextArea::from([text]);
+        textarea.move_cursor(tui_textarea::CursorMove::End);
+        let layout = textarea_visual_layout(&textarea, 4);
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+
+        ratatui::widgets::Widget::render(Paragraph::new(layout.lines), area, &mut buffer);
+
+        assert_eq!(buffer[(0, 0)].symbol(), format!(" {text}"));
+        assert!(
+            buffer[(0, 0)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn composer_leading_combining_mark_attaches_without_losing_logical_start() {
+        let text = "\u{301}a";
+        let mut textarea = TextArea::from([text]);
+
+        let start_layout = textarea_visual_layout(&textarea, 4);
+        textarea.move_cursor(tui_textarea::CursorMove::Forward);
+        let after_mark_layout = textarea_visual_layout(&textarea, 4);
+
+        assert_eq!(start_layout.lines[0].to_string(), text);
+        assert_eq!(start_layout.cursor_display_col, 0);
+        assert_eq!(after_mark_layout.cursor_display_col, 0);
+        assert_eq!(
+            composer_click_target(&textarea, Rect::new(0, 0, 4, 1), 0, 0),
+            Some((0, 1))
+        );
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(Paragraph::new(start_layout.lines), area, &mut buffer);
+        assert_eq!(buffer[(0, 0)].symbol(), "a");
+    }
+
+    #[test]
+    fn composer_zero_width_controls_preserve_source_order() {
+        for text in [
+            "a\u{200f}b",
+            "a\u{200e}b",
+            "a\u{200b}b",
+            "a\u{2060}b",
+            "\u{301}a",
+        ] {
+            let textarea = TextArea::from([text]);
+
+            let layout = textarea_visual_layout(&textarea, 10);
+
+            assert_eq!(layout.lines[0].to_string(), text, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn composer_layout_tokenizes_each_logical_line_once() {
+        let textarea = TextArea::from(["x".repeat(50_000)]);
+        reset_textarea_grapheme_tokenization_count();
+
+        let layout = textarea_visual_layout(&textarea, 10);
+
+        assert!(layout.lines.len() > 1_000);
+        assert_eq!(textarea_grapheme_tokenization_count(), 1);
+    }
+
+    #[test]
+    fn composer_frame_reuses_the_height_layout_for_rendering() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::from(["x".repeat(500)]);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        reset_textarea_grapheme_tokenization_count();
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+
+        assert_eq!(textarea_grapheme_tokenization_count(), 1);
+    }
+
+    #[test]
+    fn composer_combining_trailing_mark_keeps_cursor_and_click_target() {
+        let text = "a \u{301}";
+        let mut textarea = TextArea::from([text]);
+        textarea.move_cursor(tui_textarea::CursorMove::End);
+
+        let layout = textarea_visual_layout(&textarea, 10);
+
+        assert_eq!(textarea.cursor(), (0, 3));
+        assert_eq!(layout.lines[0].to_string(), format!("{text} "));
+        assert_eq!(layout.cursor_visual_row, 0);
+        assert_eq!(layout.cursor_display_col, UnicodeWidthStr::width(text));
+        assert_eq!(
+            layout.lines[0].spans.last().unwrap().style,
+            textarea.cursor_style()
+        );
+        assert_eq!(
+            composer_click_target(&textarea, Rect::new(0, 0, 10, 1), 2, 0),
+            Some((0, 3))
+        );
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(Paragraph::new(layout.lines), area, &mut buffer);
+        assert_eq!(buffer[(1, 0)].symbol(), " \u{301}");
+        assert_eq!(buffer[(2, 0)].symbol(), " ");
+    }
+
+    #[test]
+    fn empty_composer_cursor_starts_at_origin_before_placeholder() {
+        let mut textarea = TextArea::default();
+        textarea.set_placeholder_text("hint");
+
+        let layout = textarea_visual_layout(&textarea, 20);
+
+        assert_eq!(layout.cursor_visual_row, 0);
+        assert_eq!(layout.cursor_display_col, 0);
+        assert_eq!(layout.lines.len(), 1);
+        assert_eq!(layout.lines[0].spans[0].content.as_ref(), " ");
+        assert_eq!(layout.lines[0].spans[0].style, textarea.cursor_style());
+        assert_eq!(layout.lines[0].to_string(), " hint");
+    }
+
+    #[test]
+    fn composer_cursor_at_word_wrap_boundary_uses_next_visual_row() {
+        let mut textarea = TextArea::from(["alpha bravo"]);
+        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 6));
+
+        let layout = textarea_visual_layout(&textarea, 6);
+
+        assert_eq!(layout.cursor_visual_row, 1);
+        assert_eq!(layout.cursor_display_col, 0);
+    }
+
+    #[test]
+    fn exact_width_line_end_creates_a_synthetic_cursor_row() {
+        let mut textarea = TextArea::from(["abcdef"]);
+        textarea.move_cursor(tui_textarea::CursorMove::End);
+
+        let layout = textarea_visual_layout(&textarea, 6);
+
+        assert_eq!(layout.lines.len(), 2);
+        assert_eq!(layout.cursor_visual_row, 1);
+        assert_eq!(layout.cursor_display_col, 0);
+        assert_eq!(layout.lines[0].to_string(), "abcdef");
+        assert_eq!(layout.lines[1].to_string(), " ");
+        assert_eq!(layout.lines[1].spans[0].style, textarea.cursor_style());
+    }
+
+    #[test]
+    fn zero_width_layout_does_not_create_a_synthetic_cursor_row() {
+        let mut textarea = TextArea::from(["abcdef"]);
+        textarea.move_cursor(tui_textarea::CursorMove::End);
+
+        let layout = textarea_visual_layout(&textarea, 0);
+
+        assert_eq!(layout.lines.len(), 1);
+    }
+
+    #[test]
+    fn hard_wrapped_token_cursor_uses_display_width_within_chunk() {
+        let mut textarea = TextArea::from(["界界界"]);
+        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 2));
+
+        let layout = textarea_visual_layout(&textarea, 4);
+
+        assert_eq!(layout.cursor_visual_row, 1);
+        assert_eq!(layout.cursor_display_col, 0);
+    }
+
+    #[test]
+    fn visible_composer_cursor_includes_origin_border_and_scroll() {
+        let mut textarea = TextArea::from(["one", "two", "three", "four"]);
+        textarea.set_block(Block::default().borders(Borders::ALL));
+        textarea.move_cursor(tui_textarea::CursorMove::Bottom);
+        textarea.move_cursor(tui_textarea::CursorMove::End);
+        let area = Rect::new(10, 5, 12, 4);
+        let inner = textarea.block().unwrap().inner(area);
+        let layout = textarea_visual_layout(&textarea, inner.width as usize);
+
+        assert_eq!(
+            visible_textarea_cursor(&layout, inner),
+            Some(ratatui::layout::Position::new(inner.x + 4, inner.y + 1))
+        );
+    }
+
+    #[test]
+    fn masked_setup_layout_uses_mask_width_and_never_renders_secret() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut textarea = crate::composer_textarea::make_setup_textarea(&theme);
+        textarea.insert_str("密钥abc");
+
+        let layout = textarea_visual_layout(&textarea, 20);
+        let rendered = layout.lines.iter().map(Line::to_string).collect::<String>();
+
+        assert!(!rendered.contains("密钥abc"));
+        assert!(rendered.contains("*****"));
+        assert_eq!(layout.cursor_display_col, 5);
+    }
+
+    #[test]
+    fn masked_narrow_layout_wraps_by_mask_and_preserves_logical_selection() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let secret = "密钥abc";
+        let mut textarea = crate::composer_textarea::make_setup_textarea(&theme);
+        textarea.insert_str(secret);
+        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 1));
+        textarea.start_selection();
+        textarea.move_cursor(tui_textarea::CursorMove::End);
+
+        let layout = textarea_visual_layout(&textarea, 2);
+
+        assert_eq!(rendered_text(&layout.lines), ["**", "**", "* "]);
+        assert_eq!(layout.cursor_visual_row, 2);
+        assert_eq!(layout.cursor_display_col, 1);
+        assert_eq!(
+            layout.lines[2].spans.last().unwrap().style,
+            textarea.cursor_style()
+        );
+        let selection_style = Style::default().bg(Color::LightBlue);
+        let selected_chars = layout
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.style == selection_style)
+            .map(|span| span.content.chars().filter(|ch| *ch == '*').count())
+            .sum::<usize>();
+        assert_eq!(selected_chars, 4);
+        for span in layout.lines.iter().flat_map(|line| &line.spans) {
+            assert!(
+                span.content.chars().all(|ch| ch == '*' || ch == ' '),
+                "secret fragment leaked in span {:?}",
+                span.content
+            );
+        }
+    }
+
+    #[test]
+    fn composer_click_maps_masked_and_cjk_display_cells() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut masked = crate::composer_textarea::make_setup_textarea(&theme);
+        masked.insert_str("密钥abc");
+        let area = Rect::new(10, 5, 4, 5);
+        let inner = masked.block().unwrap().inner(area);
+        assert_eq!(
+            composer_click_target(&masked, area, inner.x + 1, inner.y + 1),
+            Some((0, 3))
+        );
+
+        let cjk = TextArea::from(["界a"]);
+        let area = Rect::new(0, 0, 6, 1);
+        assert_eq!(composer_click_target(&cjk, area, 1, 0), Some((0, 0)));
+        assert_eq!(composer_click_target(&cjk, area, 2, 0), Some((0, 1)));
+    }
+
+    #[test]
+    fn composer_click_maps_extended_grapheme_cells_and_wrapped_boundaries() {
+        for grapheme in ["👍🏽", "👨‍👩‍👧‍👦", "1️⃣"] {
+            let text = format!("{grapheme}x");
+            let textarea = TextArea::from([text.as_str()]);
+            let area = Rect::new(0, 0, 6, 1);
+            assert_eq!(
+                composer_click_target(&textarea, area, 1, 0),
+                Some((0, 0)),
+                "{grapheme:?}"
+            );
+            assert_eq!(
+                composer_click_target(&textarea, area, 2, 0),
+                Some((0, grapheme.chars().count() as u16)),
+                "{grapheme:?}"
+            );
+
+            let wrapped_text = grapheme.repeat(2);
+            let wrapped = TextArea::from([wrapped_text.as_str()]);
+            assert_eq!(
+                composer_click_target(&wrapped, Rect::new(0, 0, 2, 2), 0, 1),
+                Some((0, grapheme.chars().count() as u16)),
+                "{grapheme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_click_maps_word_wrap_and_synthetic_cursor_rows() {
+        let wrapped = TextArea::from(["alpha bravo"]);
+        assert_eq!(
+            composer_click_target(&wrapped, Rect::new(0, 0, 6, 2), 0, 1),
+            Some((0, 6))
+        );
+
+        let mut exact = TextArea::from(["abcdef"]);
+        exact.move_cursor(tui_textarea::CursorMove::End);
+        assert_eq!(
+            composer_click_target(&exact, Rect::new(0, 0, 6, 2), 0, 1),
+            Some((0, 6))
+        );
+    }
+
+    #[test]
+    fn hardware_cursor_rejects_empty_and_non_left_aligned_surfaces() {
+        let textarea = TextArea::default();
+        let layout = textarea_visual_layout(&textarea, 10);
+        assert_eq!(visible_textarea_cursor(&layout, Rect::ZERO), None);
+
+        let mut centered = TextArea::default();
+        centered.set_alignment(ratatui::layout::Alignment::Center);
+        let layout = textarea_visual_layout(&centered, 10);
+        assert_eq!(
+            visible_textarea_cursor(&layout, Rect::new(3, 4, 10, 1)),
+            None
+        );
+
+        let mut layout = textarea_visual_layout(&TextArea::from(["abc"]), 10);
+        layout.cursor_display_col = 10;
+        assert_eq!(
+            visible_textarea_cursor(&layout, Rect::new(3, 4, 10, 1)),
+            None
+        );
+
+        layout.cursor_display_col = 2;
+        assert_eq!(
+            visible_textarea_cursor(&layout, Rect::new(u16::MAX - 1, 4, 10, 1)),
+            None
+        );
+
+        layout.cursor_visual_row = layout.lines.len();
+        assert_eq!(
+            visible_textarea_cursor(&layout, Rect::new(3, 4, 10, 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn hardware_cursor_includes_nonzero_origin_without_block() {
+        let mut textarea = TextArea::from(["abc"]);
+        textarea.move_cursor(tui_textarea::CursorMove::End);
+        let layout = textarea_visual_layout(&textarea, 10);
+
+        assert_eq!(layout.lines[0].to_string(), "abc ");
+        assert_eq!(
+            visible_textarea_cursor(&layout, Rect::new(7, 9, 10, 1)),
+            Some(ratatui::layout::Position::new(10, 9))
+        );
     }
 
     #[test]
@@ -5686,9 +6572,9 @@ mod tests {
             textarea.move_cursor(tui_textarea::CursorMove::Back);
         }
 
-        let (_lines, cursor_line) = composer_visual_lines(&textarea, 6);
+        let layout = textarea_visual_layout(&textarea, 6);
 
-        assert_eq!(cursor_line, 1);
+        assert_eq!(layout.cursor_visual_row, 1);
     }
 
     /// Wrapped height the scroll math sees for `text` at `width` — the same
