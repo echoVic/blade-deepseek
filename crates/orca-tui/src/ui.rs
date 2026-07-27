@@ -41,8 +41,8 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     }
 
     let show_composer_hardware_cursor = main_composer_hardware_cursor_visible(state);
-    let composer_layout =
-        composer_visible(state).then(|| composer_visual_layout(frame.area().width, textarea));
+    let composer_layout = composer_visible(state)
+        .then(|| composer_visual_layout(frame.area().width, textarea, theme));
     let input_height = composer_layout
         .as_ref()
         .map(|layout| composer_input_height(frame.area().width, textarea, layout))
@@ -438,7 +438,7 @@ fn apply_selection_overlay(
                     line,
                     col_start,
                     col_end,
-                    theme.selection_bg,
+                    theme.selection_style(),
                 ),
                 None => line,
             },
@@ -541,10 +541,7 @@ pub(crate) fn render_live_messages(
                 height: 1,
             };
             frame.render_widget(
-                Paragraph::new(Span::styled(
-                    label,
-                    Style::default().bg(theme.selection_bg).fg(theme.text),
-                )),
+                Paragraph::new(Span::styled(label, theme.selection_style().fg(theme.text))),
                 pill,
             );
             state.jump_to_bottom_area = Some(pill);
@@ -1875,7 +1872,11 @@ fn render_textarea_surface(
     let layout = if let Some(layout) = precomputed_layout {
         layout
     } else {
-        computed_layout = textarea_visual_layout(textarea, inner.width as usize);
+        computed_layout = textarea_visual_layout_with_selection(
+            textarea,
+            inner.width as usize,
+            theme.selection_style(),
+        );
         &computed_layout
     };
     let visible_height = inner.height as usize;
@@ -1945,9 +1946,13 @@ fn composer_input_height(
     input_lines.saturating_add(block_extra)
 }
 
-fn composer_visual_layout(area_width: u16, textarea: &TextArea) -> TextareaVisualLayout {
+fn composer_visual_layout(
+    area_width: u16,
+    textarea: &TextArea,
+    theme: &Theme,
+) -> TextareaVisualLayout {
     let inner_width = textarea_inner_width(area_width, textarea) as usize;
-    textarea_visual_layout(textarea, inner_width)
+    textarea_visual_layout_with_selection(textarea, inner_width, theme.selection_style())
 }
 
 fn textarea_inner_width(area_width: u16, textarea: &TextArea) -> u16 {
@@ -2001,6 +2006,14 @@ impl TextareaCursorCell {
 }
 
 fn textarea_visual_layout(textarea: &TextArea, width: usize) -> TextareaVisualLayout {
+    textarea_visual_layout_with_selection(textarea, width, Style::default().bg(Color::LightBlue))
+}
+
+fn textarea_visual_layout_with_selection(
+    textarea: &TextArea,
+    width: usize,
+    selection_style: Style,
+) -> TextareaVisualLayout {
     if textarea.is_empty() {
         let mut spans = vec![Span::styled(" ", textarea.cursor_style())];
         if let Some(style) = textarea.placeholder_style() {
@@ -2073,6 +2086,7 @@ fn textarea_visual_layout(textarea: &TextArea, width: usize) -> TextareaVisualLa
                 selection,
                 cursor_cell,
                 range_graphemes,
+                selection_style,
             ));
             visual_rows.push(TextareaVisualRow {
                 logical_row: row,
@@ -2269,11 +2283,11 @@ fn render_textarea_visual_line(
     selection: Option<((usize, usize), (usize, usize))>,
     cursor_cell: Option<TextareaCursorCell>,
     graphemes: &[TextareaGrapheme<'_>],
+    selection_style: Style,
 ) -> Line<'static> {
     let base_style = textarea.style();
     let cursor_style = textarea.cursor_style();
     let cursor_line_style = textarea.cursor_line_style();
-    let selection_style = Style::default().bg(Color::LightBlue);
     let mut spans = Vec::new();
     let mut pending = String::new();
     let mut pending_style = base_style;
@@ -4491,6 +4505,16 @@ mod tests {
         )
     }
 
+    fn monochrome_theme() -> Theme {
+        Theme::resolve(
+            ThemeName::Dark,
+            crate::terminal_capabilities::TerminalProfile {
+                background: crate::terminal_capabilities::TerminalBackground::Unknown,
+                color_level: crate::terminal_capabilities::TerminalColorLevel::Monochrome,
+            },
+        )
+    }
+
     fn interaction_key(kind: TuiInteractionKind, id: &str) -> TuiInteractionKey {
         TuiInteractionKey::new(
             orca_core::cancel::OperationIdAllocator::new().allocate(),
@@ -5291,6 +5315,58 @@ mod tests {
         state.scroll_up(10);
         let detached_again = draw(&mut state);
         assert!(detached_again.contains("Jump to bottom (click) ↓"));
+    }
+
+    #[test]
+    fn monochrome_jump_pill_reverses_completed_buffer_cells() {
+        let theme = monochrome_theme();
+        let textarea = TextArea::default();
+        let mut state = test_state();
+        for index in 0..80 {
+            state
+                .messages
+                .push(ChatMessage::System(format!("line {index}")));
+        }
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        state.scroll_up(10);
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+
+        let pill = state.jump_to_bottom_area.expect("jump pill area");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(pill.x + 1, pill.y)].symbol(), "J");
+        assert!(
+            buffer[(pill.x + 1, pill.y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn monochrome_selection_reverses_completed_transcript_buffer_cells() {
+        let theme = monochrome_theme();
+        let textarea = TextArea::default();
+        let mut state = test_state();
+        state.push_message(ChatMessage::System("abc".to_string()));
+        let pos = crate::selection::SelectionPos { row: 0, col: 0 };
+        state.selection = Some(crate::selection::TranscriptSelection::begin(pos));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "a");
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer[(1, 0)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -6331,8 +6407,9 @@ mod tests {
     fn composer_layout_counts_soft_wrapped_visual_lines() {
         let mut textarea = TextArea::from(vec!["alpha bravo charlie".to_string()]);
         textarea.set_block(Block::default().borders(Borders::ALL));
+        let theme = Theme::named(ThemeName::Dark);
 
-        let layout = composer_visual_layout(12, &textarea);
+        let layout = composer_visual_layout(12, &textarea, &theme);
         assert_eq!(composer_input_height(12, &textarea, &layout), 5);
     }
 
@@ -7389,6 +7466,30 @@ mod tests {
                 span.content
             );
         }
+    }
+
+    #[test]
+    fn monochrome_composer_selection_reverses_completed_buffer_cells() {
+        let theme = monochrome_theme();
+        let mut textarea = TextArea::from(["abc"]);
+        textarea.set_cursor_style(Style::default());
+        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 0));
+        textarea.start_selection();
+        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 2));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(6, 1)).expect("test backend");
+
+        terminal
+            .draw(|frame| {
+                render_textarea_surface(frame, frame.area(), &textarea, None, None, &theme, false);
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "a");
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(buffer[(1, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer[(2, 0)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
