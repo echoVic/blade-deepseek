@@ -3419,7 +3419,7 @@ fn append_code_block(lines: &mut Vec<Line<'static>>, pending: PendingCodeBlock, 
             lines.push(Line::from(source_line));
         }
     } else {
-        let style = Style::default().fg(Color::Gray);
+        let style = Style::default().fg(theme.muted);
         for source_line in pending.source.lines() {
             lines.push(Line::from(Span::styled(format!("  {source_line}"), style)));
         }
@@ -3432,7 +3432,7 @@ fn render_markdown(input: &str, width: usize, theme: &Theme) -> Vec<Line<'static
     let parser = Parser::new_ext(input, opts);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
-    let mut style_stack: Vec<Style> = vec![Style::default().fg(Color::White)];
+    let mut style_stack: Vec<Style> = vec![Style::default().fg(theme.text)];
     let mut pending_code_block: Option<PendingCodeBlock> = None;
     let mut list_depth: u16 = 0;
 
@@ -3472,7 +3472,7 @@ fn render_markdown(input: &str, width: usize, theme: &Theme) -> Vec<Line<'static
                     table_rows.push(std::mem::take(&mut current_row));
                 }
                 Event::End(TagEnd::Table) => {
-                    render_table(&table_rows, &mut lines, width);
+                    render_table(&table_rows, &mut lines, width, theme);
                     table_rows.clear();
                     in_table = false;
                 }
@@ -3498,9 +3498,9 @@ fn render_markdown(input: &str, width: usize, theme: &Theme) -> Vec<Line<'static
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
                     let color = match level {
-                        pulldown_cmark::HeadingLevel::H1 => Color::Cyan,
-                        pulldown_cmark::HeadingLevel::H2 => Color::Green,
-                        _ => Color::Yellow,
+                        pulldown_cmark::HeadingLevel::H1 => theme.markdown_h1,
+                        pulldown_cmark::HeadingLevel::H2 => theme.markdown_h2,
+                        _ => theme.markdown_h3,
                     };
                     style_stack.push(Style::default().fg(color).add_modifier(Modifier::BOLD));
                 }
@@ -3530,13 +3530,13 @@ fn render_markdown(input: &str, width: usize, theme: &Theme) -> Vec<Line<'static
                     let indent = "  ".repeat(list_depth.saturating_sub(1) as usize);
                     current_spans.push(Span::styled(
                         format!("{indent}• "),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme.muted),
                     ));
                 }
                 Tag::BlockQuote(_) => {
-                    current_spans.push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
+                    current_spans.push(Span::styled("│ ", Style::default().fg(theme.muted)));
                     let base = *style_stack.last().unwrap_or(&Style::default());
-                    style_stack.push(base.fg(Color::Gray));
+                    style_stack.push(base.fg(theme.muted));
                 }
                 _ => {}
             },
@@ -3570,7 +3570,7 @@ fn render_markdown(input: &str, width: usize, theme: &Theme) -> Vec<Line<'static
             Event::Code(code) => {
                 current_spans.push(Span::styled(
                     format!("`{code}`"),
-                    Style::default().fg(Color::Magenta),
+                    Style::default().fg(theme.markdown_inline_code),
                 ));
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -3584,7 +3584,12 @@ fn render_markdown(input: &str, width: usize, theme: &Theme) -> Vec<Line<'static
     lines
 }
 
-fn render_table(rows: &[Vec<String>], lines: &mut Vec<Line<'static>>, available_width: usize) {
+fn render_table(
+    rows: &[Vec<String>],
+    lines: &mut Vec<Line<'static>>,
+    available_width: usize,
+    theme: &Theme,
+) {
     if rows.is_empty() {
         return;
     }
@@ -3613,14 +3618,14 @@ fn render_table(rows: &[Vec<String>], lines: &mut Vec<Line<'static>>, available_
     let ideal_total = ideal_widths.iter().sum::<usize>() + overhead;
 
     if ideal_total <= available_width {
-        render_table_grid(rows, &ideal_widths, col_gap, lines);
+        render_table_grid(rows, &ideal_widths, col_gap, lines, theme);
     } else {
         let col_widths = allocate_column_widths(&ideal_widths, available_width, col_gap);
         let max_col = col_widths.iter().copied().max().unwrap_or(0);
         if max_col < 12 && num_cols > 2 {
-            render_table_as_records(rows, lines, available_width);
+            render_table_as_records(rows, lines, available_width, theme);
         } else {
-            render_table_grid(rows, &col_widths, col_gap, lines);
+            render_table_grid(rows, &col_widths, col_gap, lines, theme);
         }
     }
     lines.push(Line::from(""));
@@ -3686,12 +3691,13 @@ fn render_table_grid(
     col_widths: &[usize],
     col_gap: usize,
     lines: &mut Vec<Line<'static>>,
+    theme: &Theme,
 ) {
     let header_style = Style::default()
-        .fg(Color::Cyan)
+        .fg(theme.markdown_h1)
         .add_modifier(Modifier::BOLD);
-    let cell_style = Style::default().fg(Color::White);
-    let separator_style = Style::default().fg(Color::DarkGray);
+    let cell_style = Style::default().fg(theme.text);
+    let separator_style = Style::default().fg(theme.muted);
     let gap_str: String = " ".repeat(col_gap);
 
     for (row_idx, row) in rows.iter().enumerate() {
@@ -3751,13 +3757,14 @@ fn render_table_as_records(
     rows: &[Vec<String>],
     lines: &mut Vec<Line<'static>>,
     available_width: usize,
+    theme: &Theme,
 ) {
     let header_style = Style::default()
-        .fg(Color::Cyan)
+        .fg(theme.markdown_h1)
         .add_modifier(Modifier::BOLD);
-    let key_style = Style::default().fg(Color::Yellow);
-    let value_style = Style::default().fg(Color::White);
-    let separator_style = Style::default().fg(Color::DarkGray);
+    let key_style = Style::default().fg(theme.markdown_h3);
+    let value_style = Style::default().fg(theme.text);
+    let separator_style = Style::default().fg(theme.muted);
 
     let headers: Vec<&str> = rows
         .first()
@@ -3871,7 +3878,7 @@ mod tests {
     use crate::types::{SlashMenu, SlashMenuItem, TuiEvent, TuiInteractionKey, TuiInteractionKind};
     use chrono::Utc;
     use crossbeam_channel as mpsc;
-    use orca_core::config::AdditionalWorkingDirectory;
+    use orca_core::config::{AdditionalWorkingDirectory, ThemeName};
     use orca_core::goal_types::{ThreadGoal, ThreadGoalStatus};
     use orca_core::plan_types::{PlanItem, PlanStatus};
     use orca_runtime::history::SessionSummary;
@@ -4111,7 +4118,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_and_oversized_fences_keep_plain_gray_code_style() {
+    fn unknown_and_oversized_fences_use_muted_theme_fallback() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let unknown = render_markdown("```not-a-real-language\nunknown_call();\n```", 80, &theme);
         let unknown_line = unknown
@@ -4124,7 +4131,7 @@ mod tests {
             unknown_line
                 .spans
                 .iter()
-                .all(|span| span.style.fg == Some(Color::Gray))
+                .all(|span| span.style.fg == Some(theme.muted))
         );
 
         let source = "x".repeat(crate::syntax_highlight::MAX_HIGHLIGHT_BYTES + 1);
@@ -4139,7 +4146,7 @@ mod tests {
             oversized_line
                 .spans
                 .iter()
-                .all(|span| span.style.fg == Some(Color::Gray))
+                .all(|span| span.style.fg == Some(theme.muted))
         );
     }
 
@@ -4293,8 +4300,8 @@ mod tests {
                     assert!(
                         line.spans
                             .iter()
-                            .all(|span| span.style.fg == Some(Color::Gray)),
-                        "{name}: non-empty fallback content must remain gray"
+                            .all(|span| span.style.fg == Some(theme.muted)),
+                        "{name}: non-empty fallback content must use the muted theme color"
                     );
                 }
             }
@@ -4302,17 +4309,110 @@ mod tests {
     }
 
     #[test]
-    fn inline_code_keeps_magenta_style() {
-        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+    fn inline_code_uses_the_selected_markdown_theme_color() {
+        for name in [
+            ThemeName::Dark,
+            ThemeName::Light,
+            ThemeName::Solarized,
+            ThemeName::Catppuccin,
+        ] {
+            let theme = Theme::named(name);
+            let lines = render_markdown("Use `cargo test` now.", 80, &theme);
+            let inline = lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content == "`cargo test`")
+                .expect("inline code span");
 
-        let lines = render_markdown("Use `cargo test` now.", 80, &theme);
-        let inline = lines
-            .iter()
-            .flat_map(|line| &line.spans)
-            .find(|span| span.content == "`cargo test`")
-            .expect("inline code span");
+            assert_eq!(
+                inline.style.fg,
+                Some(theme.markdown_inline_code),
+                "{name:?}"
+            );
+        }
+    }
 
-        assert_eq!(inline.style.fg, Some(Color::Magenta));
+    #[test]
+    fn markdown_roles_use_selected_theme_semantics() {
+        let fixture = "# One\n## Two\n### Three\n\nPlain **bold** *italic*.\n\n- item\n\n> quote";
+
+        for name in [
+            ThemeName::Dark,
+            ThemeName::Light,
+            ThemeName::Solarized,
+            ThemeName::Catppuccin,
+        ] {
+            let theme = Theme::named(name);
+            let lines = render_markdown(fixture, 80, &theme);
+
+            let span = |text: &str| {
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .find(|span| span.content == text)
+                    .expect(text)
+            };
+            assert_eq!(span("One").style.fg, Some(theme.markdown_h1), "{name:?}");
+            assert_eq!(span("Two").style.fg, Some(theme.markdown_h2), "{name:?}");
+            assert_eq!(span("Three").style.fg, Some(theme.markdown_h3), "{name:?}");
+            assert_eq!(span("Plain ").style.fg, Some(theme.text), "{name:?}");
+            assert_eq!(span("bold").style.fg, Some(theme.text), "{name:?}");
+            assert_eq!(span("italic").style.fg, Some(theme.text), "{name:?}");
+            assert_eq!(span("• ").style.fg, Some(theme.muted), "{name:?}");
+            assert_eq!(span("│ ").style.fg, Some(theme.muted), "{name:?}");
+            assert_eq!(span("quote").style.fg, Some(theme.muted), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn markdown_tables_and_plain_code_use_theme_semantics() {
+        for name in [
+            ThemeName::Dark,
+            ThemeName::Light,
+            ThemeName::Solarized,
+            ThemeName::Catppuccin,
+        ] {
+            let theme = Theme::named(name);
+            let grid = render_markdown("| Name | Value |\n|---|---|\n| A | B |", 80, &theme);
+            let header = grid
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.contains("Name"))
+                .expect("table header");
+            let value = grid
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.trim() == "A")
+                .expect("table value");
+            let separator = grid
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.contains('━'))
+                .expect("table separator");
+            assert_eq!(header.style.fg, Some(theme.markdown_h1), "{name:?}");
+            assert_eq!(value.style.fg, Some(theme.text), "{name:?}");
+            assert_eq!(separator.style.fg, Some(theme.muted), "{name:?}");
+
+            let records = render_markdown(
+                "| First column | Second column | Third column |\n|---|---|---|\n| one | two | three |",
+                18,
+                &theme,
+            );
+            let key = records
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.contains("First column:"))
+                .expect("record key");
+            assert_eq!(key.style.fg, Some(theme.markdown_h3), "{name:?}");
+
+            let plain = render_markdown("```not-a-real-language\ncall();\n```", 80, &theme);
+            let source = plain
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.contains("call();"))
+                .expect("plain code");
+            assert_eq!(source.style.fg, Some(theme.muted), "{name:?}");
+        }
     }
 
     #[test]
