@@ -6,7 +6,7 @@
 //! to its content when the transcript scrolls or new messages stream in below.
 
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Color;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
@@ -191,16 +191,15 @@ pub fn tmux_passthrough(sequence: &str) -> String {
 }
 
 /// Re-style the display-column range `[col_start, col_end)` of a pre-wrapped
-/// line with the theme's selection background, splitting spans at the
-/// boundaries. Foreground colors are preserved so highlighted syntax stays
-/// readable — only the background changes (like an editor selection). A
-/// `None` end highlights through the end of the line. A wide character is
-/// selected iff its leading column is inside the range.
+/// line with the theme's selection style, splitting spans at the boundaries.
+/// The selection style is patched over each source span so syntax colors and
+/// modifiers survive. A `None` end highlights through the end of the line. A
+/// wide character is selected iff its leading column is inside the range.
 pub fn apply_selection_to_line(
     line: Line<'static>,
     col_start: usize,
     col_end: Option<usize>,
-    selection_bg: Color,
+    selection_style: Style,
 ) -> Line<'static> {
     let col_end = col_end.unwrap_or(usize::MAX);
     if col_start >= col_end {
@@ -232,7 +231,7 @@ pub fn apply_selection_to_line(
                     &mut run,
                     style,
                     run_selected == Some(true),
-                    selection_bg,
+                    selection_style,
                 );
             }
             run_selected = Some(selected);
@@ -244,7 +243,7 @@ pub fn apply_selection_to_line(
             &mut run,
             style,
             run_selected == Some(true),
-            selection_bg,
+            selection_style,
         );
     }
 
@@ -259,13 +258,13 @@ fn flush_run(
     run: &mut String,
     style: ratatui::style::Style,
     selected: bool,
-    selection_bg: Color,
+    selection_style: Style,
 ) {
     if run.is_empty() {
         return;
     }
     let style = if selected {
-        style.bg(selection_bg)
+        style.patch(selection_style)
     } else {
         style
     };
@@ -301,7 +300,7 @@ pub fn slice_row_by_columns(text: &str, col_start: usize, col_end: Option<usize>
 #[cfg(test)]
 mod tests {
     use ratatui::layout::Rect;
-    use ratatui::style::{Color, Style};
+    use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
 
     use super::{
@@ -440,7 +439,7 @@ mod tests {
             Span::styled("abc", Style::default().fg(Color::Red)),
             Span::styled("def", Style::default().fg(Color::Blue)),
         ]);
-        let highlighted = apply_selection_to_line(line, 2, Some(4), SEL_BG);
+        let highlighted = apply_selection_to_line(line, 2, Some(4), Style::default().bg(SEL_BG));
         assert_eq!(
             rendered(&highlighted),
             vec![
@@ -461,7 +460,7 @@ mod tests {
             Span::styled("\"hello\"", Style::default().fg(Color::Green)),
         ]);
 
-        let highlighted = apply_selection_to_line(line, 0, None, SEL_BG);
+        let highlighted = apply_selection_to_line(line, 0, None, Style::default().bg(SEL_BG));
 
         let foregrounds: Vec<Option<Color>> =
             highlighted.spans.iter().map(|span| span.style.fg).collect();
@@ -480,7 +479,7 @@ mod tests {
     #[test]
     fn apply_selection_open_end_highlights_through_end_of_line() {
         let line = Line::from(Span::raw("abcdef"));
-        let highlighted = apply_selection_to_line(line, 3, None, SEL_BG);
+        let highlighted = apply_selection_to_line(line, 3, None, Style::default().bg(SEL_BG));
         let flags: Vec<bool> = highlighted
             .spans
             .iter()
@@ -494,7 +493,7 @@ mod tests {
     fn apply_selection_treats_wide_characters_by_leading_column() {
         // "世" occupies columns 0-1, "界" columns 2-3, "x" column 4.
         let line = Line::from(Span::raw("世界x"));
-        let highlighted = apply_selection_to_line(line, 2, Some(4), SEL_BG);
+        let highlighted = apply_selection_to_line(line, 2, Some(4), Style::default().bg(SEL_BG));
         assert_eq!(
             rendered(&highlighted),
             vec![
@@ -502,6 +501,27 @@ mod tests {
                 ("界".to_string(), true, None),
                 ("x".to_string(), false, None),
             ]
+        );
+    }
+
+    #[test]
+    fn monochrome_selection_reverses_while_preserving_source_modifiers() {
+        let source = Style::default().add_modifier(Modifier::BOLD);
+        let selected = Style::default().add_modifier(Modifier::REVERSED);
+        let line = Line::from(Span::styled("abc", source));
+
+        let rendered = apply_selection_to_line(line, 0, None, selected);
+        assert!(
+            rendered.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            rendered.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
         );
     }
 
