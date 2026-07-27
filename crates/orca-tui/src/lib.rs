@@ -47,6 +47,7 @@ mod surface_boundary_tests;
 mod surface_client;
 mod surface_projection;
 mod syntax_highlight;
+mod terminal_capabilities;
 mod terminal_lifecycle;
 pub mod theme;
 mod transcript_view;
