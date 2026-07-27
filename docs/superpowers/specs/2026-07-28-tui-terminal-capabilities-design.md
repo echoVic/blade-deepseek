@@ -28,7 +28,7 @@ This sub-project includes:
   by third-party widgets.
 - Monochrome-safe selection and jump-to-bottom styling.
 - Cache and syntax-style identity updates for color-depth changes.
-- Failure-safe startup behavior and deterministic pure tests.
+- Ownership-safe startup behavior and deterministic pure tests.
 
 It does not include:
 
@@ -98,20 +98,24 @@ colors in setup screens and colors produced by third-party widgets.
 Add workspace dependencies:
 
 ```toml
-terminal-colorsaurus = "1.0.3"
+qwertty = { version = "=0.1.6", features = ["tokio"] }
 supports-color = "3.0.2"
 ```
 
 `orca-tui` consumes both directly.
 
-`terminal-colorsaurus` owns the OSC 11 exchange, raw-mode guard, `/dev/tty`
-or Windows terminal handle, DA1 feature detection, response consumption, and
-timeout. This avoids passing OSC responses through crossterm 0.28, whose public
-event parser does not expose OSC response events.
+`qwertty` permanently owns the terminal input stream, raw mode, query
+correlator, alternate-screen and input-reporting lifecycle. Its DA1-fenced
+capability probe includes OSC 11, preserves unrelated typeahead byte-exact,
+and keeps late replies in the same lossless parser instead of exposing them to
+crossterm as fake keys.
 
-`supports-color` owns stdout TTY and environment heuristics, including
-`COLORTERM`, `TERM`, `TERM_PROGRAM`, `NO_COLOR`, `FORCE_COLOR`, and Windows
-terminal support.
+Crossterm remains ratatui's output backend only. Orca does not call
+`crossterm::event::read`, `poll`, or `EventStream` after this migration.
+
+`supports-color` remains the source of stdout TTY and color-depth heuristics,
+including `COLORTERM`, `TERM`, `TERM_PROGRAM`, `NO_COLOR`, `FORCE_COLOR`, and
+Windows terminal support.
 
 ## Theme Selection
 
@@ -137,7 +141,7 @@ Only `Auto` consults the detected background:
 |---|---|---|
 | Auto | Light | Light |
 | Auto | Dark | Dark |
-| Auto | Unknown or query failure | Dark |
+| Auto | Unknown because the probe was silent, unsupported, or malformed | Dark |
 | Dark | Any | Dark |
 | Light | Any | Light |
 | Solarized | Any | Solarized |
@@ -150,62 +154,118 @@ callers. `ThemeName::Auto` resolves to the truecolor Dark palette in that
 context because no terminal profile is supplied. Production startup uses
 `Theme::resolve`.
 
-## Startup Detection
+## Terminal Input Ownership and Startup Probe
 
-### Ordering
+A dedicated `InputRuntime` owns one `qwertty::TokioTerminalSession` on a named
+OS thread with a current-thread Tokio runtime. It is the sole reader and the
+sole writer of query/mode lifecycle commands for the entire TUI lifetime.
 
-Detection happens at the start of `run_tui_inner`, before:
+Startup order inside the owner thread:
 
-- `crossterm::terminal::enable_raw_mode`;
-- alternate-screen entry;
-- mouse, paste, focus, or keyboard-enhancement setup;
-- construction of the crossterm event reader;
-- the initial frame.
+1. Open `TokioTerminalSession`, entering raw mode.
+2. For `ThemeName::Auto`, run
+   `probe_capabilities(Duration::from_millis(250))`; explicit themes skip the
+   probe entirely.
+3. Map the reported OSC 11 background to Dark/Light. A silent, unsupported, or
+   malformed result remains Unknown.
+4. Map color depth using `supports-color`.
+5. Enter alternate screen.
+6. Enable `MouseMode::ButtonEvent` and bracketed paste.
+7. Push Orca's existing kitty flags: disambiguate escape codes, report event
+   types, and report alternate keys. Do not request associated text in this
+   migration, preserving the existing one-key-event input contract.
+8. Send the startup profile to the main thread.
+9. Continue reading events until shutdown.
 
-This gives `terminal-colorsaurus` exclusive ownership of the terminal query and
-ensures OSC/DA1 responses cannot race with Orca input events.
+The probe uses qwertty's DA1 fence. Input that is not a probe reply is buffered
+for later `next_event()` delivery. Replies that arrive after probe timeout are
+lossless `Event::Syntax` values in the same session and are ignored by Orca;
+they never enter crossterm parsing. This closes both late-reply injection and
+typeahead-loss races.
 
-### Background
+`TERM=dumb` and `TERM=linux` are skipped by qwertty without writing probe bytes.
+SSH is not special-cased: the single-owner correlator makes a bounded query
+safe even when latency causes an all-unknown result.
 
-When the configured theme is `Auto`, call:
+The main thread waits for the startup result before creating the ratatui
+terminal or first frame. `CapabilityBackend<CrosstermBackend<Stdout>>` owns only
+frame output. Qwertty emits no steady-state output except final lifecycle
+cleanup, so output streams cannot interleave during rendering.
 
-```rust
-terminal_colorsaurus::background_color(QueryOptions {
-    timeout: Duration::from_millis(250),
-})
-```
+### Continuous Input
 
-Map a successful color using `Color::perceived_lightness()`:
+`InputRuntime` selects between:
 
-- `<= 0.5` is Dark;
-- `> 0.5` is Light.
+- `session.next_event()`;
+- a shutdown signal;
+- on Unix, a `ResizeStream` SIGWINCH fallback.
+- qwertty's cross-platform `SignalStream`.
 
-Any error maps to `TerminalBackground::Unknown`.
+Do not enable qwertty in-band resize in this sub-project. Unix resize always
+comes from `ResizeStream`; Windows resize arrives through `next_event()`.
 
-When the configured theme is explicit, do not call the library; record
-`Unknown`. Background capability and color depth are independent, so explicit
-themes still receive color-depth adaptation.
+`SIGTSTP`/`SIGCONT` use qwertty `suspend()`/`resume(false)` so job control
+restores and re-enters the same mode ledger without flushing typeahead.
+`SIGINT`/`SIGTERM` and the corresponding Windows console-control events exit
+the owner loop and run normal `leave()`. Future unknown signal variants are
+ignored rather than guessed.
 
-The 250 ms timeout bounds startup latency on SSH or unusual terminals.
-Known-unsupported terminals generally return before the timeout through the
-library's DA1 feature detection.
+Suspend and teardown writes use an explicit main-thread barrier. Before
+qwertty writes suspend cleanup, the main frame loop acknowledges that it has
+stopped drawing; it resumes drawing only after qwertty has re-entered every
+recorded mode. After resume, the main thread clears ratatui's retained back
+buffer before marking the frame dirty, because qwertty re-entry clears the
+alternate screen. For terminate or input failure, the owner disconnects its event
+channels and waits for the main thread to drop ratatui and send stop before
+calling `leave()`.
 
-### Color Depth
+The control mailbox is bounded and shutdown-aware. A full mailbox or an
+unavailable acknowledgement cannot prevent stop from reaching the owner and
+cannot block terminal restoration.
 
-Call `supports_color::on(Stream::Stdout)` once:
+Events are converted into the existing crossterm `Event` vocabulary so the
+business handling chain remains unchanged. A stateful adapter handles:
 
-| Detection result | Color level |
-|---|---|
-| `has_16m` | TrueColor |
-| otherwise `has_256` | Ansi256 |
-| otherwise `has_basic` | Ansi16 |
-| `None` | Monochrome |
+- named keys, C0 controls, six modifiers, Caps/Num state, and event kind;
+- Shift+Tab as `BackTab`;
+- qwertty's 1-based mouse coordinates as crossterm's 0-based coordinates;
+- button press/release/drag and four scroll directions;
+- focus and cell resize events;
+- segmented bracketed paste reassembled into one UTF-8 `Event::Paste`;
+- `Event::Syntax` and unsupported future variants dropped, never converted to
+  fake keypresses.
 
-The output stream must be a terminal for normal TUI startup. Tests exercise
-the pure mapping from detected facts rather than relying on the test process's
-TTY.
+Invalid UTF-8 paste, malformed zero mouse coordinates, unsupported extra mouse
+buttons, and impossible future variants are ignored rather than guessed.
 
-Detection failures never stop TUI startup.
+The input channel is bounded. Sending is shutdown-aware so a full mailbox can
+never prevent the owner thread from restoring the terminal.
+
+### Cleanup
+
+On normal exit or unwind:
+
+1. Stop drawing and drop the ratatui terminal.
+2. Signal and join `InputRuntime`.
+3. The owner cancels the pending `next_event()` (cancel-safe), calls
+   `session.leave().await`, restores raw mode and every recorded mode, then
+   exits.
+4. Only after terminal restoration do other supervised runtime shutdowns
+   continue.
+
+`InputRuntime::Drop` performs the same idempotent stop/join path. A process-wide
+panic-hook registry is installed once and chains to the pre-existing hook. The
+currently active qwertty `RestoreHandle` is registered before startup becomes
+visible and cleared on normal shutdown, so restoration happens before panic
+output without accumulating hooks across repeated TUI runs. Emergency restore
+is limited to panics on the TUI owner thread or qwertty input-owner thread;
+recoverable panics on supervised worker threads do not tear down a live TUI.
+Only one TUI may own the active restore slot at a time. An RAII owner lease is
+released exactly once, so repeated `finish()`/`Drop` calls cannot clear a newer
+runtime's ownership.
+
+The previous `TerminalCleanup` and crossterm mode setup are removed to avoid
+competing ownership and double-pop/reset commands.
 
 ## Color Adaptation
 
@@ -417,16 +477,16 @@ the same contract.
 
 ## Error Handling
 
-- Background query error or timeout: `Unknown`, then Dark for Auto.
-- Color support returns `None`: Monochrome.
-- No stdout TTY: the TUI's existing startup path determines whether it can run;
-  detection itself never panics.
-- Unsupported `screen`, `TERM=dumb`, redirected streams, Windows versions
-  without query support, and malformed terminal responses are library errors
-  and fall back silently.
-- No diagnostic escape sequence or error text is written into the TUI buffer.
-- Terminal query state is restored by `terminal-colorsaurus` before Orca
-  enables its own raw mode.
+- Input-runtime open, mode setup, thread startup, or runtime failure returns a
+  typed `io::Error` to the TUI startup/loop.
+- Probe timeout, unsupported replies, and malformed replies are non-fatal and
+  produce an Unknown background.
+- A silent probe is not an error; Auto falls back to Dark.
+- Unknown color depth maps to Monochrome.
+- Invalid or unsupported qwertty input is ignored without becoming a key.
+- A full input mailbox cannot block shutdown or terminal restoration.
+- No automated test opens the developer's terminal or sends real OSC.
+- Non-TUI modes never construct `InputRuntime` and never probe.
 
 ## Testing
 
@@ -470,14 +530,18 @@ Implementation follows strict test-driven development.
 - Monochrome selection and composer selection use `REVERSED`.
 - Hardware cursor and Vim mode cursor tests remain green.
 
-### Startup
+### Input Adapter and Runtime
 
-Use an injected detector trait/function in tests:
-
-- explicit themes never invoke background detection;
-- Auto invokes it once;
-- query success, timeout, unsupported, and error map correctly;
-- detection occurs before raw-mode setup in the startup orchestration helper.
+- Every qwertty key/modifier/kind mapping used by Orca.
+- Shift+Tab, C0 controls, mouse coordinate rebasing, drag/scroll, focus, resize.
+- Segmented paste reassembly and invalid-input rejection.
+- Syntax/late-reply events never become keys.
+- Probe typeahead is delivered after startup.
+- Silent/late probe replies do not leak into crossterm.
+- Startup order: open, probe, modes, profile.
+- Stop cancels blocked `next_event`, full mailbox cannot deadlock, leave occurs
+  before join, and Drop uses the same path.
+- Main-loop batching remains capped and frame scheduling is not starved.
 
 No automated test sends a real OSC query to the developer's terminal.
 

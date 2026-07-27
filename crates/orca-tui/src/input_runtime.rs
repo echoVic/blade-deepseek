@@ -23,26 +23,27 @@ const INPUT_CHANNEL_CAPACITY: usize = 256;
 const STARTUP_CHANNEL_CAPACITY: usize = 1;
 
 static PANIC_HOOK_INIT: Once = Once::new();
-static ACTIVE_RESTORE_HANDLE: Mutex<Option<RestoreHandle>> = Mutex::new(None);
+static ACTIVE_RESTORE_HANDLE: Mutex<Option<ActiveRestore>> = Mutex::new(None);
 static TERMINAL_OWNER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-enum StartupMessage {
-    Ready(TerminalProfile),
-    Failed {
-        kind: io::ErrorKind,
-        message: String,
-    },
+struct ActiveRestore {
+    handle: RestoreHandle,
+    owner_thread: thread::ThreadId,
+    input_thread: thread::ThreadId,
 }
 
-pub(crate) struct InputRuntime {
-    profile: TerminalProfile,
-    events: mpsc::Receiver<crossterm::event::Event>,
-    stop_tx: Option<watch::Sender<bool>>,
-    join: Option<thread::JoinHandle<io::Result<()>>>,
+fn should_restore_for_panic(
+    owner_thread: thread::ThreadId,
+    input_thread: thread::ThreadId,
+    panicking_thread: thread::ThreadId,
+) -> bool {
+    panicking_thread == owner_thread || panicking_thread == input_thread
 }
 
-impl InputRuntime {
-    pub(crate) fn start(requested_theme: ThemeName) -> io::Result<Self> {
+struct TerminalOwnerLease;
+
+impl TerminalOwnerLease {
+    fn acquire() -> io::Result<Self> {
         if TERMINAL_OWNER_ACTIVE
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -52,41 +53,85 @@ impl InputRuntime {
                 "another TUI already owns the terminal",
             ));
         }
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalOwnerLease {
+    fn drop(&mut self) {
+        TERMINAL_OWNER_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+enum StartupMessage {
+    Ready(TerminalProfile),
+    Failed {
+        kind: io::ErrorKind,
+        message: String,
+    },
+}
+
+pub(crate) enum InputControl {
+    Suspend {
+        acknowledge: tokio::sync::oneshot::Sender<()>,
+    },
+    Resumed,
+}
+
+pub(crate) struct InputRuntime {
+    profile: TerminalProfile,
+    events: mpsc::Receiver<crossterm::event::Event>,
+    controls: mpsc::Receiver<InputControl>,
+    stop_tx: Option<watch::Sender<bool>>,
+    join: Option<thread::JoinHandle<io::Result<()>>>,
+    owner_lease: Option<TerminalOwnerLease>,
+}
+
+impl InputRuntime {
+    pub(crate) fn start(requested_theme: ThemeName) -> io::Result<Self> {
+        let owner_lease = TerminalOwnerLease::acquire()?;
+        let owner_thread = thread::current().id();
 
         let color_level = system_color_level();
         let (event_tx, events) = mpsc::bounded(INPUT_CHANNEL_CAPACITY);
+        let (control_tx, controls) = mpsc::bounded(1);
         let (startup_tx, startup_rx) = mpsc::bounded(STARTUP_CHANNEL_CAPACITY);
         let (stop_tx, stop_rx) = watch::channel(false);
         let join = match thread::Builder::new()
             .name("orca-tui-input".to_string())
             .spawn(move || {
-                input_thread(requested_theme, color_level, startup_tx, event_tx, stop_rx)
+                input_thread(
+                    requested_theme,
+                    color_level,
+                    startup_tx,
+                    event_tx,
+                    control_tx,
+                    stop_rx,
+                    owner_thread,
+                )
             }) {
             Ok(join) => join,
-            Err(error) => {
-                TERMINAL_OWNER_ACTIVE.store(false, Ordering::Release);
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
 
         match startup_rx.recv() {
             Ok(StartupMessage::Ready(profile)) => Ok(Self {
                 profile,
                 events,
+                controls,
                 stop_tx: Some(stop_tx),
                 join: Some(join),
+                owner_lease: Some(owner_lease),
             }),
             Ok(StartupMessage::Failed { kind, message }) => {
                 let _ = join.join();
-                TERMINAL_OWNER_ACTIVE.store(false, Ordering::Release);
                 Err(io::Error::new(kind, message))
             }
             Err(_) => {
-                let thread_error = join
-                    .join()
-                    .map_err(|_| io::Error::other("terminal input thread panicked"))?
-                    .err();
-                TERMINAL_OWNER_ACTIVE.store(false, Ordering::Release);
+                let thread_error = match join.join() {
+                    Ok(result) => result.err(),
+                    Err(_) => Some(io::Error::other("terminal input thread panicked")),
+                };
                 Err(thread_error.unwrap_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -105,17 +150,23 @@ impl InputRuntime {
         &self.events
     }
 
+    pub(crate) fn controls(&self) -> &mpsc::Receiver<InputControl> {
+        &self.controls
+    }
+
     pub(crate) fn finish(&mut self) -> io::Result<()> {
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(true);
         }
         let result = if let Some(join) = self.join.take() {
-            join.join()
-                .map_err(|_| io::Error::other("terminal input thread panicked"))?
+            match join.join() {
+                Ok(result) => result,
+                Err(_) => Err(io::Error::other("terminal input thread panicked")),
+            }
         } else {
             Ok(())
         };
-        TERMINAL_OWNER_ACTIVE.store(false, Ordering::Release);
+        self.owner_lease.take();
         result
     }
 
@@ -123,14 +174,17 @@ impl InputRuntime {
     fn from_parts_for_test(
         profile: TerminalProfile,
         events: mpsc::Receiver<crossterm::event::Event>,
+        controls: mpsc::Receiver<InputControl>,
         stop_tx: watch::Sender<bool>,
         join: thread::JoinHandle<io::Result<()>>,
     ) -> Self {
         Self {
             profile,
             events,
+            controls,
             stop_tx: Some(stop_tx),
             join: Some(join),
+            owner_lease: Some(TerminalOwnerLease),
         }
     }
 }
@@ -146,7 +200,9 @@ fn input_thread(
     color_level: TerminalColorLevel,
     startup_tx: mpsc::Sender<StartupMessage>,
     event_tx: mpsc::Sender<crossterm::event::Event>,
+    control_tx: mpsc::Sender<InputControl>,
     stop_rx: watch::Receiver<bool>,
+    owner_thread: thread::ThreadId,
 ) -> io::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -162,13 +218,14 @@ fn input_thread(
                 return Err(error);
             }
         };
-        let _restore_registration = RestoreRegistration::install(restore_handle)?;
+        let _restore_registration = RestoreRegistration::install(restore_handle, owner_thread)?;
         drive_terminal(
             driver,
             requested_theme,
             color_level,
             startup_tx,
             event_tx,
+            control_tx,
             stop_rx,
         )
         .await
@@ -178,14 +235,19 @@ fn input_thread(
 struct RestoreRegistration;
 
 impl RestoreRegistration {
-    fn install(handle: RestoreHandle) -> io::Result<Self> {
+    fn install(handle: RestoreHandle, owner_thread: thread::ThreadId) -> io::Result<Self> {
         PANIC_HOOK_INIT.call_once(|| {
             let previous = panic::take_hook();
             panic::set_hook(Box::new(move |info| {
                 if let Ok(slot) = ACTIVE_RESTORE_HANDLE.try_lock()
-                    && let Some(handle) = slot.as_ref()
+                    && let Some(active) = slot.as_ref()
+                    && should_restore_for_panic(
+                        active.owner_thread,
+                        active.input_thread,
+                        thread::current().id(),
+                    )
                 {
-                    let _ = handle.restore();
+                    let _ = active.handle.restore();
                 }
                 previous(info);
             }));
@@ -199,7 +261,11 @@ impl RestoreRegistration {
                 "terminal restore handle is already registered",
             ));
         }
-        *slot = Some(handle);
+        *slot = Some(ActiveRestore {
+            handle,
+            owner_thread,
+            input_thread: thread::current().id(),
+        });
         Ok(Self)
     }
 }
@@ -214,6 +280,7 @@ impl Drop for RestoreRegistration {
 
 struct QwerttyDriver {
     session: TokioTerminalSession,
+    signals: qwertty::SignalStream,
     #[cfg(unix)]
     resizes: qwertty::ResizeStream,
 }
@@ -222,11 +289,13 @@ impl QwerttyDriver {
     fn open() -> io::Result<(Self, RestoreHandle)> {
         let session = TokioTerminalSession::open().map_err(qwertty_error)?;
         let restore_handle = session.restore_handle();
+        let signals = session.signals().map_err(qwertty_error)?;
         #[cfg(unix)]
         let resizes = session.resize_stream().map_err(qwertty_error)?;
         Ok((
             Self {
                 session,
+                signals,
                 #[cfg(unix)]
                 resizes,
             },
@@ -235,13 +304,24 @@ impl QwerttyDriver {
     }
 }
 
+#[derive(Clone, Debug)]
+enum TerminalActivity {
+    Event(QwerttyEvent),
+    Suspend,
+    Continue,
+    Terminate,
+    Ignore,
+}
+
 trait TerminalDriver: Sized {
     async fn probe_background(&mut self, timeout: Duration) -> io::Result<Option<Rgb>>;
     async fn enter_alternate_screen(&mut self) -> io::Result<()>;
     async fn enable_mouse(&mut self) -> io::Result<()>;
     async fn enable_bracketed_paste(&mut self) -> io::Result<()>;
     async fn push_keyboard_flags(&mut self) -> io::Result<()>;
-    async fn next_event(&mut self) -> io::Result<QwerttyEvent>;
+    async fn next_activity(&mut self) -> io::Result<TerminalActivity>;
+    async fn suspend(&mut self) -> io::Result<()>;
+    async fn resume(&mut self) -> io::Result<()>;
     async fn leave(self) -> io::Result<()>;
 }
 
@@ -285,24 +365,67 @@ impl TerminalDriver for QwerttyDriver {
             .map_err(qwertty_error)
     }
 
-    async fn next_event(&mut self) -> io::Result<QwerttyEvent> {
+    async fn next_activity(&mut self) -> io::Result<TerminalActivity> {
         #[cfg(unix)]
         {
             tokio::select! {
-                event = self.session.next_event() => event.map_err(qwertty_error),
-                resize = self.resizes.next_resize() => {
-                    resize.map(QwerttyEvent::Resize).map_err(qwertty_error)
+                biased;
+                signal = self.signals.next() => {
+                    signal.map(terminal_signal_activity).map_err(qwertty_error)
                 }
+                resize = self.resizes.next_resize() => {
+                    resize
+                        .map(QwerttyEvent::Resize)
+                        .map(TerminalActivity::Event)
+                        .map_err(qwertty_error)
+                }
+                event = self.session.next_event() => {
+                    event.map(TerminalActivity::Event).map_err(qwertty_error)
+                },
             }
         }
         #[cfg(windows)]
         {
-            self.session.next_event().await.map_err(qwertty_error)
+            tokio::select! {
+                biased;
+                signal = self.signals.next() => {
+                    signal.map(terminal_signal_activity).map_err(qwertty_error)
+                }
+                event = self.session.next_event() => {
+                    event.map(TerminalActivity::Event).map_err(qwertty_error)
+                }
+            }
+        }
+    }
+
+    async fn suspend(&mut self) -> io::Result<()> {
+        self.session.suspend().await.map_err(qwertty_error)
+    }
+
+    async fn resume(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.session.resume(false).await.map_err(qwertty_error)
+        }
+        #[cfg(windows)]
+        {
+            Ok(())
         }
     }
 
     async fn leave(self) -> io::Result<()> {
         self.session.leave().await.map_err(qwertty_error)
+    }
+}
+
+fn terminal_signal_activity(signal: qwertty::TerminalSignal) -> TerminalActivity {
+    match signal {
+        qwertty::TerminalSignal::Suspend => TerminalActivity::Suspend,
+        qwertty::TerminalSignal::Continue => TerminalActivity::Continue,
+        qwertty::TerminalSignal::Terminate | qwertty::TerminalSignal::Interrupt => {
+            TerminalActivity::Terminate
+        }
+        _ => TerminalActivity::Ignore,
     }
 }
 
@@ -320,6 +443,7 @@ async fn drive_terminal<D: TerminalDriver>(
     color_level: TerminalColorLevel,
     startup_tx: mpsc::Sender<StartupMessage>,
     event_tx: mpsc::Sender<crossterm::event::Event>,
+    control_tx: mpsc::Sender<InputControl>,
     mut stop_rx: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let background = if requested_theme == ThemeName::Auto {
@@ -350,11 +474,22 @@ async fn drive_terminal<D: TerminalDriver>(
         background: terminal_background_from_rgb(requested_theme, background),
         color_level,
     };
-    startup_tx
-        .send(StartupMessage::Ready(profile))
-        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI startup receiver closed"))?;
+    if startup_tx.send(StartupMessage::Ready(profile)).is_err() {
+        return finish_driver(
+            driver,
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "TUI startup receiver closed",
+            )),
+        )
+        .await;
+    }
 
     let mut adapter = InputAdapter::default();
+    let mut event_tx = Some(event_tx);
+    let mut control_tx = Some(control_tx);
+    let mut wait_for_main_teardown = false;
+    let mut suspended = false;
     let operation = loop {
         tokio::select! {
             biased;
@@ -365,21 +500,104 @@ async fn drive_terminal<D: TerminalDriver>(
                     Err(_) => break Ok(()),
                 }
             }
-            event = driver.next_event() => {
-                let event = match event {
-                    Ok(event) => event,
-                    Err(error) => break Err(error),
+            activity = driver.next_activity() => {
+                let activity = match activity {
+                    Ok(activity) => activity,
+                    Err(error) => {
+                        wait_for_main_teardown = true;
+                        break Err(error);
+                    }
                 };
-                if let Some(event) = adapter.adapt(event)
-                    && !send_event_until_stopped(&event_tx, event, &mut stop_rx).await
-                {
-                    break Ok(());
+                match activity {
+                    TerminalActivity::Event(event) => {
+                        if let Some(event) = adapter.adapt(event)
+                            && !send_event_until_stopped(
+                                event_tx.as_ref().expect("event sender is live"),
+                                event,
+                                &mut stop_rx,
+                            )
+                            .await
+                        {
+                            break Ok(());
+                        }
+                    }
+                    TerminalActivity::Suspend => {
+                        let (acknowledge, acknowledged) = tokio::sync::oneshot::channel();
+                        if !send_control_until_stopped(
+                            control_tx.as_ref().expect("control sender is live"),
+                            InputControl::Suspend { acknowledge },
+                            &mut stop_rx,
+                        )
+                        .await
+                        {
+                            break Ok(());
+                        }
+                        tokio::select! {
+                            biased;
+                            changed = stop_rx.changed() => {
+                                match changed {
+                                    Ok(()) if *stop_rx.borrow() => break Ok(()),
+                                    Ok(()) => continue,
+                                    Err(_) => break Ok(()),
+                                }
+                            }
+                            acknowledged = acknowledged => {
+                                if acknowledged.is_err() {
+                                    wait_for_main_teardown = true;
+                                    break Err(io::Error::new(
+                                        io::ErrorKind::BrokenPipe,
+                                        "TUI suspend acknowledgement closed",
+                                    ));
+                                }
+                            }
+                        }
+                        if let Err(error) = driver.suspend().await {
+                            wait_for_main_teardown = true;
+                            break Err(error);
+                        }
+                        suspended = true;
+                    }
+                    TerminalActivity::Continue if suspended => {
+                        if let Err(error) = driver.resume().await {
+                            wait_for_main_teardown = true;
+                            break Err(error);
+                        }
+                        suspended = false;
+                        if !send_control_until_stopped(
+                            control_tx.as_ref().expect("control sender is live"),
+                            InputControl::Resumed,
+                            &mut stop_rx,
+                        )
+                        .await
+                        {
+                            break Ok(());
+                        }
+                    }
+                    TerminalActivity::Continue => {}
+                    TerminalActivity::Terminate => {
+                        wait_for_main_teardown = true;
+                        break Ok(());
+                    }
+                    TerminalActivity::Ignore => {}
                 }
             }
         }
     };
 
+    if wait_for_main_teardown {
+        event_tx.take();
+        control_tx.take();
+        wait_for_stop(&mut stop_rx).await;
+    }
     finish_driver(driver, operation).await
+}
+
+async fn wait_for_stop(stop_rx: &mut watch::Receiver<bool>) {
+    while !*stop_rx.borrow() {
+        if stop_rx.changed().await.is_err() {
+            break;
+        }
+    }
 }
 
 async fn fail_startup<D: TerminalDriver>(
@@ -425,11 +643,39 @@ async fn send_event_until_stopped(
     }
 }
 
+async fn send_control_until_stopped(
+    sender: &mpsc::Sender<InputControl>,
+    mut control: InputControl,
+    stop_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    loop {
+        match sender.try_send(control) {
+            Ok(()) => return true,
+            Err(mpsc::TrySendError::Disconnected(_)) => return false,
+            Err(mpsc::TrySendError::Full(returned)) => control = returned,
+        }
+
+        tokio::select! {
+            biased;
+            changed = stop_rx.changed() => {
+                match changed {
+                    Ok(()) if *stop_rx.borrow() => return false,
+                    Ok(()) => {}
+                    Err(_) => return false,
+                }
+            }
+            () = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::io;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
+    use std::thread::ThreadId;
     use std::time::Duration;
 
     use crossbeam_channel as mpsc;
@@ -437,13 +683,18 @@ mod tests {
     use qwertty::{Event, Key, KeyEvent, Rgb};
     use tokio::sync::watch;
 
-    use super::{StartupMessage, TerminalDriver, drive_terminal};
+    use super::{
+        InputControl, StartupMessage, TERMINAL_OWNER_ACTIVE, TerminalActivity, TerminalDriver,
+        drive_terminal, should_restore_for_panic,
+    };
     use crate::terminal_capabilities::{TerminalBackground, TerminalColorLevel};
+
+    static OWNER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct FakeDriver {
         calls: Arc<Mutex<Vec<&'static str>>>,
         background: Option<Rgb>,
-        events: VecDeque<Event>,
+        activities: VecDeque<TerminalActivity>,
         fail_at: Option<&'static str>,
     }
 
@@ -456,7 +707,19 @@ mod tests {
             Self {
                 calls,
                 background,
-                events: events.into_iter().collect(),
+                activities: events.into_iter().map(TerminalActivity::Event).collect(),
+                fail_at: None,
+            }
+        }
+
+        fn with_activities(
+            calls: Arc<Mutex<Vec<&'static str>>>,
+            activities: impl IntoIterator<Item = TerminalActivity>,
+        ) -> Self {
+            Self {
+                calls,
+                background: None,
+                activities: activities.into_iter().collect(),
                 fail_at: None,
             }
         }
@@ -498,13 +761,21 @@ mod tests {
             self.record("keyboard")
         }
 
-        async fn next_event(&mut self) -> io::Result<Event> {
+        async fn next_activity(&mut self) -> io::Result<TerminalActivity> {
             self.record("read")?;
-            if let Some(event) = self.events.pop_front() {
-                Ok(event)
+            if let Some(activity) = self.activities.pop_front() {
+                Ok(activity)
             } else {
                 std::future::pending().await
             }
+        }
+
+        async fn suspend(&mut self) -> io::Result<()> {
+            self.record("suspend")
+        }
+
+        async fn resume(&mut self) -> io::Result<()> {
+            self.record("resume")
         }
 
         async fn leave(self) -> io::Result<()> {
@@ -526,6 +797,16 @@ mod tests {
         panic!("startup message was not sent");
     }
 
+    async fn wait_for_control(receiver: &mpsc::Receiver<InputControl>) -> InputControl {
+        for _ in 0..100 {
+            if let Ok(control) = receiver.try_recv() {
+                return control;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("control message was not sent");
+    }
+
     #[test]
     fn auto_probe_precedes_modes_ready_reads_and_leave() {
         tokio::runtime::Builder::new_current_thread()
@@ -537,6 +818,7 @@ mod tests {
                 let driver = FakeDriver::new(Arc::clone(&calls), light_background(), []);
                 let (startup_tx, startup_rx) = mpsc::bounded(1);
                 let (event_tx, _event_rx) = mpsc::bounded(4);
+                let (control_tx, _control_rx) = mpsc::bounded(1);
                 let (stop_tx, stop_rx) = watch::channel(false);
 
                 let task = tokio::spawn(drive_terminal(
@@ -545,6 +827,7 @@ mod tests {
                     TerminalColorLevel::Ansi256,
                     startup_tx,
                     event_tx,
+                    control_tx,
                     stop_rx,
                 ));
                 let StartupMessage::Ready(profile) = wait_for_startup(&startup_rx).await else {
@@ -581,6 +864,7 @@ mod tests {
                 let driver = FakeDriver::new(Arc::clone(&calls), light_background(), []);
                 let (startup_tx, startup_rx) = mpsc::bounded(1);
                 let (event_tx, _event_rx) = mpsc::bounded(4);
+                let (control_tx, _control_rx) = mpsc::bounded(1);
                 let (stop_tx, stop_rx) = watch::channel(false);
 
                 let task = tokio::spawn(drive_terminal(
@@ -589,6 +873,7 @@ mod tests {
                     TerminalColorLevel::TrueColor,
                     startup_tx,
                     event_tx,
+                    control_tx,
                     stop_rx,
                 ));
                 assert!(matches!(
@@ -620,6 +905,7 @@ mod tests {
                 let driver = FakeDriver::new(Arc::clone(&calls), None, events);
                 let (startup_tx, startup_rx) = mpsc::bounded(1);
                 let (event_tx, event_rx) = mpsc::bounded(1);
+                let (control_tx, _control_rx) = mpsc::bounded(1);
                 let (stop_tx, stop_rx) = watch::channel(false);
 
                 let task = tokio::spawn(drive_terminal(
@@ -628,6 +914,7 @@ mod tests {
                     TerminalColorLevel::TrueColor,
                     startup_tx,
                     event_tx,
+                    control_tx,
                     stop_rx,
                 ));
                 let _ = wait_for_startup(&startup_rx).await;
@@ -657,6 +944,52 @@ mod tests {
     }
 
     #[test]
+    fn full_control_mailbox_never_blocks_stop_or_leave() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let driver =
+                    FakeDriver::with_activities(Arc::clone(&calls), [TerminalActivity::Suspend]);
+                let (startup_tx, startup_rx) = mpsc::bounded(1);
+                let (event_tx, _event_rx) = mpsc::bounded(1);
+                let (control_tx, control_rx) = mpsc::bounded(1);
+                control_tx
+                    .send(InputControl::Resumed)
+                    .expect("control receiver alive");
+                let (stop_tx, stop_rx) = watch::channel(false);
+
+                let task = tokio::spawn(drive_terminal(
+                    driver,
+                    ThemeName::Dark,
+                    TerminalColorLevel::TrueColor,
+                    startup_tx,
+                    event_tx,
+                    control_tx,
+                    stop_rx,
+                ));
+                let _ = wait_for_startup(&startup_rx).await;
+                for _ in 0..100 {
+                    if calls.lock().expect("calls lock").contains(&"read") {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                stop_tx.send(true).expect("stop receiver alive");
+                tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .expect("stop must interrupt a full control mailbox")
+                    .expect("driver task")
+                    .expect("clean stop");
+
+                drop(control_rx);
+                assert_eq!(calls.lock().expect("calls lock").last(), Some(&"leave"));
+            });
+    }
+
+    #[test]
     fn startup_failure_is_reported_and_still_leaves() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -667,6 +1000,7 @@ mod tests {
                 let driver = FakeDriver::new(Arc::clone(&calls), None, []).failing("mouse");
                 let (startup_tx, startup_rx) = mpsc::bounded(1);
                 let (event_tx, _event_rx) = mpsc::bounded(1);
+                let (control_tx, _control_rx) = mpsc::bounded(1);
                 let (_stop_tx, stop_rx) = watch::channel(false);
 
                 let error = drive_terminal(
@@ -675,6 +1009,7 @@ mod tests {
                     TerminalColorLevel::TrueColor,
                     startup_tx,
                     event_tx,
+                    control_tx,
                     stop_rx,
                 )
                 .await
@@ -692,7 +1027,116 @@ mod tests {
     }
 
     #[test]
+    fn terminal_signals_suspend_resume_and_terminate_through_qwertty() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let driver = FakeDriver::with_activities(
+                    Arc::clone(&calls),
+                    [
+                        TerminalActivity::Suspend,
+                        TerminalActivity::Continue,
+                        TerminalActivity::Terminate,
+                    ],
+                );
+                let (startup_tx, startup_rx) = mpsc::bounded(1);
+                let (event_tx, event_rx) = mpsc::bounded(1);
+                let (control_tx, control_rx) = mpsc::bounded(1);
+                let (stop_tx, stop_rx) = watch::channel(false);
+
+                let task = tokio::spawn(drive_terminal(
+                    driver,
+                    ThemeName::Dark,
+                    TerminalColorLevel::TrueColor,
+                    startup_tx,
+                    event_tx,
+                    control_tx,
+                    stop_rx,
+                ));
+                assert!(matches!(
+                    wait_for_startup(&startup_rx).await,
+                    StartupMessage::Ready(_)
+                ));
+                let InputControl::Suspend { acknowledge } = wait_for_control(&control_rx).await
+                else {
+                    panic!("expected suspend control");
+                };
+                acknowledge.send(()).expect("acknowledge suspend");
+                assert!(matches!(
+                    wait_for_control(&control_rx).await,
+                    InputControl::Resumed
+                ));
+                for _ in 0..100 {
+                    if matches!(event_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert!(matches!(
+                    event_rx.try_recv(),
+                    Err(mpsc::TryRecvError::Disconnected)
+                ));
+                stop_tx.send(true).expect("stop receiver alive");
+                task.await.expect("driver task").expect("clean signal exit");
+
+                assert_eq!(
+                    *calls.lock().expect("calls lock"),
+                    [
+                        "alternate",
+                        "mouse",
+                        "paste",
+                        "keyboard",
+                        "read",
+                        "suspend",
+                        "read",
+                        "resume",
+                        "read",
+                        "leave"
+                    ]
+                );
+            });
+    }
+
+    #[test]
+    fn closed_startup_receiver_still_leaves() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let driver = FakeDriver::new(Arc::clone(&calls), None, []);
+                let (startup_tx, startup_rx) = mpsc::bounded(1);
+                drop(startup_rx);
+                let (event_tx, _event_rx) = mpsc::bounded(1);
+                let (control_tx, _control_rx) = mpsc::bounded(1);
+                let (_stop_tx, stop_rx) = watch::channel(false);
+
+                let error = drive_terminal(
+                    driver,
+                    ThemeName::Dark,
+                    TerminalColorLevel::TrueColor,
+                    startup_tx,
+                    event_tx,
+                    control_tx,
+                    stop_rx,
+                )
+                .await
+                .expect_err("closed startup receiver should stop the driver");
+                assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+                assert_eq!(
+                    *calls.lock().expect("calls lock"),
+                    ["alternate", "mouse", "paste", "keyboard", "leave"]
+                );
+            });
+    }
+
+    #[test]
     fn input_runtime_finish_and_drop_signal_and_join_once() {
+        let _owner_guard = OWNER_TEST_LOCK.lock().expect("owner test lock");
         for explicit_finish in [true, false] {
             let (stop_tx, mut stop_rx) = watch::channel(false);
             let joined = Arc::new(Mutex::new(0));
@@ -710,12 +1154,14 @@ mod tests {
                 Ok(())
             });
             let (_event_tx, event_rx) = mpsc::bounded(1);
+            let (_control_tx, control_rx) = mpsc::bounded(1);
             let mut runtime = super::InputRuntime::from_parts_for_test(
                 super::TerminalProfile {
                     background: TerminalBackground::Unknown,
                     color_level: TerminalColorLevel::TrueColor,
                 },
                 event_rx,
+                control_rx,
                 stop_tx,
                 join,
             );
@@ -728,5 +1174,84 @@ mod tests {
             }
             assert_eq!(*joined.lock().expect("join count lock"), 1);
         }
+    }
+
+    #[test]
+    fn input_runtime_thread_panic_releases_global_ownership() {
+        let _owner_guard = OWNER_TEST_LOCK.lock().expect("owner test lock");
+        TERMINAL_OWNER_ACTIVE.store(true, Ordering::Release);
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        let (_event_tx, event_rx) = mpsc::bounded(1);
+        let (_control_tx, control_rx) = mpsc::bounded(1);
+        let join = std::thread::spawn(|| -> io::Result<()> {
+            panic!("simulated input thread panic");
+        });
+        let mut runtime = super::InputRuntime::from_parts_for_test(
+            super::TerminalProfile {
+                background: TerminalBackground::Unknown,
+                color_level: TerminalColorLevel::TrueColor,
+            },
+            event_rx,
+            control_rx,
+            stop_tx,
+            join,
+        );
+
+        let error = runtime.finish().expect_err("thread panic must be reported");
+        assert_eq!(error.to_string(), "terminal input thread panicked");
+        assert!(!TERMINAL_OWNER_ACTIVE.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn finished_runtime_drop_does_not_release_a_replacement_owner() {
+        let _owner_guard = OWNER_TEST_LOCK.lock().expect("owner test lock");
+        TERMINAL_OWNER_ACTIVE.store(true, Ordering::Release);
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        let (_event_tx, event_rx) = mpsc::bounded(1);
+        let (_control_tx, control_rx) = mpsc::bounded(1);
+        let join = std::thread::spawn(|| Ok(()));
+        let mut old_runtime = super::InputRuntime::from_parts_for_test(
+            super::TerminalProfile {
+                background: TerminalBackground::Unknown,
+                color_level: TerminalColorLevel::TrueColor,
+            },
+            event_rx,
+            control_rx,
+            stop_tx,
+            join,
+        );
+
+        old_runtime.finish().expect("old runtime should finish");
+        assert!(!TERMINAL_OWNER_ACTIVE.load(Ordering::Acquire));
+        assert!(
+            TERMINAL_OWNER_ACTIVE
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "replacement owner should acquire the terminal"
+        );
+
+        drop(old_runtime);
+        assert!(
+            TERMINAL_OWNER_ACTIVE.load(Ordering::Acquire),
+            "dropping the finished old runtime must not clear the replacement owner"
+        );
+        TERMINAL_OWNER_ACTIVE.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn panic_restore_is_scoped_to_terminal_owner_threads() {
+        let owner = std::thread::current().id();
+        let input = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .expect("input thread id");
+        let worker = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .expect("worker thread id");
+
+        assert!(should_restore_for_panic(owner, input, owner));
+        assert!(should_restore_for_panic(owner, input, input));
+        assert!(!should_restore_for_panic(owner, input, worker));
+
+        let _: [ThreadId; 3] = [owner, input, worker];
     }
 }

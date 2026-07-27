@@ -6,11 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::ExecutableCommand;
-use crossterm::event::{
-    self, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
-use crossterm::terminal::{self, EnterAlternateScreen};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -31,6 +27,7 @@ use crate::background_tasks::{
     foreground_task_for_tui, notify_recovered_background_approvals_for_tui, stop_task_for_tui,
 };
 use crate::bridge;
+use crate::capability_backend::CapabilityBackend;
 use crate::channels::{tui_event_channel, user_action_channel};
 use crate::clipboard;
 use crate::composer_textarea::{
@@ -42,6 +39,7 @@ use crate::input_event_actions::{
     BatchedInputEvent, MouseFlow, coalesce_input_events, handle_mouse_event, handle_paste_event,
     handle_resize_event, handle_scroll_lines, should_queue_input_event,
 };
+use crate::input_runtime::{InputControl, InputRuntime};
 use crate::interaction_broker::TuiInteractionBroker;
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
@@ -52,7 +50,6 @@ use crate::runtime_interaction_adapter::{
 };
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::submitted_turn::SubmittedTurn;
-use crate::terminal_lifecycle::TerminalCleanup;
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
 use crate::ui;
@@ -69,37 +66,18 @@ pub fn run_tui(config: RunConfig) -> i32 {
 }
 
 fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
+    let pending_input_runtime = InputRuntime::start(config.theme)?;
+    let theme = Theme::resolve(config.theme, pending_input_runtime.profile());
+    let input_rx = pending_input_runtime.events().clone();
+    let input_control_rx = pending_input_runtime.controls().clone();
+
     const FRAME_INTERVAL: Duration = Duration::from_millis(16);
     const ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
     const MAX_INPUT_EVENTS_PER_BATCH: usize = 64;
     const MAX_RUNTIME_EVENTS_PER_BATCH: usize = 256;
     const MAX_SUPERVISED_TUI_TASKS: usize = 32;
 
-    terminal::enable_raw_mode()?;
-    let mut pending_terminal_cleanup = TerminalCleanup::raw_mode_enabled();
-    let mut stdout = io::stdout();
-    // Alternate screen: the fullscreen UI owns the whole viewport, and the
-    // alt buffer has NO scrollback — so the terminal's native scrollbar
-    // cannot drag the viewport away from the frame we repaint (which used to
-    // shear the UI). Selection, copying, and wheel scrolling are all
-    // implemented in-app, so nothing native is lost; on exit the primary
-    // screen returns with the shell's history intact.
-    pending_terminal_cleanup.set_alternate_screen(stdout.execute(EnterAlternateScreen).is_ok());
-    pending_terminal_cleanup.set_mouse_captured(stdout.execute(EnableMouseCapture).is_ok());
-    pending_terminal_cleanup.set_bracketed_paste(stdout.execute(EnableBracketedPaste).is_ok());
-    // Kitty keyboard protocol: push enhancement AFTER entering alternate screen,
-    // otherwise the terminal may reset the keyboard state stack on screen switch.
-    pending_terminal_cleanup.set_keyboard_enhanced(
-        stdout
-            .execute(PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
-            ))
-            .is_ok(),
-    );
-
-    let backend = CrosstermBackend::new(stdout);
+    let backend = CapabilityBackend::new(CrosstermBackend::new(io::stdout()), theme.color_level);
 
     let workspace_root = syntax_workspace_root(&config);
     let (event_tx, pending_event_rx) = tui_event_channel();
@@ -138,7 +116,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     );
     state.approval_mode = config.approval_mode;
     state.reasoning_effort = config.reasoning_effort;
-    let theme = Theme::named(config.theme);
     if should_show_picker && !picker_sessions.is_empty() {
         state.status = AppStatus::SessionPicker;
         state.session_picker_sessions = picker_sessions;
@@ -206,7 +183,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let _ = mention_registry_tx.send(agent_mcp_registry.clone());
     let agent_controller = TuiOperationController::hosted(TuiInteractionBroker::default());
 
-    let mut agent_runtime = TuiAgentRuntime::spawn_hosted(
+    let mut agent_runtime = match TuiAgentRuntime::spawn_hosted(
         action_rx,
         event_tx.clone(),
         MAX_SUPERVISED_TUI_TASKS,
@@ -223,10 +200,18 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                 host,
             );
         },
-    )?;
-    // These moved bindings are declared after the runtime so unwinding drops
-    // the event receiver and restores the terminal before the runtime joins.
-    let terminal_cleanup = pending_terminal_cleanup;
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let mut terminal_input = pending_input_runtime;
+            terminal_input.finish()?;
+            return Err(error);
+        }
+    };
+    // Declare terminal ownership after the agent runtime. Rust drops locals in
+    // reverse declaration order, so every early return first drops ratatui,
+    // then restores/joins qwertty, and only then joins the agent runtime.
+    let mut terminal_input = pending_input_runtime;
     let event_rx = pending_event_rx;
 
     let mut vim_state = VimState::new(config.vim_mode);
@@ -282,19 +267,50 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             scheduler.did_animate(now);
         }
 
-        let mut input_events = Vec::new();
-        if event::poll(scheduler.poll_timeout(now, animation_active))? {
-            let first = event::read()?;
-            if should_queue_input_event(&first) {
-                input_events.push(first);
-            }
-            while input_events.len() < MAX_INPUT_EVENTS_PER_BATCH && event::poll(Duration::ZERO)? {
-                let next = event::read()?;
-                if should_queue_input_event(&next) {
-                    input_events.push(next);
+        let input_events = match receive_input_or_control(
+            &input_rx,
+            &input_control_rx,
+            scheduler.poll_timeout(now, animation_active),
+            MAX_INPUT_EVENTS_PER_BATCH,
+        ) {
+            Ok(InputWake::Events(events)) => events
+                .into_iter()
+                .filter(should_queue_input_event)
+                .collect(),
+            Ok(InputWake::Suspend { acknowledge }) => {
+                acknowledge.send(()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "terminal input runtime dropped suspend acknowledgement",
+                    )
+                })?;
+                loop {
+                    match input_control_rx.recv() {
+                        Ok(InputControl::Resumed) => {
+                            resume_terminal_render(&mut terminal, &mut scheduler)?;
+                            break;
+                        }
+                        Ok(InputControl::Suspend { acknowledge }) => {
+                            let _ = acknowledge.send(());
+                        }
+                        Err(_) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "terminal input runtime disconnected while suspended",
+                            ));
+                        }
+                    }
                 }
+                Vec::new()
             }
-        }
+            Ok(InputWake::Resumed) | Err(mpsc::RecvTimeoutError::Timeout) => Vec::new(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "terminal input runtime disconnected",
+                ));
+            }
+        };
 
         let iteration = run_event_loop_iteration(
             &mut scheduler,
@@ -430,15 +446,93 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         }
     }
 
-    // TerminalCleanup leaves the alternate screen (restoring the shell's
-    // scrollback) and unwinds raw mode / capture modes.
     drop(terminal);
-    terminal_cleanup.finish();
+    terminal_input.finish()?;
     mention_search.shutdown();
     drop(event_rx);
     agent_runtime.shutdown()?;
 
     Ok(exit_code)
+}
+
+fn resume_terminal_render(
+    terminal: &mut InlineTerminal,
+    scheduler: &mut FrameScheduler,
+) -> io::Result<()> {
+    complete_terminal_resume(|| terminal.clear(), || scheduler.mark_dirty())
+}
+
+fn complete_terminal_resume(
+    clear_terminal: impl FnOnce() -> io::Result<()>,
+    mark_dirty: impl FnOnce(),
+) -> io::Result<()> {
+    clear_terminal()?;
+    mark_dirty();
+    Ok(())
+}
+
+#[cfg(test)]
+fn receive_input_batch(
+    receiver: &mpsc::Receiver<Event>,
+    timeout: Duration,
+    limit: usize,
+) -> Result<Vec<Event>, mpsc::RecvTimeoutError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let first = receiver.recv_timeout(timeout)?;
+    let mut events = Vec::with_capacity(limit.min(receiver.len().saturating_add(1)));
+    events.push(first);
+    while events.len() < limit {
+        match receiver.try_recv() {
+            Ok(event) => events.push(event),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+    Ok(events)
+}
+
+enum InputWake {
+    Events(Vec<Event>),
+    Suspend {
+        acknowledge: tokio::sync::oneshot::Sender<()>,
+    },
+    Resumed,
+}
+
+fn receive_input_or_control(
+    events: &mpsc::Receiver<Event>,
+    controls: &mpsc::Receiver<InputControl>,
+    timeout: Duration,
+    limit: usize,
+) -> Result<InputWake, mpsc::RecvTimeoutError> {
+    let timeout_rx = mpsc::after(timeout);
+    crossbeam_channel::select_biased! {
+        recv(controls) -> control => {
+            match control {
+                Ok(InputControl::Suspend { acknowledge }) => {
+                    Ok(InputWake::Suspend { acknowledge })
+                }
+                Ok(InputControl::Resumed) => Ok(InputWake::Resumed),
+                Err(_) => Err(mpsc::RecvTimeoutError::Disconnected),
+            }
+        }
+        recv(events) -> event => {
+            let first = event.map_err(|_| mpsc::RecvTimeoutError::Disconnected)?;
+            let mut batch = Vec::with_capacity(limit.max(1).min(events.len().saturating_add(1)));
+            if limit > 0 {
+                batch.push(first);
+                while batch.len() < limit {
+                    match events.try_recv() {
+                        Ok(event) => batch.push(event),
+                        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+            }
+            Ok(InputWake::Events(batch))
+        }
+        recv(timeout_rx) -> _ => Err(mpsc::RecvTimeoutError::Timeout),
+    }
 }
 
 fn poll_edit_highlight(state: &mut AppState, scheduler: &mut FrameScheduler) -> bool {
@@ -508,18 +602,50 @@ fn shorten_home(path: &str) -> String {
     path.to_string()
 }
 
-type InlineTerminal = Terminal<CrosstermBackend<std::io::Stdout>>;
+type InlineTerminal = Terminal<CapabilityBackend<CrosstermBackend<std::io::Stdout>>>;
+
+fn clear_terminal_scrollback_with<T>(
+    target: &mut T,
+    mut move_home: impl FnMut(&mut T) -> io::Result<()>,
+    mut clear_all: impl FnMut(&mut T) -> io::Result<()>,
+    mut clear_purge: impl FnMut(&mut T) -> io::Result<()>,
+    mut clear_frame: impl FnMut(&mut T) -> io::Result<()>,
+) -> io::Result<()> {
+    move_home(target)?;
+    clear_all(target)?;
+    clear_purge(target)?;
+    clear_frame(target)
+}
 
 /// Erase the native scrollback and on-screen content. Used by the clear-screen shortcut so a
 /// fresh session starts on a clean terminal instead of stacking under the old transcript.
 fn clear_terminal_scrollback(terminal: &mut InlineTerminal) -> io::Result<()> {
     use crossterm::terminal::{Clear, ClearType};
-    let stdout = terminal.backend_mut();
-    stdout.execute(crossterm::cursor::MoveTo(0, 0))?;
-    stdout.execute(Clear(ClearType::All))?;
-    stdout.execute(Clear(ClearType::Purge))?;
-    terminal.clear()?;
-    Ok(())
+    clear_terminal_scrollback_with(
+        terminal,
+        |terminal| {
+            terminal
+                .backend_mut()
+                .inner_mut()
+                .execute(crossterm::cursor::MoveTo(0, 0))?;
+            Ok(())
+        },
+        |terminal| {
+            terminal
+                .backend_mut()
+                .inner_mut()
+                .execute(Clear(ClearType::All))?;
+            Ok(())
+        },
+        |terminal| {
+            terminal
+                .backend_mut()
+                .inner_mut()
+                .execute(Clear(ClearType::Purge))?;
+            Ok(())
+        },
+        Terminal::clear,
+    )
 }
 
 #[cfg(test)]
@@ -639,6 +765,238 @@ mod tests {
         ModelRuntimeConfig, OutputFormat, ProviderKind, ThemeName, ToolConfig, WorkflowConfig,
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn receive_input_batch_waits_drains_and_caps() {
+        let (sender, receiver) = mpsc::bounded(128);
+        for character in 'a'..='z' {
+            sender
+                .send(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                )))
+                .expect("receiver alive");
+        }
+
+        let first = receive_input_batch(&receiver, Duration::from_millis(10), 5)
+            .expect("queued input should be received");
+        assert_eq!(first.len(), 5);
+        assert_eq!(receiver.len(), 21);
+
+        let remaining = receive_input_batch(&receiver, Duration::from_millis(10), 64)
+            .expect("remaining queued input should be received");
+        assert_eq!(remaining.len(), 21);
+        assert!(receiver.is_empty());
+
+        sender
+            .send(Event::Key(KeyEvent::new(
+                KeyCode::Char('!'),
+                KeyModifiers::NONE,
+            )))
+            .expect("receiver alive");
+        assert_eq!(
+            receive_input_batch(&receiver, Duration::from_millis(10), 0),
+            Ok(Vec::new())
+        );
+        assert_eq!(receiver.len(), 1);
+    }
+
+    #[test]
+    fn receive_input_batch_reports_timeout_and_disconnect() {
+        let (sender, receiver) = mpsc::bounded(1);
+        assert_eq!(
+            receive_input_batch(&receiver, Duration::from_millis(1), 64),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        drop(sender);
+        assert_eq!(
+            receive_input_batch(&receiver, Duration::from_millis(1), 64),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+    }
+
+    #[test]
+    fn receive_input_or_control_prioritizes_suspend_over_queued_keys() {
+        let (event_tx, event_rx) = mpsc::bounded(1);
+        event_tx
+            .send(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("event receiver alive");
+        let (control_tx, control_rx) = mpsc::bounded(1);
+        let (acknowledge, acknowledged) = tokio::sync::oneshot::channel();
+        control_tx
+            .send(InputControl::Suspend { acknowledge })
+            .expect("control receiver alive");
+
+        let wake = receive_input_or_control(&event_rx, &control_rx, Duration::from_millis(10), 64)
+            .expect("suspend control should win");
+        let InputWake::Suspend { acknowledge } = wake else {
+            panic!("expected suspend control");
+        };
+        acknowledge
+            .send(())
+            .expect("acknowledgement receiver alive");
+        assert_eq!(
+            acknowledged.blocking_recv(),
+            Ok(()),
+            "input owner receives the frame-loop acknowledgement"
+        );
+        assert_eq!(event_rx.len(), 1, "queued key waits until resume");
+    }
+
+    #[test]
+    fn completed_resume_clears_ratatui_before_marking_the_frame_dirty() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let clear_calls = std::rc::Rc::clone(&calls);
+        let dirty_calls = std::rc::Rc::clone(&calls);
+
+        complete_terminal_resume(
+            move || {
+                clear_calls.borrow_mut().push("clear");
+                Ok(())
+            },
+            move || dirty_calls.borrow_mut().push("dirty"),
+        )
+        .expect("resume should complete");
+
+        assert_eq!(*calls.borrow(), ["clear", "dirty"]);
+
+        let dirty = std::rc::Rc::new(std::cell::Cell::new(false));
+        let dirty_after_error = std::rc::Rc::clone(&dirty);
+        let error = complete_terminal_resume(
+            || Err(io::Error::other("clear failed")),
+            move || dirty_after_error.set(true),
+        )
+        .expect_err("clear failure should stop resume");
+        assert_eq!(error.to_string(), "clear failed");
+        assert!(!dirty.get());
+    }
+
+    #[test]
+    fn terminal_input_ownership_is_single_and_drop_ordered() {
+        let production = include_str!("app.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production source before tests");
+
+        for forbidden in [
+            "event::poll",
+            "event::read",
+            "EventStream",
+            "enable_raw_mode",
+            "EnterAlternateScreen",
+            "EnableMouseCapture",
+            "EnableBracketedPaste",
+            "PushKeyboardEnhancementFlags",
+            "TerminalCleanup",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "production app must not own terminal input/mode operation {forbidden}"
+            );
+        }
+
+        let start = production
+            .find("InputRuntime::start")
+            .expect("qwertty input starts");
+        let terminal = production
+            .find("Terminal::new")
+            .expect("ratatui terminal is constructed");
+        let drop_terminal = production
+            .find("drop(terminal)")
+            .expect("ratatui terminal is explicitly dropped");
+        let finish_after_drop = production[drop_terminal..]
+            .find("terminal_input.finish")
+            .expect("qwertty input is explicitly finished");
+        assert!(start < terminal);
+        assert!(finish_after_drop > 0);
+    }
+
+    #[test]
+    fn clear_terminal_runs_move_all_purge_then_frame_clear() {
+        let mut calls = Vec::new();
+
+        clear_terminal_scrollback_with(
+            &mut calls,
+            |calls| {
+                calls.push("MoveTo");
+                Ok(())
+            },
+            |calls| {
+                calls.push("All");
+                Ok(())
+            },
+            |calls| {
+                calls.push("Purge");
+                Ok(())
+            },
+            |calls| {
+                calls.push("FrameClear");
+                Ok(())
+            },
+        )
+        .expect("clear sequence should succeed");
+
+        assert_eq!(calls, ["MoveTo", "All", "Purge", "FrameClear"]);
+    }
+
+    #[test]
+    fn clear_terminal_preserves_each_stage_error_and_short_circuits() {
+        let stages = ["MoveTo", "All", "Purge", "FrameClear"];
+        let kinds = [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::TimedOut,
+        ];
+        let messages = ["move failed", "all failed", "purge failed", "frame failed"];
+
+        for failing_stage in 0..stages.len() {
+            let mut calls = Vec::new();
+            let result = clear_terminal_scrollback_with(
+                &mut calls,
+                |calls| {
+                    calls.push("MoveTo");
+                    if failing_stage == 0 {
+                        Err(io::Error::new(kinds[0], messages[0]))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |calls| {
+                    calls.push("All");
+                    if failing_stage == 1 {
+                        Err(io::Error::new(kinds[1], messages[1]))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |calls| {
+                    calls.push("Purge");
+                    if failing_stage == 2 {
+                        Err(io::Error::new(kinds[2], messages[2]))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |calls| {
+                    calls.push("FrameClear");
+                    if failing_stage == 3 {
+                        Err(io::Error::new(kinds[3], messages[3]))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+
+            let error = result.expect_err("selected clear stage should fail");
+            assert_eq!(error.kind(), kinds[failing_stage]);
+            assert_eq!(error.to_string(), messages[failing_stage]);
+            assert_eq!(calls, stages[..=failing_stage]);
+        }
+    }
 
     fn test_config(history_mode: HistoryMode) -> RunConfig {
         RunConfig {

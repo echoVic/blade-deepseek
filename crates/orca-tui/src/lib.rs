@@ -45,7 +45,6 @@ mod status_key_actions;
 mod submitted_turn;
 mod syntax_highlight;
 mod terminal_capabilities;
-mod terminal_lifecycle;
 pub mod theme;
 mod transcript_view;
 pub mod types;
