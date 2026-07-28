@@ -28,6 +28,7 @@ mod input_event_actions;
 mod input_runtime;
 mod interaction_broker;
 mod key_event_actions;
+mod keybindings;
 mod mention_menu_actions;
 mod mention_search_manager;
 mod operation_controller;

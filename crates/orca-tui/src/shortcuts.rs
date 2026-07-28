@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ShortcutScope {
     Global,
     Idle,
@@ -25,7 +25,7 @@ pub struct ResolvedShortcutHint {
     pub has_registered_binding: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ShortcutContext {
     Global,
     Idle,
@@ -33,7 +33,7 @@ pub enum ShortcutContext {
     Approval,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ShortcutAction {
     Global(GlobalShortcut),
     Idle(IdleShortcut),
@@ -62,7 +62,7 @@ impl KeyBinding {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum GlobalShortcut {
     Cancel,
     OpenTranscriptSearch,
@@ -72,7 +72,7 @@ pub enum GlobalShortcut {
     ClearScreen,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum IdleShortcut {
     Submit,
     Newline,
@@ -89,7 +89,7 @@ pub enum IdleShortcut {
     ExpandToolOutput,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RunningShortcut {
     BackgroundCurrentTurn,
     Interrupt,
@@ -104,7 +104,7 @@ pub enum RunningShortcut {
     HalfPageDown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ApprovalShortcut {
     SelectAllow,
     SelectDeny,
@@ -317,6 +317,75 @@ const APPROVAL_BINDINGS: &[(ApprovalShortcut, KeyBinding)] = &[
         KeyBinding::new(KeyCode::Char('d'), KeyModifiers::NONE),
     ),
 ];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LegacyBinding {
+    pub(crate) context: ShortcutContext,
+    pub(crate) action: ShortcutAction,
+    pub(crate) key: KeyCode,
+    pub(crate) modifiers: KeyModifiers,
+}
+
+impl LegacyBinding {
+    const fn new(context: ShortcutContext, action: ShortcutAction, binding: KeyBinding) -> Self {
+        Self {
+            context,
+            action,
+            key: binding.key,
+            modifiers: binding.modifiers,
+        }
+    }
+
+    pub(crate) const fn as_key_event(self) -> KeyEvent {
+        KeyEvent::new(self.key, self.modifiers)
+    }
+}
+
+pub(crate) fn configurable_legacy_bindings() -> impl Iterator<Item = LegacyBinding> {
+    GLOBAL_BINDINGS
+        .iter()
+        .map(|(action, binding)| {
+            LegacyBinding::new(
+                ShortcutContext::Global,
+                ShortcutAction::Global(*action),
+                *binding,
+            )
+        })
+        .chain(IDLE_BINDINGS.iter().map(|(action, binding)| {
+            LegacyBinding::new(
+                ShortcutContext::Idle,
+                ShortcutAction::Idle(*action),
+                *binding,
+            )
+        }))
+        .chain(RUNNING_BINDINGS.iter().map(|(action, binding)| {
+            LegacyBinding::new(
+                ShortcutContext::Running,
+                ShortcutAction::Running(*action),
+                *binding,
+            )
+        }))
+        .chain(
+            APPROVAL_BINDINGS
+                .iter()
+                .filter(|(action, _)| {
+                    matches!(
+                        action,
+                        ApprovalShortcut::SelectAllow
+                            | ApprovalShortcut::SelectDeny
+                            | ApprovalShortcut::ToggleSelection
+                            | ApprovalShortcut::Confirm
+                    )
+                })
+                .map(|(action, binding)| {
+                    LegacyBinding::new(
+                        ShortcutContext::Approval,
+                        ShortcutAction::Approval(*action),
+                        *binding,
+                    )
+                }),
+        )
+}
 
 pub fn resolve_shortcut(context: ShortcutContext, event: KeyEvent) -> Option<ShortcutAction> {
     if let Some(shortcut) = global_shortcut(event) {
@@ -550,7 +619,10 @@ fn match_binding<T: Copy>(event: KeyEvent, bindings: &[(T, KeyBinding)]) -> Opti
         .map(|(action, _)| *action)
 }
 
-fn normalize_key_parts(key: KeyCode, mut modifiers: KeyModifiers) -> (KeyCode, KeyModifiers) {
+pub(crate) fn normalize_key_parts(
+    key: KeyCode,
+    mut modifiers: KeyModifiers,
+) -> (KeyCode, KeyModifiers) {
     let KeyCode::Char(ch) = key else {
         return (key, modifiers);
     };
