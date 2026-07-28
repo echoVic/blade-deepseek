@@ -6503,8 +6503,10 @@ mod tests {
             workflows: WorkflowConfig::default(),
             theme: ThemeName::default(),
             vim_mode: false,
+            vim_insert_escape: None,
             update_check: false,
             desktop_notifications: false,
+            terminal_notifications: false,
             auto_memory: false,
         }
     }

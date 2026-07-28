@@ -234,6 +234,7 @@ fn real_api_config(api_key: String, max_budget_usd: f64) -> Result<RunConfig, St
         workflows: WorkflowConfig::default(),
         theme: ThemeName::Dark,
         vim_mode: false,
+        vim_insert_escape: None,
         update_check: false,
         desktop_notifications: false,
         terminal_notifications: false,

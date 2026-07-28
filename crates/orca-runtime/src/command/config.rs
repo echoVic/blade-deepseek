@@ -90,6 +90,7 @@ pub fn assemble_run_config(
         workflows: file.workflows.resolved(),
         theme: file.theme,
         vim_mode: file.vim_mode,
+        vim_insert_escape: file.vim_insert_escape,
         update_check: file.update_check,
         desktop_notifications,
         terminal_notifications: file.terminal_notifications,
@@ -111,6 +112,9 @@ mod tests {
     fn assembles_shared_run_config_without_losing_launch_fields() {
         let file = FileConfig {
             mode: Some(ApprovalMode::Plan),
+            vim_insert_escape: Some(
+                orca_core::config::VimInsertEscapeSequence::parse("jj").unwrap(),
+            ),
             update_check: false,
             desktop_notifications: true,
             auto_memory: true,
@@ -147,6 +151,10 @@ mod tests {
         assert!(config.show_session_picker);
         assert_eq!(config.max_budget_usd, Some(2.5));
         assert!(!config.update_check);
+        assert_eq!(
+            config.vim_insert_escape.as_ref().map(|value| value.as_str()),
+            Some("jj")
+        );
         assert!(config.desktop_notifications);
         assert!(config.auto_memory);
     }

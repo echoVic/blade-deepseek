@@ -2567,6 +2567,7 @@ mod tests {
             workflows: WorkflowConfig::default(),
             theme: Default::default(),
             vim_mode: false,
+            vim_insert_escape: None,
             update_check: false,
             desktop_notifications: false,
             terminal_notifications: false,
