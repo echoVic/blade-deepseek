@@ -1,0 +1,16 @@
+[package]
+name = "orca-windows-runner"
+version = "0.1.0"
+edition = "2024"
+description = "Native Windows process-tree runner for Orca"
+license = "MIT"
+
+[[bin]]
+name = "orca-windows-runner"
+path = "src/main.rs"
+
+[dependencies]
+base64 = { workspace = true }
+orca-platform = { path = "../orca-platform" }
+serde = { workspace = true }
+serde_json = { workspace = true }

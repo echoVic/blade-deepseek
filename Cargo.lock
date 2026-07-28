@@ -1512,6 +1512,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "orca-platform"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "orca-provider"
 version = "0.1.0"
 dependencies = [
@@ -1548,8 +1559,10 @@ dependencies = [
  "orca-core",
  "orca-file-search",
  "orca-mcp",
+ "orca-platform",
  "orca-provider",
  "orca-tools",
+ "orca-windows-sandbox",
  "reqwest",
  "rusqlite",
  "serde",
@@ -1608,6 +1621,39 @@ dependencies = [
  "tempfile",
  "tui-textarea",
  "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "orca-windows-runner"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "orca-platform",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "orca-windows-sandbox"
+version = "0.1.0"
+dependencies = [
+ "orca-platform",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "orca-windows-sandbox-setup"
+version = "0.1.0"
+dependencies = [
+ "orca-windows-sandbox",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

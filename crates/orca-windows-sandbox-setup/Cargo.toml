@@ -1,0 +1,18 @@
+[package]
+name = "orca-windows-sandbox-setup"
+version = "0.1.0"
+edition = "2024"
+description = "Native Windows sandbox capability setup helper for Orca"
+license = "MIT"
+
+[[bin]]
+name = "orca-windows-sandbox-setup"
+path = "src/main.rs"
+
+[dependencies]
+orca-windows-sandbox = { path = "../orca-windows-sandbox" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

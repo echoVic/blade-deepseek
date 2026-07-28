@@ -1,0 +1,69 @@
+#[cfg(windows)]
+mod windows {
+    use std::io::Read;
+    use std::process::Command;
+
+    use orca_platform::process::ProcessJob;
+    use orca_platform::terminal::{spawn_windows_pty, spawn_windows_pty_named};
+
+    #[test]
+    fn conpty_runs_native_command_and_supports_resize() {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/S", "/C", "echo ORCA_CONPTY_OK"]);
+
+        let mut process = spawn_windows_pty(&command, Some(100), Some(30)).unwrap();
+        process.input.resize(120, 40).unwrap();
+        let status = process.child.wait().unwrap();
+        process.input.close();
+
+        let mut output = String::new();
+        process.reader.read_to_string(&mut output).unwrap();
+        assert!(status.success(), "ConPTY command failed: {status:?}");
+        assert!(output.contains("ORCA_CONPTY_OK"), "output was {output:?}");
+    }
+
+    #[test]
+    fn conpty_child_enters_job_before_running_user_code() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let result_path = temp.path().join("membership");
+        let job_name = format!(r"Local\Orca.ConPtyContract.{}", std::process::id());
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "windows::conpty_job_membership_helper",
+                "--nocapture",
+            ])
+            .env("ORCA_CONPTY_JOB_NAME", &job_name)
+            .env("ORCA_CONPTY_JOB_MEMBERSHIP", &result_path);
+
+        let mut process = spawn_windows_pty_named(&command, Some(100), Some(30), &job_name)
+            .expect("spawn ConPTY child atomically inside named Job Object");
+        let status = process.child.wait().expect("wait for ConPTY helper");
+        process.input.close();
+
+        assert!(
+            status.success(),
+            "ConPTY membership helper failed: {status:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(result_path).expect("membership result"),
+            "owned",
+            "the ConPTY child must belong to its Job Object before user code executes"
+        );
+    }
+
+    #[test]
+    fn conpty_job_membership_helper() {
+        let Some(job_name) = std::env::var_os("ORCA_CONPTY_JOB_NAME") else {
+            return;
+        };
+        let result_path =
+            std::env::var_os("ORCA_CONPTY_JOB_MEMBERSHIP").expect("membership result path");
+        let owned = ProcessJob::open_named(&job_name.to_string_lossy())
+            .and_then(|job| job.contains_process(std::process::id()))
+            .unwrap_or(false);
+        std::fs::write(result_path, if owned { "owned" } else { "escaped" })
+            .expect("write membership result");
+    }
+}

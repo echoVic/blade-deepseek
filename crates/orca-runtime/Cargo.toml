@@ -10,6 +10,8 @@ orca-mcp = { path = "../orca-mcp" }
 orca-tools = { path = "../orca-tools" }
 orca-provider = { path = "../orca-provider" }
 orca-approval = { path = "../orca-approval" }
+orca-platform = { path = "../orca-platform" }
+orca-windows-sandbox = { path = "../orca-windows-sandbox" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
