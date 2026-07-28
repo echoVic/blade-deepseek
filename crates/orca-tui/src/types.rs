@@ -3344,6 +3344,8 @@ mod tests {
             assert!(state.queued_submission_in_flight.is_none());
             assert!(state.queued_follow_up_autosend);
             assert!(state.queued_input_error.is_none());
+            assert!(state.queued_user_messages.is_empty());
+            assert!(state.queued_submission_in_flight.is_none());
             assert!(!state.queued_follow_up_pending_or_in_flight());
         }
     }

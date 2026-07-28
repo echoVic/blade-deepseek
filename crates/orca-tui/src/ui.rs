@@ -65,12 +65,15 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     } else {
         0
     };
+    let queue_preview_lines = queued_preview_lines(state, frame.area().width, theme);
+    let queue_preview_height = queue_preview_lines.len().min(3) as u16;
 
     let chunks = main_layout(
         frame.area(),
         goal_height,
         plan_height,
         activity_height,
+        queue_preview_height,
         search_height,
         input_height,
     );
@@ -91,15 +94,18 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     if activity_height > 0 {
         render_activity(frame, chunks[3], state, theme);
     }
+    if queue_preview_height > 0 {
+        frame.render_widget(Paragraph::new(queue_preview_lines), chunks[4]);
+    }
     if search_height > 0 {
-        state.search_area = Some(chunks[4]);
-        render_search_bar(frame, chunks[4], state, theme);
+        state.search_area = Some(chunks[5]);
+        render_search_bar(frame, chunks[5], state, theme);
     }
     if composer_visible(state) {
-        state.input_area = Some(chunks[5]);
+        state.input_area = Some(chunks[6]);
         render_input(
             frame,
-            chunks[5],
+            chunks[6],
             textarea,
             composer_layout.as_ref().expect("visible composer layout"),
             state,
@@ -107,15 +113,15 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
             show_composer_hardware_cursor,
         );
     }
-    render_status(frame, chunks[6], state, theme);
+    render_status(frame, chunks[7], state, theme);
 
     if !state.transcript_search.open && state.slash_menu.is_some() {
-        render_slash_menu(frame, chunks[5], state, theme);
+        render_slash_menu(frame, chunks[6], state, theme);
     }
 
     if !state.transcript_search.open && state.mention.phase.is_some() && state.slash_menu.is_none()
     {
-        render_mention_candidates(frame, chunks[5], state, theme);
+        render_mention_candidates(frame, chunks[6], state, theme);
     }
 
     if state.status == AppStatus::WaitingApproval {
@@ -132,6 +138,7 @@ fn main_layout(
     goal_height: u16,
     plan_height: u16,
     activity_height: u16,
+    queue_preview_height: u16,
     search_height: u16,
     input_height: u16,
 ) -> std::rc::Rc<[Rect]> {
@@ -146,6 +153,7 @@ fn main_layout(
         Constraint::Fill(1),
         Constraint::Length(plan_height),
         Constraint::Length(activity_height),
+        Constraint::Length(queue_preview_height),
         Constraint::Length(search_height),
         Constraint::Length(input_height),
         Constraint::Length(1),
@@ -191,6 +199,61 @@ fn search_visible(state: &AppState) -> bool {
             state.status,
             AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
         )
+}
+
+fn queued_preview_lines(state: &AppState, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    if state.panel_mode != PanelMode::Conversation
+        || !matches!(state.status, AppStatus::Idle | AppStatus::Running)
+        || !state.queued_follow_up_pending_or_in_flight()
+        || width == 0
+    {
+        return Vec::new();
+    }
+    let Some(snapshot) =
+        crate::queued_input::QueuedPreviewSnapshot::from_queue(&state.queued_user_messages)
+    else {
+        return Vec::new();
+    };
+    let width = width as usize;
+    let header = state.queued_input_error.as_ref().map_or_else(
+        || format!(" Queued {} · Alt+Up edit latest", snapshot.len),
+        |error| format!(" Queue error · {error}"),
+    );
+    let header_color = if state.queued_input_error.is_some() {
+        theme.error
+    } else {
+        theme.muted
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        truncate_to_display_width(&header, width),
+        Style::default().fg(header_color),
+    ))];
+    let item_style = Style::default()
+        .fg(theme.muted)
+        .add_modifier(Modifier::ITALIC);
+    lines.push(Line::from(Span::styled(
+        truncate_to_display_width(&format!(" ↳ {}", snapshot.first), width),
+        item_style,
+    )));
+    if let Some(second) = snapshot.second {
+        lines.push(Line::from(Span::styled(
+            truncate_to_display_width(&format!(" ↳ {second}"), width),
+            item_style,
+        )));
+    } else if let Some(latest) = snapshot.latest {
+        lines.push(Line::from(Span::styled(
+            truncate_to_display_width(
+                &format!(
+                    " … {} more · latest: {latest}",
+                    snapshot.len.saturating_sub(1)
+                ),
+                width,
+            ),
+            item_style,
+        )));
+    }
+    lines.truncate(3);
+    lines
 }
 
 fn render_goal_banner(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -4164,6 +4227,150 @@ mod tests {
         }
     }
 
+    fn queued(text: &str) -> crate::queued_input::QueuedUserMessage {
+        crate::queued_input::QueuedUserMessage::from_composer(
+            text.to_string(),
+            Vec::new(),
+            orca_runtime::mentions::MentionBindings::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn queued_preview_uses_two_three_and_exactly_three_rows() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        for (count, expected_rows) in [(1, 2), (2, 3), (3, 3), (10, 3), (64, 3)] {
+            let mut state = test_state();
+            for index in 0..count {
+                state
+                    .enqueue_user_message(queued(&format!("item {index}")))
+                    .unwrap();
+            }
+            let lines = queued_preview_lines(&state, 80, &theme);
+            assert_eq!(lines.len(), expected_rows, "count={count}");
+            assert!(lines[0].to_string().contains(&format!("Queued {count}")));
+            assert!(lines[1].to_string().contains("item 0"));
+            if count > 2 {
+                assert!(
+                    lines[2]
+                        .to_string()
+                        .contains(&format!("item {}", count - 1))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn queued_preview_keeps_unicode_clusters_and_paste_placeholders() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        let visible = "e\u{301} 👍🏽 👨‍👩‍👧‍👦 1️⃣ 中文 [Pasted Content 1001 chars]";
+        state
+            .enqueue_user_message(
+                crate::queued_input::QueuedUserMessage::from_composer(
+                    visible.to_string(),
+                    vec![(
+                        "[Pasted Content 1001 chars]".to_string(),
+                        "secret payload".repeat(100),
+                    )],
+                    orca_runtime::mentions::MentionBindings::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let rendered = queued_preview_lines(&state, 80, &theme)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for cluster in ["e\u{301}", "👍🏽", "👨‍👩‍👧‍👦", "1️⃣", "中文"] {
+            assert!(rendered.contains(cluster), "{cluster:?}: {rendered:?}");
+        }
+        assert!(rendered.contains("[Pasted Content 1001 chars]"));
+        assert!(!rendered.contains("secret payload"));
+    }
+
+    #[test]
+    fn queued_preview_is_hidden_outside_conversation_idle_or_running() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.enqueue_user_message(queued("queued")).unwrap();
+        for (status, panel, visible) in [
+            (AppStatus::Idle, PanelMode::Conversation, true),
+            (AppStatus::Running, PanelMode::Conversation, true),
+            (AppStatus::WaitingUserInput, PanelMode::Conversation, false),
+            (AppStatus::WaitingApproval, PanelMode::Conversation, false),
+            (AppStatus::Compacting, PanelMode::Conversation, false),
+            (AppStatus::Idle, PanelMode::Workflows, false),
+            (AppStatus::Idle, PanelMode::Agents, false),
+        ] {
+            state.status = status;
+            state.panel_mode = panel;
+            assert_eq!(
+                !queued_preview_lines(&state, 80, &theme).is_empty(),
+                visible,
+                "{status:?} {panel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn queued_preview_never_overlaps_search_composer_status_or_cursor() {
+        let mut state = test_state();
+        state.enter_running();
+        state
+            .enqueue_user_message(queued("queued follow up"))
+            .unwrap();
+        state.open_transcript_search();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::from(["draft"]);
+        let (backend, events) = RecordingBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+
+        let rendered = format!("{:?}", terminal.backend().inner.buffer());
+        assert!(rendered.contains("Queued 1"));
+        let search = state.search_area.unwrap();
+        let input = state.input_area.unwrap();
+        assert!(search.bottom() <= input.y);
+        let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+        assert!(search.contains(cursor));
+        assert!(
+            take_cursor_events(&events)
+                .iter()
+                .any(|event| matches!(event, CursorEvent::Move(_)))
+        );
+    }
+
+    #[test]
+    fn compact_queued_preview_frames_never_panic_or_escape_bounds() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        for width in [0, 1, 2, 8] {
+            for height in 1..=8 {
+                let mut state = test_state();
+                state.enter_running();
+                state.enqueue_user_message(queued("queued")).unwrap();
+                let textarea = TextArea::from(["draft"]);
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                        .unwrap();
+
+                terminal
+                    .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                    .unwrap();
+
+                if let Some(input) = state.input_area {
+                    assert!(input.bottom() <= height, "{width}x{height}: {input:?}");
+                }
+                assert_eq!(terminal.backend().buffer().area.width, width);
+                assert_eq!(terminal.backend().buffer().area.height, height);
+            }
+        }
+    }
+
     fn line_containing<'a>(lines: &'a [Line<'static>], needle: &str) -> &'a Line<'static> {
         let (marker, source) = needle
             .strip_prefix('+')
@@ -4350,20 +4557,20 @@ mod tests {
     #[test]
     fn open_search_reserves_one_row_without_squeezing_composer_or_status() {
         let area = Rect::new(0, 0, 80, 20);
-        let chunks = main_layout(area, 0, 0, 2, 1, 3);
-        assert_eq!(chunks[4].height, 1);
-        assert_eq!(chunks[5].height, 3);
-        assert_eq!(chunks[6].height, 1);
-        assert_eq!(chunks[4].bottom(), chunks[5].y);
+        let chunks = main_layout(area, 0, 0, 2, 0, 1, 3);
+        assert_eq!(chunks[5].height, 1);
+        assert_eq!(chunks[6].height, 3);
+        assert_eq!(chunks[7].height, 1);
+        assert_eq!(chunks[5].bottom(), chunks[6].y);
     }
 
     #[test]
     fn compact_search_layout_preserves_fixed_chrome_before_transcript() {
-        let chunks = main_layout(Rect::new(0, 0, 20, 6), 0, 0, 0, 1, 3);
+        let chunks = main_layout(Rect::new(0, 0, 20, 6), 0, 0, 0, 0, 1, 3);
         assert_eq!(chunks[1].height, 1);
-        assert_eq!(chunks[4].height, 1);
-        assert_eq!(chunks[5].height, 3);
-        assert_eq!(chunks[6].height, 1);
+        assert_eq!(chunks[5].height, 1);
+        assert_eq!(chunks[6].height, 3);
+        assert_eq!(chunks[7].height, 1);
     }
 
     #[test]
