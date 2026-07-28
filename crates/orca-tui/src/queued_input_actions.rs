@@ -1,9 +1,17 @@
+use crossbeam_channel as mpsc;
+use crossterm::event::{Event, KeyCode, KeyEvent};
+use orca_core::config::RunConfig;
 use tui_textarea::TextArea;
 
+use crate::composer_input_actions::{apply_composer_key_input, insert_composer_newline};
 use crate::composer_textarea::{make_textarea, make_textarea_with_text, textarea_text};
+use crate::mention_menu_actions::handle_mention_menu_key;
+use crate::operation_controller::TuiOperationInterrupt;
 use crate::queued_input::QueuedUserMessage;
+use crate::running_actions::handle_running_shortcut;
+use crate::shortcuts::{RunningShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::theme::Theme;
-use crate::types::{AppState, AppStatus, PanelMode};
+use crate::types::{AppState, AppStatus, PanelMode, UserAction};
 use crate::vim::VimState;
 
 pub(crate) fn enqueue_composer_follow_up(
@@ -63,6 +71,48 @@ pub(crate) fn restore_latest_queued_message(
     state.pending_pastes = composer.pending_pastes;
     state.reset_history_navigation();
     true
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_running_key(
+    ev: &Event,
+    key: &KeyEvent,
+    state: &mut AppState,
+    config: &RunConfig,
+    action_tx: &mpsc::Sender<UserAction>,
+    operation: &impl TuiOperationInterrupt,
+    textarea: &mut TextArea,
+    vim_state: &mut VimState,
+    theme: &Theme,
+) -> bool {
+    if state.panel_mode == PanelMode::Conversation
+        && (!state.mention.candidates.is_empty()
+            || (state.mention.phase.is_some() && key.code == KeyCode::Esc))
+        && handle_mention_menu_key(ev, key, state, textarea, vim_state, theme)
+    {
+        return true;
+    }
+
+    if let Some(ShortcutAction::Running(shortcut)) =
+        resolve_shortcut(ShortcutContext::Running, *key)
+    {
+        match shortcut {
+            RunningShortcut::SubmitQueued => {
+                enqueue_composer_follow_up(state, textarea, vim_state, theme);
+            }
+            RunningShortcut::Newline => insert_composer_newline(textarea, state),
+            RunningShortcut::EditLatestQueued => {
+                restore_latest_queued_message(state, textarea, vim_state, theme);
+            }
+            shortcut => handle_running_shortcut(shortcut, state, action_tx, operation),
+        }
+        return true;
+    }
+
+    if state.panel_mode == PanelMode::Conversation {
+        return apply_composer_key_input(ev, key, state, config, textarea, vim_state, theme);
+    }
+    false
 }
 
 #[cfg(test)]

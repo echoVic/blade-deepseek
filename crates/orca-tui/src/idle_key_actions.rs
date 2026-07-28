@@ -12,6 +12,7 @@ use crate::composer_input_actions::{
 use crate::idle_navigation_actions::handle_idle_navigation_shortcut;
 use crate::idle_submit_actions::handle_idle_submit;
 use crate::mention_menu_actions::handle_mention_menu_key;
+use crate::queued_input_actions::restore_latest_queued_message;
 use crate::shortcuts::{IdleShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::slash_menu_actions::handle_slash_menu_key;
 use crate::theme::Theme;
@@ -59,6 +60,11 @@ pub(crate) fn handle_idle_key(
     }
 
     match resolve_shortcut(ShortcutContext::Idle, *key) {
+        Some(ShortcutAction::Idle(IdleShortcut::EditLatestQueued)) => {
+            if state.status == crate::types::AppStatus::Idle {
+                restore_latest_queued_message(state, textarea, vim_state, theme);
+            }
+        }
         Some(ShortcutAction::Idle(IdleShortcut::Submit)) => {
             handle_idle_submit(
                 textarea,
