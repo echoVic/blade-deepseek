@@ -71,6 +71,21 @@ enum StartupMessage {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InputRuntimeOptions {
+    pub(crate) theme: ThemeName,
+    pub(crate) focus_events: bool,
+}
+
+impl From<ThemeName> for InputRuntimeOptions {
+    fn from(theme: ThemeName) -> Self {
+        Self {
+            theme,
+            focus_events: false,
+        }
+    }
+}
+
 pub(crate) enum InputControl {
     Suspend {
         acknowledge: tokio::sync::oneshot::Sender<()>,
@@ -88,7 +103,7 @@ pub(crate) struct InputRuntime {
 }
 
 impl InputRuntime {
-    pub(crate) fn start(requested_theme: ThemeName) -> io::Result<Self> {
+    pub(crate) fn start(options: InputRuntimeOptions) -> io::Result<Self> {
         let owner_lease = TerminalOwnerLease::acquire()?;
         let owner_thread = thread::current().id();
 
@@ -101,7 +116,7 @@ impl InputRuntime {
             .name("orca-tui-input".to_string())
             .spawn(move || {
                 input_thread(
-                    requested_theme,
+                    options,
                     color_level,
                     startup_tx,
                     event_tx,
@@ -196,7 +211,7 @@ impl Drop for InputRuntime {
 }
 
 fn input_thread(
-    requested_theme: ThemeName,
+    options: InputRuntimeOptions,
     color_level: TerminalColorLevel,
     startup_tx: mpsc::Sender<StartupMessage>,
     event_tx: mpsc::Sender<crossterm::event::Event>,
@@ -221,7 +236,7 @@ fn input_thread(
         let _restore_registration = RestoreRegistration::install(restore_handle, owner_thread)?;
         drive_terminal(
             driver,
-            requested_theme,
+            options,
             color_level,
             startup_tx,
             event_tx,
@@ -318,6 +333,7 @@ trait TerminalDriver: Sized {
     async fn enter_alternate_screen(&mut self) -> io::Result<()>;
     async fn enable_mouse(&mut self) -> io::Result<()>;
     async fn enable_bracketed_paste(&mut self) -> io::Result<()>;
+    async fn enable_focus_events(&mut self) -> io::Result<()>;
     async fn push_keyboard_flags(&mut self) -> io::Result<()>;
     async fn next_activity(&mut self) -> io::Result<TerminalActivity>;
     async fn suspend(&mut self) -> io::Result<()>;
@@ -351,6 +367,13 @@ impl TerminalDriver for QwerttyDriver {
     async fn enable_bracketed_paste(&mut self) -> io::Result<()> {
         self.session
             .enable_bracketed_paste()
+            .await
+            .map_err(qwertty_error)
+    }
+
+    async fn enable_focus_events(&mut self) -> io::Result<()> {
+        self.session
+            .enable_focus_events()
             .await
             .map_err(qwertty_error)
     }
@@ -439,14 +462,15 @@ fn qwertty_error(error: qwertty::Error) -> io::Error {
 
 async fn drive_terminal<D: TerminalDriver>(
     mut driver: D,
-    requested_theme: ThemeName,
+    options: impl Into<InputRuntimeOptions>,
     color_level: TerminalColorLevel,
     startup_tx: mpsc::Sender<StartupMessage>,
     event_tx: mpsc::Sender<crossterm::event::Event>,
     control_tx: mpsc::Sender<InputControl>,
     mut stop_rx: watch::Receiver<bool>,
 ) -> io::Result<()> {
-    let background = if requested_theme == ThemeName::Auto {
+    let options = options.into();
+    let background = if options.theme == ThemeName::Auto {
         match driver.probe_background(CAPABILITY_PROBE_TIMEOUT).await {
             Ok(background) => background,
             Err(error) => {
@@ -466,12 +490,17 @@ async fn drive_terminal<D: TerminalDriver>(
     if let Err(error) = driver.enable_bracketed_paste().await {
         return fail_startup(driver, startup_tx, error).await;
     }
+    if options.focus_events
+        && let Err(error) = driver.enable_focus_events().await
+    {
+        return fail_startup(driver, startup_tx, error).await;
+    }
     if let Err(error) = driver.push_keyboard_flags().await {
         return fail_startup(driver, startup_tx, error).await;
     }
 
     let profile = TerminalProfile {
-        background: terminal_background_from_rgb(requested_theme, background),
+        background: terminal_background_from_rgb(options.theme, background),
         color_level,
     };
     if startup_tx.send(StartupMessage::Ready(profile)).is_err() {
@@ -684,8 +713,8 @@ mod tests {
     use tokio::sync::watch;
 
     use super::{
-        InputControl, StartupMessage, TERMINAL_OWNER_ACTIVE, TerminalActivity, TerminalDriver,
-        drive_terminal, should_restore_for_panic,
+        InputControl, InputRuntimeOptions, StartupMessage, TERMINAL_OWNER_ACTIVE, TerminalActivity,
+        TerminalDriver, drive_terminal, should_restore_for_panic,
     };
     use crate::terminal_capabilities::{TerminalBackground, TerminalColorLevel};
 
@@ -755,6 +784,10 @@ mod tests {
 
         async fn enable_bracketed_paste(&mut self) -> io::Result<()> {
             self.record("paste")
+        }
+
+        async fn enable_focus_events(&mut self) -> io::Result<()> {
+            self.record("focus")
         }
 
         async fn push_keyboard_flags(&mut self) -> io::Result<()> {
@@ -887,6 +920,59 @@ mod tests {
                     *calls.lock().expect("calls lock"),
                     ["alternate", "mouse", "paste", "keyboard", "read", "leave"]
                 );
+            });
+    }
+
+    #[test]
+    fn focus_events_are_enabled_only_when_requested_before_keyboard_flags() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                for (focus_events, expected) in [
+                    (
+                        true,
+                        vec![
+                            "alternate",
+                            "mouse",
+                            "paste",
+                            "focus",
+                            "keyboard",
+                            "read",
+                            "leave",
+                        ],
+                    ),
+                    (
+                        false,
+                        vec!["alternate", "mouse", "paste", "keyboard", "read", "leave"],
+                    ),
+                ] {
+                    let calls = Arc::new(Mutex::new(Vec::new()));
+                    let driver = FakeDriver::new(Arc::clone(&calls), None, []);
+                    let (startup_tx, startup_rx) = mpsc::bounded(1);
+                    let (event_tx, _event_rx) = mpsc::bounded(1);
+                    let (control_tx, _control_rx) = mpsc::bounded(1);
+                    let (stop_tx, stop_rx) = watch::channel(false);
+
+                    let task = tokio::spawn(drive_terminal(
+                        driver,
+                        InputRuntimeOptions {
+                            theme: ThemeName::Dark,
+                            focus_events,
+                        },
+                        TerminalColorLevel::TrueColor,
+                        startup_tx,
+                        event_tx,
+                        control_tx,
+                        stop_rx,
+                    ));
+                    let _ = wait_for_startup(&startup_rx).await;
+                    stop_tx.send(true).expect("stop receiver alive");
+                    task.await.expect("driver task").expect("clean stop");
+
+                    assert_eq!(*calls.lock().expect("calls lock"), expected);
+                }
             });
     }
 

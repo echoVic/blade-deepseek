@@ -8,6 +8,7 @@ use orca_core::config::RunConfig;
 use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{insert_composer_paste, insert_pasted_text};
 use crate::selection::{SelectionGranularity, TranscriptSelection};
+use crate::terminal_presentation::TerminalPresentation;
 use crate::types::{AppState, AppStatus, PanelMode};
 
 #[derive(Debug, PartialEq)]
@@ -28,6 +29,54 @@ pub(crate) fn should_queue_input_event(event: &Event) -> bool {
         event,
         Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved
     )
+}
+
+pub(crate) fn consume_focus_event(event: &Event, presentation: &mut TerminalPresentation) -> bool {
+    match event {
+        Event::FocusGained => {
+            presentation.set_focused(true);
+            true
+        }
+        Event::FocusLost => {
+            presentation.set_focused(false);
+            true
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    use super::consume_focus_event;
+    use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
+
+    fn presentation() -> TerminalPresentation {
+        TerminalPresentation::new(
+            true,
+            TerminalPresentationProfile {
+                osc9_supported: true,
+                tmux_passthrough: false,
+            },
+        )
+    }
+
+    #[test]
+    fn consume_focus_event_updates_only_presentation_focus() {
+        let mut presentation = presentation();
+        presentation.set_focused(false);
+
+        assert!(consume_focus_event(&Event::FocusGained, &mut presentation));
+        assert!(presentation.is_focused());
+        assert!(consume_focus_event(&Event::FocusLost, &mut presentation));
+        assert!(!presentation.is_focused());
+        assert!(!consume_focus_event(
+            &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut presentation
+        ));
+        assert!(!presentation.is_focused());
+    }
 }
 
 /// A terminal resize re-wraps every transcript line, so content positions

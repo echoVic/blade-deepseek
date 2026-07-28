@@ -37,10 +37,10 @@ use crate::composer_textarea::{
 use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
 use crate::hosted_runtime::{TuiHostedEventObserver, TuiHostedOperationOutcome};
 use crate::input_event_actions::{
-    BatchedInputEvent, MouseFlow, coalesce_input_events, handle_mouse_event, handle_paste_event,
-    handle_resize_event, handle_scroll_lines, should_queue_input_event,
+    BatchedInputEvent, MouseFlow, coalesce_input_events, consume_focus_event, handle_mouse_event,
+    handle_paste_event, handle_resize_event, handle_scroll_lines, should_queue_input_event,
 };
-use crate::input_runtime::{InputControl, InputRuntime};
+use crate::input_runtime::{InputControl, InputRuntime, InputRuntimeOptions};
 use crate::interaction_broker::TuiInteractionBroker;
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
@@ -53,6 +53,7 @@ use crate::slash_command_actions::{SettingsIntent, decode_settings_intent};
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::submitted_turn::SubmittedTurn;
 use crate::surface_actions::TuiSurfaceActions;
+use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
 use crate::ui;
@@ -69,10 +70,18 @@ pub fn run_tui(config: RunConfig) -> i32 {
 }
 
 fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
-    let pending_input_runtime = InputRuntime::start(config.theme)?;
+    let pending_input_runtime = InputRuntime::start(InputRuntimeOptions {
+        theme: config.theme,
+        focus_events: config.terminal_notifications,
+    })?;
     let theme = Theme::resolve(config.theme, pending_input_runtime.profile());
     let input_rx = pending_input_runtime.events().clone();
     let input_control_rx = pending_input_runtime.controls().clone();
+    let presentation_profile = TerminalPresentationProfile::from_identity(
+        &qwertty::caps::identity_from_env(None, qwertty::caps::std_env_source),
+    );
+    let mut presentation =
+        TerminalPresentation::new(config.terminal_notifications, presentation_profile);
 
     const FRAME_INTERVAL: Duration = Duration::from_millis(16);
     const ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
@@ -295,6 +304,9 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             handle_scroll_lines(&mut state, lines, Instant::now());
                         }
                         BatchedInputEvent::Event(ev) => {
+                            if consume_focus_event(&ev, &mut presentation) {
+                                return Ok(None);
+                            }
                             if handle_paste_event(&ev, &mut state, &config, &mut textarea) {
                                 return Ok(None);
                             }
@@ -975,6 +987,30 @@ mod tests {
             .expect("qwertty input is explicitly finished");
         assert!(start < terminal);
         assert!(finish_after_drop > 0);
+    }
+
+    #[test]
+    fn focus_events_are_consumed_before_normal_input_handlers() {
+        let production = include_str!("app.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production source before tests");
+        let focus = production
+            .find("consume_focus_event(&ev")
+            .expect("focus consumption");
+        let paste = production
+            .find("handle_paste_event(&ev")
+            .expect("paste handling");
+        let resize = production
+            .find("handle_resize_event(&ev")
+            .expect("resize handling");
+        let key = production
+            .find("let Event::Key(key) = &ev")
+            .expect("key handling");
+
+        assert!(focus < paste);
+        assert!(focus < resize);
+        assert!(focus < key);
     }
 
     #[test]
