@@ -51,6 +51,10 @@ impl TerminalNotification {
             message: message.into(),
         }
     }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 pub(crate) struct TerminalPresentation {
@@ -154,6 +158,11 @@ impl TerminalPresentation {
 
     #[cfg(test)]
     fn pending_len(&self) -> usize {
+        self.pending_notifications.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_len_for_test(&self) -> usize {
         self.pending_notifications.len()
     }
 }
