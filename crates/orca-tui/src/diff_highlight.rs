@@ -693,12 +693,43 @@ pub(crate) fn parse_unified_diff(diff: &str) -> ParsedDiff {
     parsed
 }
 
-fn source_style(kind: DiffLineKind, theme: &Theme) -> (&'static str, ratatui::style::Color) {
+fn source_color(kind: DiffLineKind, theme: &Theme) -> ratatui::style::Color {
     match kind {
-        DiffLineKind::Context => ("     ", theme.muted),
-        DiffLineKind::Insert => ("    +", theme.diff_add),
-        DiffLineKind::Delete => ("    -", theme.diff_remove),
+        DiffLineKind::Context => theme.muted,
+        DiffLineKind::Insert => theme.diff_add,
+        DiffLineKind::Delete => theme.diff_remove,
     }
+}
+
+fn decimal_width(value: usize) -> usize {
+    value.max(1).ilog10() as usize + 1
+}
+
+fn parsed_gutter_width(parsed: &ParsedDiff) -> usize {
+    parsed
+        .hunks
+        .iter()
+        .flat_map(DiffHunk::source_lines)
+        .flat_map(|line| [line.old_line, line.new_line])
+        .flatten()
+        .map(decimal_width)
+        .max()
+        .unwrap_or(1)
+}
+
+fn source_gutter(line: &DiffSourceLine, width: usize) -> String {
+    let old = line
+        .old_line
+        .map_or_else(|| " ".repeat(width), |number| format!("{number:>width$}"));
+    let new = line
+        .new_line
+        .map_or_else(|| " ".repeat(width), |number| format!("{number:>width$}"));
+    let marker = match line.kind {
+        DiffLineKind::Context => ' ',
+        DiffLineKind::Insert => '+',
+        DiffLineKind::Delete => '-',
+    };
+    format!("{old} {new} {marker} ")
 }
 
 fn unstructured_line_color(line: &str, theme: &Theme) -> ratatui::style::Color {
@@ -733,9 +764,13 @@ fn rendered_source_line(
     syntax_spans: Option<StyledSourceLine>,
     refined: Option<&RefinedDiffStyles>,
     theme: &Theme,
+    gutter_width: usize,
 ) -> Line<'static> {
-    let (prefix, fallback_color) = source_style(line.kind, theme);
-    let mut spans = vec![Span::styled(prefix, Style::default().fg(fallback_color))];
+    let fallback_color = source_color(line.kind, theme);
+    let mut spans = vec![Span::styled(
+        source_gutter(line, gutter_width),
+        Style::default().fg(fallback_color),
+    )];
     spans.extend(
         refined_spans(line, refined)
             .or(syntax_spans)
@@ -762,12 +797,19 @@ fn rendered_metadata_line(line: &str, theme: &Theme) -> Line<'static> {
     ))
 }
 
-fn render_hunk_fallback(hunk: &DiffHunk, entry_budget: usize, theme: &Theme) -> Vec<Line<'static>> {
+fn render_hunk_fallback(
+    hunk: &DiffHunk,
+    entry_budget: usize,
+    theme: &Theme,
+    gutter_width: usize,
+) -> Vec<Line<'static>> {
     hunk.entries
         .iter()
         .take(entry_budget)
         .map(|entry| match entry {
-            DiffHunkEntry::Source(line) => rendered_source_line(line, None, None, theme),
+            DiffHunkEntry::Source(line) => {
+                rendered_source_line(line, None, None, theme, gutter_width)
+            }
             DiffHunkEntry::Metadata(line) => rendered_metadata_line(line, theme),
         })
         .collect()
@@ -778,6 +820,7 @@ fn render_hunk_with(
     entry_budget: usize,
     theme: &Theme,
     refined: Option<&RefinedDiffStyles>,
+    gutter_width: usize,
     mut highlight: impl FnMut(DiffSide, &str) -> Option<StyledSourceLine>,
 ) -> Vec<Line<'static>> {
     let visible_entries = hunk.entries.iter().take(entry_budget).collect::<Vec<_>>();
@@ -789,7 +832,7 @@ fn render_hunk_with(
         let spans = match line.kind {
             DiffLineKind::Context => {
                 if highlight(DiffSide::Old, &line.content).is_none() {
-                    return render_hunk_fallback(hunk, entry_budget, theme);
+                    return render_hunk_fallback(hunk, entry_budget, theme, gutter_width);
                 }
                 highlight(DiffSide::New, &line.content)
             }
@@ -797,7 +840,7 @@ fn render_hunk_with(
             DiffLineKind::Delete => highlight(DiffSide::Old, &line.content),
         };
         let Some(spans) = spans else {
-            return render_hunk_fallback(hunk, entry_budget, theme);
+            return render_hunk_fallback(hunk, entry_budget, theme, gutter_width);
         };
         highlighted.push(spans);
     }
@@ -811,6 +854,7 @@ fn render_hunk_with(
                 Some(highlighted.next().expect("one style per source line")),
                 refined,
                 theme,
+                gutter_width,
             ),
             DiffHunkEntry::Metadata(line) => rendered_metadata_line(line, theme),
         })
@@ -861,9 +905,10 @@ fn syntax_is_eligible(parsed: &ParsedDiff) -> bool {
 fn render_parsed_diff_with(
     parsed: &ParsedDiff,
     theme: &Theme,
-    mut render_hunk: impl FnMut(&DiffHunk, usize) -> Vec<Line<'static>>,
+    mut render_hunk: impl FnMut(&DiffHunk, usize, usize) -> Vec<Line<'static>>,
 ) -> Vec<Line<'static>> {
     let total_lines = parsed_line_count(parsed);
+    let gutter_width = parsed_gutter_width(parsed);
     let mut remaining = MAX_RENDERED_DIFF_LINES;
     let mut rendered = Vec::with_capacity(total_lines.min(MAX_RENDERED_DIFF_LINES) + 1);
 
@@ -893,7 +938,7 @@ fn render_parsed_diff_with(
             }
 
             let entry_budget = remaining.min(hunk.entries.len());
-            let hunk_lines = render_hunk(hunk, entry_budget);
+            let hunk_lines = render_hunk(hunk, entry_budget, gutter_width);
             assert_eq!(
                 hunk_lines.len(),
                 entry_budget,
@@ -928,8 +973,8 @@ pub(crate) fn render_parsed_diff(
         );
         return parsed.raw_fallback.as_deref().map_or_else(
             || {
-                render_parsed_diff_with(parsed, theme, |hunk, entry_budget| {
-                    render_hunk_fallback(hunk, entry_budget, theme)
+                render_parsed_diff_with(parsed, theme, |hunk, entry_budget, gutter_width| {
+                    render_hunk_fallback(hunk, entry_budget, theme, gutter_width)
                 })
             },
             |raw_diff| render_raw_diff(raw_diff, theme),
@@ -942,7 +987,7 @@ pub(crate) fn render_parsed_diff(
         .flatten();
     let refined = syntax_eligible.then_some(refined).flatten();
 
-    render_parsed_diff_with(parsed, theme, |hunk, entry_budget| {
+    render_parsed_diff_with(parsed, theme, |hunk, entry_budget, gutter_width| {
         syntax_path
             .and_then(|path| {
                 let mut old =
@@ -954,13 +999,14 @@ pub(crate) fn render_parsed_diff(
                     entry_budget,
                     theme,
                     refined,
+                    gutter_width,
                     |side, content| match side {
                         DiffSide::Old => old.highlight_line(content),
                         DiffSide::New => new.highlight_line(content),
                     },
                 ))
             })
-            .unwrap_or_else(|| render_hunk_fallback(hunk, entry_budget, theme))
+            .unwrap_or_else(|| render_hunk_fallback(hunk, entry_budget, theme, gutter_width))
     })
 }
 
@@ -1053,10 +1099,38 @@ mod tests {
             .collect()
     }
 
+    fn span_text<'a>(line: &'a Line<'_>, index: usize) -> &'a str {
+        line.spans[index].content.as_ref()
+    }
+
     fn find_rendered_line<'a>(lines: &'a [Line<'static>], needle: &str) -> &'a Line<'static> {
+        let (marker, source_needle) = needle
+            .strip_prefix('+')
+            .map(|source| (Some('+'), source))
+            .or_else(|| needle.strip_prefix('-').map(|source| (Some('-'), source)))
+            .unwrap_or((None, needle));
+        let marker_matches = |line: &Line<'static>| {
+            marker.is_none_or(|marker| {
+                line.spans
+                    .first()
+                    .is_some_and(|span| span.content.ends_with(&format!("{marker} ")))
+            })
+        };
+        if marker.is_some()
+            && let Some(line) = lines.iter().find(|line| {
+                marker_matches(line)
+                    && line.spans[1..]
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                        == source_needle
+            })
+        {
+            return line;
+        }
         lines
             .iter()
-            .find(|line| rendered_text(line).contains(needle))
+            .find(|line| rendered_text(line).contains(source_needle) && marker_matches(line))
             .unwrap_or_else(|| panic!("rendered line containing {needle:?}"))
     }
 
@@ -1080,7 +1154,20 @@ mod tests {
         color: ratatui::style::Color,
     ) {
         assert_eq!(line.spans.len(), 2);
-        assert_eq!(line.spans[0].content.as_ref(), prefix);
+        let marker = prefix.trim();
+        if marker.is_empty() {
+            assert!(
+                line.spans[0].content.ends_with("  "),
+                "context gutter: {:?}",
+                line.spans[0].content
+            );
+        } else {
+            assert!(
+                line.spans[0].content.ends_with(&format!("{marker} ")),
+                "changed gutter: {:?}",
+                line.spans[0].content
+            );
+        }
         assert_eq!(line.spans[0].style.fg, Some(color));
         assert_eq!(line.spans[1].content.as_ref(), content);
         assert_eq!(line.spans[1].style.fg, Some(color));
@@ -1229,6 +1316,63 @@ mod tests {
     }
 
     #[test]
+    fn structured_diff_uses_one_right_aligned_dual_line_number_gutter() {
+        let diff = "\
+--- a/value.rs
++++ b/value.rs
+@@ -9,2 +99,2 @@ fn value()
+ old
+-before
++after
+";
+        let theme = dark_theme();
+        let lines = render_unified_diff(diff, &theme, None);
+
+        let context = find_rendered_line(&lines, "old");
+        let deletion = find_rendered_line(&lines, "before");
+        let insertion = find_rendered_line(&lines, "after");
+
+        assert_eq!(span_text(context, 0), "  9  99   ");
+        assert_eq!(span_text(deletion, 0), " 10     - ");
+        assert_eq!(span_text(insertion, 0), "    100 + ");
+        assert_eq!(context.spans[0].style.fg, Some(theme.muted));
+        assert_eq!(deletion.spans[0].style.fg, Some(theme.diff_remove));
+        assert_eq!(insertion.spans[0].style.fg, Some(theme.diff_add));
+    }
+
+    #[test]
+    fn multiple_hunks_share_the_largest_gutter_width() {
+        let diff = "\
+--- a/value.rs
++++ b/value.rs
+@@ -9 +9 @@ first
+-old nine
++new nine
+@@ -123 +123 @@ second
+-old one twenty three
++new one twenty three
+";
+        let lines = render_unified_diff(diff, &dark_theme(), None);
+
+        assert_eq!(
+            span_text(find_rendered_line(&lines, "old nine"), 0),
+            "  9     - "
+        );
+        assert_eq!(
+            span_text(find_rendered_line(&lines, "new nine"), 0),
+            "      9 + "
+        );
+        assert_eq!(
+            span_text(find_rendered_line(&lines, "old one twenty three"), 0),
+            "123     - "
+        );
+        assert_eq!(
+            span_text(find_rendered_line(&lines, "new one twenty three"), 0),
+            "    123 + "
+        );
+    }
+
+    #[test]
     fn malformed_hunk_candidate_forces_first_paint_raw_fallback() {
         assert_malformed_raw_fallback(
             "\
@@ -1319,9 +1463,16 @@ diff --git a/value.rs b/value.rs
         );
         assert_eq!(
             rendered.iter().map(rendered_text).collect::<Vec<_>>(),
-            diff.lines()
-                .map(|line| format!("    {line}"))
-                .collect::<Vec<_>>()
+            vec![
+                "    @@ -1 +1 @@",
+                "1   - let old = 1;",
+                "  1 + let value = 2;",
+                "    --- a/other.rs",
+                "    +++ b/other.rs",
+                "    @@ -1 +1 @@",
+                "1   - let other = 1;",
+                "  1 + let other = 2;",
+            ]
         );
         assert_plain_source(
             find_rendered_line(&rendered, "+let value = 2;"),
@@ -1680,9 +1831,22 @@ index 333..444 100644
         );
         assert_eq!(
             rendered.iter().map(rendered_text).collect::<Vec<_>>(),
-            diff.lines()
-                .map(|line| format!("    {line}"))
-                .collect::<Vec<_>>()
+            vec![
+                "    diff --git a/a.rs b/a.rs",
+                "    index 111..222 100644",
+                "    --- a/a.rs",
+                "    +++ b/a.rs",
+                "    @@ -1 +1 @@",
+                "1   - old_a",
+                "  1 + new_a",
+                "    diff --git a/b.py b/b.py",
+                "    index 333..444 100644",
+                "    --- a/b.py",
+                "    +++ b/b.py",
+                "    @@ -1 +1 @@",
+                "1   - old_b",
+                "  1 + new_b",
+            ]
         );
         assert_plain_source(
             find_rendered_line(&rendered, "+new_a"),
@@ -1915,9 +2079,18 @@ index 333..444 100644
         );
         assert_eq!(
             rendered.iter().map(rendered_text).collect::<Vec<_>>(),
-            diff.lines()
-                .map(|line| format!("    {line}"))
-                .collect::<Vec<_>>()
+            vec![
+                "    --- a/first.rs",
+                "    +++ b/first.rs",
+                "    @@ -1 +1 @@",
+                "1   - fn old() {}",
+                "  1 + fn first() { let value = 1; }",
+                "    --- a/second.py",
+                "    +++ b/second.py",
+                "    @@ -1 +1 @@",
+                "1   - value = 0",
+                "  1 + value = 1",
+            ]
         );
     }
 
@@ -2019,9 +2192,18 @@ metadata instead of paired new header
         let rendered = render_parsed_diff(&parsed, &theme, None);
         assert_eq!(
             rendered.iter().map(rendered_text).collect::<Vec<_>>(),
-            diff.lines()
-                .map(|line| format!("    {line}"))
-                .collect::<Vec<_>>()
+            vec![
+                "    --- a/one.py\t2026-07-24 10:00:00",
+                "    +++ b/one.py\t2026-07-24 10:01:00",
+                "    @@ -1 +1 @@",
+                "1   - value = 0",
+                "  1 + value = 1",
+                "    --- a/two.py\t2026-07-24 10:02:00",
+                "    +++ b/two.py\t2026-07-24 10:03:00",
+                "    @@ -1 +1 @@",
+                "1   - other = 0",
+                "  1 + other = 1",
+            ]
         );
         assert_plain_source(
             find_rendered_line(&rendered, "+value = 1"),
@@ -2310,7 +2492,7 @@ metadata instead of paired new header
         let lines = render_unified_diff(RUST_DIFF, &theme, None);
         let inserted = find_rendered_line(&lines, "+fn new");
 
-        assert_eq!(inserted.spans[0].content.as_ref(), "    +");
+        assert_eq!(inserted.spans[0].content.as_ref(), "  1 + ");
         assert_eq!(inserted.spans[0].style.fg, Some(theme.diff_add));
         assert_eq!(
             inserted.spans[1..]
@@ -2413,28 +2595,32 @@ metadata instead of paired new header
         };
         let mut highlighted_new = false;
 
-        let rendered =
-            super::render_hunk_with(&hunk, hunk.entries.len(), &theme, None, |side, content| {
-                match side {
-                    super::DiffSide::New => {
-                        highlighted_new = true;
-                        Some(vec![Span::styled(
-                            content.to_owned(),
-                            Style::default().fg(ratatui::style::Color::Magenta),
-                        )])
-                    }
-                    super::DiffSide::Old => {
-                        assert!(
-                            highlighted_new,
-                            "old-side failure must happen after a successful new-side line"
-                        );
-                        None
-                    }
+        let rendered = super::render_hunk_with(
+            &hunk,
+            hunk.entries.len(),
+            &theme,
+            None,
+            1,
+            |side, content| match side {
+                super::DiffSide::New => {
+                    highlighted_new = true;
+                    Some(vec![Span::styled(
+                        content.to_owned(),
+                        Style::default().fg(ratatui::style::Color::Magenta),
+                    )])
                 }
-            });
+                super::DiffSide::Old => {
+                    assert!(
+                        highlighted_new,
+                        "old-side failure must happen after a successful new-side line"
+                    );
+                    None
+                }
+            },
+        );
 
-        assert_plain_source(&rendered[0], "    +", "let new = 2;", theme.diff_add);
-        assert_plain_source(&rendered[1], "    -", "let old = 1;", theme.diff_remove);
+        assert_plain_source(&rendered[0], "  1 + ", "let new = 2;", theme.diff_add);
+        assert_plain_source(&rendered[1], "1   - ", "let old = 1;", theme.diff_remove);
     }
 
     #[test]
@@ -2451,15 +2637,23 @@ metadata instead of paired new header
         let visible_source_entries =
             super::MAX_RENDERED_DIFF_LINES - parsed.prelude.len() - parsed.hunks.len();
 
-        let rendered = super::render_parsed_diff_with(&parsed, &theme, |hunk, entry_budget| {
-            super::render_hunk_with(hunk, entry_budget, &theme, None, |_side, content| {
-                highlight_calls += 1;
-                Some(vec![Span::raw(content.to_owned())])
-            })
-        });
+        let rendered =
+            super::render_parsed_diff_with(&parsed, &theme, |hunk, entry_budget, gutter_width| {
+                super::render_hunk_with(
+                    hunk,
+                    entry_budget,
+                    &theme,
+                    None,
+                    gutter_width,
+                    |_side, content| {
+                        highlight_calls += 1;
+                        Some(vec![Span::raw(content.to_owned())])
+                    },
+                )
+            });
 
         assert_eq!(rendered.len(), 81);
-        assert_eq!(rendered_text(&rendered[79]), "    +let value_76 = 76;");
+        assert_eq!(rendered_text(&rendered[79]), "     77 + let value_76 = 76;");
         assert_eq!(rendered_text(&rendered[80]), "    [... diff truncated ...]");
         assert_eq!(highlight_calls, visible_source_entries);
     }
@@ -2504,6 +2698,7 @@ metadata instead of paired new header
             parsed.hunks[0].entries.len(),
             &theme,
             None,
+            1,
             |_side, content| {
                 highlighted_content.push(content.to_owned());
                 Some(vec![Span::raw(content.to_owned())])
@@ -2518,9 +2713,9 @@ metadata instead of paired new header
         assert_eq!(
             rendered.iter().map(rendered_text).collect::<Vec<_>>(),
             vec![
-                "     \"\"\"open string",
+                "1 1   \"\"\"open string",
                 "    \\ No newline at end of file",
-                "    +value = 1",
+                "  2 + value = 1",
             ]
         );
     }
