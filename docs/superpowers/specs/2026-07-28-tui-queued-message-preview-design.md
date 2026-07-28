@@ -145,12 +145,13 @@ pub(crate) fn reject_queued_submission(
 
 1. requires `Idle`;
 2. requires `queued_follow_up_autosend`;
-3. pops exactly one item from the FIFO front;
-4. records input history at actual dispatch time;
-5. appends the visible `ChatMessage::User`;
-6. enters `Running` and scrolls to bottom;
-7. stores a clone in `queued_submission_in_flight`;
-8. returns `UserAction::SubmitWithMentions`.
+3. requires `queued_submission_in_flight.is_none()`;
+4. pops exactly one item from the FIFO front;
+5. records input history at actual dispatch time;
+6. appends the visible `ChatMessage::User`;
+7. enters `Running` and scrolls to bottom;
+8. stores a clone in `queued_submission_in_flight`;
+9. returns `UserAction::SubmitWithMentions`.
 
 It does not send the action itself. The event/action layer remains responsible
 for side effects.
@@ -253,7 +254,7 @@ enforce actual admission and operation serialization.
 
 ### Explicit Interrupt
 
-When the user interrupts the active turn with `Esc` or `Ctrl+G`:
+When the user interrupts the active turn with `Esc`, `Ctrl+G`, or `Ctrl+C`:
 
 - existing interrupt behavior is preserved;
 - `queued_follow_up_autosend` becomes `false`;
@@ -279,6 +280,11 @@ Starting any new foreground user turn restores
 - the dispatcher sees `BackgroundCurrentTurn` before the promoted submit
   because both are sent in that order and background is a bypass control;
 - remaining queued messages continue FIFO behind the new foreground turn.
+
+The promoted item remains in `queued_submission_in_flight` until its
+`TurnStarted`. If the backgrounded turn's terminal event arrives first, that
+event cannot promote another queued item because the admission fence is still
+occupied.
 
 ## `Alt+Up` Restore
 
