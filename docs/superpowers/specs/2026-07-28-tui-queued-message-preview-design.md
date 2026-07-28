@@ -416,9 +416,9 @@ After `TurnStarted`, the message is no longer retractable. A later failed or
 verification-failed terminal is a completed turn boundary and may advance the
 next queued follow-up unless the user explicitly interrupted.
 
-### Channel Failure
+### Channel Admission Failure
 
-If sending the promoted `UserAction` fails:
+If `try_send` reports a full or disconnected action channel:
 
 - restore the in-flight queued item to the front of the queue;
 - remove the optimistic transcript row;
@@ -426,7 +426,8 @@ If sending the promoted `UserAction` fails:
 - show an error;
 - do not drop mention or paste state.
 
-Tests use disconnected channels to prove this path.
+Tests cover both full and disconnected channels. The event loop never blocks
+waiting for action-channel capacity while promoting a queued follow-up.
 
 ## Files
 
@@ -503,6 +504,12 @@ Add bounded preview height/rendering and integrate the region into
 Keep slash-menu projection idle-only while allowing the shared editor path to
 run in Running.
 
+### Modify `crates/orca-tui/src/display_text.rs`
+
+Upgrade `truncate_to_display_width` to iterate extended grapheme clusters rather
+than scalar characters. Preserve its current ASCII/CJK behavior and prove that
+combining sequences, emoji modifiers, ZWJ families, and keycaps stay intact.
+
 ### Modify `crates/orca-tui/src/idle_submit_actions.rs`
 
 Resume queue autosend when a new user foreground turn is submitted. Do not
@@ -547,7 +554,7 @@ otherwise change idle submission.
 - `TurnStarted` clears in-flight restore state;
 - rejection before start restores exact composer state;
 - failure after start does not restore;
-- disconnected action channel restores the item to queue front;
+- full and disconnected action channels restore the item to queue front;
 - explicit interrupt suppresses autosend;
 - new foreground submit resumes autosend;
 - background-current sends background control before one queued submit.
