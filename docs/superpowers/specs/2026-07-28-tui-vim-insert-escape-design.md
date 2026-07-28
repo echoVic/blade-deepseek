@@ -183,6 +183,22 @@ higher-priority Backtrack shortcut and Running Esc remains Interrupt after the
 held character is flushed. At the `VimState` unit boundary, an Esc that reaches
 Insert handling still performs the existing Insert-to-Normal transition.
 
+The first configured character starts a pending sequence only after the current
+global, status, menu, panel, and shortcut routing declines the key and it
+actually reaches `VimState::handle`. Therefore configuring a sequence whose
+first character is an active higher-priority shortcut does not steal that
+shortcut.
+
+Once a first character has reached Vim and is pending, the app-level key
+preflight resolves the pending sequence before routing the next key:
+
+- an exact second character completes the explicitly initiated remap;
+- every other key flushes the first character, then enters the unchanged
+  routing chain.
+
+This gives the initiated two-key sequence deterministic precedence without
+changing which keys are allowed to start it.
+
 Key release events remain filtered by the existing preflight layer and never
 start, complete, or flush the sequence.
 
@@ -222,21 +238,29 @@ whether text changed.
 Existing `cancel_pending_command` continues to reset only Normal/Visual command
 parser state. It must not silently discard Insert text.
 
-Before a higher-priority owner consumes an event, it flushes the held Insert
-prefix while it still owns the current textarea cursor:
+`app.rs` owns the key boundary centrally. Before invoking
+`handle_key_event_preflight`, it asks `VimState` to resolve an existing pending
+prefix against the current press:
 
-- global shortcuts and active transcript search;
-- shortcut overlay and workflow panel;
-- approval-mode cycling;
-- slash and mention menus;
-- idle/running submit, queue, history, newline, and navigation shortcuts;
-- Tab completion or direct textarea Tab input;
+- exact second character: consume the key and stop routing;
+- non-match or expired prefix: flush once, then continue unchanged routing;
+- no pending prefix: continue unchanged routing.
+
+This one boundary covers global shortcuts, transcript search, shortcut
+overlay, workflow panel, approval-mode cycling, slash/mention menus,
+idle/running submit, queue, history, newline, navigation, Tab, setup, picker,
+approval, Compacting, and physical Esc without duplicating flush logic in each
+handler.
+
+Non-key input flushes in `app.rs` immediately before ownership transfers:
+
 - paste;
 - mouse press/drag/release and synthetic Enter;
-- wheel/scroll input;
-- setup, picker, approval, Compacting, and runtime status transitions;
-- composer replacement, queue restoration, backtrack restoration, and
-  submission rejection.
+- wheel/scroll input.
+
+Runtime events flush before a status transition or composer replacement.
+Defensive composer-reset methods also clear any pending prefix so no hidden
+state can carry into a replacement textarea.
 
 Ordering is observable:
 
@@ -246,6 +270,12 @@ Ordering is observable:
 - `j` then submit includes `j` in the submitted composer;
 - `j` then runtime transition leaves `j` in the composer before the new status
   takes ownership.
+
+Queue restoration and other explicit composer replacement keep their existing
+replacement semantics: the held prefix is flushed into the old composer first,
+then the requested replacement occurs, and no hidden prefix carries into the
+new composer. Submission and queue-enqueue paths instead snapshot only after
+the flush, so the character is included in submitted or queued text.
 
 If the remap is disabled or Vim is not in Insert mode, flushing is a no-op.
 
@@ -322,27 +352,13 @@ Registers and dot-repeat state retain the command-core lifecycle contract.
   - own the configured sequence and pending Insert prefix;
   - exact match, mismatch/overlap, flush, history, Unicode, and disabled-mode
     tests.
-- `crates/orca-tui/src/composer_input_actions.rs`
-  - flush before Tab bypasses `VimState`.
-- `crates/orca-tui/src/key_event_actions.rs`
-  - receive the textarea and flush before preflight-owned keys.
-- `crates/orca-tui/src/idle_key_actions.rs`
-  - flush before idle/menu/panel owners consume a key.
-- `crates/orca-tui/src/idle_navigation_actions.rs`
-  - preserve flush ordering for `ExpandToolOutput`.
-- `crates/orca-tui/src/queued_input_actions.rs`
-  - flush before running/menu/queue owners consume a key.
-- `crates/orca-tui/src/status_key_actions.rs`
-  - flush before status-specific owners consume a key.
 - `crates/orca-tui/src/runtime_event_actions.rs`
   - flush before status changes or composer replacement.
 - `crates/orca-tui/src/app.rs`
   - construct `VimState` with the effective sequence;
   - flush an expired prefix at the top of the loop and refresh input state;
+  - resolve pending key input before the existing preflight;
   - flush before paste, mouse, wheel, and synthetic Enter.
-- `crates/orca-tui/src/input_event_actions.rs`
-  - pass `VimState` and theme where paste must flush before insertion, or keep
-    the flush at the app ownership boundary with focused ordering tests.
 - all test/runtime files that construct `RunConfig`
   - set `vim_insert_escape: None` unless the test explicitly exercises it.
 
@@ -381,9 +397,11 @@ or terminal capability changes are required.
 ### Ownership boundaries
 
 - submit includes a held prefix;
-- queue submit and composer restore preserve it;
-- Tab, paste, mouse, wheel, search, menus, workflow panel, approval, setup,
-  Compacting, and runtime status transitions flush once;
+- queue submit includes a held prefix; composer replacement flushes before
+  replacement and carries no hidden prefix into the replacement;
+- the app-level pending-key preflight covers Tab, search, menus, workflow
+  panel, approval, setup, Compacting, Esc, submit, queue, and navigation;
+- paste, mouse, wheel, and runtime status transitions flush once;
 - mouse ordering inserts at the pre-click cursor;
 - paste payload `"jj"` remains pasted text;
 - release events never affect prefix state.
