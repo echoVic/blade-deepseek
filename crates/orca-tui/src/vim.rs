@@ -617,18 +617,11 @@ fn multiplied_count(base: usize, multiplier: usize) -> usize {
 }
 
 fn move_to_line_head(textarea: &mut TextArea<'_>) {
-    let (_, col) = textarea.cursor();
-    for _ in 0..col {
-        textarea.move_cursor(CursorMove::Back);
-    }
+    textarea.move_cursor(CursorMove::Head);
 }
 
 fn move_to_line_end(textarea: &mut TextArea<'_>) {
-    let (row, col) = textarea.cursor();
-    let remaining = textarea.lines()[row].chars().count().saturating_sub(col);
-    for _ in 0..remaining {
-        textarea.move_cursor(CursorMove::Forward);
-    }
+    textarea.move_cursor(CursorMove::End);
 }
 
 fn move_to_row_head(textarea: &mut TextArea<'_>, row: usize) {
@@ -714,18 +707,19 @@ fn delete_lines(textarea: &mut TextArea<'_>, count: usize) -> Option<String> {
     if start_row == 0 && reaches_end {
         textarea.select_all();
     } else if reaches_end {
-        move_to_row_head(textarea, start_row - 1);
-        move_to_line_end(textarea);
+        textarea.move_cursor(CursorMove::Head);
+        textarea.move_cursor(CursorMove::Up);
+        textarea.move_cursor(CursorMove::End);
         textarea.start_selection();
         textarea.move_cursor(CursorMove::Bottom);
-        move_to_line_end(textarea);
+        textarea.move_cursor(CursorMove::End);
     } else {
-        move_to_row_head(textarea, start_row);
+        textarea.move_cursor(CursorMove::Head);
         textarea.start_selection();
         for _ in 0..count {
             textarea.move_cursor(CursorMove::Down);
         }
-        move_to_line_head(textarea);
+        textarea.move_cursor(CursorMove::Head);
     }
 
     textarea.cut().then_some(register_text)
@@ -755,7 +749,16 @@ fn paste_register(textarea: &mut TextArea<'_>, value: &VimRegisterValue, count: 
         VimRegisterKind::Characterwise => repeat_text(&value.text, "", count),
         VimRegisterKind::Linewise => {
             let normalized = value.text.strip_suffix('\n').unwrap_or(&value.text);
-            repeat_text(normalized, "\n", count).map(|text| format!("\n{text}"))
+            repeat_text(normalized, "\n", count).and_then(|text| {
+                let total = text.len().checked_add(1)?;
+                if total > MAX_VIM_PASTE_BYTES {
+                    return None;
+                }
+                let mut payload = String::with_capacity(total);
+                payload.push('\n');
+                payload.push_str(&text);
+                Some(payload)
+            })
         }
     };
     let Some(payload) = payload.filter(|payload| !payload.is_empty()) else {
@@ -893,6 +896,65 @@ mod tests {
         state.handle(input('0'), &mut textarea, &theme);
 
         assert_eq!(textarea.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn line_positioning_avoids_composer_sized_iteration() {
+        let production = include_str!("vim.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production vim source");
+        let line_head = production
+            .split("fn move_to_line_head")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n\nfn move_to_line_end").next())
+            .expect("move_to_line_head source");
+        let line_end = production
+            .split("fn move_to_line_end")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n\nfn move_to_row_head").next())
+            .expect("move_to_line_end source");
+        let delete_lines = production
+            .split("fn delete_lines")
+            .nth(1)
+            .and_then(|tail| tail.split("\nfn yank_lines").next())
+            .expect("delete_lines source");
+
+        assert!(line_head.contains("textarea.move_cursor(CursorMove::Head);"));
+        assert!(!line_head.contains("for _ in"));
+        assert!(line_end.contains("textarea.move_cursor(CursorMove::End);"));
+        assert!(!line_end.contains("for _ in"));
+        assert!(!delete_lines.contains("move_to_row_head"));
+    }
+
+    #[test]
+    fn line_commands_handle_twenty_thousand_columns_and_rows() {
+        let theme = Theme::named(ThemeName::Dark);
+        let mut line_state = VimState::new(true);
+        let long_line = "x".repeat(20_000);
+        let mut long_line_area = TextArea::from([long_line.as_str()]);
+        long_line_area.move_cursor(CursorMove::End);
+
+        line_state.handle(input('0'), &mut long_line_area, &theme);
+
+        assert_eq!(long_line_area.cursor(), (0, 0));
+
+        let mut row_state = VimState::new(true);
+        let lines = (0..20_001)
+            .map(|row| format!("line-{row}"))
+            .collect::<Vec<_>>();
+        let mut many_rows_area = TextArea::from(lines);
+        many_rows_area.move_cursor(CursorMove::Bottom);
+
+        handle_sequence(&mut row_state, &mut many_rows_area, &theme, "dd");
+
+        assert_eq!(many_rows_area.lines().len(), 20_000);
+        assert_eq!(
+            many_rows_area.lines().last().map(String::as_str),
+            Some("line-19999")
+        );
+        assert!(many_rows_area.undo());
+        assert_eq!(many_rows_area.lines().len(), 20_001);
     }
 
     #[test]
@@ -1043,6 +1105,36 @@ mod tests {
 
         assert_eq!(textarea.lines(), &["keep"]);
         assert!(!textarea.undo());
+    }
+
+    #[test]
+    fn linewise_paste_counts_the_leading_newline_in_the_one_mib_bound() {
+        let theme = Theme::named(ThemeName::Dark);
+        for (body_bytes, should_paste) in [
+            (MAX_VIM_PASTE_BYTES - 1, true),
+            (MAX_VIM_PASTE_BYTES, false),
+        ] {
+            let mut state = VimState::new(true);
+            state.registers.unnamed = Some(VimRegisterValue {
+                text: "x".repeat(body_bytes),
+                kind: VimRegisterKind::Linewise,
+            });
+            let mut textarea = TextArea::from(["keep"]);
+
+            state.handle(input('p'), &mut textarea, &theme);
+
+            if should_paste {
+                assert_eq!(
+                    textarea.lines().join("\n").len(),
+                    "keep".len() + MAX_VIM_PASTE_BYTES
+                );
+                assert!(textarea.undo());
+                assert_eq!(textarea.lines(), &["keep"]);
+            } else {
+                assert_eq!(textarea.lines(), &["keep"]);
+                assert!(!textarea.undo());
+            }
+        }
     }
 
     #[test]
