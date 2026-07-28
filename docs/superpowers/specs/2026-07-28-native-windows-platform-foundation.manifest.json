@@ -351,7 +351,7 @@
       "server-test-client-unix-libc",
       "tests/support/server_test_client.rs",
       "unix_libc_process",
-      9,
+      7,
       "windows-test-portability"
     ],
     [

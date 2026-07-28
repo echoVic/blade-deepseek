@@ -464,6 +464,11 @@ struct PseudoConsole {
     api: ConPtyApi,
 }
 
+// ConPTY handles are kernel-owned resources, and this value is transferred
+// between the shell session manager and its cleanup thread while remaining
+// exclusively owned by the Rust wrapper.
+unsafe impl Send for PseudoConsole {}
+
 impl PseudoConsole {
     fn new(
         input: HANDLE,
@@ -851,6 +856,10 @@ fn win32(operation: &str, code: u32) -> WindowsSandboxError {
 struct OwnedHandle {
     raw: HANDLE,
 }
+
+// HANDLE ownership is exclusive and the Win32 handle APIs are thread-safe;
+// moving the owner between threads does not duplicate or alias the handle.
+unsafe impl Send for OwnedHandle {}
 
 impl OwnedHandle {
     fn new(raw: HANDLE) -> Self {

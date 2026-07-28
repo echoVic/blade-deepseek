@@ -32,6 +32,15 @@ const MAX_TRANSCRIPT_LINES: usize = 64;
 const MAX_TRANSCRIPT_LINE_CHARS: usize = 2_048;
 const MAX_DIAGNOSTIC_STDERR_BYTES: usize = 8 * 1024;
 
+#[cfg(unix)]
+const TERMINATE_SIGNAL: i32 = libc::SIGTERM;
+#[cfg(not(unix))]
+const TERMINATE_SIGNAL: i32 = 0;
+#[cfg(unix)]
+const KILL_SIGNAL: i32 = libc::SIGKILL;
+#[cfg(not(unix))]
+const KILL_SIGNAL: i32 = 0;
+
 #[derive(Debug)]
 pub struct ServerTestError {
     message: String,
@@ -271,9 +280,9 @@ impl SpawnedChildGuard {
 impl Drop for SpawnedChildGuard {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
-            let _ = signal_process_group(self.process_group_id, libc::SIGTERM);
+            let _ = signal_process_group(self.process_group_id, TERMINATE_SIGNAL);
             thread::sleep(Duration::from_millis(20));
-            let _ = signal_process_group(self.process_group_id, libc::SIGKILL);
+            let _ = signal_process_group(self.process_group_id, KILL_SIGNAL);
             let _ = child.kill();
             let _ = wait_child_retry(child);
         }
@@ -947,7 +956,7 @@ impl ServerTestClient {
         let mut leader_exited = leader_already_exited;
         if let Some(process_group_id) = self.process_group_id {
             if let Err(error) =
-                signal_process_group_for_cleanup(process_group_id, libc::SIGTERM, leader_exited)
+                signal_process_group_for_cleanup(process_group_id, TERMINATE_SIGNAL, leader_exited)
             {
                 first_error = Some(error);
             }
@@ -961,7 +970,7 @@ impl ServerTestClient {
                 }
             }
             if let Err(error) =
-                signal_process_group_for_cleanup(process_group_id, libc::SIGKILL, leader_exited)
+                signal_process_group_for_cleanup(process_group_id, KILL_SIGNAL, leader_exited)
                 && first_error.is_none()
             {
                 first_error = Some(error);

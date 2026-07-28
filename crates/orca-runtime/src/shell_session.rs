@@ -1301,6 +1301,10 @@ fn initialize_spawned_shell(
         ShellChild::Process(child) => child,
         #[cfg(windows)]
         ShellChild::WindowsPty(_) => unreachable!("standard spawn returned a ConPTY child"),
+        #[cfg(windows)]
+        ShellChild::WindowsSandbox(_) | ShellChild::WindowsSandboxPty(_) => {
+            unreachable!("standard spawn returned a sandbox child")
+        }
     };
     Ok((child, stdin, stdout_reader, stderr_reader))
 }

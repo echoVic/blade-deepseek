@@ -3640,7 +3640,7 @@ mod tests {
             "pub(crate) fn launch_async_subagent(",
             "fn spawn_async_subagent_worker(",
             "fn async_subagent_result_payload(",
-            ".arg(\"subagent-worker\")",
+            "\"subagent-worker\".to_string()",
             "TaskRegistry::new_for_cwd",
             "mark_worker_spawned",
             "complete_with_usage",

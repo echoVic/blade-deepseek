@@ -1,9 +1,10 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use orca_core::approval_types::ActionKind;
+use orca_core::external_config::ExternalToolConfig;
 use serde_json::Value;
 
 #[path = "support/sandbox_test_parent.rs"]
@@ -683,27 +684,47 @@ fn external_tool_descriptor_runs_from_orca_tools_dir() {
     let workspace = make_temp_workspace("external-workspace");
     fs::create_dir_all(workspace.join("scripts")).expect("scripts dir");
     let output_file = workspace.join("deploy-output.txt");
-    let script = workspace.join("scripts/deploy.sh");
-    fs::write(
-        &script,
+    #[cfg(unix)]
+    let command = {
+        let script = workspace.join("scripts/deploy.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat > {}\nprintf 'deploy ok'\n",
+                shell_escape(&output_file)
+            ),
+        )
+        .expect("write script");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        "./scripts/deploy.sh".to_string()
+    };
+    #[cfg(windows)]
+    let command = {
+        // Keep this test native on Windows: external tools are evaluated by
+        // the resolved PowerShell/cmd dialect rather than a Unix fixture.
+        let output_path = output_file
+            .to_string_lossy()
+            .replace('`', "``")
+            .replace('"', "`\"");
         format!(
-            "#!/bin/sh\ncat > {}\nprintf 'deploy ok'\n",
-            shell_escape(&output_file)
-        ),
-    )
-    .expect("write script");
-    let mut permissions = fs::metadata(&script).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).unwrap();
+            "$input = [Console]::In.ReadToEnd(); Set-Content -LiteralPath \"{output_path}\" -Value $input -NoNewline; Write-Output \"deploy ok\""
+        )
+    };
     fs::write(
         tools_dir.join("deploy.toml"),
-        r#"
-name = "deploy"
-description = "Deploy the current branch"
-action_kind = "write"
-command = "./scripts/deploy.sh"
-schema = { target = { type = "string", description = "environment" } }
-"#,
+        toml::to_string(&ExternalToolConfig {
+            name: "deploy".to_string(),
+            description: "Deploy the current branch".to_string(),
+            action_kind: ActionKind::Write,
+            command,
+            schema: serde_json::json!({
+                "target": { "type": "string", "description": "environment" }
+            }),
+        })
+        .expect("serialize descriptor"),
     )
     .expect("write descriptor");
 
@@ -791,6 +812,7 @@ fn find_task_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     files
 }
 
+#[cfg(unix)]
 fn shell_escape(path: &std::path::Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }

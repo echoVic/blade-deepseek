@@ -509,16 +509,19 @@ mod tests {
 
     #[test]
     fn bwrap_lookup_rejects_workspace_controlled_binary() {
-        use std::os::unix::fs::PermissionsExt;
-
         let workspace = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
         for dir in [workspace.path(), external.path()] {
             let binary = dir.join("bwrap");
             std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
-            let mut permissions = binary.metadata().unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(binary, permissions).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                let mut permissions = binary.metadata().unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(binary, permissions).unwrap();
+            }
         }
         let path = std::env::join_paths([workspace.path(), external.path()]).unwrap();
 
