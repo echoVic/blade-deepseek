@@ -900,6 +900,8 @@ mod tests {
         insert_composer_paste, insert_pasted_text, make_textarea_with_text, textarea_text,
     };
     use crate::idle_submit_actions::handle_idle_submit;
+    use crate::key_event_actions::handle_transcript_search_key;
+    use crate::selection::{SelectionGranularity, SelectionPos, TranscriptSelection};
     use crate::slash_command_actions::handle_slash_command;
     use crate::types::{ApprovalOption, PendingTuiInput, SlashMenu, SlashMenuItem, SubMenu};
     use crate::types::{TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
@@ -4953,6 +4955,199 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("hi"));
         assert!(rendered.contains("answer"));
+    }
+
+    #[test]
+    fn search_keyboard_frames_move_active_match_without_composer_mutation() {
+        let (mut state, _rx) = test_state();
+        for index in 0..30 {
+            state.push_message(ChatMessage::System(format!("row {index:02} alpha")));
+        }
+        state.auto_scroll = false;
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea = TextArea::from(["composer draft"]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10))
+            .expect("test backend");
+        terminal
+            .draw(|frame| ui::render(frame, &mut state, &textarea, &theme))
+            .expect("initial draw");
+
+        state.open_transcript_search();
+        state.replace_transcript_search_query("alpha");
+        terminal
+            .draw(|frame| ui::render(frame, &mut state, &textarea, &theme))
+            .expect("search draw");
+        let first = state.transcript_search.active_ordinal();
+        assert!(format!("{:?}", terminal.backend().buffer()).contains("1/30"));
+
+        handle_transcript_search_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+        );
+        terminal
+            .draw(|frame| ui::render(frame, &mut state, &textarea, &theme))
+            .expect("next draw");
+        assert_ne!(state.transcript_search.active_ordinal(), first);
+        assert!(!state.auto_scroll);
+        assert_eq!(textarea.lines(), &["composer draft".to_string()]);
+
+        handle_transcript_search_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            &mut state,
+        );
+        assert_eq!(state.transcript_search.active_ordinal(), first);
+    }
+
+    #[test]
+    fn running_search_esc_closes_before_interrupt_and_paste_never_touches_composer() {
+        let (mut state, _state_action_rx) = test_state();
+        state.enter_running();
+        state.open_transcript_search();
+        let mut textarea = TextArea::from(["composer"]);
+        let operation = crate::test_support::TestOperationInterrupt::default();
+        let mut config = test_config(HistoryMode::Record);
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::unbounded();
+
+        assert!(handle_paste_event(
+            &Event::Paste("alpha\r\nbeta".to_string()),
+            &mut state,
+            &config,
+            &mut textarea,
+        ));
+        assert_eq!(state.transcript_search.query(), "alpha beta");
+        assert_eq!(textarea.lines(), &["composer".to_string()]);
+        assert!(state.pending_pastes.is_empty());
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key_event_preflight(
+            esc,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &operation,
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(!state.transcript_search.open);
+        assert_eq!(operation.call_count(), 0);
+
+        let preloaded = Arc::new(Mutex::new(None));
+        let mut vim = VimState::new(false);
+        let theme = Theme::named(ThemeName::Dark);
+        handle_status_key(
+            &Event::Key(esc),
+            &esc,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &operation,
+            &preloaded,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(operation.call_count(), 1);
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+    }
+
+    #[test]
+    fn mouse_selection_over_search_match_wins_and_copy_stays_exact() {
+        let (mut state, _rx) = test_state();
+        state.push_message(ChatMessage::System("alpha beta".to_string()));
+        state.open_transcript_search();
+        state.replace_transcript_search_query("alpha");
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8))
+            .expect("test backend");
+        terminal
+            .draw(|frame| ui::render(frame, &mut state, &textarea, &theme))
+            .expect("search draw");
+
+        state.selection = Some(TranscriptSelection::unit(
+            SelectionGranularity::Cell,
+            SelectionPos { row: 0, col: 1 },
+            SelectionPos { row: 0, col: 3 },
+        ));
+        terminal
+            .draw(|frame| ui::render(frame, &mut state, &textarea, &theme))
+            .expect("selection draw");
+        assert_eq!(
+            state
+                .transcript_render_cache
+                .extract_text(state.selection.as_ref().unwrap()),
+            "lph"
+        );
+        let selected_cells = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.style().bg == theme.selection_style().bg)
+            .count();
+        assert!(selected_cells >= 3);
+    }
+
+    #[test]
+    fn streaming_and_resize_refresh_matches_without_stealing_active_identity() {
+        let (mut state, _rx) = test_state();
+        state.update(TuiEvent::MessageDelta(
+            "prefix long words before alpha\n\nhidden alpha".to_string(),
+        ));
+        state.open_transcript_search();
+        state.replace_transcript_search_query("alpha");
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 8))
+            .expect("test backend");
+        terminal
+            .draw(|frame| ui::render(frame, &mut state, &textarea, &theme))
+            .expect("held draw");
+        assert_eq!(state.transcript_search.match_count(), 1);
+        let identity = state
+            .transcript_search
+            .active_match()
+            .unwrap()
+            .line_identity;
+
+        state.update(TuiEvent::MessageDelta("\n".to_string()));
+        terminal
+            .draw(|frame| ui::render(frame, &mut state, &textarea, &theme))
+            .expect("released draw");
+        assert_eq!(state.transcript_search.match_count(), 2);
+        assert_eq!(
+            state
+                .transcript_search
+                .active_match()
+                .unwrap()
+                .line_identity,
+            identity
+        );
+        let before = state.transcript_search.active_match().unwrap().start;
+
+        let mut resized = ratatui::Terminal::new(ratatui::backend::TestBackend::new(8, 8))
+            .expect("resized backend");
+        resized
+            .draw(|frame| ui::render(frame, &mut state, &textarea, &theme))
+            .expect("resized draw");
+        assert_eq!(
+            state
+                .transcript_search
+                .active_match()
+                .unwrap()
+                .line_identity,
+            identity
+        );
+        assert_ne!(
+            state.transcript_search.active_match().unwrap().start,
+            before
+        );
     }
 
     #[test]
