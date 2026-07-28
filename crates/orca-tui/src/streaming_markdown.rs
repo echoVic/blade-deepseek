@@ -53,12 +53,18 @@ impl StreamingMarkdownAssembler {
         }
         self.finished = true;
         if let Some(mut table) = self.active_table.take() {
-            table.push_str(&self.partial_line);
-            self.partial_line.clear();
-            return vec![StreamingMarkdownAction::AppendFrozen {
+            let partial_line = std::mem::take(&mut self.partial_line);
+            if table_row(&partial_line) {
+                table.push_str(&partial_line);
+            }
+            let mut actions = vec![StreamingMarkdownAction::AppendFrozen {
                 text: table,
                 trailing_blank: false,
             }];
+            if !partial_line.is_empty() && !table_row(&partial_line) {
+                actions.push(StreamingMarkdownAction::FinishTail(partial_line));
+            }
+            return actions;
         }
         let mut hidden_suffix = self.pipe_candidate.take().unwrap_or_default();
         hidden_suffix.push_str(&self.partial_line);
@@ -564,6 +570,27 @@ ordinary
                 text: "| Name | Value |\n|---|---|\n| A | 1 |\n".to_string(),
                 trailing_blank: false,
             }]
+        );
+    }
+
+    #[test]
+    fn table_finish_keeps_partial_non_table_tail_separate() {
+        let mut assembler = StreamingMarkdownAssembler::default();
+        assert!(
+            assembler
+                .push("| Name | Value |\n|---|---|\n| A | 1 |\n")
+                .is_empty()
+        );
+        assert!(assembler.push("after").is_empty());
+        assert_eq!(
+            assembler.finish(),
+            vec![
+                StreamingMarkdownAction::AppendFrozen {
+                    text: "| Name | Value |\n|---|---|\n| A | 1 |\n".to_string(),
+                    trailing_blank: false,
+                },
+                StreamingMarkdownAction::FinishTail("after".to_string()),
+            ]
         );
     }
 }
