@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +14,147 @@ pub struct UpdateInfo {
     pub current: String,
     pub latest: String,
     pub url: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UpdatePreflight {
+    Continue,
+    Prompt(UpdateInfo),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UpdateAction {
+    NpmGlobalLatest,
+    StandaloneInstaller { install_dir: Option<PathBuf> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateCommand {
+    pub program: &'static str,
+    pub args: Vec<String>,
+    pub display: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UpdateRunOutcome {
+    Updated,
+    Failed(Option<i32>),
+    StartFailed(String),
+}
+
+impl UpdateAction {
+    pub fn command(&self) -> UpdateCommand {
+        match self {
+            Self::NpmGlobalLatest => UpdateCommand {
+                program: "npm",
+                args: vec![
+                    "install".to_string(),
+                    "-g".to_string(),
+                    "@blade-ai/orca@latest".to_string(),
+                    "--registry".to_string(),
+                    "https://registry.npmjs.org".to_string(),
+                ],
+                display:
+                    "npm install -g @blade-ai/orca@latest --registry https://registry.npmjs.org"
+                        .to_string(),
+            },
+            Self::StandaloneInstaller { install_dir } => {
+                standalone_update_command(install_dir.clone())
+            }
+        }
+    }
+
+    pub fn command_display(&self) -> String {
+        self.command().display
+    }
+}
+
+pub fn current_update_action() -> UpdateAction {
+    let current_exe = std::env::current_exe().ok();
+    update_action_from_env_and_exe(|name| std::env::var_os(name), current_exe.as_deref())
+}
+
+fn update_action_from_env_and_exe(
+    get_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    current_exe: Option<&Path>,
+) -> UpdateAction {
+    if get_env("ORCA_MANAGED_BY_NPM").is_some() {
+        UpdateAction::NpmGlobalLatest
+    } else {
+        UpdateAction::StandaloneInstaller {
+            install_dir: current_exe.and_then(|path| path.parent().map(Path::to_path_buf)),
+        }
+    }
+}
+
+fn standalone_update_command(install_dir: Option<PathBuf>) -> UpdateCommand {
+    let script = if install_dir.is_some() {
+        "tmp=$(mktemp) && trap 'rm -f \"$tmp\"' EXIT INT TERM && curl -fsSL https://orcaagent.dev/install.sh -o \"$tmp\" && ORCA_NON_INTERACTIVE=1 INSTALL_DIR=\"$1\" sh \"$tmp\""
+    } else {
+        "tmp=$(mktemp) && trap 'rm -f \"$tmp\"' EXIT INT TERM && curl -fsSL https://orcaagent.dev/install.sh -o \"$tmp\" && ORCA_NON_INTERACTIVE=1 sh \"$tmp\""
+    };
+    let mut args = vec![
+        "-c".to_string(),
+        script.to_string(),
+        "orca-update".to_string(),
+    ];
+    let display = if let Some(install_dir) = install_dir {
+        args.push(install_dir.display().to_string());
+        format!(
+            "curl -fsSL https://orcaagent.dev/install.sh -o <tmp> && ORCA_NON_INTERACTIVE=1 INSTALL_DIR={} sh <tmp>",
+            install_dir.display()
+        )
+    } else {
+        "curl -fsSL https://orcaagent.dev/install.sh -o <tmp> && ORCA_NON_INTERACTIVE=1 sh <tmp>"
+            .to_string()
+    };
+
+    UpdateCommand {
+        program: "sh",
+        args,
+        display,
+    }
+}
+
+pub fn is_dev_build_run() -> bool {
+    cfg!(debug_assertions)
+        || std::env::current_exe()
+            .ok()
+            .is_some_and(|exe| exe_in_cargo_target(&exe))
+}
+
+fn exe_in_cargo_target(exe: &Path) -> bool {
+    exe.ancestors()
+        .any(|ancestor| ancestor.file_name().is_some_and(|name| name == "target"))
+}
+
+pub fn update_preflight(enabled: bool, current_version: &str) -> UpdatePreflight {
+    update_preflight_with(enabled && !is_dev_build_run(), current_version, |version| {
+        check_latest_for_prompt(version)
+    })
+}
+
+fn update_preflight_with(
+    enabled: bool,
+    current_version: &str,
+    check_latest: impl FnOnce(&str) -> Result<Option<UpdateInfo>, String>,
+) -> UpdatePreflight {
+    if !enabled {
+        return UpdatePreflight::Continue;
+    }
+    match check_latest(current_version) {
+        Ok(Some(info)) => UpdatePreflight::Prompt(info),
+        Ok(None) | Err(_) => UpdatePreflight::Continue,
+    }
+}
+
+pub fn run_update(action: &UpdateAction) -> UpdateRunOutcome {
+    let command = action.command();
+    match Command::new(command.program).args(&command.args).status() {
+        Ok(status) if status.success() => UpdateRunOutcome::Updated,
+        Ok(status) => UpdateRunOutcome::Failed(status.code()),
+        Err(error) => UpdateRunOutcome::StartFailed(error.to_string()),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -177,6 +319,102 @@ fn update_cache_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preflight_prompts_when_update_is_available() {
+        let outcome = update_preflight_with(true, "0.1.7", |_| {
+            Ok(Some(UpdateInfo {
+                current: "0.1.7".to_string(),
+                latest: "0.1.8".to_string(),
+                url: "https://example.test/releases/tag/v0.1.8".to_string(),
+            }))
+        });
+
+        assert!(matches!(
+            outcome,
+            UpdatePreflight::Prompt(UpdateInfo { latest, .. }) if latest == "0.1.8"
+        ));
+    }
+
+    #[test]
+    fn preflight_continues_when_disabled_or_check_fails() {
+        assert_eq!(
+            update_preflight_with(false, "0.1.7", |_| {
+                panic!("disabled update check must not run")
+            }),
+            UpdatePreflight::Continue
+        );
+        assert_eq!(
+            update_preflight_with(true, "0.1.7", |_| Err("offline".to_string())),
+            UpdatePreflight::Continue
+        );
+    }
+
+    #[test]
+    fn update_action_uses_npm_when_launched_from_npm_wrapper() {
+        let action = update_action_from_env_and_exe(
+            |name| match name {
+                "ORCA_MANAGED_BY_NPM" => Some("1".into()),
+                _ => None,
+            },
+            Some(std::path::Path::new("/custom/bin/orca")),
+        );
+
+        assert_eq!(
+            action.command().display,
+            "npm install -g @blade-ai/orca@latest --registry https://registry.npmjs.org"
+        );
+    }
+
+    #[test]
+    fn update_action_reruns_standalone_installer_for_current_executable_dir() {
+        let action = update_action_from_env_and_exe(
+            |_| None,
+            Some(std::path::Path::new("/custom/bin/orca")),
+        );
+
+        assert_eq!(
+            action.command().display,
+            "curl -fsSL https://orcaagent.dev/install.sh -o <tmp> && ORCA_NON_INTERACTIVE=1 INSTALL_DIR=/custom/bin sh <tmp>"
+        );
+    }
+
+    #[test]
+    fn standalone_update_command_downloads_before_running_installer() {
+        let action = update_action_from_env_and_exe(
+            |_| None,
+            Some(std::path::Path::new("/custom/bin/orca")),
+        );
+        let command = action.command();
+
+        assert_eq!(command.program, "sh");
+        assert!(command.args.iter().any(|arg| arg.contains("mktemp")));
+        assert!(command.args.iter().any(|arg| {
+            arg.contains("curl -fsSL https://orcaagent.dev/install.sh -o \"$tmp\"")
+        }));
+        assert!(command.args.iter().any(|arg| {
+            arg.contains("&& ORCA_NON_INTERACTIVE=1 INSTALL_DIR=\"$1\" sh \"$tmp\"")
+        }));
+        assert!(
+            !command
+                .args
+                .iter()
+                .any(|arg| arg.contains("| ORCA_NON_INTERACTIVE"))
+        );
+    }
+
+    #[test]
+    fn development_executables_are_not_update_eligible() {
+        assert!(exe_in_cargo_target(std::path::Path::new(
+            "/repo/target/debug/orca"
+        )));
+        assert!(exe_in_cargo_target(std::path::Path::new(
+            "/repo/target/aarch64-apple-darwin/release/orca"
+        )));
+        assert!(!exe_in_cargo_target(std::path::Path::new(
+            "/Users/dev/.orca/bin/orca"
+        )));
+    }
 
     #[test]
     fn normalize_version_strips_v_prefix() {
