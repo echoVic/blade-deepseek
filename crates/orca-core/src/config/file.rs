@@ -277,7 +277,7 @@ pub fn environment_overrides() -> Result<ConfigOverrides, String> {
             .or_else(|| std::env::var("DEEPSEEK_MODEL").ok()),
         mode: std::env::var("ORCA_MODE")
             .ok()
-            .map(|mode| parse_approval_mode(&mode))
+            .map(|mode| parse_approval_mode_value(&mode))
             .transpose()?,
         api_key: std::env::var("ORCA_API_KEY")
             .ok()
@@ -293,7 +293,7 @@ pub fn environment_overrides() -> Result<ConfigOverrides, String> {
     })
 }
 
-fn parse_approval_mode(mode: &str) -> Result<ApprovalMode, String> {
+pub fn parse_approval_mode_value(mode: &str) -> Result<ApprovalMode, String> {
     ApprovalMode::from_str(mode, true).map_err(|_| {
         format!("unsupported mode '{mode}'. Use suggest, auto-edit, full-auto, or plan")
     })

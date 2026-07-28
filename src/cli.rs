@@ -19,8 +19,6 @@ use crate::model::ModelSelection;
 use crate::runtime::controller;
 use crate::runtime::history;
 
-const MAX_WORKER_API_KEY_BYTES: u64 = 64 * 1024;
-
 #[derive(Debug, Parser)]
 #[command(name = "orca")]
 #[command(version)]
@@ -352,6 +350,10 @@ impl From<WorkflowArgs> for orca_runtime::workflow::command::WorkflowCommandRequ
 
 #[derive(Debug, Parser)]
 struct SubagentWorkerArgs {
+    /// Product version inherited from the parent executable.
+    #[arg(long, hide = true, default_value = env!("CARGO_PKG_VERSION"))]
+    app_version: String,
+
     /// Workspace directory where the parent async task was launched.
     #[arg(long)]
     cwd: PathBuf,
@@ -525,14 +527,41 @@ impl From<TrustArgs> for orca_runtime::command::trust::TrustCommandRequest {
     }
 }
 
+impl From<SubagentWorkerArgs> for orca_runtime::command::launch::SubagentWorkerLaunchRequest {
+    fn from(args: SubagentWorkerArgs) -> Self {
+        Self {
+            app_version: args.app_version,
+            cwd: args.cwd,
+            child_cwd: args.child_cwd,
+            provider: args.provider,
+            model: args.model,
+            api_key: args.api_key,
+            api_key_stdin: args.api_key_stdin,
+            base_url: args.base_url,
+            session_id: args.session_id,
+            agent_id: args.agent_id,
+            subagent_depth: args.subagent_depth,
+            request_json: args.request_json,
+            worktree_repo_root: args.worktree_repo_root,
+            worktree_path: args.worktree_path,
+        }
+    }
+}
+
 pub fn run() -> i32 {
     let cli = Cli::parse();
 
     if matches!(cli.mode.as_deref(), Some("server")) {
-        return run_server(cli);
+        return orca_runtime::command::launch::run_protocol(protocol_request(
+            cli,
+            orca_runtime::command::launch::ProtocolMode::Server,
+        ));
     }
     if matches!(cli.mode.as_deref(), Some("acp")) {
-        return run_acp(cli);
+        return orca_runtime::command::launch::run_protocol(protocol_request(
+            cli,
+            orca_runtime::command::launch::ProtocolMode::Acp,
+        ));
     }
 
     match cli.command {
@@ -540,476 +569,47 @@ pub fn run() -> i32 {
         Some(Command::History(args)) => orca_runtime::command::history::run(args.into()),
         Some(Command::Workflow(args)) => orca_runtime::workflow::command::run(args.into()),
         Some(Command::Trust(args)) => orca_runtime::command::trust::run(args.into()),
-        Some(Command::SubagentWorker(args)) => run_subagent_worker(args),
-        None => run_placeholder(cli),
-    }
-}
-
-fn load_effective_file_config(
-    cwd: &std::path::Path,
-    cli: ConfigOverrides,
-) -> Result<file::FileConfig, String> {
-    let file_config = file::load_layered_config(cwd);
-    let env = env_overrides()?;
-    Ok(file::apply_override_layers(file_config, env, cli))
-}
-
-fn env_overrides() -> Result<ConfigOverrides, String> {
-    Ok(ConfigOverrides {
-        model: env::var("ORCA_MODEL")
-            .ok()
-            .or_else(|| env::var("DEEPSEEK_MODEL").ok()),
-        mode: match env::var("ORCA_MODE") {
-            Ok(mode) => Some(parse_approval_mode_value(&mode)?),
-            Err(_) => None,
-        },
-        api_key: env::var("ORCA_API_KEY")
-            .ok()
-            .or_else(|| env::var("DEEPSEEK_API_KEY").ok()),
-        base_url: env::var("ORCA_BASE_URL")
-            .ok()
-            .or_else(|| env::var("DEEPSEEK_BASE_URL").ok()),
-        reasoning_effort: match env::var("ORCA_REASONING_EFFORT")
-            .ok()
-            .or_else(|| env::var("DEEPSEEK_REASONING_EFFORT").ok())
-        {
-            Some(value) => Some(parse_reasoning_effort_value(&value)?),
-            None => None,
-        },
-    })
-}
-
-fn parse_approval_mode_value(mode: &str) -> Result<ApprovalMode, String> {
-    ApprovalMode::from_str(mode, true).map_err(|_| {
-        format!("unsupported mode '{mode}'. Use suggest, auto-edit, full-auto, or plan")
-    })
-}
-
-fn parse_reasoning_effort_value(value: &str) -> Result<ReasoningEffort, String> {
-    match value {
-        "high" => Ok(ReasoningEffort::High),
-        "max" => Ok(ReasoningEffort::Max),
-        other => Err(format!(
-            "unsupported reasoning_effort '{other}'. Use high or max"
-        )),
-    }
-}
-
-fn run_subagent_worker(args: SubagentWorkerArgs) -> i32 {
-    let request: SubagentRequest = match serde_json::from_str(&args.request_json) {
-        Ok(request) => request,
-        Err(error) => {
-            eprintln!("orca: invalid subagent worker request JSON: {error}");
-            return 1;
+        Some(Command::SubagentWorker(args)) => {
+            orca_runtime::command::launch::run_subagent_worker(args.into())
         }
-    };
-    let api_key = match resolve_worker_api_key(args.api_key, args.api_key_stdin) {
-        Ok(api_key) => api_key,
-        Err(error) => {
-            eprintln!("orca: {error}");
-            return 1;
-        }
-    };
-    let config = match build_worker_run_config(
-        &args.cwd,
-        args.provider,
-        args.model.clone(),
-        api_key,
-        args.base_url.clone(),
-    ) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("orca: {error}");
-            return 1;
-        }
-    };
-    let worktree = match (args.worktree_repo_root, args.worktree_path) {
-        (Some(repo_root), Some(path)) => Some(AsyncSubagentWorktree { repo_root, path }),
-        (None, None) => None,
-        _ => {
-            eprintln!("orca: --worktree-repo-root and --worktree-path must be provided together");
-            return 1;
-        }
-    };
-
-    subagent_async_worker::run_async_subagent_worker(
-        subagent_async_worker::AsyncSubagentWorkerInput {
-            config,
-            cwd: args.cwd,
-            child_cwd: args.child_cwd,
-            task_session_id: args.session_id,
-            agent_id: args.agent_id,
-            request,
-            child_depth: args.subagent_depth,
-            worktree,
-        },
-    )
-}
-
-fn build_worker_run_config(
-    cwd: &Path,
-    provider: ProviderKind,
-    model_override: Option<String>,
-    api_key_override: Option<String>,
-    base_url_override: Option<String>,
-) -> Result<RunConfig, String> {
-    let file_config = load_effective_file_config(
-        cwd,
-        ConfigOverrides {
-            model: model_override,
-            mode: None,
-            api_key: api_key_override,
-            base_url: base_url_override,
-            reasoning_effort: None,
-        },
-    )?;
-    let model = ModelSelection::parse(file_config.model)?;
-
-    Ok(RunConfig {
-        app_version: env!("CARGO_PKG_VERSION").to_string(),
-        prompt: String::new(),
-        cwd: Some(cwd.to_path_buf()),
-        output_format: OutputFormat::Jsonl,
-        approval_mode: file_config.mode.unwrap_or_default(),
-        provider,
-        verifier: None,
-        model,
-        model_runtime: file_config.model_runtime,
-        reasoning_effort: file_config.reasoning_effort,
-        api_key: file_config.api_key,
-        base_url: file_config.base_url,
-        history_mode: HistoryMode::Disabled,
-        show_session_picker: false,
-        active_permission_profile: None,
-        permission_profiles: file_config.permission_profiles,
-        runtime_workspace_roots: None,
-        permission_rules: file_config.permissions,
-        additional_working_directories: Vec::new(),
-        max_budget_usd: None,
-        mcp_servers: file_config.mcp_servers,
-        hooks: file_config.hooks,
-        external_tools: crate::tools::external::load_default_external_tools(),
-        subagents: file_config.subagents.normalized(),
-        tools: file_config.tools.normalized(),
-        workflows: file_config.workflows.resolved(),
-        theme: file_config.theme,
-        vim_mode: file_config.vim_mode,
-        update_check: file_config.update_check,
-        desktop_notifications: false,
-        auto_memory: file_config.auto_memory,
-    })
-}
-
-fn resolve_worker_api_key(
-    api_key_arg: Option<String>,
-    api_key_stdin: bool,
-) -> Result<Option<String>, String> {
-    resolve_worker_api_key_from_reader(api_key_arg, api_key_stdin, std::io::stdin())
-}
-
-fn resolve_worker_api_key_from_reader(
-    api_key_arg: Option<String>,
-    api_key_stdin: bool,
-    reader: impl Read,
-) -> Result<Option<String>, String> {
-    if !api_key_stdin {
-        return Ok(api_key_arg);
-    }
-    if api_key_arg.is_some() {
-        return Err("--api-key and --api-key-stdin cannot be used together".to_string());
-    }
-    let mut api_key = String::new();
-    reader
-        .take(MAX_WORKER_API_KEY_BYTES + 1)
-        .read_to_string(&mut api_key)
-        .map_err(|error| format!("failed to read worker credential from stdin: {error}"))?;
-    if api_key.len() as u64 > MAX_WORKER_API_KEY_BYTES {
-        return Err("worker credential from stdin exceeds 64 KiB".to_string());
-    }
-    Ok(Some(api_key))
-}
-
-fn resolve_history_mode(
-    resume: Option<String>,
-    fork: Option<String>,
-    continue_latest: bool,
-    fallback: HistoryMode,
-) -> HistoryMode {
-    if let Some(selector) = fork {
-        HistoryMode::Fork(selector)
-    } else if let Some(selector) = resume.or_else(|| {
-        if continue_latest {
-            Some("latest".to_string())
-        } else {
-            None
-        }
-    }) {
-        HistoryMode::Resume(selector)
-    } else {
-        fallback
-    }
-}
-
-fn run_placeholder(cli: Cli) -> i32 {
-    let resume_like =
-        cli.resume.is_some() as u8 + cli.fork.is_some() as u8 + cli.continue_latest as u8;
-    if resume_like > 1 {
-        eprintln!("orca: --resume, --fork, and --continue are mutually exclusive");
-        return 1;
-    }
-
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let mode = match cli.mode {
-        Some(mode) => match parse_approval_mode_value(&mode) {
-            Ok(mode) => Some(mode),
-            Err(error) => {
-                eprintln!("orca: {error}");
-                return 1;
+        None => {
+            let request = orca_runtime::command::launch::InteractiveLaunchRequest {
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                resume: cli.resume,
+                fork: cli.fork,
+                continue_latest: cli.continue_latest,
+                session_picker: cli.session_picker,
+                model: cli.model,
+                mode: cli.mode,
+                api_key: cli.api_key,
+                base_url: cli.base_url,
+                provider: cli.provider,
+                prompt: cli.prompt,
+            };
+            match orca_runtime::command::launch::prepare_interactive(request) {
+                Ok(config) => orca_tui::cli::run(config),
+                Err(error) => {
+                    eprintln!("orca: {error}");
+                    1
+                }
             }
-        },
-        None => None,
-    };
-    let file_config = match load_effective_file_config(
-        &cwd,
-        ConfigOverrides {
-            model: cli.model,
-            mode,
-            api_key: cli.api_key,
-            base_url: cli.base_url,
-            reasoning_effort: None,
-        },
-    ) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("orca: {error}");
-            return 1;
         }
-    };
-
-    let api_key = file_config.api_key;
-    let base_url = file_config.base_url;
-
-    let model = file_config.model;
-    let model = match ModelSelection::parse(model) {
-        Ok(model) => model,
-        Err(error) => {
-            eprintln!("orca: {error}");
-            return 1;
-        }
-    };
-
-    let history_mode = resolve_history_mode(
-        cli.resume,
-        cli.fork,
-        cli.continue_latest,
-        HistoryMode::Record,
-    );
-
-    let config = RunConfig {
-        app_version: env!("CARGO_PKG_VERSION").to_string(),
-        prompt: cli.prompt.join(" "),
-        cwd: None,
-        output_format: OutputFormat::Text,
-        approval_mode: file_config.mode.unwrap_or_default(),
-        provider: cli.provider,
-        verifier: None,
-        model,
-        model_runtime: file_config.model_runtime,
-        reasoning_effort: file_config.reasoning_effort,
-        api_key,
-        base_url,
-        history_mode,
-        show_session_picker: cli.session_picker,
-        active_permission_profile: None,
-        permission_profiles: file_config.permission_profiles,
-        runtime_workspace_roots: None,
-        permission_rules: file_config.permissions,
-        additional_working_directories: Vec::new(),
-        max_budget_usd: None,
-        mcp_servers: file_config.mcp_servers,
-        hooks: file_config.hooks,
-        external_tools: crate::tools::external::load_default_external_tools(),
-        subagents: file_config.subagents.normalized(),
-        tools: file_config.tools.normalized(),
-        workflows: file_config.workflows.resolved(),
-        theme: file_config.theme,
-        vim_mode: file_config.vim_mode,
-        update_check: file_config.update_check,
-        desktop_notifications: file_config.desktop_notifications,
-        auto_memory: file_config.auto_memory,
-    };
-
-    orca_tui::cli::run(config)
+    }
 }
 
-fn run_server(cli: Cli) -> i32 {
-    if cli.command.is_some() || !cli.prompt.is_empty() {
-        eprintln!("orca: --mode=server cannot be combined with a subcommand or prompt");
-        return 1;
-    }
-
-    let cwd = cli
-        .cwd
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let file_config = match load_effective_file_config(
-        &cwd,
-        ConfigOverrides {
-            model: cli.model,
-            mode: None,
-            api_key: cli.api_key,
-            base_url: cli.base_url,
-            reasoning_effort: None,
-        },
-    ) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("orca: {error}");
-            return 1;
-        }
-    };
-
-    let model = match ModelSelection::parse(file_config.model) {
-        Ok(model) => model,
-        Err(error) => {
-            eprintln!("orca: {error}");
-            return 1;
-        }
-    };
-
-    let config = RunConfig {
+fn protocol_request(
+    cli: Cli,
+    mode: orca_runtime::command::launch::ProtocolMode,
+) -> orca_runtime::command::launch::ProtocolLaunchRequest {
+    orca_runtime::command::launch::ProtocolLaunchRequest {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
-        prompt: String::new(),
-        cwd: Some(cwd),
-        output_format: OutputFormat::Jsonl,
-        approval_mode: file_config.mode.unwrap_or_default(),
+        mode,
+        has_command: cli.command.is_some(),
+        prompt: cli.prompt,
+        cwd: cli.cwd,
         provider: cli.provider,
-        verifier: None,
-        model,
-        model_runtime: file_config.model_runtime,
-        reasoning_effort: file_config.reasoning_effort,
-        api_key: file_config.api_key,
-        base_url: file_config.base_url,
-        history_mode: HistoryMode::Record,
-        show_session_picker: false,
-        active_permission_profile: None,
-        permission_profiles: file_config.permission_profiles,
-        runtime_workspace_roots: None,
-        permission_rules: file_config.permissions,
-        additional_working_directories: Vec::new(),
-        max_budget_usd: None,
-        mcp_servers: file_config.mcp_servers,
-        hooks: file_config.hooks,
-        external_tools: crate::tools::external::load_default_external_tools(),
-        subagents: file_config.subagents.normalized(),
-        tools: file_config.tools.normalized(),
-        workflows: file_config.workflows.resolved(),
-        theme: file_config.theme,
-        vim_mode: file_config.vim_mode,
-        update_check: file_config.update_check,
-        desktop_notifications: false,
-        auto_memory: file_config.auto_memory,
-    };
-
-    crate::server::run(crate::server::ServerConfig { run_config: config })
-}
-
-fn run_acp(cli: Cli) -> i32 {
-    if cli.command.is_some() || !cli.prompt.is_empty() {
-        eprintln!("orca: --mode=acp cannot be combined with a subcommand or prompt");
-        return 1;
-    }
-
-    let cwd = cli
-        .cwd
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let file_config = match load_effective_file_config(
-        &cwd,
-        ConfigOverrides {
-            model: cli.model,
-            mode: None,
-            api_key: cli.api_key,
-            base_url: cli.base_url,
-            reasoning_effort: None,
-        },
-    ) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("orca: {error}");
-            return 1;
-        }
-    };
-
-    let model = match ModelSelection::parse(file_config.model) {
-        Ok(model) => model,
-        Err(error) => {
-            eprintln!("orca: {error}");
-            return 1;
-        }
-    };
-
-    let config = RunConfig {
-        app_version: env!("CARGO_PKG_VERSION").to_string(),
-        prompt: String::new(),
-        cwd: Some(cwd),
-        output_format: OutputFormat::Jsonl,
-        approval_mode: file_config.mode.unwrap_or_default(),
-        provider: cli.provider,
-        verifier: None,
-        model,
-        model_runtime: file_config.model_runtime,
-        reasoning_effort: file_config.reasoning_effort,
-        api_key: file_config.api_key,
-        base_url: file_config.base_url,
-        history_mode: HistoryMode::Record,
-        show_session_picker: false,
-        active_permission_profile: None,
-        permission_profiles: file_config.permission_profiles,
-        runtime_workspace_roots: None,
-        permission_rules: file_config.permissions,
-        additional_working_directories: Vec::new(),
-        max_budget_usd: None,
-        mcp_servers: file_config.mcp_servers,
-        hooks: file_config.hooks,
-        external_tools: crate::tools::external::load_default_external_tools(),
-        subagents: file_config.subagents.normalized(),
-        tools: file_config.tools.normalized(),
-        workflows: file_config.workflows.resolved(),
-        theme: file_config.theme,
-        vim_mode: file_config.vim_mode,
-        update_check: file_config.update_check,
-        desktop_notifications: false,
-        auto_memory: file_config.auto_memory,
-    };
-
-    crate::acp::run(config)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn worker_key_arg_remains_compatible_without_stdin_handoff() {
-        assert_eq!(
-            resolve_worker_api_key_from_reader(Some("legacy-key".to_string()), false, io::empty(),)
-                .unwrap(),
-            Some("legacy-key".to_string())
-        );
-        assert!(
-            resolve_worker_api_key_from_reader(Some("key".to_string()), true, io::empty()).is_err()
-        );
-    }
-
-    #[test]
-    fn worker_key_stdin_handoff_is_bounded() {
-        assert_eq!(
-            resolve_worker_api_key_from_reader(None, true, io::Cursor::new(b"private-key"))
-                .unwrap(),
-            Some("private-key".to_string())
-        );
-        let oversized = vec![b'x'; MAX_WORKER_API_KEY_BYTES as usize + 1];
-        assert!(
-            resolve_worker_api_key_from_reader(None, true, io::Cursor::new(oversized)).is_err()
-        );
+        model: cli.model,
+        api_key: cli.api_key,
+        base_url: cli.base_url,
     }
 }

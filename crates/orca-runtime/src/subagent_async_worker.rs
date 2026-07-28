@@ -364,6 +364,8 @@ fn spawn_async_subagent_worker(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .arg("subagent-worker")
+        .arg("--app-version")
+        .arg(&config.app_version)
         .arg("--cwd")
         .arg(cwd)
         .arg("--child-cwd")
