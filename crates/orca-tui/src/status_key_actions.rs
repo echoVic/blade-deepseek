@@ -129,12 +129,14 @@ where
         );
     }
 
-    if state.status == AppStatus::Compacting
-        && let Some(ShortcutAction::Running(shortcut)) =
+    if state.status == AppStatus::Compacting {
+        vim_state.cancel_pending_command();
+        if let Some(ShortcutAction::Running(shortcut)) =
             resolve_shortcut(ShortcutContext::Running, *key)
-        && compacting_shortcut_allowed(shortcut)
-    {
-        handle_running_shortcut(shortcut, state, action_tx, operation);
+            && compacting_shortcut_allowed(shortcut)
+        {
+            handle_running_shortcut(shortcut, state, action_tx, operation);
+        }
     }
 
     Ok(StatusKeyFlow::Continue)
@@ -745,6 +747,56 @@ mod tests {
 
         assert_eq!(operation.call_count(), 1);
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+    }
+
+    #[test]
+    fn compacting_keys_clear_only_pending_vim_command_state() {
+        for (code, modifiers) in [
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Up, KeyModifiers::NONE),
+            (KeyCode::Char('z'), KeyModifiers::NONE),
+        ] {
+            let (action_tx, _action_rx) = mpsc::unbounded();
+            let mut state = AppState::new(
+                action_tx.clone(),
+                "test".to_string(),
+                "mock".to_string(),
+                "/tmp".to_string(),
+            );
+            state.set_status(AppStatus::Compacting);
+            let mut config = config();
+            config.vim_mode = true;
+            let shared = Arc::new(Mutex::new(config.clone()));
+            let operation = TestOperationInterrupt::default();
+            let theme = Theme::named(ThemeName::Dark);
+            let mut vim = VimState::new(true);
+            vim.seed_pending_count_for_test();
+            vim.set_named_register_for_test(0, "saved");
+            vim.set_repeat_for_test();
+            let mut textarea = TextArea::from(["draft"]);
+
+            press_status_key(
+                code,
+                modifiers,
+                &mut state,
+                &mut config,
+                &shared,
+                &action_tx,
+                &operation,
+                &mut textarea,
+                &mut vim,
+                &theme,
+            );
+
+            assert!(!vim.has_pending_command_for_test(), "{code:?}");
+            assert_eq!(
+                vim.named_register_for_test(0),
+                Some(("saved", false)),
+                "{code:?}"
+            );
+            assert!(vim.has_repeat_for_test(), "{code:?}");
+            assert_eq!(textarea.lines(), &["draft".to_string()], "{code:?}");
+        }
     }
 
     #[test]

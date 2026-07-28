@@ -66,6 +66,9 @@ Co-authored-by: TRAE CLI <noreply@bytedance.com>
   - routing regression tests.
 - `crates/orca-tui/src/idle_key_actions.rs`
   - cancel parser state after menu/panel/idle-shortcut consumption.
+- `crates/orca-tui/src/idle_navigation_actions.rs`
+  - cancel the pending parser state only when `ExpandToolOutput` actually
+    consumes the key; preserve it when the key falls through to Vim.
 - `crates/orca-tui/src/queued_input_actions.rs`
   - cancel parser state after running menu/shortcut consumption.
 - `crates/orca-tui/src/app.rs`
@@ -2275,6 +2278,21 @@ Quality review must inspect:
 
 Resolve every Important/Critical issue with a new RED/GREEN cycle and focused
 reverification.
+
+- [ ] **Step 3a: Run independent-review regression tests**
+
+Run:
+
+```sh
+cargo test -p orca-tui line_positioning_avoids_composer_sized_iteration --lib -- --test-threads=1
+cargo test -p orca-tui line_commands_handle_twenty_thousand_columns_and_rows --lib -- --test-threads=1
+cargo test -p orca-tui linewise_paste_counts_the_leading_newline_in_the_one_mib_bound --lib -- --test-threads=1
+cargo test -p orca-tui compacting_keys_clear_only_pending_vim_command_state --lib -- --test-threads=1
+```
+
+Expected: large composers avoid document-sized cursor loops, the complete
+linewise payload stays within 1 MiB, and every Compacting key clears only the
+pending parser state.
 
 - [ ] **Step 4: Run package gates on committed HEAD**
 
