@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::approval_rules::PermissionRules;
 use crate::approval_types::ApprovalMode;
@@ -15,6 +15,62 @@ use crate::tool_types::ToolOutputTruncation;
 
 pub mod file;
 pub mod folder_trust;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VimInsertEscapeSequence {
+    value: String,
+    first: char,
+    second: char,
+}
+
+impl VimInsertEscapeSequence {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        const ERROR: &str =
+            "vim_insert_escape must contain exactly two non-whitespace, non-control characters";
+
+        let mut characters = value.chars();
+        let Some(first) = characters.next() else {
+            return Err(ERROR.to_string());
+        };
+        let Some(second) = characters.next() else {
+            return Err(ERROR.to_string());
+        };
+        if characters.next().is_some()
+            || [first, second]
+                .into_iter()
+                .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(ERROR.to_string());
+        }
+        Ok(Self {
+            value: value.to_string(),
+            first,
+            second,
+        })
+    }
+
+    pub fn first(&self) -> char {
+        self.first
+    }
+
+    pub fn second(&self) -> char {
+        self.second
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+}
+
+impl<'de> Deserialize<'de> for VimInsertEscapeSequence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -725,6 +781,22 @@ mod tests {
         ] {
             assert_eq!(serde_json::from_str::<ThemeName>(wire).unwrap(), theme);
             assert_eq!(serde_json::to_string(&theme).unwrap(), wire);
+        }
+    }
+
+    #[test]
+    fn vim_insert_escape_validates_exactly_two_printable_non_whitespace_scalars() {
+        for (value, first, second) in [("jj", 'j', 'j'), ("jk", 'j', 'k'), ("你好", '你', '好')]
+        {
+            let sequence = VimInsertEscapeSequence::parse(value).unwrap();
+            assert_eq!(sequence.first(), first);
+            assert_eq!(sequence.second(), second);
+            assert_eq!(sequence.as_str(), value);
+        }
+
+        for value in ["", "j", "jjj", "j ", " j", "\nj", "j\u{7f}"] {
+            let error = VimInsertEscapeSequence::parse(value).unwrap_err();
+            assert!(error.contains("exactly two"), "{value:?}: {error}");
         }
     }
 
