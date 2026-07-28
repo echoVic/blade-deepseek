@@ -1,7 +1,7 @@
 use orca_runtime::mentions::MentionBindings;
 use std::collections::VecDeque;
 
-use crate::composer_textarea::expand_pending_pastes;
+use crate::composer_textarea::{expand_pending_pastes, retain_active_pending_pastes};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct QueuedUserMessage {
@@ -95,10 +95,8 @@ impl QueuedUserMessage {
         submission_bindings.reconcile(&expanded);
         submission_bindings.reconcile(&submission_text);
 
-        let pending_pastes = pending_pastes
-            .into_iter()
-            .filter(|(placeholder, _)| trimmed_visible.contains(placeholder))
-            .collect();
+        let mut pending_pastes = pending_pastes;
+        retain_active_pending_pastes(&trimmed_visible, &mut pending_pastes);
 
         Some(Self {
             visible_text: trimmed_visible,
@@ -264,5 +262,26 @@ mod tests {
         assert_eq!(snapshot.first, "first");
         assert_eq!(snapshot.second.as_deref(), Some("second"));
         assert_eq!(snapshot.latest, None);
+    }
+
+    #[test]
+    fn queued_message_retains_only_exact_active_overlapping_paste_placeholder() {
+        let base = "[Pasted Content 1001 chars]";
+        let suffixed = "[Pasted Content 1001 chars] #2";
+        let message = QueuedUserMessage::from_composer(
+            suffixed.to_string(),
+            vec![
+                (base.to_string(), "base payload".to_string()),
+                (suffixed.to_string(), "second payload".to_string()),
+            ],
+            MentionBindings::default(),
+        )
+        .unwrap();
+
+        let restored = message.into_composer_state();
+        assert_eq!(
+            restored.pending_pastes,
+            vec![(suffixed.to_string(), "second payload".to_string())]
+        );
     }
 }

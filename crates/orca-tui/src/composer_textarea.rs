@@ -106,11 +106,7 @@ pub(crate) fn insert_composer_paste(
     }
 
     let visible_text = textarea_text(textarea);
-    let active_placeholders = locate_pending_pastes(&visible_text, pending_pastes)
-        .into_iter()
-        .map(|(_, _, index)| pending_pastes[index].0.clone())
-        .collect::<Vec<_>>();
-    pending_pastes.retain(|(placeholder, _)| active_placeholders.contains(placeholder));
+    retain_active_pending_pastes(&visible_text, pending_pastes);
     let placeholder = next_large_paste_placeholder(pending_pastes, char_count);
     if !textarea.insert_str(&placeholder) {
         return false;
@@ -156,6 +152,17 @@ pub(crate) fn expand_pending_pastes(
         expanded.replace_range(start..end, actual);
     }
     expanded
+}
+
+pub(crate) fn retain_active_pending_pastes(
+    visible_text: &str,
+    pending_pastes: &mut Vec<(String, String)>,
+) {
+    let active_placeholders = locate_pending_pastes(visible_text, pending_pastes)
+        .into_iter()
+        .map(|(_, _, index)| pending_pastes[index].0.clone())
+        .collect::<Vec<_>>();
+    pending_pastes.retain(|(placeholder, _)| active_placeholders.contains(placeholder));
 }
 
 fn locate_pending_pastes(
