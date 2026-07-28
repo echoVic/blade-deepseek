@@ -11,6 +11,8 @@ pub(crate) enum StreamingMarkdownAction {
 pub(crate) struct StreamingMarkdownAssembler {
     partial_line: String,
     current_block: String,
+    pipe_candidate: Option<String>,
+    active_table: Option<String>,
     fence: Option<FenceState>,
     finished: bool,
 }
@@ -33,20 +35,11 @@ impl StreamingMarkdownAssembler {
         let complete = self.partial_line[..=last_newline].to_owned();
         self.partial_line.drain(..=last_newline);
         let mut actions = Vec::new();
+        let mut current_block_changed = false;
         for line in complete.split_inclusive('\n') {
-            self.current_block.push_str(line);
-            if let Some(fence) = self.fence {
-                if fence_closes(line, fence) {
-                    self.fence = None;
-                    self.freeze_current_block(&mut actions, false);
-                }
-            } else if let Some(fence) = fence_open(line) {
-                self.fence = Some(fence);
-            } else if line_is_blank(line) {
-                self.freeze_current_block(&mut actions, true);
-            }
+            self.process_complete_line(line, &mut actions, &mut current_block_changed);
         }
-        if !self.current_block.is_empty() {
+        if current_block_changed && !self.current_block.is_empty() {
             actions.push(StreamingMarkdownAction::UpdateTail(
                 self.current_block.clone(),
             ));
@@ -59,19 +52,95 @@ impl StreamingMarkdownAssembler {
             return Vec::new();
         }
         self.finished = true;
-        if self.current_block.is_empty() && self.partial_line.is_empty() {
-            Vec::new()
-        } else {
-            self.current_block.clear();
-            vec![StreamingMarkdownAction::FinishTail(std::mem::take(
-                &mut self.partial_line,
-            ))]
+        if let Some(mut table) = self.active_table.take() {
+            table.push_str(&self.partial_line);
+            self.partial_line.clear();
+            return vec![StreamingMarkdownAction::AppendFrozen {
+                text: table,
+                trailing_blank: false,
+            }];
         }
+        let mut hidden_suffix = self.pipe_candidate.take().unwrap_or_default();
+        hidden_suffix.push_str(&self.partial_line);
+        self.partial_line.clear();
+        if self.current_block.is_empty() && hidden_suffix.is_empty() {
+            return Vec::new();
+        }
+        self.current_block.clear();
+        vec![StreamingMarkdownAction::FinishTail(hidden_suffix)]
     }
 
     #[cfg(test)]
-    fn held_text_for_test(&self) -> &str {
-        &self.partial_line
+    fn held_text_for_test(&self) -> String {
+        let mut held = self
+            .active_table
+            .as_ref()
+            .or(self.pipe_candidate.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        held.push_str(&self.partial_line);
+        held
+    }
+
+    fn process_complete_line(
+        &mut self,
+        line: &str,
+        actions: &mut Vec<StreamingMarkdownAction>,
+        current_block_changed: &mut bool,
+    ) {
+        if let Some(table) = self.active_table.as_mut() {
+            if line_is_blank(line) {
+                table.push_str(line);
+                self.release_table(actions, true);
+                return;
+            }
+            if table_row(line) {
+                table.push_str(line);
+                return;
+            }
+            self.release_table(actions, false);
+        }
+
+        if let Some(candidate) = self.pipe_candidate.take() {
+            if table_delimiter(line) {
+                if !self.current_block.is_empty() {
+                    self.freeze_current_block(actions, false);
+                    *current_block_changed = false;
+                }
+                let mut table = candidate;
+                table.push_str(line);
+                self.active_table = Some(table);
+                return;
+            }
+            self.current_block.push_str(&candidate);
+            *current_block_changed = true;
+        }
+
+        if let Some(fence) = self.fence {
+            self.current_block.push_str(line);
+            *current_block_changed = true;
+            if fence_closes(line, fence) {
+                self.fence = None;
+                self.freeze_current_block(actions, false);
+                *current_block_changed = false;
+            }
+            return;
+        }
+
+        if let Some(fence) = fence_open(line) {
+            self.current_block.push_str(line);
+            *current_block_changed = true;
+            self.fence = Some(fence);
+        } else if plausible_table_header(line) {
+            self.pipe_candidate = Some(line.to_owned());
+        } else {
+            self.current_block.push_str(line);
+            *current_block_changed = true;
+            if line_is_blank(line) {
+                self.freeze_current_block(actions, true);
+                *current_block_changed = false;
+            }
+        }
     }
 
     fn freeze_current_block(
@@ -86,6 +155,15 @@ impl StreamingMarkdownAssembler {
             trailing_blank,
         });
         actions.push(StreamingMarkdownAction::ClearTail);
+    }
+
+    fn release_table(&mut self, actions: &mut Vec<StreamingMarkdownAction>, trailing_blank: bool) {
+        if let Some(text) = self.active_table.take() {
+            actions.push(StreamingMarkdownAction::AppendFrozen {
+                text,
+                trailing_blank,
+            });
+        }
     }
 }
 
@@ -121,6 +199,65 @@ fn fence_closes(line: &str, fence: FenceState) -> bool {
 
 fn line_is_blank(line: &str) -> bool {
     line.trim().is_empty()
+}
+
+fn unescaped_pipe_cells(line: &str) -> Option<Vec<&str>> {
+    let content = line.strip_suffix('\n').unwrap_or(line);
+    let mut separators = Vec::new();
+    let mut preceding_backslashes = 0;
+    for (index, character) in content.char_indices() {
+        if character == '\\' {
+            preceding_backslashes += 1;
+            continue;
+        }
+        if character == '|' && preceding_backslashes % 2 == 0 {
+            separators.push(index);
+        }
+        preceding_backslashes = 0;
+    }
+    if separators.is_empty() {
+        return None;
+    }
+
+    let mut cells = Vec::with_capacity(separators.len() + 1);
+    let mut start = 0;
+    for separator in separators {
+        cells.push(&content[start..separator]);
+        start = separator + 1;
+    }
+    cells.push(&content[start..]);
+    if cells.first().is_some_and(|cell| cell.trim().is_empty()) {
+        cells.remove(0);
+    }
+    if cells.last().is_some_and(|cell| cell.trim().is_empty()) {
+        cells.pop();
+    }
+    Some(cells)
+}
+
+fn plausible_table_header(line: &str) -> bool {
+    let Some(cells) = unescaped_pipe_cells(line) else {
+        return false;
+    };
+    cells.len() >= 2 && cells.iter().any(|cell| !cell.trim().is_empty()) && !table_delimiter(line)
+}
+
+fn table_delimiter(line: &str) -> bool {
+    let Some(cells) = unescaped_pipe_cells(line) else {
+        return false;
+    };
+    cells.len() >= 2
+        && cells.iter().all(|cell| {
+            let trimmed = cell.trim();
+            let without_left = trimmed.strip_prefix(':').unwrap_or(trimmed);
+            let without_colons = without_left.strip_suffix(':').unwrap_or(without_left);
+            !without_colons.is_empty() && without_colons.chars().all(|character| character == '-')
+        })
+}
+
+fn table_row(line: &str) -> bool {
+    unescaped_pipe_cells(line)
+        .is_some_and(|cells| cells.len() >= 2 && cells.iter().any(|cell| !cell.trim().is_empty()))
 }
 
 #[cfg(test)]
@@ -297,11 +434,114 @@ mod tests {
                 prefix.push_str(piece);
                 actions.extend(assembler.push(piece));
                 let mut reconstructed = reconstructed_action_text(&actions);
-                reconstructed.push_str(assembler.held_text_for_test());
+                reconstructed.push_str(&assembler.held_text_for_test());
                 assert_eq!(reconstructed, prefix);
             }
             actions.extend(assembler.finish());
             assert_eq!(reconstructed_action_text(&actions), prefix);
         }
+    }
+
+    #[test]
+    fn pipe_header_candidate_is_hidden_until_confirmed_or_rejected() {
+        let mut confirmed = StreamingMarkdownAssembler::default();
+        assert!(confirmed.push("| Name | Value |\n").is_empty());
+        assert_eq!(confirmed.held_text_for_test(), "| Name | Value |\n");
+        assert!(confirmed.push("|---|---|\n").is_empty());
+        assert_eq!(
+            confirmed.held_text_for_test(),
+            "| Name | Value |\n|---|---|\n"
+        );
+
+        let mut rejected = StreamingMarkdownAssembler::default();
+        assert!(rejected.push("A | B\n").is_empty());
+        assert_eq!(
+            rejected.push("ordinary next line\n"),
+            vec![StreamingMarkdownAction::UpdateTail(
+                "A | B\nordinary next line\n".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn table_detection_handles_escaped_pipes_empty_cells_and_alignment() {
+        let mut escaped = StreamingMarkdownAssembler::default();
+        assert_eq!(
+            escaped.push(
+                r"escaped \| pipe
+ordinary
+"
+            ),
+            vec![StreamingMarkdownAction::UpdateTail(
+                r"escaped \| pipe
+ordinary
+"
+                .to_string()
+            )]
+        );
+
+        let mut empty = StreamingMarkdownAssembler::default();
+        assert_eq!(
+            empty.push("| | |\n|---|---|\n"),
+            vec![StreamingMarkdownAction::UpdateTail(
+                "| | |\n|---|---|\n".to_string()
+            )]
+        );
+
+        let mut aligned = StreamingMarkdownAssembler::default();
+        assert!(
+            aligned
+                .push("| Left | Center | Right |\n|:---|:---:|---:|\n")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn confirmed_table_remains_hidden_until_boundary_then_emits_once() {
+        let mut assembler = StreamingMarkdownAssembler::default();
+        assert!(assembler.push("| Name | Value |\n|---|---|\n").is_empty());
+        assert!(assembler.push("| A | 1 |\n").is_empty());
+        assert_eq!(
+            assembler.push("\n"),
+            vec![StreamingMarkdownAction::AppendFrozen {
+                text: "| Name | Value |\n|---|---|\n| A | 1 |\n\n".to_string(),
+                trailing_blank: true,
+            }]
+        );
+        assert!(assembler.finish().is_empty());
+    }
+
+    #[test]
+    fn table_releases_before_non_table_terminator_and_at_finish() {
+        let mut terminated = StreamingMarkdownAssembler::default();
+        assert!(
+            terminated
+                .push("| Name | Value |\n|---|---|\n| A | 1 |\n")
+                .is_empty()
+        );
+        assert_eq!(
+            terminated.push("after\n"),
+            vec![
+                StreamingMarkdownAction::AppendFrozen {
+                    text: "| Name | Value |\n|---|---|\n| A | 1 |\n".to_string(),
+                    trailing_blank: false,
+                },
+                StreamingMarkdownAction::UpdateTail("after\n".to_string()),
+            ]
+        );
+
+        let mut finished = StreamingMarkdownAssembler::default();
+        assert!(
+            finished
+                .push("| Name | Value |\n|---|---|\n| A | 1 |\n")
+                .is_empty()
+        );
+        assert_eq!(
+            finished.finish(),
+            vec![StreamingMarkdownAction::AppendFrozen {
+                text: "| Name | Value |\n|---|---|\n| A | 1 |\n".to_string(),
+                trailing_blank: false,
+            }]
+        );
     }
 }
