@@ -78,6 +78,10 @@ impl TerminalPresentation {
         self.focused = focused;
     }
 
+    pub(crate) const fn is_focused(&self) -> bool {
+        self.focused
+    }
+
     pub(crate) fn enqueue(&mut self, notification: TerminalNotification) {
         if !self.notifications_enabled || self.focused {
             return;
