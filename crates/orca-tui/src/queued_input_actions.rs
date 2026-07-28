@@ -133,10 +133,21 @@ pub(crate) fn handle_running_key(
     {
         match shortcut {
             RunningShortcut::SubmitQueued => {
+                if state.panel_mode != PanelMode::Conversation {
+                    return false;
+                }
                 enqueue_composer_follow_up(state, textarea, vim_state, theme);
             }
-            RunningShortcut::Newline => insert_composer_newline(textarea, state),
+            RunningShortcut::Newline => {
+                if state.panel_mode != PanelMode::Conversation {
+                    return false;
+                }
+                insert_composer_newline(textarea, state);
+            }
             RunningShortcut::EditLatestQueued => {
+                if state.panel_mode != PanelMode::Conversation {
+                    return false;
+                }
                 restore_latest_queued_message(state, textarea, vim_state, theme);
             }
             shortcut => handle_running_shortcut(shortcut, state, action_tx),
@@ -318,5 +329,33 @@ mod tests {
             assert!(!state.input_history.iter().any(|entry| entry == "first"));
             assert!(state.queued_input_error.is_some());
         }
+    }
+
+    #[test]
+    fn non_conversation_running_enter_never_queues_composer_text() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state();
+        state.panel_mode = PanelMode::Workflows;
+        let config = crate::test_support::test_run_config();
+        let operation = crate::test_support::TestOperationInterrupt::default();
+        let theme = theme();
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("hidden draft", &vim, &theme);
+        let key = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+
+        assert!(!handle_running_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &config,
+            &action_tx,
+            &operation,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+        assert!(state.queued_user_messages.is_empty());
+        assert_eq!(textarea_text(&textarea), "hidden draft");
+        assert!(action_rx.try_recv().is_err());
     }
 }

@@ -2025,7 +2025,7 @@ impl AppState {
         let Some(prompt) = self
             .queued_submission_in_flight
             .as_ref()
-            .map(|message| message.visible_text().to_string())
+            .map(|message| message.submission_text().to_string())
         else {
             return;
         };
