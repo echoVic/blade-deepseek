@@ -5,6 +5,7 @@ use tui_textarea::TextArea;
 
 use crate::composer_input_actions::{apply_composer_key_input, insert_composer_newline};
 use crate::composer_textarea::{make_textarea, make_textarea_with_text, textarea_text};
+use crate::keybindings::ShortcutInvocation;
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::operation_controller::TuiOperationInterrupt;
 use crate::queued_input::QueuedUserMessage;
@@ -137,35 +138,61 @@ pub(crate) fn handle_running_key(
     if let Some(ShortcutAction::Running(shortcut)) =
         resolve_shortcut(ShortcutContext::Running, *key)
     {
-        vim_state.cancel_pending_command();
-        match shortcut {
-            RunningShortcut::SubmitQueued => {
-                if state.panel_mode != PanelMode::Conversation {
-                    return false;
-                }
-                enqueue_composer_follow_up(state, textarea, vim_state, theme);
-            }
-            RunningShortcut::Newline => {
-                if state.panel_mode != PanelMode::Conversation {
-                    return false;
-                }
-                insert_composer_newline(textarea, state);
-            }
-            RunningShortcut::EditLatestQueued => {
-                if state.panel_mode != PanelMode::Conversation {
-                    return false;
-                }
-                restore_latest_queued_message(state, textarea, vim_state, theme);
-            }
-            shortcut => handle_running_shortcut(shortcut, state, action_tx, operation),
-        }
-        return true;
+        return handle_running_shortcut_invocation(
+            ShortcutInvocation::key(ShortcutAction::Running(shortcut), *key),
+            state,
+            config,
+            action_tx,
+            operation,
+            textarea,
+            vim_state,
+            theme,
+        );
     }
 
     if state.panel_mode == PanelMode::Conversation {
         return apply_composer_key_input(ev, key, state, config, textarea, vim_state, theme);
     }
     false
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_running_shortcut_invocation(
+    invocation: ShortcutInvocation,
+    state: &mut AppState,
+    _config: &RunConfig,
+    action_tx: &mpsc::Sender<UserAction>,
+    operation: &impl TuiOperationInterrupt,
+    textarea: &mut TextArea,
+    vim_state: &mut VimState,
+    theme: &Theme,
+) -> bool {
+    let ShortcutAction::Running(shortcut) = invocation.action else {
+        return false;
+    };
+    vim_state.cancel_pending_command();
+    match shortcut {
+        RunningShortcut::SubmitQueued => {
+            if state.panel_mode != PanelMode::Conversation {
+                return false;
+            }
+            enqueue_composer_follow_up(state, textarea, vim_state, theme);
+        }
+        RunningShortcut::Newline => {
+            if state.panel_mode != PanelMode::Conversation {
+                return false;
+            }
+            insert_composer_newline(textarea, state);
+        }
+        RunningShortcut::EditLatestQueued => {
+            if state.panel_mode != PanelMode::Conversation {
+                return false;
+            }
+            restore_latest_queued_message(state, textarea, vim_state, theme);
+        }
+        shortcut => handle_running_shortcut(shortcut, state, action_tx, operation),
+    }
+    true
 }
 
 #[cfg(test)]
@@ -397,5 +424,55 @@ mod tests {
         assert_eq!(textarea_text(&textarea), "draft");
         assert!(state.queued_user_messages.is_empty());
         assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn running_chord_newline_executes_semantics_without_inserting_tail_key() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = state();
+        let config = crate::test_support::test_run_config();
+        let operation = crate::test_support::TestOperationInterrupt::default();
+        let theme = theme();
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("draft", &vim, &theme);
+
+        assert!(handle_running_shortcut_invocation(
+            ShortcutInvocation::chord(ShortcutAction::Running(RunningShortcut::Newline)),
+            &mut state,
+            &config,
+            &action_tx,
+            &operation,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+
+        assert_eq!(textarea_text(&textarea), "draft\n");
+    }
+
+    #[test]
+    fn running_chord_composer_action_is_rejected_outside_conversation() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = state();
+        state.panel_mode = PanelMode::Workflows;
+        let config = crate::test_support::test_run_config();
+        let operation = crate::test_support::TestOperationInterrupt::default();
+        let theme = theme();
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("draft", &vim, &theme);
+
+        assert!(!handle_running_shortcut_invocation(
+            ShortcutInvocation::chord(ShortcutAction::Running(RunningShortcut::SubmitQueued,)),
+            &mut state,
+            &config,
+            &action_tx,
+            &operation,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+
+        assert_eq!(textarea_text(&textarea), "draft");
+        assert!(state.queued_user_messages.is_empty());
     }
 }
