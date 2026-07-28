@@ -7854,10 +7854,8 @@ mod tests {
             (crate::vim::VimMode::Visual, theme.approval),
         ] {
             let mut state = test_state();
-            let vim = crate::vim::VimState {
-                enabled: true,
-                mode,
-            };
+            let mut vim = crate::vim::VimState::new(true);
+            vim.mode = mode;
             let textarea = crate::composer_textarea::make_textarea(&vim, &theme);
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
