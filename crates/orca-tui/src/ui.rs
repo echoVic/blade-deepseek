@@ -26,6 +26,7 @@ use crate::theme::Theme;
 use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::{TranscriptRenderContext, viewport_paragraph};
 use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, CopyNotice, PanelMode};
+use crate::workspace_status::{GitIdentity, compact_cwd};
 
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
     // Recomputed below when the widgets are actually shown; cleared here so
@@ -2721,17 +2722,81 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     frame.render_widget(paragraph, area);
 }
 
+fn workspace_status_spans(
+    state: &AppState,
+    theme: &Theme,
+    available_width: usize,
+) -> Vec<Span<'static>> {
+    let separator = "  ·  ";
+    let separator_width = UnicodeWidthStr::width(separator);
+    if available_width <= separator_width {
+        return Vec::new();
+    }
+
+    let git_label = state.workspace_git.as_ref().map(GitIdentity::label);
+    let git_width = git_label
+        .as_deref()
+        .map(|label| separator_width + UnicodeWidthStr::width(label))
+        .unwrap_or(0);
+
+    let make_spans = |cwd: String, git: Option<String>| {
+        let mut spans = vec![Span::styled(
+            format!("{separator}{cwd}"),
+            Style::default().fg(theme.muted),
+        )];
+        if let Some(git) = git {
+            spans.push(Span::styled(
+                format!("{separator}{git}"),
+                Style::default().fg(theme.muted),
+            ));
+        }
+        spans
+    };
+
+    if let Some(git) = git_label.as_ref()
+        && available_width > separator_width + git_width
+    {
+        let cwd = compact_cwd(
+            &state.cwd,
+            available_width
+                .saturating_sub(separator_width)
+                .saturating_sub(git_width),
+        );
+        if !cwd.is_empty() {
+            return make_spans(cwd, Some(git.clone()));
+        }
+    }
+
+    let cwd = compact_cwd(&state.cwd, available_width - separator_width);
+    if cwd.is_empty() {
+        Vec::new()
+    } else {
+        make_spans(cwd, None)
+    }
+}
+
 fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
     let separator = "  ·  ";
     let mode_prefix = separator;
     let mode_value = state.approval_mode.as_str();
     let mode_width = UnicodeWidthStr::width(mode_prefix) + UnicodeWidthStr::width(mode_value);
+    let context = (state.context_limit_tokens > 0).then(|| context_cell(state, theme));
+    let reserved_context_width = context
+        .as_ref()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .filter(|context_width| mode_width + context_width <= width)
+        .unwrap_or(0);
     let model = format!(
         " {} ({})",
         state.model_name,
         state.reasoning_effort.as_str()
     );
-    let model = truncate_to_display_width(&model, width.saturating_sub(mode_width));
+    let model = truncate_to_display_width(
+        &model,
+        width
+            .saturating_sub(mode_width)
+            .saturating_sub(reserved_context_width),
+    );
     let mut used = UnicodeWidthStr::width(model.as_str()) + mode_width;
     let mut spans = vec![
         Span::styled(model, Style::default().fg(theme.muted)),
@@ -2742,14 +2807,24 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
         ),
     ];
 
-    let mut optional = Vec::new();
-    if state.context_limit_tokens > 0 {
-        optional.push(context_cell(state, theme));
+    if let Some(context) = context {
+        let context_width = UnicodeWidthStr::width(context.content.as_ref());
+        if used + context_width <= width {
+            used += context_width;
+            spans.push(context);
+        }
     }
+
+    for span in workspace_status_spans(state, theme, width.saturating_sub(used)) {
+        used += UnicodeWidthStr::width(span.content.as_ref());
+        spans.push(span);
+    }
+
+    let mut lower_priority = Vec::new();
     // Session cost only appears once there is something to report; a fresh
     // session keeps the bar clean instead of showing zeros.
     if state.usage.total_tokens() > 0 {
-        optional.push(Span::styled(
+        lower_priority.push(Span::styled(
             format!(
                 "{separator}{} tokens{separator}{}",
                 format_token_count(state.usage.total_tokens()),
@@ -2758,12 +2833,12 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
             Style::default().fg(theme.muted),
         ));
     }
-    optional.push(Span::styled(
+    lower_priority.push(Span::styled(
         format!("{separator}F1 shortcuts"),
         Style::default().fg(theme.muted),
     ));
 
-    for span in optional {
+    for span in lower_priority {
         let span_width = UnicodeWidthStr::width(span.content.as_ref());
         if used + span_width <= width {
             used += span_width;
@@ -5843,6 +5918,146 @@ mod tests {
                 approval_mode_color(mode, &theme),
                 "wrong status color for {}",
                 mode.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_status_spans_keep_full_then_compact_cwd_with_git() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.cwd = "~/Documents/GitHub/blade-deepseek".to_string();
+        state.workspace_git = Some(GitIdentity::Branch("feature/footer".to_string()));
+
+        assert_eq!(
+            workspace_status_spans(&state, &theme, 80)
+                .into_iter()
+                .map(|span| span.content.into_owned())
+                .collect::<String>(),
+            "  ·  ~/Documents/GitHub/blade-deepseek  ·  git:feature/footer"
+        );
+        assert_eq!(
+            workspace_status_spans(&state, &theme, 46)
+                .into_iter()
+                .map(|span| span.content.into_owned())
+                .collect::<String>(),
+            "  ·  ~/…/blade-deepseek  ·  git:feature/footer"
+        );
+    }
+
+    #[test]
+    fn workspace_status_spans_drop_git_before_cwd_and_bound_unicode() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.cwd = "~/项目/👍🏽-workspace".to_string();
+        state.workspace_git = Some(GitIdentity::Branch(
+            "feature/a-branch-too-wide-for-the-cell".to_string(),
+        ));
+
+        let text = workspace_status_spans(&state, &theme, 18)
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+        assert!(text.starts_with("  ·  "));
+        assert!(!text.contains("git:"));
+        assert!(UnicodeWidthStr::width(text.as_str()) <= 18);
+        assert_eq!(text.contains('👍'), text.contains('🏽'));
+    }
+
+    #[test]
+    fn workspace_status_spans_label_detached_head() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.cwd = "/repo".to_string();
+        state.workspace_git = Some(GitIdentity::Detached("5bbb60aa".to_string()));
+
+        assert!(
+            workspace_status_spans(&state, &theme, 40)
+                .into_iter()
+                .map(|span| span.content.into_owned())
+                .collect::<String>()
+                .contains("git:@5bbb60aa")
+        );
+    }
+
+    #[test]
+    fn status_line_prioritizes_context_workspace_then_usage_and_shortcuts() {
+        let mut state = test_state();
+        state.context_limit_tokens = 1000;
+        state.context_used_tokens = 250;
+        state.usage.input_tokens = 8_000;
+        state.usage.output_tokens = 664;
+        state.usage.estimated_cost_usd = 0.003852;
+        state.cwd = "~/Documents/GitHub/blade-deepseek".to_string();
+        state.workspace_git = Some(GitIdentity::Branch("feature/footer".to_string()));
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        let wide = status_line(&state, &theme, 180).to_string();
+        assert!(wide.contains("context 75%"));
+        assert!(wide.contains("~/Documents/GitHub/blade-deepseek"));
+        assert!(wide.contains("git:feature/footer"));
+        assert!(wide.contains("8.7k tokens"));
+        assert!(wide.contains("F1 shortcuts"));
+
+        let medium = status_line(&state, &theme, 92).to_string();
+        assert!(medium.contains("context 75%"));
+        assert!(medium.contains("blade-deepseek"));
+        assert!(medium.contains("git:feature/footer"));
+        assert!(!medium.contains("tokens"));
+        assert!(!medium.contains("shortcuts"));
+
+        let narrow = status_line(&state, &theme, 46).to_string();
+        assert!(narrow.contains("suggest"));
+        assert!(narrow.contains("context 75%"));
+        assert!(!narrow.contains("git:"));
+        assert!(!narrow.contains("blade-deepseek"));
+    }
+
+    #[test]
+    fn status_line_reserves_known_context_before_truncating_a_long_model() {
+        let mut state = test_state();
+        state.model_name = "a-very-long-model-name-that-would-fill-the-footer".to_string();
+        state.context_limit_tokens = 1000;
+        state.context_used_tokens = 250;
+        state.cwd = "~/workspace".to_string();
+        state.workspace_git = Some(GitIdentity::Branch("main".to_string()));
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        let text = status_line(&state, &theme, 46).to_string();
+
+        assert!(text.contains("suggest"));
+        assert!(text.contains("context 75%"));
+        assert!(!text.contains("~/workspace"));
+        assert!(!text.contains("git:main"));
+        assert!(UnicodeWidthStr::width(text.as_str()) <= 46);
+    }
+
+    #[test]
+    fn status_line_is_pure_and_deterministic_for_captured_workspace_state() {
+        let mut state = test_state();
+        state.cwd = "~/repo".to_string();
+        state.workspace_git = Some(GitIdentity::Branch("main".to_string()));
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        let first = status_line(&state, &theme, 120);
+        let second = status_line(&state, &theme, 120);
+        assert_eq!(first, second);
+
+        let source = include_str!("ui.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production UI source");
+        for forbidden in [
+            "std::process",
+            "Command::new",
+            "orca_tools::process",
+            "workspace_status::snapshot",
+            "read_to_string",
+            "read_dir",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "rendering must not perform workspace I/O: {forbidden}"
             );
         }
     }
