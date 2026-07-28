@@ -46,6 +46,8 @@ pub struct SessionMeta {
     pub permission_rules: PermissionRules,
     #[serde(default)]
     pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_writable_directories: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
 }
@@ -549,6 +551,7 @@ pub struct ThreadMetadataPatch {
     pub runtime_workspace_roots: Option<Vec<PathBuf>>,
     pub permission_rules: Option<PermissionRules>,
     pub additional_working_directories: Option<Vec<AdditionalWorkingDirectory>>,
+    pub metadata_writable_directories: Option<Vec<PathBuf>>,
     pub network_domain_permissions: Option<HashMap<String, PermissionProfileNetworkAccess>>,
 }
 
@@ -560,6 +563,7 @@ pub struct StoredThreadProjection {
     pub runtime_workspace_roots: Vec<PathBuf>,
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    pub metadata_writable_directories: Vec<PathBuf>,
     pub network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
     pub message_count: usize,
     pub messages: Vec<Value>,
@@ -758,4 +762,25 @@ pub trait ThreadStore {
         limit: usize,
         sort_direction: SortDirection,
     ) -> io::Result<StoredThreadItemPage>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionMeta;
+
+    #[test]
+    fn legacy_session_metadata_defaults_metadata_write_escalations_to_empty() {
+        let metadata: SessionMeta = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "session_id": "legacy-session",
+            "cwd": "/workspace",
+            "provider": "mock",
+            "model": null,
+            "title": "legacy",
+            "created_at": "2026-07-28T00:00:00Z"
+        }))
+        .expect("legacy session metadata");
+
+        assert!(metadata.metadata_writable_directories.is_empty());
+    }
 }

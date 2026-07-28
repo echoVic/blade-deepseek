@@ -964,6 +964,10 @@ impl ThreadStore for JsonlThreadStore {
                     meta.additional_working_directories = additional_working_directories;
                     patched = true;
                 }
+                if let Some(metadata_writable_directories) = patch.metadata_writable_directories {
+                    meta.metadata_writable_directories = metadata_writable_directories;
+                    patched = true;
+                }
                 if let Some(network_domain_permissions) = patch.network_domain_permissions {
                     meta.network_domain_permissions = network_domain_permissions;
                     patched = true;
@@ -1014,6 +1018,7 @@ impl ThreadStore for JsonlThreadStore {
             runtime_workspace_roots: meta.runtime_workspace_roots,
             active_permission_profile: meta.active_permission_profile,
             additional_working_directories: meta.additional_working_directories,
+            metadata_writable_directories: meta.metadata_writable_directories,
             network_domain_permissions: meta.network_domain_permissions,
             message_count: stored_messages.len(),
             messages: projected_messages,

@@ -2344,13 +2344,25 @@ fn tool_request(name: ToolName) -> ToolRequest {
 }
 
 fn sandbox_seatbelt_available() -> bool {
-    std::process::Command::new("sandbox-exec")
-        .arg("-p")
-        .arg("(version 1) (allow default)")
-        .arg("true")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    #[cfg(target_os = "macos")]
+    {
+        let available = std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg("(version 1) (allow default)")
+            .arg("true")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        assert!(
+            available,
+            "macOS Seatbelt is required for sandbox contract tests"
+        );
+        available
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 fn test_run_config() -> RunConfig {

@@ -231,7 +231,19 @@ impl RuntimeShellSessionManager {
     }
 
     pub fn spawn(&mut self, command: ShellSessionCommand) -> io::Result<ShellSessionHandle> {
-        self.spawn_with_task_registry(command, self.tasks.clone())
+        self.spawn_with_metadata_roots(command, Vec::new())
+    }
+
+    pub(crate) fn spawn_with_metadata_roots(
+        &mut self,
+        command: ShellSessionCommand,
+        metadata_writable_directories: Vec<PathBuf>,
+    ) -> io::Result<ShellSessionHandle> {
+        self.spawn_with_task_registry_and_metadata_roots(
+            command,
+            metadata_writable_directories,
+            self.tasks.clone(),
+        )
     }
 
     pub fn spawn_with_task_registry(
@@ -239,10 +251,21 @@ impl RuntimeShellSessionManager {
         command: ShellSessionCommand,
         tasks: TaskRegistry,
     ) -> io::Result<ShellSessionHandle> {
+        self.spawn_with_task_registry_and_metadata_roots(command, Vec::new(), tasks)
+    }
+
+    pub(crate) fn spawn_with_task_registry_and_metadata_roots(
+        &mut self,
+        command: ShellSessionCommand,
+        metadata_writable_directories: Vec<PathBuf>,
+        tasks: TaskRegistry,
+    ) -> io::Result<ShellSessionHandle> {
         let requested_terminal = command.terminal;
         let description = command.description.clone();
         let task = tasks.create_shell(description.clone(), command.command.clone());
         tasks.mark_running(&task.id).map_err(io::Error::other)?;
+        let uses_seatbelt = cfg!(target_os = "macos")
+            && !matches!(command.sandbox, ShellSandboxMode::DangerFullAccess);
 
         let mut process = match command.sandbox {
             ShellSandboxMode::WorkspaceWrite {
@@ -255,6 +278,7 @@ impl RuntimeShellSessionManager {
                     cwd: &command.cwd,
                     readable_roots: &command.additional_readable_directories,
                     additional_roots: &command.additional_working_directories,
+                    metadata_writable_roots: &metadata_writable_directories,
                     denied_roots: &command.denied_working_directories,
                     network_access,
                     exclude_tmpdir_env_var,
@@ -271,6 +295,7 @@ impl RuntimeShellSessionManager {
                     cwd: &command.cwd,
                     readable_roots: &command.additional_readable_directories,
                     additional_roots: &command.additional_working_directories,
+                    metadata_writable_roots: &metadata_writable_directories,
                     denied_roots: &command.denied_working_directories,
                     network_access,
                     allow_global_read,
@@ -291,6 +316,9 @@ impl RuntimeShellSessionManager {
                     process.env_remove(key);
                 }
             }
+        }
+        if uses_seatbelt {
+            process.env("ORCA_SANDBOX", "seatbelt");
         }
         let stdio = configure_shell_stdio(&mut process, requested_terminal)?;
         let effective_terminal = stdio.effective_terminal();

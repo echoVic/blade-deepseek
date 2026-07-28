@@ -9162,13 +9162,25 @@ fn server_mode_rejects_turn_start_for_unknown_thread() {
 }
 
 fn sandbox_seatbelt_available() -> bool {
-    Command::new("sandbox-exec")
-        .arg("-p")
-        .arg("(version 1) (allow default)")
-        .arg("true")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    #[cfg(target_os = "macos")]
+    {
+        let available = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg("(version 1) (allow default)")
+            .arg("true")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        assert!(
+            available,
+            "macOS Seatbelt is required for sandbox contract tests"
+        );
+        available
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 fn wait_for_child_output_with_timeout(

@@ -41,6 +41,7 @@ pub(in crate::server::router) fn dispatch_command_exec_operation<W: Write>(
             cwd.as_ref(),
             env,
             options,
+            None,
             *terminal,
             id,
             writer,

@@ -258,6 +258,7 @@ impl RuntimePermissionRequestHandler for AllowRequestedPermissions {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TurnPermissionOverlay {
     additional_working_directories: Vec<PathBuf>,
+    metadata_writable_directories: Vec<PathBuf>,
     network_domain_permissions:
         std::collections::HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
     strict_auto_review: bool,
@@ -267,6 +268,7 @@ pub struct TurnPermissionOverlay {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TurnPermissionOverlayDelta {
     additional_working_directories: Vec<PathBuf>,
+    metadata_writable_directories: Vec<PathBuf>,
     network_domain_permissions:
         std::collections::HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
     strict_auto_review: bool,
@@ -275,6 +277,10 @@ pub struct TurnPermissionOverlayDelta {
 impl TurnPermissionOverlayDelta {
     pub fn additional_working_directories(&self) -> &[PathBuf] {
         &self.additional_working_directories
+    }
+
+    pub fn metadata_writable_directories(&self) -> &[PathBuf] {
+        &self.metadata_writable_directories
     }
 
     pub fn network_domain_permissions(
@@ -291,6 +297,10 @@ impl TurnPermissionOverlayDelta {
 impl TurnPermissionOverlay {
     pub fn additional_working_directories(&self) -> &[PathBuf] {
         &self.additional_working_directories
+    }
+
+    pub fn metadata_writable_directories(&self) -> &[PathBuf] {
+        &self.metadata_writable_directories
     }
 
     pub fn network_domain_permissions(
@@ -321,6 +331,11 @@ impl TurnPermissionOverlay {
                 self.additional_working_directories.push(root.clone());
             }
         }
+        for root in &other.metadata_writable_directories {
+            if !self.metadata_writable_directories.contains(root) {
+                self.metadata_writable_directories.push(root.clone());
+            }
+        }
         for (domain, access) in &other.network_domain_permissions {
             self.network_domain_permissions
                 .insert(domain.clone(), *access);
@@ -335,6 +350,12 @@ impl TurnPermissionOverlay {
             .filter(|root| !baseline.additional_working_directories.contains(root))
             .cloned()
             .collect();
+        let metadata_writable_directories = self
+            .metadata_writable_directories
+            .iter()
+            .filter(|root| !baseline.metadata_writable_directories.contains(root))
+            .cloned()
+            .collect();
         let network_domain_permissions = self
             .network_domain_permissions
             .iter()
@@ -345,6 +366,7 @@ impl TurnPermissionOverlay {
             .collect();
         TurnPermissionOverlayDelta {
             additional_working_directories,
+            metadata_writable_directories,
             network_domain_permissions,
             strict_auto_review: self.strict_auto_review && !baseline.strict_auto_review,
         }
@@ -354,6 +376,11 @@ impl TurnPermissionOverlay {
         for root in &delta.additional_working_directories {
             if !self.additional_working_directories.contains(root) {
                 self.additional_working_directories.push(root.clone());
+            }
+        }
+        for root in &delta.metadata_writable_directories {
+            if !self.metadata_writable_directories.contains(root) {
+                self.metadata_writable_directories.push(root.clone());
             }
         }
         for (domain, access) in &delta.network_domain_permissions {
@@ -394,15 +421,27 @@ impl TurnPermissionOverlay {
             && let Some(write_roots) = file_system.write.as_ref()
         {
             for root in write_roots {
-                if !root.as_os_str().is_empty()
-                    && !self.additional_working_directories.contains(root)
-                {
+                if root.as_os_str().is_empty() {
+                    continue;
+                }
+                if is_exact_metadata_root(root) {
+                    if !self.metadata_writable_directories.contains(root) {
+                        self.metadata_writable_directories.push(root.clone());
+                    }
+                } else if !self.additional_working_directories.contains(root) {
                     self.additional_working_directories.push(root.clone());
                 }
             }
         }
         self.merge_network_permissions(permissions);
     }
+}
+
+fn is_exact_metadata_root(path: &std::path::Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(".git" | ".agents" | ".codex")
+    )
 }
 
 #[cfg(test)]
@@ -414,6 +453,7 @@ mod tests {
     use orca_core::config::PermissionProfileNetworkAccess;
 
     use crate::network_proxy::RuntimeNetworkBlockReport;
+    use crate::protocol::{RequestFileSystemPermissions, RequestPermissionProfile};
     use crate::sandbox_denial::SandboxDenialDiagnostic;
 
     use super::{
@@ -432,9 +472,42 @@ mod tests {
     }
 
     #[test]
+    fn approved_exact_metadata_roots_are_kept_separate() {
+        let mut overlay = TurnPermissionOverlay::default();
+
+        overlay.merge_permissions(&RequestPermissionProfile {
+            file_system: Some(RequestFileSystemPermissions {
+                write: Some(vec![
+                    PathBuf::from("/repo/.git"),
+                    PathBuf::from("/repo/.agents"),
+                    PathBuf::from("/repo/.codex"),
+                    PathBuf::from("/repo"),
+                    PathBuf::from("/repo/.git/config"),
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            overlay.metadata_writable_directories(),
+            &[
+                PathBuf::from("/repo/.git"),
+                PathBuf::from("/repo/.agents"),
+                PathBuf::from("/repo/.codex"),
+            ]
+        );
+        assert_eq!(
+            overlay.additional_working_directories(),
+            &[PathBuf::from("/repo"), PathBuf::from("/repo/.git/config"),]
+        );
+    }
+
+    #[test]
     fn permission_overlay_delta_carries_only_worker_changes() {
         let baseline = TurnPermissionOverlay {
             additional_working_directories: vec![PathBuf::from("/existing")],
+            metadata_writable_directories: vec![PathBuf::from("/repo/.git")],
             network_domain_permissions: HashMap::from([(
                 "api.example.com".to_string(),
                 PermissionProfileNetworkAccess::Allow,
@@ -444,6 +517,10 @@ mod tests {
         };
         let current = TurnPermissionOverlay {
             additional_working_directories: vec![PathBuf::from("/existing"), PathBuf::from("/new")],
+            metadata_writable_directories: vec![
+                PathBuf::from("/repo/.git"),
+                PathBuf::from("/repo/.agents"),
+            ],
             network_domain_permissions: HashMap::from([
                 (
                     "api.example.com".to_string(),
@@ -464,6 +541,10 @@ mod tests {
             &[PathBuf::from("/new")]
         );
         assert_eq!(
+            delta.metadata_writable_directories(),
+            &[PathBuf::from("/repo/.agents")]
+        );
+        assert_eq!(
             delta
                 .network_domain_permissions()
                 .get("blocked.example.com"),
@@ -476,6 +557,10 @@ mod tests {
         assert_eq!(
             canonical.additional_working_directories(),
             &[PathBuf::from("/existing"), PathBuf::from("/new")]
+        );
+        assert_eq!(
+            canonical.metadata_writable_directories(),
+            &[PathBuf::from("/repo/.git"), PathBuf::from("/repo/.agents")]
         );
         assert_eq!(
             canonical

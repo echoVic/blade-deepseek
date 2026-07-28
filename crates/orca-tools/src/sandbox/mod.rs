@@ -12,6 +12,14 @@ pub mod bwrap;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub mod linux;
 
+const PROTECTED_METADATA_DIRS: [&str; 3] = [".git", ".agents", ".codex"];
+
+pub fn is_protected_metadata_root(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| PROTECTED_METADATA_DIRS.contains(&name))
+}
+
 /// Platform read roots a Linux shell runtime needs when the sandbox root is a
 /// fresh tmpfs. Exposed here so the pure `bwrap` argv builder (compiled on all
 /// platforms) can consult the same list the Linux backend uses.
@@ -24,6 +32,10 @@ pub struct WorkspaceWriteSandboxCommandContext<'a> {
     pub cwd: &'a Path,
     pub readable_roots: &'a [PathBuf],
     pub additional_roots: &'a [PathBuf],
+    /// Roots explicitly escalated to write workspace metadata
+    /// (`.git`/`.agents`/`.codex`). Unlike `additional_roots`, these are the
+    /// only grants allowed to override the default metadata protection.
+    pub metadata_writable_roots: &'a [PathBuf],
     pub denied_roots: &'a [PathBuf],
     pub network_access: bool,
     pub exclude_tmpdir_env_var: bool,
@@ -36,6 +48,7 @@ pub struct ReadOnlySandboxCommandContext<'a> {
     pub cwd: &'a Path,
     pub readable_roots: &'a [PathBuf],
     pub additional_roots: &'a [PathBuf],
+    pub metadata_writable_roots: &'a [PathBuf],
     pub denied_roots: &'a [PathBuf],
     pub network_access: bool,
     pub allow_global_read: bool,
@@ -48,6 +61,7 @@ pub fn bash_command(command: &str, cwd: &Path) -> Command {
         cwd,
         readable_roots: &[],
         additional_roots: &[],
+        metadata_writable_roots: &[],
         denied_roots: &[],
         network_access: true,
         exclude_tmpdir_env_var: false,
@@ -72,6 +86,7 @@ pub fn bash_command_with_additional_roots(
         cwd,
         readable_roots: &[],
         additional_roots,
+        metadata_writable_roots: &[],
         denied_roots: &[],
         network_access: true,
         exclude_tmpdir_env_var: false,
@@ -98,7 +113,13 @@ pub fn platform_default_read_roots() -> Vec<PathBuf> {
 
 #[cfg(test)]
 pub fn seatbelt_available() -> bool {
-    platform::seatbelt_available()
+    let available = platform::seatbelt_available();
+    #[cfg(target_os = "macos")]
+    assert!(
+        available,
+        "macOS Seatbelt is required: /usr/bin/sandbox-exec could not compile and run the probe policy"
+    );
+    available
 }
 
 #[cfg(test)]
@@ -174,9 +195,10 @@ mod platform {
 
         #[test]
         fn sandbox_blocks_writes_outside_workspace() {
-            if !seatbelt_available() {
-                return;
-            }
+            assert!(
+                seatbelt_available(),
+                "macOS Seatbelt is required for sandbox behavior tests"
+            );
 
             let parent = crate::sandbox::sandbox_test_parent("sandbox-module-deny-");
             let workspace_path = parent.path().join("workspace");
@@ -199,11 +221,6 @@ mod platform {
 #[cfg(not(target_os = "macos"))]
 mod platform {
     use super::*;
-
-    /// Protected workspace metadata directories: readable but not writable by
-    /// default, matching the macOS Seatbelt backend.
-    #[cfg(target_os = "linux")]
-    const PROTECTED_METADATA_DIRS: [&str; 3] = [".git", ".agents", ".codex"];
 
     #[cfg(target_os = "linux")]
     fn canonicalize_all(roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -242,8 +259,21 @@ mod platform {
         // Writable: the workspace cwd plus any explicit additional roots, plus
         // temp dirs unless excluded.
         let additional_roots = canonicalize_all(context.additional_roots);
+        let metadata_writable_roots = canonicalize_all(
+            &context
+                .metadata_writable_roots
+                .iter()
+                .filter(|root| is_protected_metadata_root(root))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
         let mut writable_roots = vec![cwd.clone()];
         for root in &additional_roots {
+            if !writable_roots.contains(root) {
+                writable_roots.push(root.clone());
+            }
+        }
+        for root in &metadata_writable_roots {
             if !writable_roots.contains(root) {
                 writable_roots.push(root.clone());
             }
@@ -261,16 +291,15 @@ mod platform {
         }
 
         // Protect workspace metadata (readable, not writable) unless the caller
-        // explicitly granted it as a writable additional root.
+        // explicitly granted that exact metadata directory through the
+        // dedicated escalation channel. A broad ordinary writable root never
+        // re-opens workspace metadata.
         let mut read_only_roots = Vec::new();
         for name in PROTECTED_METADATA_DIRS {
             let metadata = cwd.join(name);
-            if metadata.exists()
-                && !additional_roots
-                    .iter()
-                    .any(|root| metadata.starts_with(root))
-            {
-                read_only_roots.push(metadata);
+            let canonical_metadata = metadata.canonicalize().unwrap_or_else(|_| metadata.clone());
+            if metadata.exists() && !metadata_writable_roots.contains(&canonical_metadata) {
+                read_only_roots.push(canonical_metadata);
             }
         }
 
@@ -319,7 +348,29 @@ mod platform {
 
         // Additional roots are writable even in read-only mode (e.g. an
         // explicitly granted output directory), matching the Seatbelt profile.
-        let writable_roots = canonicalize_all(context.additional_roots);
+        let mut writable_roots = canonicalize_all(context.additional_roots);
+        let metadata_writable_roots = canonicalize_all(
+            &context
+                .metadata_writable_roots
+                .iter()
+                .filter(|root| is_protected_metadata_root(root))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        for root in &metadata_writable_roots {
+            if !writable_roots.contains(root) {
+                writable_roots.push(root.clone());
+            }
+        }
+
+        let mut read_only_roots = Vec::new();
+        for name in PROTECTED_METADATA_DIRS {
+            let metadata = cwd.join(name);
+            let canonical_metadata = metadata.canonicalize().unwrap_or_else(|_| metadata.clone());
+            if metadata.exists() && !metadata_writable_roots.contains(&canonical_metadata) {
+                read_only_roots.push(canonical_metadata);
+            }
+        }
 
         // A restricted read scope (allow_global_read == false) is fail-closed:
         // only listed roots are visible.
@@ -344,7 +395,7 @@ mod platform {
                 readable_roots: canonicalize_all(context.readable_roots),
                 allowed_unix_socket_roots: canonicalize_all(context.allowed_unix_socket_roots),
                 writable_roots,
-                read_only_roots: Vec::new(),
+                read_only_roots,
                 denied_roots,
                 network_access: context.network_access,
             },

@@ -40,10 +40,24 @@ impl ServerShellManager {
         command: ShellSessionCommand,
         task_registry: Option<TaskRegistry>,
     ) -> io::Result<ShellSessionHandle> {
+        self.spawn_with_metadata_roots(cwd, command, Vec::new(), task_registry)
+    }
+
+    pub(super) fn spawn_with_metadata_roots(
+        &mut self,
+        cwd: &Path,
+        command: ShellSessionCommand,
+        metadata_writable_directories: Vec<std::path::PathBuf>,
+        task_registry: Option<TaskRegistry>,
+    ) -> io::Result<ShellSessionHandle> {
         let manager = self.manager_for_cwd(cwd);
         match task_registry {
-            Some(task_registry) => manager.spawn_with_task_registry(command, task_registry),
-            None => manager.spawn(command),
+            Some(task_registry) => manager.spawn_with_task_registry_and_metadata_roots(
+                command,
+                metadata_writable_directories,
+                task_registry,
+            ),
+            None => manager.spawn_with_metadata_roots(command, metadata_writable_directories),
         }
     }
 

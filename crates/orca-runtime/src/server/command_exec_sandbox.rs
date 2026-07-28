@@ -133,6 +133,7 @@ fn apply_folder_trust_gate(
         },
         additional_readable_roots,
         additional_writable_roots: Vec::new(),
+        metadata_writable_roots: Vec::new(),
         denied_writable_roots: sandbox.denied_writable_roots,
         allowed_unix_socket_roots: Vec::new(),
         network_policy_domains: HashMap::new(),
@@ -196,6 +197,7 @@ pub struct CommandExecSandbox {
     pub mode: ShellSandboxMode,
     pub additional_readable_roots: Vec<PathBuf>,
     pub additional_writable_roots: Vec<PathBuf>,
+    pub metadata_writable_roots: Vec<PathBuf>,
     pub denied_writable_roots: Vec<PathBuf>,
     pub allowed_unix_socket_roots: Vec<PathBuf>,
     pub network_policy_domains: HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
@@ -207,6 +209,7 @@ impl CommandExecSandbox {
             mode,
             additional_readable_roots: Vec::new(),
             additional_writable_roots: Vec::new(),
+            metadata_writable_roots: Vec::new(),
             denied_writable_roots: Vec::new(),
             allowed_unix_socket_roots: Vec::new(),
             network_policy_domains: HashMap::new(),
@@ -283,6 +286,7 @@ fn shell_sandbox_mode_from_permission_profile(
         mode,
         additional_readable_roots,
         additional_writable_roots: resolved.additional_writable_roots,
+        metadata_writable_roots: resolved.metadata_writable_roots,
         denied_writable_roots: resolved.denied_writable_roots,
         allowed_unix_socket_roots: resolved.allowed_unix_socket_roots,
         network_policy_domains: resolved.network_policy_domains,
@@ -294,6 +298,7 @@ struct ResolvedPermissionProfile {
     builtin: Option<String>,
     additional_readable_roots: Vec<PathBuf>,
     additional_writable_roots: Vec<PathBuf>,
+    metadata_writable_roots: Vec<PathBuf>,
     denied_writable_roots: Vec<PathBuf>,
     allowed_unix_socket_roots: Vec<PathBuf>,
     network_access: Option<bool>,
@@ -311,6 +316,7 @@ fn resolve_permission_profile(
     let mut seen = Vec::new();
     let mut additional_readable_roots = Vec::new();
     let mut additional_writable_roots = Vec::new();
+    let mut metadata_writable_roots = Vec::new();
     let mut denied_writable_roots = Vec::new();
     let mut allowed_unix_socket_roots = Vec::new();
     let mut network_access = None;
@@ -321,6 +327,7 @@ fn resolve_permission_profile(
                 builtin: Some(name),
                 additional_readable_roots,
                 additional_writable_roots,
+                metadata_writable_roots,
                 denied_writable_roots,
                 allowed_unix_socket_roots,
                 network_access,
@@ -370,7 +377,11 @@ fn resolve_permission_profile(
                             push_unique_path(&mut additional_readable_roots, root.clone());
                         }
                         if access.allows_write() {
-                            push_unique_path(&mut additional_writable_roots, root.clone());
+                            push_writable_root(
+                                &mut additional_writable_roots,
+                                &mut metadata_writable_roots,
+                                root.clone(),
+                            );
                         }
                         if access.denies_write() {
                             push_unique_path(&mut denied_writable_roots, root);
@@ -392,8 +403,12 @@ fn resolve_permission_profile(
                 if access.allows_read() && !additional_readable_roots.contains(&root) {
                     additional_readable_roots.push(root.clone());
                 }
-                if access.allows_write() && !additional_writable_roots.contains(&root) {
-                    additional_writable_roots.push(root.clone());
+                if access.allows_write() {
+                    push_writable_root(
+                        &mut additional_writable_roots,
+                        &mut metadata_writable_roots,
+                        root.clone(),
+                    );
                 }
                 if access.denies_write() && !denied_writable_roots.contains(&root) {
                     denied_writable_roots.push(root);
@@ -413,6 +428,7 @@ fn resolve_permission_profile(
         builtin: None,
         additional_readable_roots,
         additional_writable_roots,
+        metadata_writable_roots,
         denied_writable_roots,
         allowed_unix_socket_roots,
         network_access,
@@ -547,6 +563,18 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
+fn push_writable_root(
+    additional_writable_roots: &mut Vec<PathBuf>,
+    metadata_writable_roots: &mut Vec<PathBuf>,
+    root: PathBuf,
+) {
+    if orca_tools::sandbox::is_protected_metadata_root(&root) {
+        push_unique_path(metadata_writable_roots, root);
+    } else {
+        push_unique_path(additional_writable_roots, root);
+    }
+}
+
 fn is_builtin_permission_profile_name(profile: &str) -> bool {
     matches!(profile, "read-only" | "workspace" | "danger-full-access")
 }
@@ -660,6 +688,7 @@ mod folder_trust_tests {
             },
             additional_readable_roots: vec![PathBuf::from("/inputs")],
             additional_writable_roots: vec![PathBuf::from("/outputs")],
+            metadata_writable_roots: vec![PathBuf::from("/workspace/.git")],
             denied_writable_roots: vec![PathBuf::from("/secret")],
             allowed_unix_socket_roots: vec![PathBuf::from("/run/service.sock")],
             network_policy_domains: HashMap::from([(
@@ -685,6 +714,7 @@ mod folder_trust_tests {
         );
         assert!(gated.additional_readable_roots.contains(&cwd));
         assert!(gated.additional_writable_roots.is_empty());
+        assert!(gated.metadata_writable_roots.is_empty());
         assert_eq!(gated.denied_writable_roots, vec![PathBuf::from("/secret")]);
         assert!(gated.allowed_unix_socket_roots.is_empty());
         assert!(gated.network_policy_domains.is_empty());
