@@ -61,6 +61,7 @@ mod transcript_view;
 pub mod types;
 pub mod ui;
 pub mod vim;
+mod vim_command;
 mod workflow_notifications;
 mod workflow_panel_actions;
 mod workspace_status;
