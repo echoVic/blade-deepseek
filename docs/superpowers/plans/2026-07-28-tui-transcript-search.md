@@ -3005,4 +3005,3 @@ git status --short --branch
 ```
 
 Keep the branch and worktree for the remaining P2 roadmap.
-
