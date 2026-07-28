@@ -30,6 +30,7 @@ dirs = { workspace = true }
 crossbeam-channel = { workspace = true }
 syntect = { workspace = true }
 two-face = { workspace = true }
+similar = { workspace = true, features = ["inline"] }
 libc = { workspace = true }
 
 [dev-dependencies]

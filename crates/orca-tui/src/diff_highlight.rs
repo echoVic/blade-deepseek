@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use similar::{ChangeTag, TextDiff};
 
 use crate::syntax_highlight::{
     LineHighlighter, MAX_HIGHLIGHT_BYTES, MAX_HIGHLIGHT_LINES, StyledSourceLine, SyntaxTheme,
@@ -13,6 +15,7 @@ use crate::theme::Theme;
 
 const MAX_RENDERED_DIFF_LINES: usize = 80;
 const TRUNCATION_MARKER: &str = "    [... diff truncated ...]";
+const INLINE_DIFF_DEADLINE: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DiffLineKind {
@@ -33,6 +36,170 @@ pub(crate) struct DiffSourceLine {
 pub(crate) enum DiffHunkEntry {
     Source(DiffSourceLine),
     Metadata(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplacementCluster {
+    delete_start: usize,
+    delete_end: usize,
+    insert_start: usize,
+    insert_end: usize,
+}
+
+fn replacement_clusters(entries: &[DiffHunkEntry]) -> Vec<ReplacementCluster> {
+    let mut clusters = Vec::new();
+    let mut index = 0;
+    while index < entries.len() {
+        let delete_start = index;
+        while matches!(
+            entries.get(index),
+            Some(DiffHunkEntry::Source(DiffSourceLine {
+                kind: DiffLineKind::Delete,
+                ..
+            }))
+        ) {
+            index += 1;
+        }
+        if index == delete_start {
+            index += 1;
+            continue;
+        }
+        let insert_start = index;
+        while matches!(
+            entries.get(index),
+            Some(DiffHunkEntry::Source(DiffSourceLine {
+                kind: DiffLineKind::Insert,
+                ..
+            }))
+        ) {
+            index += 1;
+        }
+        if index > insert_start {
+            clusters.push(ReplacementCluster {
+                delete_start,
+                delete_end: insert_start,
+                insert_start,
+                insert_end: index,
+            });
+        }
+    }
+    clusters
+}
+
+type InlineSegmentMap = HashMap<usize, Vec<(bool, String)>>;
+
+fn owned_inline_segments(
+    change: &similar::InlineChange<'_, str>,
+    expected: &str,
+) -> Option<Vec<(bool, String)>> {
+    let mut segments = change
+        .iter_strings_lossy()
+        .map(|(emphasized, value)| (emphasized, value.into_owned()))
+        .collect::<Vec<_>>();
+    let last = segments.last_mut()?;
+    if let Some(without_newline) = last.1.strip_suffix('\n') {
+        last.1 = without_newline.to_owned();
+    }
+    segments.retain(|(_, value)| !value.is_empty());
+    (segments
+        .iter()
+        .map(|(_, value)| value.as_str())
+        .collect::<String>()
+        == expected)
+        .then_some(segments)
+}
+
+fn cluster_inline_segments(
+    entries: &[DiffHunkEntry],
+    cluster: ReplacementCluster,
+) -> Option<InlineSegmentMap> {
+    let old_lines = entries[cluster.delete_start..cluster.delete_end]
+        .iter()
+        .map(|entry| match entry {
+            DiffHunkEntry::Source(line) => Some(line.content.as_str()),
+            DiffHunkEntry::Metadata(_) => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let new_lines = entries[cluster.insert_start..cluster.insert_end]
+        .iter()
+        .map(|entry| match entry {
+            DiffHunkEntry::Source(line) => Some(line.content.as_str()),
+            DiffHunkEntry::Metadata(_) => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let old_text = format!("{}\n", old_lines.join("\n"));
+    let new_text = format!("{}\n", new_lines.join("\n"));
+    if !content_within_limits(&old_text) || !content_within_limits(&new_text) {
+        return None;
+    }
+
+    let diff = TextDiff::from_lines(&old_text, &new_text);
+    let deadline = Some(Instant::now() + INLINE_DIFF_DEADLINE);
+    let mut segments = InlineSegmentMap::new();
+    for change in diff
+        .ops()
+        .iter()
+        .flat_map(|op| diff.iter_inline_changes_deadline(op, deadline))
+    {
+        match change.tag() {
+            ChangeTag::Delete => {
+                let old_index = change.old_index()?;
+                let entry_index = cluster.delete_start.checked_add(old_index)?;
+                let values = owned_inline_segments(&change, old_lines.get(old_index)?)?;
+                if segments.insert(entry_index, values).is_some() {
+                    return None;
+                }
+            }
+            ChangeTag::Insert => {
+                let new_index = change.new_index()?;
+                let entry_index = cluster.insert_start.checked_add(new_index)?;
+                let values = owned_inline_segments(&change, new_lines.get(new_index)?)?;
+                if segments.insert(entry_index, values).is_some() {
+                    return None;
+                }
+            }
+            ChangeTag::Equal => {
+                let old_index = change.old_index()?;
+                let new_index = change.new_index()?;
+                let old_entry = cluster.delete_start.checked_add(old_index)?;
+                let new_entry = cluster.insert_start.checked_add(new_index)?;
+                let old_values = vec![(false, old_lines.get(old_index)?.to_string())];
+                let new_values = vec![(false, new_lines.get(new_index)?.to_string())];
+                if segments.insert(old_entry, old_values).is_some()
+                    || segments.insert(new_entry, new_values).is_some()
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    let expected_len = cluster
+        .delete_end
+        .saturating_sub(cluster.delete_start)
+        .saturating_add(cluster.insert_end.saturating_sub(cluster.insert_start));
+    let has_emphasized = segments
+        .values()
+        .flatten()
+        .any(|(emphasized, value)| *emphasized && !value.is_empty());
+    let has_unchanged = segments.values().flatten().any(|(emphasized, value)| {
+        !*emphasized && value.chars().any(|character| !character.is_whitespace())
+    });
+    (segments.len() == expected_len && has_emphasized && has_unchanged).then_some(segments)
+}
+
+fn visible_inline_segments(entries: &[DiffHunkEntry], entry_budget: usize) -> InlineSegmentMap {
+    let visible_end = entry_budget.min(entries.len());
+    let mut output = InlineSegmentMap::new();
+    for cluster in replacement_clusters(entries) {
+        if cluster.insert_end > visible_end {
+            continue;
+        }
+        let Some(cluster_segments) = cluster_inline_segments(entries, cluster) else {
+            continue;
+        };
+        output.extend(cluster_segments);
+    }
+    output
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -774,12 +941,93 @@ fn with_background(mut style: Style, background: Option<Color>) -> Style {
     style
 }
 
+fn emphasized_style(style: Style, kind: DiffLineKind, emphasized: bool, theme: &Theme) -> Style {
+    if !emphasized {
+        return with_background(style, row_background(kind, theme));
+    }
+    if theme.color_level == TerminalColorLevel::Monochrome {
+        return style.add_modifier(ratatui::style::Modifier::BOLD);
+    }
+    let background = match kind {
+        DiffLineKind::Insert => Some(theme.diff_add_emphasis_bg),
+        DiffLineKind::Delete => Some(theme.diff_remove_emphasis_bg),
+        DiffLineKind::Context => None,
+    };
+    with_background(style, background)
+}
+
+fn merge_inline_segments(
+    content: &str,
+    styled: StyledSourceLine,
+    inline: &[(bool, String)],
+    kind: DiffLineKind,
+    theme: &Theme,
+) -> Option<StyledSourceLine> {
+    let styled_text = styled
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let inline_text = inline
+        .iter()
+        .map(|(_, value)| value.as_str())
+        .collect::<String>();
+    if styled_text != content || inline_text != content {
+        return None;
+    }
+
+    let mut styled_ranges = Vec::with_capacity(styled.len());
+    let mut offset = 0usize;
+    for span in styled {
+        let start = offset;
+        offset = offset.checked_add(span.content.len())?;
+        styled_ranges.push((start, offset, span));
+    }
+    let mut inline_ranges = Vec::with_capacity(inline.len());
+    offset = 0;
+    for (emphasized, value) in inline {
+        let start = offset;
+        offset = offset.checked_add(value.len())?;
+        inline_ranges.push((start, offset, *emphasized));
+    }
+    if offset != content.len() {
+        return None;
+    }
+
+    let mut output = Vec::new();
+    let mut styled_index = 0usize;
+    let mut inline_index = 0usize;
+    while styled_index < styled_ranges.len() && inline_index < inline_ranges.len() {
+        let (styled_start, styled_end, styled_span) = &styled_ranges[styled_index];
+        let (inline_start, inline_end, emphasized) = inline_ranges[inline_index];
+        let start = (*styled_start).max(inline_start);
+        let end = (*styled_end).min(inline_end);
+        if start < end {
+            output.push(Span::styled(
+                content.get(start..end)?.to_owned(),
+                emphasized_style(styled_span.style, kind, emphasized, theme),
+            ));
+        }
+        if *styled_end <= inline_end {
+            styled_index += 1;
+        }
+        if inline_end <= *styled_end {
+            inline_index += 1;
+        }
+    }
+    let reconstructed = output
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    (reconstructed == content).then_some(output)
+}
+
 fn rendered_source_line(
     line: &DiffSourceLine,
     syntax_spans: Option<StyledSourceLine>,
     refined: Option<&RefinedDiffStyles>,
     theme: &Theme,
     gutter_width: usize,
+    inline: Option<&[(bool, String)]>,
 ) -> Line<'static> {
     let fallback_color = source_color(line.kind, theme);
     let background = row_background(line.kind, theme);
@@ -795,11 +1043,23 @@ fn rendered_source_line(
                 Style::default().fg(fallback_color),
             )]
         });
-    spans.extend(
-        content_spans
-            .into_iter()
-            .map(|span| Span::styled(span.content, with_background(span.style, background))),
-    );
+    let content_spans = inline
+        .and_then(|inline| {
+            merge_inline_segments(
+                &line.content,
+                content_spans.clone(),
+                inline,
+                line.kind,
+                theme,
+            )
+        })
+        .unwrap_or_else(|| {
+            content_spans
+                .into_iter()
+                .map(|span| Span::styled(span.content, with_background(span.style, background)))
+                .collect()
+        });
+    spans.extend(content_spans);
     Line::from(spans)
 }
 
@@ -840,13 +1100,20 @@ fn render_hunk_fallback(
     theme: &Theme,
     gutter_width: usize,
 ) -> Vec<Line<'static>> {
+    let inline_segments = visible_inline_segments(&hunk.entries, entry_budget);
     hunk.entries
         .iter()
         .take(entry_budget)
-        .map(|entry| match entry {
-            DiffHunkEntry::Source(line) => {
-                rendered_source_line(line, None, None, theme, gutter_width)
-            }
+        .enumerate()
+        .map(|(entry_index, entry)| match entry {
+            DiffHunkEntry::Source(line) => rendered_source_line(
+                line,
+                None,
+                None,
+                theme,
+                gutter_width,
+                inline_segments.get(&entry_index).map(Vec::as_slice),
+            ),
             DiffHunkEntry::Metadata(line) => rendered_metadata_line(line, theme),
         })
         .collect()
@@ -861,6 +1128,7 @@ fn render_hunk_with(
     mut highlight: impl FnMut(DiffSide, &str) -> Option<StyledSourceLine>,
 ) -> Vec<Line<'static>> {
     let visible_entries = hunk.entries.iter().take(entry_budget).collect::<Vec<_>>();
+    let inline_segments = visible_inline_segments(&hunk.entries, entry_budget);
     let mut highlighted = Vec::with_capacity(visible_entries.len());
     for entry in &visible_entries {
         let DiffHunkEntry::Source(line) = entry else {
@@ -885,13 +1153,15 @@ fn render_hunk_with(
     let mut highlighted = highlighted.into_iter();
     visible_entries
         .into_iter()
-        .map(|entry| match entry {
+        .enumerate()
+        .map(|(entry_index, entry)| match entry {
             DiffHunkEntry::Source(line) => rendered_source_line(
                 line,
                 Some(highlighted.next().expect("one style per source line")),
                 refined,
                 theme,
                 gutter_width,
+                inline_segments.get(&entry_index).map(Vec::as_slice),
             ),
             DiffHunkEntry::Metadata(line) => rendered_metadata_line(line, theme),
         })
@@ -1064,8 +1334,9 @@ mod tests {
 
     use super::{
         DiffHunk, DiffHunkEntry, DiffLineKind, DiffSourceLine, RefinedDiffStyles,
-        compute_file_scoped_styles, compute_parsed_diff_file_scoped_styles, parse_unified_diff,
-        render_parsed_diff, render_unified_diff,
+        ReplacementCluster, compute_file_scoped_styles, compute_parsed_diff_file_scoped_styles,
+        parse_unified_diff, render_parsed_diff, render_unified_diff, replacement_clusters,
+        visible_inline_segments,
     };
     use crate::syntax_highlight::{
         MAX_HIGHLIGHT_BYTES, MAX_HIGHLIGHT_LINE_BYTES, MAX_HIGHLIGHT_LINES, StyledSourceLine,
@@ -1081,6 +1352,14 @@ mod tests {
 -fn old() { let value = \"old\"; }
 +fn new() { let value = \"new\"; }
  context();
+";
+
+    const INLINE_DIFF: &str = "\
+--- a/value.rs
++++ b/value.rs
+@@ -1 +1 @@
+-let colour = \"red apple\";
++let color = \"green apple\";
 ";
 
     fn dark_theme() -> Theme {
@@ -1130,18 +1409,20 @@ mod tests {
         let deletion = find_rendered_line(&lines, "-fn old");
         let insertion = find_rendered_line(&lines, "+fn new");
 
-        assert!(
-            deletion
-                .spans
-                .iter()
-                .all(|span| span.style.bg == Some(Color::Rgb(0x4a, 0x22, 0x1d)))
-        );
-        assert!(
-            insertion
-                .spans
-                .iter()
-                .all(|span| span.style.bg == Some(Color::Rgb(0x21, 0x3a, 0x2b)))
-        );
+        assert_eq!(deletion.spans[0].style.bg, Some(theme.diff_remove_bg));
+        assert_eq!(insertion.spans[0].style.bg, Some(theme.diff_add_bg));
+        assert!(deletion.spans.iter().skip(1).all(|span| matches!(
+            span.style.bg,
+            Some(background)
+                if background == theme.diff_remove_bg
+                    || background == theme.diff_remove_emphasis_bg
+        )));
+        assert!(insertion.spans.iter().skip(1).all(|span| matches!(
+            span.style.bg,
+            Some(background)
+                if background == theme.diff_add_bg
+                    || background == theme.diff_add_emphasis_bg
+        )));
     }
 
     #[test]
@@ -1242,14 +1523,27 @@ mod tests {
     }
 
     fn without_backgrounds(spans: &[Span<'_>]) -> StyledSourceLine {
-        spans
-            .iter()
-            .map(|span| {
-                let mut style = span.style;
-                style.bg = None;
-                Span::styled(span.content.to_string(), style)
-            })
-            .collect()
+        let mut output: StyledSourceLine = Vec::new();
+        for span in spans {
+            let mut style = span.style;
+            style.bg = None;
+            if let Some(previous) = output.last_mut()
+                && previous.style == style
+            {
+                previous.content.to_mut().push_str(span.content.as_ref());
+                continue;
+            }
+            output.push(Span::styled(span.content.to_string(), style));
+        }
+        output
+    }
+
+    fn assert_same_styled_text(left: &[Span<'_>], right: &[Span<'_>]) {
+        assert_eq!(without_backgrounds(left), without_backgrounds(right));
+    }
+
+    fn assert_different_styled_text(left: &[Span<'_>], right: &[Span<'_>]) {
+        assert_ne!(without_backgrounds(left), without_backgrounds(right));
     }
 
     fn assert_plain_source(
@@ -1258,7 +1552,7 @@ mod tests {
         content: &str,
         color: ratatui::style::Color,
     ) {
-        assert_eq!(line.spans.len(), 2);
+        assert!(line.spans.len() >= 2);
         let marker = prefix.trim();
         if marker.is_empty() {
             assert!(
@@ -1274,8 +1568,18 @@ mod tests {
             );
         }
         assert_eq!(line.spans[0].style.fg, Some(color));
-        assert_eq!(line.spans[1].content.as_ref(), content);
-        assert_eq!(line.spans[1].style.fg, Some(color));
+        assert_eq!(
+            line.spans[1..]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            content
+        );
+        assert!(
+            line.spans[1..]
+                .iter()
+                .all(|span| span.style.fg == Some(color))
+        );
     }
 
     fn assert_malformed_raw_fallback(diff: &str) {
@@ -1417,6 +1721,370 @@ mod tests {
                 (DiffLineKind::Delete, Some(3), None, "old"),
                 (DiffLineKind::Insert, None, Some(3), "new"),
             ]
+        );
+    }
+
+    #[test]
+    fn replacement_clusters_include_only_adjacent_delete_then_insert_blocks() {
+        let entries = vec![
+            DiffHunkEntry::Source(DiffSourceLine {
+                kind: DiffLineKind::Delete,
+                old_line: Some(1),
+                new_line: None,
+                content: "old one".to_string(),
+            }),
+            DiffHunkEntry::Source(DiffSourceLine {
+                kind: DiffLineKind::Delete,
+                old_line: Some(2),
+                new_line: None,
+                content: "old two".to_string(),
+            }),
+            DiffHunkEntry::Source(DiffSourceLine {
+                kind: DiffLineKind::Insert,
+                old_line: None,
+                new_line: Some(1),
+                content: "new one".to_string(),
+            }),
+            DiffHunkEntry::Source(DiffSourceLine {
+                kind: DiffLineKind::Insert,
+                old_line: None,
+                new_line: Some(2),
+                content: "new two".to_string(),
+            }),
+            DiffHunkEntry::Source(DiffSourceLine {
+                kind: DiffLineKind::Context,
+                old_line: Some(3),
+                new_line: Some(3),
+                content: "context".to_string(),
+            }),
+            DiffHunkEntry::Source(DiffSourceLine {
+                kind: DiffLineKind::Delete,
+                old_line: Some(4),
+                new_line: None,
+                content: "old three".to_string(),
+            }),
+            DiffHunkEntry::Metadata("\\ No newline at end of file".to_string()),
+            DiffHunkEntry::Source(DiffSourceLine {
+                kind: DiffLineKind::Insert,
+                old_line: None,
+                new_line: Some(4),
+                content: "new three".to_string(),
+            }),
+        ];
+
+        assert_eq!(
+            replacement_clusters(&entries),
+            vec![ReplacementCluster {
+                delete_start: 0,
+                delete_end: 2,
+                insert_start: 2,
+                insert_end: 4,
+            }]
+        );
+    }
+
+    #[test]
+    fn adjacent_replacement_emphasizes_only_changed_inline_tokens() {
+        let theme = dark_theme();
+        let lines = render_unified_diff(INLINE_DIFF, &theme, None);
+        let deletion = find_rendered_line(&lines, "-let colour");
+        let insertion = find_rendered_line(&lines, "+let color");
+
+        assert!(deletion.spans.iter().any(|span| {
+            span.content.contains("colour") && span.style.bg == Some(theme.diff_remove_emphasis_bg)
+        }));
+        assert!(insertion.spans.iter().any(|span| {
+            span.content.contains("color") && span.style.bg == Some(theme.diff_add_emphasis_bg)
+        }));
+        assert!(deletion.spans.iter().any(|span| {
+            span.content.contains("apple") && span.style.bg == Some(theme.diff_remove_bg)
+        }));
+        assert!(insertion.spans.iter().any(|span| {
+            span.content.contains("apple") && span.style.bg == Some(theme.diff_add_bg)
+        }));
+        assert_eq!(
+            deletion.spans[1..]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "let colour = \"red apple\";"
+        );
+        assert_eq!(
+            insertion.spans[1..]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "let color = \"green apple\";"
+        );
+    }
+
+    #[test]
+    fn multiline_replacement_maps_inline_segments_to_their_original_rows() {
+        let diff = "\
+--- a/value.txt
++++ b/value.txt
+@@ -10,2 +20,2 @@
+-first red apple
+-second blue berry
++first green apple
++second gold berry
+";
+        let theme = dark_theme();
+        let lines = render_unified_diff(diff, &theme, None);
+        let first_old = find_rendered_line(&lines, "-first red apple");
+        let second_old = find_rendered_line(&lines, "-second blue berry");
+        let first_new = find_rendered_line(&lines, "+first green apple");
+        let second_new = find_rendered_line(&lines, "+second gold berry");
+
+        for (line, changed, background) in [
+            (first_old, "red", theme.diff_remove_emphasis_bg),
+            (second_old, "blue", theme.diff_remove_emphasis_bg),
+            (first_new, "green", theme.diff_add_emphasis_bg),
+            (second_new, "gold", theme.diff_add_emphasis_bg),
+        ] {
+            assert!(line.spans.iter().any(|span| {
+                span.content.contains(changed) && span.style.bg == Some(background)
+            }));
+        }
+        assert_eq!(span_text(first_old, 0), "10    - ");
+        assert_eq!(span_text(second_old, 0), "11    - ");
+        assert_eq!(span_text(first_new, 0), "   20 + ");
+        assert_eq!(span_text(second_new, 0), "   21 + ");
+    }
+
+    #[test]
+    fn unknown_extension_still_receives_inline_emphasis_over_fallback_foreground() {
+        let diff = "\
+--- a/value.unknown
++++ b/value.unknown
+@@ -1 +1 @@
+-let colour = \"red apple\";
++let color = \"green apple\";
+";
+        let theme = dark_theme();
+        let lines = render_unified_diff(diff, &theme, None);
+        let deletion = find_rendered_line(&lines, "-let colour");
+        let insertion = find_rendered_line(&lines, "+let color");
+
+        assert!(deletion.spans.iter().any(|span| {
+            span.content.contains("colour")
+                && span.style.fg == Some(theme.diff_remove)
+                && span.style.bg == Some(theme.diff_remove_emphasis_bg)
+        }));
+        assert!(insertion.spans.iter().any(|span| {
+            span.content.contains("color")
+                && span.style.fg == Some(theme.diff_add)
+                && span.style.bg == Some(theme.diff_add_emphasis_bg)
+        }));
+    }
+
+    #[test]
+    fn nonadjacent_replacement_entries_do_not_receive_inline_emphasis() {
+        let diff = "\
+--- a/value.rs
++++ b/value.rs
+@@ -1,2 +1,2 @@
+-let colour = \"red apple\";
+ context
++let color = \"green apple\";
+";
+        let theme = dark_theme();
+        let lines = render_unified_diff(diff, &theme, None);
+        let deletion = find_rendered_line(&lines, "-let colour");
+        let insertion = find_rendered_line(&lines, "+let color");
+
+        assert!(
+            deletion
+                .spans
+                .iter()
+                .all(|span| { span.style.bg != Some(theme.diff_remove_emphasis_bg) })
+        );
+        assert!(
+            insertion
+                .spans
+                .iter()
+                .all(|span| { span.style.bg != Some(theme.diff_add_emphasis_bg) })
+        );
+    }
+
+    #[test]
+    fn low_similarity_replacement_keeps_only_whole_row_backgrounds() {
+        let diff = "\
+--- a/value.rs
++++ b/value.rs
+@@ -1 +1 @@
+-alpha beta gamma
++one two three
+";
+        let theme = dark_theme();
+        let lines = render_unified_diff(diff, &theme, None);
+        let deletion = find_rendered_line(&lines, "-alpha");
+        let insertion = find_rendered_line(&lines, "+one");
+
+        assert!(
+            deletion
+                .spans
+                .iter()
+                .all(|span| { span.style.bg != Some(theme.diff_remove_emphasis_bg) })
+        );
+        assert!(
+            insertion
+                .spans
+                .iter()
+                .all(|span| { span.style.bg != Some(theme.diff_add_emphasis_bg) })
+        );
+    }
+
+    #[test]
+    fn inline_emphasis_preserves_unicode_and_combining_text_exactly() {
+        let diff = "\
+--- a/value.txt
++++ b/value.txt
+@@ -1 +1 @@
+-cafe\u{301} 👍🏽 red
++cafe\u{301} 👍🏽 green
+";
+        let theme = dark_theme();
+        let lines = render_unified_diff(diff, &theme, None);
+        let deletion = find_rendered_line(&lines, "-cafe");
+        let insertion = find_rendered_line(&lines, "+cafe");
+
+        assert_eq!(
+            deletion.spans[1..]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "cafe\u{301} 👍🏽 red"
+        );
+        assert_eq!(
+            insertion.spans[1..]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "cafe\u{301} 👍🏽 green"
+        );
+        assert!(insertion.spans.iter().any(|span| {
+            span.content.contains("green") && span.style.bg == Some(theme.diff_add_emphasis_bg)
+        }));
+    }
+
+    #[test]
+    fn inline_emphasis_preserves_refined_foreground_and_modifiers() {
+        let theme = dark_theme();
+        let overlay = Color::Rgb(1, 2, 3);
+        let refined = RefinedDiffStyles::from([(
+            1,
+            vec![Span::styled(
+                "let color = \"green apple\";",
+                Style::default().fg(overlay).add_modifier(Modifier::ITALIC),
+            )],
+        )]);
+        let lines = render_unified_diff(INLINE_DIFF, &theme, Some(&refined));
+        let insertion = find_rendered_line(&lines, "+let color");
+        let emphasized = insertion
+            .spans
+            .iter()
+            .find(|span| span.style.bg == Some(theme.diff_add_emphasis_bg))
+            .expect("emphasized refined span");
+
+        assert_eq!(emphasized.style.fg, Some(overlay));
+        assert!(emphasized.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn monochrome_inline_emphasis_uses_bold_without_backgrounds() {
+        let theme = Theme::resolve(
+            ThemeName::Dark,
+            TerminalProfile {
+                background: TerminalBackground::Dark,
+                color_level: TerminalColorLevel::Monochrome,
+            },
+        );
+        let lines = render_unified_diff(INLINE_DIFF, &theme, None);
+        let deletion = find_rendered_line(&lines, "-let colour");
+        let insertion = find_rendered_line(&lines, "+let color");
+
+        assert!(deletion.spans.iter().all(|span| span.style.bg.is_none()));
+        assert!(insertion.spans.iter().all(|span| span.style.bg.is_none()));
+        assert!(deletion.spans.iter().any(|span| {
+            span.content.contains("colour") && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(insertion.spans.iter().any(|span| {
+            span.content.contains("color") && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn truncated_replacement_cluster_is_not_partially_emphasized() {
+        let inserted = (1..77)
+            .map(|index| format!("+new unrelated {index}\n"))
+            .collect::<String>();
+        let diff = format!(
+            "--- a/value.txt\n+++ b/value.txt\n@@ -1 +1,77 @@\n-old value\n+new value\n{inserted}"
+        );
+        let theme = dark_theme();
+        let lines = render_unified_diff(&diff, &theme, None);
+        let visible_insertion = find_rendered_line(&lines, "+new value");
+
+        assert_eq!(lines.len(), 81);
+        assert!(
+            visible_insertion
+                .spans
+                .iter()
+                .all(|span| { span.style.bg != Some(theme.diff_add_emphasis_bg) })
+        );
+    }
+
+    #[test]
+    fn visible_inline_segments_rejects_a_cluster_cut_by_entry_budget() {
+        let entries = vec![
+            DiffHunkEntry::Source(DiffSourceLine {
+                kind: DiffLineKind::Delete,
+                old_line: Some(1),
+                new_line: None,
+                content: "let colour = \"red apple\";".to_string(),
+            }),
+            DiffHunkEntry::Source(DiffSourceLine {
+                kind: DiffLineKind::Insert,
+                old_line: None,
+                new_line: Some(1),
+                content: "let color = \"green apple\";".to_string(),
+            }),
+            DiffHunkEntry::Source(DiffSourceLine {
+                kind: DiffLineKind::Insert,
+                old_line: None,
+                new_line: Some(2),
+                content: "another inserted line".to_string(),
+            }),
+        ];
+
+        assert!(
+            visible_inline_segments(&entries, 2).is_empty(),
+            "a partially visible replacement cluster must not be refined"
+        );
+    }
+
+    #[test]
+    fn over_limit_replacement_line_skips_inline_emphasis() {
+        let old = format!("prefix {} old", "x".repeat(MAX_HIGHLIGHT_LINE_BYTES));
+        let new = format!("prefix {} new", "x".repeat(MAX_HIGHLIGHT_LINE_BYTES));
+        let diff = format!("--- a/value.txt\n+++ b/value.txt\n@@ -1 +1 @@\n-{old}\n+{new}\n");
+        let theme = dark_theme();
+        let lines = render_unified_diff(&diff, &theme, None);
+        let deletion = find_rendered_line(&lines, "-prefix");
+        let insertion = find_rendered_line(&lines, "+prefix");
+
+        assert!(
+            deletion
+                .spans
+                .iter()
+                .all(|span| { span.style.bg != Some(theme.diff_remove_emphasis_bg) })
+        );
+        assert!(
+            insertion
+                .spans
+                .iter()
+                .all(|span| { span.style.bg != Some(theme.diff_add_emphasis_bg) })
         );
     }
 
@@ -2671,10 +3339,10 @@ metadata instead of paired new header
             &theme,
         );
 
-        assert_eq!(without_backgrounds(&deleted.spans[1..]), old_expected[1]);
-        assert_eq!(without_backgrounds(&value.spans[1..]), new_expected[0]);
-        assert_eq!(without_backgrounds(&print.spans[1..]), new_expected[1]);
-        assert_ne!(without_backgrounds(&value.spans[1..]), leaked[2]);
+        assert_same_styled_text(&deleted.spans[1..], &old_expected[1]);
+        assert_same_styled_text(&value.spans[1..], &new_expected[0]);
+        assert_same_styled_text(&print.spans[1..], &new_expected[1]);
+        assert_different_styled_text(&value.spans[1..], &leaked[2]);
     }
 
     #[test]
@@ -2699,10 +3367,10 @@ metadata instead of paired new header
         let fresh_old = highlight_sequence("item.py", &["old tail\"\"\""], &theme);
         let fresh_new = highlight_sequence("item.py", &["new tail\"\"\""], &theme);
 
-        assert_eq!(without_backgrounds(&deleted.spans[1..]), old_expected[1]);
-        assert_eq!(without_backgrounds(&inserted.spans[1..]), new_expected[1]);
-        assert_ne!(without_backgrounds(&deleted.spans[1..]), fresh_old[0]);
-        assert_ne!(without_backgrounds(&inserted.spans[1..]), fresh_new[0]);
+        assert_same_styled_text(&deleted.spans[1..], &old_expected[1]);
+        assert_same_styled_text(&inserted.spans[1..], &new_expected[1]);
+        assert_different_styled_text(&deleted.spans[1..], &fresh_old[0]);
+        assert_different_styled_text(&inserted.spans[1..], &fresh_new[0]);
     }
 
     #[test]
@@ -2807,8 +3475,8 @@ metadata instead of paired new header
         let fresh = highlight_sequence("item.py", &["value = 1"], &theme);
         let leaked = highlight_sequence("item.py", &["\"\"\"open string", "value = 1"], &theme);
 
-        assert_eq!(without_backgrounds(&inserted.spans[1..]), fresh[0]);
-        assert_ne!(without_backgrounds(&inserted.spans[1..]), leaked[1]);
+        assert_same_styled_text(&inserted.spans[1..], &fresh[0]);
+        assert_different_styled_text(&inserted.spans[1..], &leaked[1]);
     }
 
     #[test]
@@ -3167,7 +3835,7 @@ class Item:
         assert!(refined.contains_key(&4));
         assert_ne!(warm_field.spans[1..], cold_field.spans[1..]);
         assert_eq!(refined.get(&4), Some(&direct[3]));
-        assert_eq!(without_backgrounds(&warm_field.spans[1..]), direct[3]);
+        assert_same_styled_text(&warm_field.spans[1..], &direct[3]);
     }
 
     #[test]

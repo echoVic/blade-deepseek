@@ -1686,6 +1686,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "similar",
  "supports-color",
  "syntect",
  "tempfile",
