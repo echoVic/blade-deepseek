@@ -43,6 +43,7 @@ pub mod shortcuts;
 mod slash_command_actions;
 mod slash_menu_actions;
 mod status_key_actions;
+mod streaming_markdown;
 mod submitted_turn;
 mod surface_actions;
 #[cfg(test)]
