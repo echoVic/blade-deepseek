@@ -801,8 +801,44 @@ mod tests {
             Some((value.text.as_str(), value.kind))
         }
 
-        fn has_pending_command_for_test(&self) -> bool {
+        pub(crate) fn has_pending_command_for_test(&self) -> bool {
             self.parser.has_pending()
+        }
+
+        pub(crate) fn named_register_for_test(&self, name: u8) -> Option<(&str, bool)> {
+            self.registers
+                .read(VimRegisterSelector::Named(name))
+                .map(|value| (value.text.as_str(), value.kind == VimRegisterKind::Linewise))
+        }
+
+        pub(crate) fn seed_pending_count_for_test(&mut self) {
+            let _ = self.parser.resolve_normal(Input {
+                key: Key::Char('2'),
+                ctrl: false,
+                alt: false,
+                shift: false,
+            });
+        }
+
+        pub(crate) fn set_named_register_for_test(&mut self, name: u8, text: &str) {
+            self.registers.write(
+                VimRegisterSelector::Named(name),
+                VimRegisterValue {
+                    text: text.to_string(),
+                    kind: VimRegisterKind::Characterwise,
+                },
+            );
+        }
+
+        pub(crate) fn set_repeat_for_test(&mut self) {
+            self.last_change = Some(RepeatableChange::DeleteChars {
+                count: 1,
+                register: VimRegisterSelector::Unnamed,
+            });
+        }
+
+        pub(crate) fn has_repeat_for_test(&self) -> bool {
+            self.last_change.is_some()
         }
     }
 

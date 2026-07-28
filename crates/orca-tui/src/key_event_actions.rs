@@ -10,6 +10,7 @@ use crate::approval_mode_actions::cycle_approval_mode;
 use crate::global_actions::{GlobalShortcutFlow, handle_global_shortcut};
 use crate::shortcuts::{GlobalShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::types::{AppState, AppStatus, PanelMode, UserAction};
+use crate::vim::VimState;
 
 pub(crate) enum KeyEventFlow {
     Continue,
@@ -173,6 +174,7 @@ mod tests {
         let mut state = state_with_search_matches();
         state.enter_running();
         let config = test_run_config();
+        let mut vim = crate::vim::VimState::new(false);
 
         let ctrl_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         assert!(matches!(
@@ -181,6 +183,7 @@ mod tests {
                 &mut state,
                 &config,
                 &action_tx,
+                &mut vim,
                 || Ok(()),
             )
             .unwrap(),
@@ -194,10 +197,36 @@ mod tests {
             &mut state,
             &config,
             &action_tx,
+            &mut vim,
             || Ok(()),
         )
         .unwrap();
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+    }
+
+    #[test]
+    fn global_and_search_preflight_clear_only_pending_vim_command_state() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        let config = test_run_config();
+        let mut vim = crate::vim::VimState::new(true);
+        vim.seed_pending_count_for_test();
+        vim.set_named_register_for_test(0, "saved");
+        vim.set_repeat_for_test();
+
+        handle_key_event_preflight(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(!vim.has_pending_command_for_test());
+        assert_eq!(vim.named_register_for_test(0), Some(("saved", false)));
+        assert!(vim.has_repeat_for_test());
     }
 
     #[test]
@@ -228,6 +257,7 @@ pub(crate) fn handle_key_event_preflight<F>(
     state: &mut AppState,
     config: &RunConfig,
     action_tx: &mpsc::Sender<UserAction>,
+    vim_state: &mut VimState,
     clear_terminal: F,
 ) -> io::Result<KeyEventFlow>
 where
@@ -240,6 +270,7 @@ where
     if let Some(ShortcutAction::Global(GlobalShortcut::Cancel)) =
         resolve_shortcut(ShortcutContext::Global, key)
     {
+        vim_state.cancel_pending_command();
         return match handle_global_shortcut(
             GlobalShortcut::Cancel,
             state,
@@ -252,10 +283,12 @@ where
     }
 
     if handle_transcript_search_key(key, state) == SearchKeyFlow::Handled {
+        vim_state.cancel_pending_command();
         return Ok(KeyEventFlow::Continue);
     }
 
     if let Some(ShortcutAction::Global(shortcut)) = resolve_shortcut(ShortcutContext::Global, key) {
+        vim_state.cancel_pending_command();
         return match handle_global_shortcut(shortcut, state, action_tx, clear_terminal)? {
             GlobalShortcutFlow::Continue => Ok(KeyEventFlow::Continue),
             GlobalShortcutFlow::Exit(code) => Ok(KeyEventFlow::Exit(code)),
@@ -263,6 +296,7 @@ where
     }
 
     if state.show_shortcuts && key.code == KeyCode::Esc {
+        vim_state.cancel_pending_command();
         state.show_shortcuts = false;
         return Ok(KeyEventFlow::Continue);
     }
@@ -270,6 +304,7 @@ where
     // Esc dismisses an active mouse selection before any other Esc meaning
     // (cancel turn, close panel); a second Esc then does the usual thing.
     if key.code == KeyCode::Esc && state.selection.is_some() {
+        vim_state.cancel_pending_command();
         state.invalidate_selection();
         return Ok(KeyEventFlow::Continue);
     }
@@ -280,6 +315,7 @@ where
             AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
         )
     {
+        vim_state.cancel_pending_command();
         cycle_approval_mode(config, state, action_tx);
         return Ok(KeyEventFlow::Continue);
     }
@@ -288,6 +324,7 @@ where
         && state.panel_mode == PanelMode::Workflows
         && key.code == KeyCode::Esc
     {
+        vim_state.cancel_pending_command();
         state.show_conversation();
         return Ok(KeyEventFlow::Continue);
     }

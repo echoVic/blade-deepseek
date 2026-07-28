@@ -1685,6 +1685,7 @@ dependencies = [
  "orca-core",
  "orca-file-search",
  "orca-mcp",
+ "orca-platform",
  "orca-provider",
  "orca-runtime",
  "orca-tools",

@@ -128,12 +128,14 @@ pub(crate) fn handle_running_key(
             || (state.mention.phase.is_some() && key.code == KeyCode::Esc))
         && handle_mention_menu_key(ev, key, state, textarea, vim_state, theme)
     {
+        vim_state.cancel_pending_command();
         return true;
     }
 
     if let Some(ShortcutAction::Running(shortcut)) =
         resolve_shortcut(ShortcutContext::Running, *key)
     {
+        vim_state.cancel_pending_command();
         match shortcut {
             RunningShortcut::SubmitQueued => {
                 if state.panel_mode != PanelMode::Conversation {

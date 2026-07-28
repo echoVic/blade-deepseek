@@ -8,6 +8,7 @@ doctest = false
 
 [dependencies]
 orca-core = { path = "../orca-core" }
+orca-platform = { path = "../orca-platform" }
 orca-mcp = { path = "../orca-mcp" }
 orca-tools = { path = "../orca-tools" }
 orca-provider = { path = "../orca-provider" }
