@@ -16,7 +16,7 @@ use crate::setup_actions::{SetupFlow, handle_setup_key};
 use crate::shortcuts::{RunningShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, UserAction};
-use crate::vim::VimState;
+use crate::vim::{VimState, VimTranscriptSearchIntent};
 
 pub(crate) enum StatusKeyFlow {
     Continue,
@@ -74,6 +74,31 @@ where
     if state.status == AppStatus::WaitingApproval {
         handle_approval_dialog_key(key, state, action_tx);
         return Ok(StatusKeyFlow::Continue);
+    }
+
+    if matches!(
+        state.status,
+        AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
+    ) && let Some(intent) = vim_state.transcript_search_intent(key.code)
+    {
+        let handled = match intent {
+            VimTranscriptSearchIntent::Open => {
+                state.open_transcript_search();
+                true
+            }
+            VimTranscriptSearchIntent::Next if state.transcript_search.has_query() => {
+                state.search_next();
+                true
+            }
+            VimTranscriptSearchIntent::Previous if state.transcript_search.has_query() => {
+                state.search_previous();
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            return Ok(StatusKeyFlow::Continue);
+        }
     }
 
     if matches!(state.status, AppStatus::Idle | AppStatus::WaitingUserInput) {
@@ -168,6 +193,170 @@ mod tests {
             terminal_notifications: false,
             auto_memory: false,
         }
+    }
+
+    fn prepare_two_search_matches(state: &mut AppState) {
+        state.push_message(crate::types::ChatMessage::System("alpha one".to_string()));
+        state.push_message(crate::types::ChatMessage::System("alpha two".to_string()));
+        let theme = Theme::named(ThemeName::Dark);
+        let messages = &state.messages;
+        let revisions = &state.message_revisions;
+        state.transcript_render_cache.prepare(
+            messages,
+            revisions,
+            crate::transcript_view::TranscriptRenderContext::new(&theme, 40, 0, false),
+            |_, message, theme, width, tick, force_expand| {
+                crate::ui::build_lines_for_messages(
+                    std::slice::from_ref(message),
+                    theme,
+                    width,
+                    tick,
+                    force_expand,
+                )
+            },
+        );
+        state.open_transcript_search();
+        state.replace_transcript_search_query("alpha");
+        state.refresh_transcript_search();
+    }
+
+    #[test]
+    fn vim_slash_opens_search_in_every_conversation_status_without_composer_edit() {
+        for status in [
+            AppStatus::Idle,
+            AppStatus::Running,
+            AppStatus::WaitingUserInput,
+        ] {
+            let (action_tx, _action_rx) = mpsc::unbounded();
+            let mut state = AppState::new(
+                action_tx.clone(),
+                "test".to_string(),
+                "mock".to_string(),
+                "/tmp".to_string(),
+            );
+            state.set_status(status);
+            let mut config = config();
+            config.vim_mode = true;
+            let shared = Arc::new(Mutex::new(config.clone()));
+            let operation = TestOperationInterrupt::default();
+            let preloaded = Arc::new(Mutex::new(None));
+            let mut textarea = TextArea::from(["draft"]);
+            let mut vim = VimState::new(true);
+            let theme = Theme::named(ThemeName::Dark);
+            let key = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE);
+
+            handle_status_key(
+                &Event::Key(key),
+                &key,
+                &mut state,
+                &mut config,
+                &shared,
+                &action_tx,
+                &operation,
+                &preloaded,
+                &mut textarea,
+                &mut vim,
+                &theme,
+                None,
+                || Ok(()),
+            )
+            .unwrap();
+
+            assert!(state.transcript_search.open, "{status:?}");
+            assert_eq!(textarea.lines(), &["draft".to_string()]);
+            assert_eq!(operation.call_count(), 0);
+        }
+    }
+
+    #[test]
+    fn vim_n_and_shift_n_navigate_closed_running_search_without_interrupt() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.enter_running();
+        prepare_two_search_matches(&mut state);
+        state.close_transcript_search();
+        let first = state.transcript_search.active_ordinal();
+        let mut config = config();
+        config.vim_mode = true;
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let operation = TestOperationInterrupt::default();
+        let preloaded = Arc::new(Mutex::new(None));
+        let mut textarea = TextArea::from(["draft"]);
+        let mut vim = VimState::new(true);
+        let theme = Theme::named(ThemeName::Dark);
+
+        for code in [KeyCode::Char('n'), KeyCode::Char('N')] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            handle_status_key(
+                &Event::Key(key),
+                &key,
+                &mut state,
+                &mut config,
+                &shared,
+                &action_tx,
+                &operation,
+                &preloaded,
+                &mut textarea,
+                &mut vim,
+                &theme,
+                None,
+                || Ok(()),
+            )
+            .unwrap();
+            if code == KeyCode::Char('n') {
+                assert_ne!(state.transcript_search.active_ordinal(), first);
+            } else {
+                assert_eq!(state.transcript_search.active_ordinal(), first);
+            }
+        }
+        assert_eq!(operation.call_count(), 0);
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn vim_insert_slash_remains_composer_text() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut config = config();
+        config.vim_mode = true;
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let operation = TestOperationInterrupt::default();
+        let preloaded = Arc::new(Mutex::new(None));
+        let mut textarea = TextArea::default();
+        let mut vim = VimState::new(true);
+        vim.mode = crate::vim::VimMode::Insert;
+        let theme = Theme::named(ThemeName::Dark);
+        let key = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE);
+
+        handle_status_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &operation,
+            &preloaded,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(textarea.lines(), &["/".to_string()]);
+        assert!(!state.transcript_search.open);
     }
 
     #[test]

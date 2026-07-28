@@ -5,6 +5,13 @@ use tui_textarea::{CursorMove, Input, Key, TextArea};
 use crate::theme::Theme;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VimTranscriptSearchIntent {
+    Open,
+    Next,
+    Previous,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VimMode {
     Insert,
     Normal,
@@ -58,6 +65,21 @@ impl VimState {
                 .fg(cursor_color)
                 .add_modifier(Modifier::REVERSED),
         );
+    }
+
+    pub(crate) fn transcript_search_intent(
+        &self,
+        key: crossterm::event::KeyCode,
+    ) -> Option<VimTranscriptSearchIntent> {
+        if !self.enabled || self.mode != VimMode::Normal {
+            return None;
+        }
+        match key {
+            crossterm::event::KeyCode::Char('/') => Some(VimTranscriptSearchIntent::Open),
+            crossterm::event::KeyCode::Char('n') => Some(VimTranscriptSearchIntent::Next),
+            crossterm::event::KeyCode::Char('N') => Some(VimTranscriptSearchIntent::Previous),
+            _ => None,
+        }
     }
 
     pub fn reset_insert(&mut self, textarea: &mut TextArea<'_>, theme: &Theme) {
@@ -327,5 +349,37 @@ mod tests {
         let mut textarea = TextArea::from(vec!["abc".to_string()]);
         state.handle(input('x'), &mut textarea, &theme);
         assert_eq!(textarea.lines(), &["bc".to_string()]);
+    }
+
+    #[test]
+    fn vim_normal_mode_resolves_transcript_search_intents() {
+        let state = VimState::new(true);
+        assert_eq!(
+            state.transcript_search_intent(crossterm::event::KeyCode::Char('/')),
+            Some(VimTranscriptSearchIntent::Open)
+        );
+        assert_eq!(
+            state.transcript_search_intent(crossterm::event::KeyCode::Char('n')),
+            Some(VimTranscriptSearchIntent::Next)
+        );
+        assert_eq!(
+            state.transcript_search_intent(crossterm::event::KeyCode::Char('N')),
+            Some(VimTranscriptSearchIntent::Previous)
+        );
+    }
+
+    #[test]
+    fn vim_insert_and_visual_modes_do_not_resolve_search_intents() {
+        let mut state = VimState::new(true);
+        state.mode = VimMode::Insert;
+        assert_eq!(
+            state.transcript_search_intent(crossterm::event::KeyCode::Char('/')),
+            None
+        );
+        state.mode = VimMode::Visual;
+        assert_eq!(
+            state.transcript_search_intent(crossterm::event::KeyCode::Char('n')),
+            None
+        );
     }
 }
