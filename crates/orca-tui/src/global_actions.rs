@@ -30,6 +30,7 @@ where
                     | AppStatus::WaitingApproval
                     | AppStatus::WaitingUserInput
             ) {
+                state.suspend_queued_follow_up_autosend();
                 operation.interrupt_current();
                 let _ = action_tx.send(UserAction::Interrupt);
                 return Ok(GlobalShortcutFlow::Continue);
@@ -100,6 +101,7 @@ mod tests {
 
         assert_eq!(operation.call_count(), 1);
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+        assert!(!state.queued_follow_up_autosend);
     }
 
     #[test]

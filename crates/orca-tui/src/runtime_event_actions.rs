@@ -4,6 +4,7 @@ use tui_textarea::TextArea;
 
 use crate::bridge;
 use crate::composer_textarea::make_textarea_with_text;
+use crate::queued_input_actions::{QueuedDispatch, dispatch_next_queued_user_message};
 use crate::terminal_presentation::{TerminalNotification, TerminalPresentation};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, TuiEvent, UserAction};
@@ -67,8 +68,11 @@ pub(crate) fn handle_runtime_event(
         return;
     }
 
+    let queued_submission_rejected = matches!(tui_event, TuiEvent::SubmissionRejected { .. })
+        && state.queued_submission_in_flight.is_some();
     let restored_prompt = match &tui_event {
-        TuiEvent::Backtracked { prompt } | TuiEvent::SubmissionRejected { prompt, .. } => {
+        TuiEvent::Backtracked { prompt } => Some(prompt.clone()),
+        TuiEvent::SubmissionRejected { prompt, .. } if !queued_submission_rejected => {
             Some(prompt.clone())
         }
         _ => None,
@@ -88,13 +92,23 @@ pub(crate) fn handle_runtime_event(
     if let Some(id) = batch_queued_workflow_notification_id {
         remove_pending_workflow_notification_by_id(state, &id);
     }
-    if let Some(prompt) = restored_prompt {
+    if queued_submission_rejected {
+        if let Some(composer) = state.take_rejected_queued_composer_state() {
+            vim_state.reset_insert(textarea, theme);
+            *textarea = make_textarea_with_text(&composer.visible_text, vim_state, theme);
+            state.mention_bindings = composer.mention_bindings;
+            state.pending_pastes = composer.pending_pastes;
+            state.reset_history_navigation();
+        }
+    } else if let Some(prompt) = restored_prompt {
         vim_state.reset_insert(textarea, theme);
         *textarea = make_textarea_with_text(&prompt, vim_state, theme);
     }
     if workflow_notification_turn_boundary {
         drain_pending_workflow_notifications(state, pending_workflow_notifications);
-        submit_pending_workflow_notification(state, action_tx, false);
+        if dispatch_next_queued_user_message(state, action_tx) == QueuedDispatch::None {
+            submit_pending_workflow_notification(state, action_tx, false);
+        }
     } else {
         submit_pending_workflow_notification(state, action_tx, true);
     }
@@ -107,11 +121,17 @@ pub(crate) fn handle_runtime_event(
 mod tests {
     use super::*;
     use crate::composer_textarea::textarea_text;
+    use crate::queued_input::QueuedUserMessage;
+    use crate::queued_input_actions::{QueuedDispatch, dispatch_next_queued_user_message};
     use crate::terminal_presentation::TerminalNotification;
-    use crate::types::{TuiInteractionKey, TuiInteractionKind};
+    use crate::types::{
+        ChatMessage, PendingWorkflowNotification, TuiInteractionKey, TuiInteractionKind,
+    };
     use orca_core::cancel::OperationIdAllocator;
     use orca_core::config::ThemeName;
+    use orca_runtime::mentions::{MentionBinding, MentionBindings, MentionFileKind, MentionTarget};
     use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
+    use std::path::PathBuf;
 
     fn interaction_key(kind: TuiInteractionKind, id: &str) -> TuiInteractionKey {
         TuiInteractionKey::new(OperationIdAllocator::new().allocate(), id, kind)
@@ -119,6 +139,227 @@ mod tests {
 
     fn notification_message(event: &TuiEvent, state: &AppState) -> Option<TerminalNotification> {
         terminal_notification_for_event(event, state)
+    }
+
+    fn test_presentation() -> TerminalPresentation {
+        TerminalPresentation::new(
+            false,
+            crate::terminal_presentation::TerminalPresentationProfile {
+                osc9_supported: false,
+                tmux_passthrough: false,
+            },
+        )
+    }
+
+    fn queue_text(state: &mut AppState, text: &str) {
+        state
+            .enqueue_user_message(
+                QueuedUserMessage::from_composer(
+                    text.to_string(),
+                    Vec::new(),
+                    MentionBindings::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn terminal_boundary_promotes_user_follow_up_before_workflow_notification() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        queue_text(&mut state, "first");
+        state
+            .pending_workflow_notifications
+            .push_back(PendingWorkflowNotification {
+                id: "workflow-1".to_string(),
+                prompt: "internal workflow".to_string(),
+            });
+        state.enter_running();
+        let pending = bridge::PendingWorkflowNotifications::new();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut textarea = TextArea::default();
+        let mut vim = VimState::new(false);
+        let mut presentation = test_presentation();
+
+        handle_runtime_event(
+            TuiEvent::SessionCompleted {
+                status: "success".to_string(),
+            },
+            &mut state,
+            &action_tx,
+            &pending,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut presentation,
+        );
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "first"
+        ));
+        assert_eq!(state.pending_workflow_notifications.len(), 1);
+    }
+
+    #[test]
+    fn every_terminal_status_promotes_one_follow_up() {
+        for status in ["success", "failed", "verification_failed", "cancelled"] {
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let mut state = AppState::new(
+                action_tx.clone(),
+                "test".to_string(),
+                "mock".to_string(),
+                "/tmp".to_string(),
+            );
+            queue_text(&mut state, status);
+            state.enter_running();
+            let pending = bridge::PendingWorkflowNotifications::new();
+            let theme = Theme::named(ThemeName::Dark);
+            let mut textarea = TextArea::default();
+            let mut vim = VimState::new(false);
+            let mut presentation = test_presentation();
+
+            handle_runtime_event(
+                TuiEvent::SessionCompleted {
+                    status: status.to_string(),
+                },
+                &mut state,
+                &action_tx,
+                &pending,
+                &mut textarea,
+                &mut vim,
+                &theme,
+                &mut presentation,
+            );
+            assert!(matches!(
+                action_rx.try_recv(),
+                Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == status
+            ));
+        }
+    }
+
+    #[test]
+    fn occupied_admission_fence_blocks_late_terminal() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        queue_text(&mut state, "first");
+        queue_text(&mut state, "second");
+        assert_eq!(
+            dispatch_next_queued_user_message(&mut state, &action_tx),
+            QueuedDispatch::Started
+        );
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "first"
+        ));
+        state.set_status(AppStatus::Idle);
+        let pending = bridge::PendingWorkflowNotifications::new();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut textarea = TextArea::default();
+        let mut vim = VimState::new(false);
+        let mut presentation = test_presentation();
+
+        handle_runtime_event(
+            TuiEvent::SessionCompleted {
+                status: "backgrounded".to_string(),
+            },
+            &mut state,
+            &action_tx,
+            &pending,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut presentation,
+        );
+
+        assert!(action_rx.try_recv().is_err());
+        assert_eq!(state.queued_user_messages.len(), 1);
+        assert_eq!(state.queued_user_messages[0].visible_text(), "second");
+    }
+
+    #[test]
+    fn rejected_promoted_follow_up_restores_visible_paste_and_mentions() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/workspace".to_string(),
+        );
+        let visible = "review @item.rs [Pasted Content 1001 chars]";
+        let mention_start = visible.find("@item.rs").unwrap();
+        let pasted = "payload\n".repeat(150);
+        state
+            .enqueue_user_message(
+                QueuedUserMessage::from_composer(
+                    visible.to_string(),
+                    vec![("[Pasted Content 1001 chars]".to_string(), pasted.clone())],
+                    MentionBindings::from_bindings(
+                        visible,
+                        vec![MentionBinding {
+                            start: mention_start,
+                            end: mention_start + "@item.rs".len(),
+                            visible: "@item.rs".to_string(),
+                            target: MentionTarget::File {
+                                root: PathBuf::from("/workspace"),
+                                path: "item.rs".to_string(),
+                                kind: MentionFileKind::File,
+                            },
+                        }],
+                    ),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            dispatch_next_queued_user_message(&mut state, &action_tx),
+            QueuedDispatch::Started
+        );
+        let prompt = match action_rx.try_recv().unwrap() {
+            UserAction::SubmitWithMentions { prompt, .. } => prompt,
+            other => panic!("unexpected action: {other:?}"),
+        };
+        let pending = bridge::PendingWorkflowNotifications::new();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut textarea = TextArea::default();
+        let mut vim = VimState::new(false);
+        let mut presentation = test_presentation();
+
+        handle_runtime_event(
+            TuiEvent::SubmissionRejected {
+                prompt,
+                message: "rejected".to_string(),
+            },
+            &mut state,
+            &action_tx,
+            &pending,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut presentation,
+        );
+
+        assert_eq!(textarea_text(&textarea), visible);
+        assert_eq!(state.pending_pastes[0].1, pasted);
+        assert_eq!(state.mention_bindings.bindings().len(), 1);
+        assert!(state.queued_submission_in_flight.is_none());
+        assert!(
+            !state
+                .messages
+                .iter()
+                .any(|message| matches!(message, ChatMessage::User(text) if text == visible))
+        );
     }
 
     #[test]

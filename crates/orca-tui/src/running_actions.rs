@@ -1,6 +1,7 @@
 use crossbeam_channel as mpsc;
 
 use crate::operation_controller::TuiOperationInterrupt;
+use crate::queued_input_actions::dispatch_next_queued_user_message;
 use crate::shortcuts::RunningShortcut;
 use crate::types::{AppState, AppStatus, UserAction};
 
@@ -14,8 +15,11 @@ pub(crate) fn handle_running_shortcut(
         RunningShortcut::BackgroundCurrentTurn => {
             let _ = action_tx.send(UserAction::BackgroundCurrentTurn);
             state.set_status(AppStatus::Idle);
+            state.resume_queued_follow_up_autosend();
+            dispatch_next_queued_user_message(state, action_tx);
         }
         RunningShortcut::Interrupt => {
+            state.suspend_queued_follow_up_autosend();
             operation.interrupt_current();
             let _ = action_tx.send(UserAction::Interrupt);
         }
@@ -44,5 +48,73 @@ pub(crate) fn handle_running_shortcut(
         RunningShortcut::SubmitQueued
         | RunningShortcut::Newline
         | RunningShortcut::EditLatestQueued => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queued_input::QueuedUserMessage;
+    use crate::test_support::TestOperationInterrupt;
+    use orca_runtime::mentions::MentionBindings;
+
+    fn state(action_tx: mpsc::Sender<UserAction>) -> AppState {
+        AppState::new(
+            action_tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        )
+    }
+
+    fn queued(text: &str) -> QueuedUserMessage {
+        QueuedUserMessage::from_composer(text.to_string(), Vec::new(), MentionBindings::default())
+            .unwrap()
+    }
+
+    #[test]
+    fn running_interrupt_suspends_queued_autosend() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state(action_tx.clone());
+        state.enter_running();
+        let operation = TestOperationInterrupt::default();
+
+        handle_running_shortcut(
+            RunningShortcut::Interrupt,
+            &mut state,
+            &action_tx,
+            &operation,
+        );
+
+        assert!(!state.queued_follow_up_autosend);
+        assert_eq!(operation.call_count(), 1);
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+    }
+
+    #[test]
+    fn background_control_precedes_one_queued_submit() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state(action_tx.clone());
+        state.enter_running();
+        state.enqueue_user_message(queued("follow up")).unwrap();
+        let operation = TestOperationInterrupt::default();
+
+        handle_running_shortcut(
+            RunningShortcut::BackgroundCurrentTurn,
+            &mut state,
+            &action_tx,
+            &operation,
+        );
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::BackgroundCurrentTurn)
+        ));
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "follow up"
+        ));
+        assert!(state.queued_submission_in_flight.is_some());
+        assert_eq!(operation.call_count(), 0);
     }
 }
