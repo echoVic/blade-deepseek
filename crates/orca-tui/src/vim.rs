@@ -757,19 +757,16 @@ fn repeat_text(text: &str, separator: &str, count: usize) -> Option<String> {
 fn paste_register(textarea: &mut TextArea<'_>, value: &VimRegisterValue, count: usize) -> bool {
     let payload = match value.kind {
         VimRegisterKind::Characterwise => repeat_text(&value.text, "", count),
-        VimRegisterKind::Linewise => {
-            let normalized = value.text.strip_suffix('\n').unwrap_or(&value.text);
-            repeat_text(normalized, "\n", count).and_then(|text| {
-                let total = text.len().checked_add(1)?;
-                if total > MAX_VIM_PASTE_BYTES {
-                    return None;
-                }
-                let mut payload = String::with_capacity(total);
-                payload.push('\n');
-                payload.push_str(&text);
-                Some(payload)
-            })
-        }
+        VimRegisterKind::Linewise => repeat_text(&value.text, "\n", count).and_then(|text| {
+            let total = text.len().checked_add(1)?;
+            if total > MAX_VIM_PASTE_BYTES {
+                return None;
+            }
+            let mut payload = String::with_capacity(total);
+            payload.push('\n');
+            payload.push_str(&text);
+            Some(payload)
+        }),
     };
     let Some(payload) = payload.filter(|payload| !payload.is_empty()) else {
         return false;
@@ -1117,6 +1114,20 @@ mod tests {
         assert_eq!(textarea.lines(), &["zero", "zero", "zero", "one"]);
         assert!(textarea.undo());
         assert_eq!(textarea.lines(), &["zero", "one"]);
+    }
+
+    #[test]
+    fn linewise_paste_preserves_a_selected_trailing_empty_line() {
+        let theme = Theme::named(ThemeName::Dark);
+        let mut state = VimState::new(true);
+        let mut textarea = TextArea::from(["a", ""]);
+
+        handle_sequence(&mut state, &mut textarea, &theme, "2yy");
+        handle_sequence(&mut state, &mut textarea, &theme, "p");
+
+        assert_eq!(textarea.lines(), &["a", "a", "", ""]);
+        assert!(textarea.undo());
+        assert_eq!(textarea.lines(), &["a", ""]);
     }
 
     #[test]
