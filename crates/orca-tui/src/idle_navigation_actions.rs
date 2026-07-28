@@ -67,6 +67,7 @@ pub(crate) fn handle_idle_navigation_shortcut(
         }
         IdleShortcut::Submit
         | IdleShortcut::Newline
+        | IdleShortcut::EditLatestQueued
         | IdleShortcut::HistoryPrevious
         | IdleShortcut::HistoryNext => {}
     }

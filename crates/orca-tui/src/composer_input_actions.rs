@@ -10,11 +10,15 @@ use crate::composer_textarea::{
 };
 use crate::slash_menu_actions::update_slash_menu;
 use crate::theme::Theme;
-use crate::types::AppState;
+use crate::types::{AppState, AppStatus};
 use crate::vim::VimState;
 
 pub(crate) fn refresh_input_menus(textarea: &TextArea, state: &mut AppState, config: &RunConfig) {
-    update_slash_menu(textarea, state, config);
+    if state.status == AppStatus::Idle {
+        update_slash_menu(textarea, state, config);
+    } else {
+        state.slash_menu = None;
+    }
 }
 
 pub(crate) fn insert_composer_newline(textarea: &mut TextArea, state: &mut AppState) {
@@ -145,5 +149,45 @@ mod windows_input_tests {
         } else {
             assert_eq!(normalized, event);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use orca_core::config::ThemeName;
+
+    use super::*;
+    use crate::composer_textarea::{make_textarea_with_text, textarea_text};
+    use crate::types::{AppState, AppStatus};
+
+    #[test]
+    fn running_slash_text_never_opens_local_command_menu() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = AppStatus::Running;
+        let config = crate::test_support::test_run_config();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("/compac", &vim, &theme);
+        let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
+
+        apply_composer_key_input(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &config,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert_eq!(textarea_text(&textarea), "/compact");
+        assert!(state.slash_menu.is_none());
     }
 }
