@@ -54,6 +54,7 @@ pub(crate) fn handle_runtime_event(
     theme: &Theme,
     presentation: &mut TerminalPresentation,
 ) {
+    let initial_status = state.status;
     let terminal_notification = terminal_notification_for_event(&tui_event, state);
     if let TuiEvent::ApprovalNeeded {
         key, tool, target, ..
@@ -122,6 +123,9 @@ pub(crate) fn handle_runtime_event(
         }
     } else if !state.queued_follow_up_pending_or_in_flight() {
         submit_pending_workflow_notification(state, action_tx, true);
+    }
+    if state.status != initial_status {
+        vim_state.cancel_pending_command();
     }
     if state.auto_scroll {
         state.scroll_to_bottom();
@@ -769,5 +773,47 @@ mod tests {
             &theme,
         );
         assert_eq!(vim.mode, crate::vim::VimMode::Insert);
+    }
+
+    #[test]
+    fn idle_workflow_auto_submission_clears_pending_vim_command() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let pending = bridge::PendingWorkflowNotifications::new();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut presentation = test_presentation();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state
+            .pending_workflow_notifications
+            .push_back(PendingWorkflowNotification {
+                id: "workflow-1".to_string(),
+                prompt: "internal workflow".to_string(),
+            });
+        let mut textarea = TextArea::from(["draft"]);
+        let mut vim = VimState::new(true);
+        vim.seed_pending_count_for_test();
+
+        handle_runtime_event(
+            TuiEvent::Notice("wake".to_string()),
+            &mut state,
+            &action_tx,
+            &pending,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut presentation,
+        );
+
+        assert_eq!(state.status, AppStatus::Running);
+        assert!(!vim.has_pending_command_for_test());
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SubmitWorkflowNotification(notification))
+                if notification.id == "workflow-1"
+        ));
     }
 }

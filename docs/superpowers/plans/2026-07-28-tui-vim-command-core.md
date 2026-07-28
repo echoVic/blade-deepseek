@@ -2298,12 +2298,15 @@ cargo test -p orca-tui runtime_status_transitions_clear_pending_vim_commands_but
 cargo test -p orca-tui tab_clears_pending_vim_prefix_before_direct_textarea_input --lib -- --test-threads=1
 cargo test -p orca-tui zero_width_visual_commands_do_not_copy_stale_yank_text --lib -- --test-threads=1
 cargo test -p orca-tui dd_deletes_a_seventy_thousand_character_only_line_atomically --lib -- --test-threads=1
+cargo test -p orca-tui idle_workflow_auto_submission_clears_pending_vim_command --lib -- --test-threads=1
+cargo test -p orca-tui linewise_paste_preserves_a_selected_trailing_empty_line --lib -- --test-threads=1
 ```
 
 Expected: large composers avoid document-sized cursor loops, the complete
 linewise payload stays within 1 MiB, runtime/Tab boundaries clear only the
 pending parser state, zero-width Visual commands cannot copy stale yank text,
-and `dd` removes an ultra-long only line atomically.
+`dd` removes an ultra-long only line atomically, workflow auto-submission does
+not retain a pending prefix, and linewise paste preserves trailing empty lines.
 
 - [ ] **Step 4: Run package gates on committed HEAD**
 
