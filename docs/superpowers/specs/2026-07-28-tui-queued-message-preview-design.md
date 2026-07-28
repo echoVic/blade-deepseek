@@ -78,10 +78,15 @@ Each queued item owns the complete state required both to submit and to restore:
 The queue never stores rendered `Line` values, cache entries, or transcript
 coordinates.
 
+For rendering, `QueuedPreviewSnapshot::from_queue` reads only queue length,
+front, second, and back. It materializes at most two preview strings even when
+the queue is full.
+
 The model exposes:
 
 ```rust
 pub(crate) struct QueuedUserMessage;
+pub(crate) struct QueuedPreviewSnapshot;
 
 impl QueuedUserMessage {
     pub(crate) fn from_composer(
@@ -115,6 +120,7 @@ trimmed submission text, matching the existing idle-submit pipeline.
 pub(crate) queued_user_messages: VecDeque<QueuedUserMessage>,
 pub(crate) queued_submission_in_flight: Option<QueuedUserMessage>,
 pub(crate) queued_follow_up_autosend: bool,
+pub(crate) queued_input_error: Option<String>,
 ```
 
 The queue capacity is exactly `USER_ACTION_CAPACITY` (64). This prevents the new
@@ -134,9 +140,13 @@ pub(crate) fn begin_next_queued_message(
     &mut self,
 ) -> Option<UserAction>;
 
-pub(crate) fn finish_queued_submission_start(&mut self);
+pub(crate) fn commit_queued_submission_admission(&mut self);
 
-pub(crate) fn reject_queued_submission(
+pub(crate) fn rollback_queued_submission(
+    &mut self,
+) -> Option<QueuedUserMessage>;
+
+pub(crate) fn take_rejected_queued_composer_state(
     &mut self,
 ) -> Option<QueuedComposerState>;
 ```
@@ -147,14 +157,15 @@ pub(crate) fn reject_queued_submission(
 2. requires `queued_follow_up_autosend`;
 3. requires `queued_submission_in_flight.is_none()`;
 4. pops exactly one item from the FIFO front;
-5. records input history at actual dispatch time;
-6. appends the visible `ChatMessage::User`;
-7. enters `Running` and scrolls to bottom;
-8. stores a clone in `queued_submission_in_flight`;
-9. returns `UserAction::SubmitWithMentions`.
+5. appends the visible `ChatMessage::User`;
+6. enters `Running` and scrolls to bottom;
+7. stores a clone in `queued_submission_in_flight`;
+8. returns `UserAction::SubmitWithMentions`.
 
 It does not send the action itself. The event/action layer remains responsible
-for side effects.
+for side effects. After `try_send` accepts the action,
+`commit_queued_submission_admission` records the in-flight submission in input
+history. A full or disconnected channel rolls back before history is touched.
 
 `TurnStarted` clears `queued_submission_in_flight`. Before that event, a
 `SubmissionRejected` restores the exact visible composer state, pending-paste
@@ -211,8 +222,12 @@ If the 64-item queue is full:
 
 - the input remains in the composer;
 - no message or history entry is added;
-- the TUI emits a bounded visible error/notice;
+- the queue preview header shows a bounded error;
 - no dispatcher action is sent.
+
+The error is queue-local state, not a `ChatMessage::Error`, so it cannot appear
+after a still-mutating assistant tail or enter `TranscriptRenderCache`. The next
+successful enqueue, restore, promotion, or queue reset clears it.
 
 ### Waiting for Approval or Input
 
@@ -362,6 +377,10 @@ Each message preview:
 - uses muted/italic styling while preserving no secret expansion;
 - renders safely when width is zero or very narrow.
 
+When `queued_input_error` is present, row 1 shows
+`Queue error · <bounded reason>` in the error color while rows 2–3 retain the
+same head/latest queue summary.
+
 The preview does not mutate `TranscriptRenderCache`, transcript search matches,
 selection coordinates, or scroll offsets.
 
@@ -430,7 +449,7 @@ If `try_send` reports a full or disconnected action channel:
 - restore the in-flight queued item to the front of the queue;
 - remove the optimistic transcript row;
 - return to `Idle`;
-- show an error;
+- show the same queue-local bounded error;
 - do not drop mention or paste state.
 
 Tests cover both full and disconnected channels. The event loop never blocks
@@ -455,6 +474,41 @@ Own:
 - promote one FIFO item to a `UserAction`;
 - running composer key handling;
 - runtime-boundary dispatch helpers.
+
+The focused public surface is:
+
+```rust
+pub(crate) fn enqueue_composer_follow_up(
+    state: &mut AppState,
+    textarea: &mut TextArea,
+    vim_state: &mut VimState,
+    theme: &Theme,
+) -> bool;
+
+pub(crate) fn restore_latest_queued_message(
+    state: &mut AppState,
+    textarea: &mut TextArea,
+    vim_state: &mut VimState,
+    theme: &Theme,
+) -> bool;
+
+pub(crate) fn dispatch_next_queued_user_message(
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+) -> QueuedDispatch;
+
+pub(crate) fn handle_running_key(
+    ev: &Event,
+    key: &KeyEvent,
+    state: &mut AppState,
+    config: &RunConfig,
+    action_tx: &mpsc::Sender<UserAction>,
+    operation: &impl TuiOperationInterrupt,
+    textarea: &mut TextArea,
+    vim_state: &mut VimState,
+    theme: &Theme,
+) -> bool;
+```
 
 ### Modify `crates/orca-tui/src/lib.rs`
 
