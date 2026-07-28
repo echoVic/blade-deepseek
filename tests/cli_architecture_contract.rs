@@ -42,6 +42,47 @@ fn binary_entrypoint_has_no_library_reexport_shims() {
     assert!(main.contains("mod cli;"));
     assert!(!main.contains("mod runtime;"));
     assert!(!main.contains("mod config;"));
+
+    for shim in [
+        "src/acp.rs",
+        "src/approval/mod.rs",
+        "src/config/mod.rs",
+        "src/event/mod.rs",
+        "src/mcp/mod.rs",
+        "src/mentions.rs",
+        "src/model.rs",
+        "src/provider/mod.rs",
+        "src/runtime/mod.rs",
+        "src/sandbox/mod.rs",
+        "src/server.rs",
+        "src/tools/mod.rs",
+        "src/tui/mod.rs",
+        "src/verification/mod.rs",
+    ] {
+        assert!(
+            !std::path::Path::new(shim).exists(),
+            "obsolete shim remains: {shim}"
+        );
+    }
+}
+
+#[test]
+fn root_runtime_dependencies_match_the_thin_binary() {
+    let manifest = fs::read_to_string("Cargo.toml").expect("read root manifest");
+    let value: toml::Value = toml::from_str(&manifest).expect("parse root manifest");
+    let dependencies = value["dependencies"]
+        .as_table()
+        .expect("root dependencies")
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        dependencies,
+        ["clap", "orca-core", "orca-runtime", "orca-tui"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
 }
 
 #[test]

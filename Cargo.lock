@@ -192,10 +192,8 @@ name = "blade-deepseek"
 version = "0.2.55"
 dependencies = [
  "base64",
- "chrono",
  "clap",
  "crossterm",
- "dirs",
  "libc",
  "orca-approval",
  "orca-core",
@@ -204,20 +202,10 @@ dependencies = [
  "orca-runtime",
  "orca-tools",
  "orca-tui",
- "pulldown-cmark",
- "ratatui",
- "reqwest",
- "serde",
  "serde_json",
- "similar",
  "tempfile",
- "tiktoken-rs",
- "tokio",
  "toml",
- "tui-textarea",
- "unicode-width 0.2.0",
  "uuid",
- "zstd",
 ]
 
 [[package]]

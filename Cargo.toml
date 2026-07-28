@@ -53,32 +53,19 @@ path = "src/main.rs"
 
 [dependencies]
 orca-core = { path = "crates/orca-core" }
-orca-mcp = { path = "crates/orca-mcp" }
-orca-tools = { path = "crates/orca-tools" }
-orca-provider = { path = "crates/orca-provider" }
-orca-approval = { path = "crates/orca-approval" }
 orca-runtime = { path = "crates/orca-runtime" }
 orca-tui = { path = "crates/orca-tui" }
 clap = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-reqwest = { workspace = true }
-tokio = { workspace = true }
-toml = { workspace = true }
-tiktoken-rs = { workspace = true }
-dirs = { workspace = true }
-ratatui = { workspace = true }
-crossterm = { workspace = true }
-tui-textarea = { workspace = true }
-pulldown-cmark = { workspace = true }
-uuid = { workspace = true }
-chrono = { workspace = true }
-unicode-width = { workspace = true }
-zstd = { workspace = true }
-similar = { workspace = true }
-libc = { workspace = true }
 
 [dev-dependencies]
+orca-approval = { path = "crates/orca-approval" }
+orca-mcp = { path = "crates/orca-mcp" }
+orca-provider = { path = "crates/orca-provider" }
+orca-tools = { path = "crates/orca-tools" }
 tempfile = { workspace = true }
 base64 = { workspace = true }
-libc = "0.2"
+crossterm = { workspace = true }
+libc = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+uuid = { workspace = true }
