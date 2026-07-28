@@ -76,6 +76,7 @@ pub enum GlobalShortcut {
 pub enum IdleShortcut {
     Submit,
     Newline,
+    EditLatestQueued,
     HistoryPrevious,
     HistoryNext,
     ScrollUp,
@@ -92,6 +93,9 @@ pub enum IdleShortcut {
 pub enum RunningShortcut {
     BackgroundCurrentTurn,
     Interrupt,
+    SubmitQueued,
+    Newline,
+    EditLatestQueued,
     ScrollUp,
     ScrollDown,
     PageUp,
@@ -159,6 +163,10 @@ const IDLE_BINDINGS: &[(IdleShortcut, KeyBinding)] = &[
         KeyBinding::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
     ),
     (
+        IdleShortcut::EditLatestQueued,
+        KeyBinding::new(KeyCode::Up, KeyModifiers::ALT),
+    ),
+    (
         IdleShortcut::HistoryPrevious,
         KeyBinding::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
     ),
@@ -212,6 +220,26 @@ const RUNNING_BINDINGS: &[(RunningShortcut, KeyBinding)] = &[
     (
         RunningShortcut::Interrupt,
         KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+    ),
+    (
+        RunningShortcut::SubmitQueued,
+        KeyBinding::new(KeyCode::Enter, KeyModifiers::NONE),
+    ),
+    (
+        RunningShortcut::Newline,
+        KeyBinding::new(KeyCode::Enter, KeyModifiers::SHIFT),
+    ),
+    (
+        RunningShortcut::Newline,
+        KeyBinding::new(KeyCode::Enter, KeyModifiers::ALT),
+    ),
+    (
+        RunningShortcut::Newline,
+        KeyBinding::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+    ),
+    (
+        RunningShortcut::EditLatestQueued,
+        KeyBinding::new(KeyCode::Up, KeyModifiers::ALT),
     ),
     (
         RunningShortcut::ScrollUp,
@@ -406,6 +434,11 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     },
     ShortcutHint {
         scope: ShortcutScope::Idle,
+        keys: "alt+up",
+        action: "edit latest queued message",
+    },
+    ShortcutHint {
+        scope: ShortcutScope::Idle,
         keys: "up/down / ctrl+p/ctrl+n",
         action: "previous or next prompt",
     },
@@ -438,6 +471,21 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
         scope: ShortcutScope::Running,
         keys: "esc / ctrl+g",
         action: "interrupt current turn",
+    },
+    ShortcutHint {
+        scope: ShortcutScope::Running,
+        keys: "enter",
+        action: "queue follow-up",
+    },
+    ShortcutHint {
+        scope: ShortcutScope::Running,
+        keys: "alt+enter / shift+enter",
+        action: "insert newline",
+    },
+    ShortcutHint {
+        scope: ShortcutScope::Running,
+        keys: "alt+up",
+        action: "edit latest queued message",
     },
     ShortcutHint {
         scope: ShortcutScope::Running,
@@ -610,6 +658,41 @@ mod tests {
         assert_eq!(
             running_shortcut(key(KeyCode::Char('b'), KeyModifiers::CONTROL)),
             Some(RunningShortcut::BackgroundCurrentTurn)
+        );
+    }
+
+    #[test]
+    fn queued_message_shortcuts_are_context_specific() {
+        assert_eq!(
+            resolve_shortcut(ShortcutContext::Idle, key(KeyCode::Up, KeyModifiers::ALT)),
+            Some(ShortcutAction::Idle(IdleShortcut::EditLatestQueued))
+        );
+        assert_eq!(
+            resolve_shortcut(
+                ShortcutContext::Running,
+                key(KeyCode::Up, KeyModifiers::ALT)
+            ),
+            Some(ShortcutAction::Running(RunningShortcut::EditLatestQueued))
+        );
+        assert_eq!(
+            resolve_shortcut(
+                ShortcutContext::Running,
+                key(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(ShortcutAction::Running(RunningShortcut::SubmitQueued))
+        );
+        for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            assert_eq!(
+                resolve_shortcut(ShortcutContext::Running, key(KeyCode::Enter, modifiers)),
+                Some(ShortcutAction::Running(RunningShortcut::Newline))
+            );
+        }
+        assert_eq!(
+            resolve_shortcut(
+                ShortcutContext::Running,
+                key(KeyCode::Char('j'), KeyModifiers::CONTROL)
+            ),
+            Some(ShortcutAction::Running(RunningShortcut::Newline))
         );
     }
 
