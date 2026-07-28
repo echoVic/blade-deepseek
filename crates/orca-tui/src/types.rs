@@ -2059,7 +2059,7 @@ impl AppState {
         !self.queued_user_messages.is_empty() || self.queued_submission_in_flight.is_some()
     }
 
-    fn reset_queued_user_messages(&mut self) {
+    pub(crate) fn reset_queued_user_messages(&mut self) {
         self.queued_user_messages.clear();
         self.queued_submission_in_flight = None;
         self.queued_follow_up_autosend = true;

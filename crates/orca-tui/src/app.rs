@@ -6167,6 +6167,26 @@ mod tests {
 
             let (mut state, _rx) = test_state();
             state.status = AppStatus::Idle;
+            state
+                .enqueue_user_message(
+                    crate::queued_input::QueuedUserMessage::from_composer(
+                        "queued".to_string(),
+                        Vec::new(),
+                        orca_runtime::mentions::MentionBindings::default(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            state.queued_submission_in_flight = Some(
+                crate::queued_input::QueuedUserMessage::from_composer(
+                    "in flight".to_string(),
+                    Vec::new(),
+                    orca_runtime::mentions::MentionBindings::default(),
+                )
+                .unwrap(),
+            );
+            state.queued_input_error = Some("error".to_string());
+            state.suspend_queued_follow_up_autosend();
             state.slash_menu = Some(SlashMenu {
                 items: commands::all_commands()
                     .iter()
@@ -6211,6 +6231,10 @@ mod tests {
             assert_eq!(state.status, AppStatus::SessionPicker);
             assert!(!state.session_picker_sessions.is_empty());
             assert!(state.slash_menu.is_none());
+            assert!(state.queued_user_messages.is_empty());
+            assert!(state.queued_submission_in_flight.is_none());
+            assert!(state.queued_input_error.is_none());
+            assert!(state.queued_follow_up_autosend);
         });
     }
 

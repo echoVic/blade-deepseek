@@ -264,6 +264,7 @@ fn select_slash_menu_command(
             *textarea = make_textarea(vim_state, theme);
             match RuntimeSurfaceHostHandle::list_saved_sessions(20) {
                 Ok(sessions) if !sessions.is_empty() => {
+                    state.reset_queued_user_messages();
                     state.session_picker_sessions = sessions;
                     state.session_picker_selected = 0;
                     state.status = AppStatus::SessionPicker;
