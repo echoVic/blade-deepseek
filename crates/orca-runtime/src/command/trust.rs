@@ -31,35 +31,36 @@ pub fn run_with_writers(
         .cwd
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     match request.action {
-        TrustAction::Show => {
-            let _ = writeln!(
-                stdout,
+        TrustAction::Show => write_success(
+            stdout,
+            format_args!(
                 "{}: {}",
                 cwd.display(),
                 trust_level_label(folder_trust::trust_level(&cwd))
-            );
-            0
-        }
+            ),
+        ),
         TrustAction::Add => match folder_trust::set_trust(&cwd, TrustLevel::Trusted) {
-            Ok(()) => {
-                let _ = writeln!(stdout, "trusted {}", cwd.display());
-                0
-            }
+            Ok(()) => write_success(stdout, format_args!("trusted {}", cwd.display())),
             Err(error) => {
                 let _ = writeln!(stderr, "orca: failed to trust folder: {error}");
                 1
             }
         },
         TrustAction::Remove => match folder_trust::set_trust(&cwd, TrustLevel::Untrusted) {
-            Ok(()) => {
-                let _ = writeln!(stdout, "marked {} untrusted", cwd.display());
-                0
-            }
+            Ok(()) => write_success(stdout, format_args!("marked {} untrusted", cwd.display())),
             Err(error) => {
                 let _ = writeln!(stderr, "orca: failed to update folder trust: {error}");
                 1
             }
         },
+    }
+}
+
+fn write_success(writer: &mut impl Write, args: std::fmt::Arguments<'_>) -> i32 {
+    if writeln!(writer, "{args}").is_ok() {
+        0
+    } else {
+        1
     }
 }
 
@@ -73,10 +74,50 @@ fn trust_level_label(level: Option<TrustLevel>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::*;
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn unknown_trust_level_has_explicit_safe_label() {
         assert_eq!(trust_level_label(None), "unknown (treated as untrusted)");
+    }
+
+    #[test]
+    fn show_returns_failure_when_stdout_is_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut stdout = FailingWriter;
+        let mut stderr = Vec::new();
+
+        let code = run_with_writers(
+            TrustCommandRequest {
+                cwd: Some(temp.path().to_path_buf()),
+                action: TrustAction::Show,
+            },
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn shared_success_writer_reports_closed_output() {
+        assert_eq!(
+            write_success(&mut FailingWriter, format_args!("success")),
+            1
+        );
     }
 }
