@@ -120,8 +120,9 @@ pub(crate) fn handle_idle_key(
 mod tests {
     use super::*;
     use crate::test_support::test_run_config;
+    use crate::types::TuiEvent;
     use crossterm::event::KeyModifiers;
-    use orca_core::config::ThemeName;
+    use orca_core::config::{ThemeName, VimInsertEscapeSequence};
 
     #[test]
     fn nonempty_composer_keeps_vim_count_when_e_matches_expand_shortcut() {
@@ -191,5 +192,49 @@ mod tests {
 
         assert_eq!(textarea.cursor(), (0, 0));
         assert!(!vim.has_pending_command_for_test());
+    }
+
+    #[test]
+    fn configured_first_character_does_not_steal_consumed_idle_shortcut() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.update(TuiEvent::ToolRequested {
+            id: "tool-1".to_string(),
+            name: "grep".to_string(),
+            target: None,
+        });
+        let mut config = test_run_config();
+        config.vim_mode = true;
+        config.vim_insert_escape = Some(VimInsertEscapeSequence::parse("ee").unwrap());
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::with_insert_escape(true, config.vim_insert_escape.clone());
+        vim.mode = crate::vim::VimMode::Insert;
+        let mut textarea = TextArea::default();
+        let key = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+
+        handle_idle_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert!(textarea.is_empty());
+        assert!(!vim.has_pending_insert_escape_for_test());
+        let crate::types::ChatMessage::ToolCall { expanded, .. } = &state.messages[0] else {
+            panic!("expected tool call");
+        };
+        assert!(*expanded);
     }
 }

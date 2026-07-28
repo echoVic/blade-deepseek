@@ -61,6 +61,8 @@ pub(crate) fn handle_runtime_event(
     } = &tui_event
         && state.approval_is_allowlisted(tool, target.as_deref())
     {
+        vim_state.flush_pending_insert_escape(textarea);
+        vim_state.cancel_pending_command();
         let _ = action_tx.send(UserAction::RespondToInteraction {
             key: key.clone(),
             response: crate::types::TuiInteractionResponse::Approval(true),
@@ -93,6 +95,7 @@ pub(crate) fn handle_runtime_event(
     let previous_status = state.status;
     state.update(tui_event);
     if state.status != previous_status {
+        vim_state.flush_pending_insert_escape(textarea);
         vim_state.cancel_pending_command();
     }
     if let Some(notification) = terminal_notification {
@@ -104,6 +107,7 @@ pub(crate) fn handle_runtime_event(
     }
     if queued_submission_rejected {
         if let Some(composer) = state.take_rejected_queued_composer_state() {
+            vim_state.flush_pending_insert_escape(textarea);
             vim_state.reset_insert(textarea, theme);
             *textarea = make_textarea_with_text(&composer.visible_text, vim_state, theme);
             state.mention_bindings = composer.mention_bindings;
@@ -111,6 +115,7 @@ pub(crate) fn handle_runtime_event(
             state.reset_history_navigation();
         }
     } else if let Some(prompt) = restored_prompt {
+        vim_state.flush_pending_insert_escape(textarea);
         vim_state.reset_insert(textarea, theme);
         *textarea = make_textarea_with_text(&prompt, vim_state, theme);
     }
@@ -125,6 +130,7 @@ pub(crate) fn handle_runtime_event(
         submit_pending_workflow_notification(state, action_tx, true);
     }
     if state.status != initial_status {
+        vim_state.flush_pending_insert_escape(textarea);
         vim_state.cancel_pending_command();
     }
     if state.auto_scroll {
@@ -143,10 +149,21 @@ mod tests {
         ChatMessage, PendingWorkflowNotification, TuiInteractionKey, TuiInteractionKind,
     };
     use orca_core::cancel::OperationIdAllocator;
-    use orca_core::config::ThemeName;
+    use orca_core::config::{ThemeName, VimInsertEscapeSequence};
     use orca_runtime::mentions::{MentionBinding, MentionBindings, MentionFileKind, MentionTarget};
     use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
     use std::path::PathBuf;
+    use std::time::Instant;
+    use tui_textarea::CursorMove;
+
+    fn vim_insert_input(character: char) -> tui_textarea::Input {
+        tui_textarea::Input {
+            key: tui_textarea::Key::Char(character),
+            ctrl: false,
+            alt: false,
+            shift: false,
+        }
+    }
 
     fn interaction_key(kind: TuiInteractionKind, id: &str) -> TuiInteractionKey {
         TuiInteractionKey::new(OperationIdAllocator::new().allocate(), id, kind)
@@ -773,6 +790,47 @@ mod tests {
             &theme,
         );
         assert_eq!(vim.mode, crate::vim::VimMode::Insert);
+    }
+
+    #[test]
+    fn runtime_status_transition_flushes_pending_insert_escape_before_new_owner() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let pending = bridge::PendingWorkflowNotifications::new();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut presentation = test_presentation();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.enter_running();
+        let started = Instant::now();
+        let mut vim =
+            VimState::with_insert_escape(true, Some(VimInsertEscapeSequence::parse("jj").unwrap()));
+        vim.mode = crate::vim::VimMode::Insert;
+        let mut textarea = TextArea::from(["draft"]);
+        textarea.move_cursor(CursorMove::End);
+        vim.handle_at(vim_insert_input('j'), &mut textarea, &theme, started);
+
+        handle_runtime_event(
+            TuiEvent::UserInputRequested {
+                key: interaction_key(TuiInteractionKind::UserInput, "input"),
+                question: "question".to_string(),
+                choices: Vec::new(),
+            },
+            &mut state,
+            &action_tx,
+            &pending,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut presentation,
+        );
+
+        assert_eq!(textarea_text(&textarea), "draftj");
+        assert!(!vim.has_pending_insert_escape_for_test());
+        assert_eq!(state.status, AppStatus::WaitingUserInput);
     }
 
     #[test]

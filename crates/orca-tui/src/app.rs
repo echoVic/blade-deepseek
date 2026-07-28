@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::ExecutableCommand;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use tui_textarea::{Input, TextArea};
 
 #[cfg(test)]
 use orca_core::cancel::CancelToken;
@@ -29,6 +30,7 @@ use crate::bridge;
 use crate::capability_backend::CapabilityBackend;
 use crate::channels::{tui_event_channel, user_action_channel};
 use crate::clipboard;
+use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{
     make_setup_textarea, make_textarea, textarea_cursor_byte_index, textarea_text,
 };
@@ -53,8 +55,78 @@ use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationPro
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
 use crate::ui;
-use crate::vim::VimState;
+use crate::vim::{PendingInsertEscapeFlow, VimState};
 use crate::workspace_status;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingInsertEscapeRouting {
+    Continue,
+    Consumed,
+}
+
+fn refresh_after_insert_escape_flush(
+    state: &mut AppState,
+    config: &RunConfig,
+    textarea: &TextArea<'_>,
+) {
+    state.reset_history_navigation();
+    refresh_input_menus(textarea, state, config);
+}
+
+fn resolve_pending_insert_escape_before_routing(
+    event: &Event,
+    now: Instant,
+    vim_state: &mut VimState,
+    textarea: &mut TextArea<'_>,
+    state: &mut AppState,
+    config: &RunConfig,
+    theme: &Theme,
+) -> PendingInsertEscapeRouting {
+    let Event::Key(key) = event else {
+        return PendingInsertEscapeRouting::Continue;
+    };
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return PendingInsertEscapeRouting::Continue;
+    }
+    match vim_state.resolve_pending_insert_escape(&Input::from(event.clone()), now, textarea) {
+        PendingInsertEscapeFlow::Consumed => {
+            vim_state.configure_block(textarea, theme);
+            PendingInsertEscapeRouting::Consumed
+        }
+        PendingInsertEscapeFlow::Flushed => {
+            refresh_after_insert_escape_flush(state, config, textarea);
+            PendingInsertEscapeRouting::Continue
+        }
+        PendingInsertEscapeFlow::NoPending => PendingInsertEscapeRouting::Continue,
+    }
+}
+
+fn flush_pending_insert_escape_before_non_key(
+    vim_state: &mut VimState,
+    textarea: &mut TextArea<'_>,
+    state: &mut AppState,
+    config: &RunConfig,
+) -> bool {
+    if !vim_state.flush_pending_insert_escape(textarea) {
+        return false;
+    }
+    refresh_after_insert_escape_flush(state, config, textarea);
+    true
+}
+
+fn flush_expired_insert_escape(
+    now: Instant,
+    vim_state: &mut VimState,
+    textarea: &mut TextArea<'_>,
+    state: &mut AppState,
+    config: &RunConfig,
+) -> bool {
+    if !vim_state.flush_expired_insert_escape(now, textarea) {
+        return false;
+    }
+    refresh_after_insert_escape_flush(state, config, textarea);
+    true
+}
 
 pub fn run_tui(config: RunConfig) -> i32 {
     match run_tui_inner(config) {
@@ -224,7 +296,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let terminal_input = pending_input_runtime;
     let event_rx = pending_event_rx;
 
-    let mut vim_state = VimState::new(config.vim_mode);
+    let mut vim_state =
+        VimState::with_insert_escape(config.vim_mode, config.vim_insert_escape.clone());
     let mut textarea = if needs_setup {
         make_setup_textarea(&theme)
     } else {
@@ -269,6 +342,15 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
             let exit_code = 'main: loop {
                 let now = Instant::now();
+                if flush_expired_insert_escape(
+                    now,
+                    &mut vim_state,
+                    &mut textarea,
+                    &mut state,
+                    &config,
+                ) {
+                    scheduler.mark_dirty();
+                }
                 if let Ok(registry) = mention_registry_rx.try_recv() {
                     mention_search.install_registry(registry);
                 }
@@ -351,6 +433,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         match event {
                             IterationEvent::Input(input_event) => match input_event {
                                 BatchedInputEvent::ScrollLines(lines) => {
+                                    flush_pending_insert_escape_before_non_key(
+                                        &mut vim_state,
+                                        &mut textarea,
+                                        &mut state,
+                                        &config,
+                                    );
                                     vim_state.cancel_pending_command();
                                     handle_scroll_lines(&mut state, lines, Instant::now());
                                 }
@@ -358,12 +446,40 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                     if consume_focus_event(&ev, presentation) {
                                         return Ok(None);
                                     }
+                                    if resolve_pending_insert_escape_before_routing(
+                                        &ev,
+                                        Instant::now(),
+                                        &mut vim_state,
+                                        &mut textarea,
+                                        &mut state,
+                                        &config,
+                                        &theme,
+                                    ) == PendingInsertEscapeRouting::Consumed
+                                    {
+                                        return Ok(None);
+                                    }
+                                    if matches!(ev, Event::Paste(_)) {
+                                        flush_pending_insert_escape_before_non_key(
+                                            &mut vim_state,
+                                            &mut textarea,
+                                            &mut state,
+                                            &config,
+                                        );
+                                    }
                                     if handle_paste_event(&ev, &mut state, &config, &mut textarea) {
                                         vim_state.cancel_pending_command();
                                         return Ok(None);
                                     }
                                     if handle_resize_event(&ev, &mut state) {
                                         return Ok(None);
+                                    }
+                                    if matches!(ev, Event::Mouse(_)) {
+                                        flush_pending_insert_escape_before_non_key(
+                                            &mut vim_state,
+                                            &mut textarea,
+                                            &mut state,
+                                            &config,
+                                        );
                                     }
                                     match handle_mouse_event(
                                         &ev,
@@ -909,9 +1025,19 @@ mod tests {
     };
     use crate::workflow_panel_actions::handle_workflows_panel_key;
     use orca_core::config::{
-        ModelRuntimeConfig, OutputFormat, ProviderKind, ThemeName, ToolConfig, WorkflowConfig,
+        ModelRuntimeConfig, OutputFormat, ProviderKind, ThemeName, ToolConfig,
+        VimInsertEscapeSequence, WorkflowConfig,
     };
     use tempfile::tempdir;
+
+    fn vim_insert_input(character: char) -> tui_textarea::Input {
+        tui_textarea::Input {
+            key: tui_textarea::Key::Char(character),
+            ctrl: false,
+            alt: false,
+            shift: false,
+        }
+    }
 
     fn inserted_source_line<'a>(
         lines: &'a [ratatui::text::Line<'static>],
@@ -962,6 +1088,200 @@ mod tests {
             Ok(Vec::new())
         );
         assert_eq!(receiver.len(), 1);
+    }
+
+    #[test]
+    fn pending_insert_escape_preflight_precedes_shortcuts_only_after_sequence_started() {
+        let theme = Theme::named(ThemeName::Dark);
+        let sequence = VimInsertEscapeSequence::parse("jj").unwrap();
+        let started = Instant::now();
+        let mut vim = VimState::with_insert_escape(true, Some(sequence));
+        vim.mode = crate::vim::VimMode::Insert;
+        let mut textarea = TextArea::default();
+        let mut state = test_state().0;
+        let config = test_config(HistoryMode::Disabled);
+
+        let first = Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            resolve_pending_insert_escape_before_routing(
+                &first,
+                started,
+                &mut vim,
+                &mut textarea,
+                &mut state,
+                &config,
+                &theme,
+            ),
+            PendingInsertEscapeRouting::Continue,
+        );
+        vim.handle_at(vim_insert_input('j'), &mut textarea, &theme, started);
+
+        let second = Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            resolve_pending_insert_escape_before_routing(
+                &second,
+                started + Duration::from_millis(1),
+                &mut vim,
+                &mut textarea,
+                &mut state,
+                &config,
+                &theme,
+            ),
+            PendingInsertEscapeRouting::Consumed,
+        );
+        assert_eq!(vim.mode, crate::vim::VimMode::Normal);
+        assert!(textarea.is_empty());
+    }
+
+    #[test]
+    fn pending_insert_escape_flushes_before_submit_and_paste_ownership() {
+        let theme = Theme::named(ThemeName::Dark);
+        let started = Instant::now();
+        let sequence = VimInsertEscapeSequence::parse("jj").unwrap();
+
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut config = test_config(HistoryMode::Disabled);
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let mut vim = VimState::with_insert_escape(true, Some(sequence.clone()));
+        vim.mode = crate::vim::VimMode::Insert;
+        let mut textarea = TextArea::default();
+        vim.handle_at(vim_insert_input('j'), &mut textarea, &theme, started);
+
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            resolve_pending_insert_escape_before_routing(
+                &enter,
+                started + Duration::from_millis(1),
+                &mut vim,
+                &mut textarea,
+                &mut state,
+                &config,
+                &theme,
+            ),
+            PendingInsertEscapeRouting::Continue,
+        );
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+        ));
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "j"
+        ));
+
+        let mut paste_state = test_state().0;
+        let paste_config = test_config(HistoryMode::Disabled);
+        let mut paste_vim = VimState::with_insert_escape(true, Some(sequence));
+        paste_vim.mode = crate::vim::VimMode::Insert;
+        let mut paste_area = TextArea::default();
+        paste_vim.handle_at(vim_insert_input('j'), &mut paste_area, &theme, started);
+        assert!(flush_pending_insert_escape_before_non_key(
+            &mut paste_vim,
+            &mut paste_area,
+            &mut paste_state,
+            &paste_config,
+        ));
+        assert!(handle_paste_event(
+            &Event::Paste("jj".to_string()),
+            &mut paste_state,
+            &paste_config,
+            &mut paste_area,
+        ));
+        assert_eq!(textarea_text(&paste_area), "jjj");
+    }
+
+    #[test]
+    fn pending_insert_escape_flushes_before_running_escape_interrupt() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.enter_running();
+        let mut config = test_config(HistoryMode::Disabled);
+        config.vim_mode = true;
+        config.vim_insert_escape = Some(VimInsertEscapeSequence::parse("jj").unwrap());
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let operation = crate::test_support::TestOperationInterrupt::default();
+        let preloaded = Arc::new(Mutex::new(None));
+        let theme = Theme::named(ThemeName::Dark);
+        let started = Instant::now();
+        let mut vim = VimState::with_insert_escape(true, config.vim_insert_escape.clone());
+        vim.mode = crate::vim::VimMode::Insert;
+        let mut textarea = TextArea::default();
+        vim.handle_at(vim_insert_input('j'), &mut textarea, &theme, started);
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let event = Event::Key(key);
+
+        assert_eq!(
+            resolve_pending_insert_escape_before_routing(
+                &event,
+                started + Duration::from_millis(1),
+                &mut vim,
+                &mut textarea,
+                &mut state,
+                &config,
+                &theme,
+            ),
+            PendingInsertEscapeRouting::Continue,
+        );
+        handle_status_key(
+            &event,
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &operation,
+            &preloaded,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(textarea_text(&textarea), "j");
+        assert_eq!(state.status, AppStatus::Running);
+        assert_eq!(operation.call_count(), 1);
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+    }
+
+    #[test]
+    fn expired_insert_escape_flush_refreshes_input_state_once() {
+        let theme = Theme::named(ThemeName::Dark);
+        let config = test_config(HistoryMode::Disabled);
+        let started = Instant::now();
+        let mut vim =
+            VimState::with_insert_escape(true, Some(VimInsertEscapeSequence::parse("jj").unwrap()));
+        vim.mode = crate::vim::VimMode::Insert;
+        let mut textarea = TextArea::default();
+        let mut state = test_state().0;
+        vim.handle_at(vim_insert_input('j'), &mut textarea, &theme, started);
+
+        assert!(flush_expired_insert_escape(
+            started + Duration::from_millis(501),
+            &mut vim,
+            &mut textarea,
+            &mut state,
+            &config,
+        ));
+        assert_eq!(textarea_text(&textarea), "j");
+        assert!(!vim.has_pending_insert_escape_for_test());
     }
 
     #[test]
