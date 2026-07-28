@@ -797,6 +797,24 @@ fn rendered_metadata_line(line: &str, theme: &Theme) -> Line<'static> {
     ))
 }
 
+fn hunk_scope(header: &str) -> &str {
+    header
+        .strip_prefix("@@")
+        .and_then(|rest| rest.split_once("@@"))
+        .map_or("", |(_, suffix)| suffix.trim())
+}
+
+fn rendered_hunk_separator(hunk: &DiffHunk, gutter_width: usize, theme: &Theme) -> Line<'static> {
+    let gutter = format!("{:>width$} {:>width$}   ", "⋮", "⋮", width = gutter_width);
+    Line::from(vec![
+        Span::styled(gutter, Style::default().fg(theme.border)),
+        Span::styled(
+            hunk_scope(&hunk.header).to_owned(),
+            Style::default().fg(theme.muted),
+        ),
+    ])
+}
+
 fn render_hunk_fallback(
     hunk: &DiffHunk,
     entry_budget: usize,
@@ -928,10 +946,7 @@ fn render_parsed_diff_with(
             if remaining == 0 {
                 break;
             }
-            rendered.push(Line::from(Span::styled(
-                format!("    {}", hunk.header),
-                Style::default().fg(theme.border),
-            )));
+            rendered.push(rendered_hunk_separator(hunk, gutter_width, theme));
             remaining -= 1;
             if remaining == 0 {
                 break 'hunks;
@@ -1373,6 +1388,33 @@ mod tests {
     }
 
     #[test]
+    fn hunk_separator_hides_coordinates_and_keeps_scope_context() {
+        let diff = "\
+--- a/value.rs
++++ b/value.rs
+@@ -12 +34 @@ impl Value
+-old
++new
+";
+        let lines = render_unified_diff(diff, &dark_theme(), None);
+        let separator = &lines[2];
+        let text = rendered_text(separator);
+
+        assert_eq!(text, " ⋮  ⋮   impl Value");
+        assert!(!text.contains("@@"));
+        assert!(!text.contains("-12"));
+        assert!(!text.contains("+34"));
+    }
+
+    #[test]
+    fn hunk_separator_without_scope_contains_only_the_dual_ellipsis_gutter() {
+        let diff = "--- a/v\n+++ b/v\n@@ -1 +1 @@\n-old\n+new\n";
+        let lines = render_unified_diff(diff, &dark_theme(), None);
+
+        assert_eq!(rendered_text(&lines[2]), "⋮ ⋮   ");
+    }
+
+    #[test]
     fn malformed_hunk_candidate_forces_first_paint_raw_fallback() {
         assert_malformed_raw_fallback(
             "\
@@ -1464,12 +1506,12 @@ diff --git a/value.rs b/value.rs
         assert_eq!(
             rendered.iter().map(rendered_text).collect::<Vec<_>>(),
             vec![
-                "    @@ -1 +1 @@",
+                "⋮ ⋮   ",
                 "1   - let old = 1;",
                 "  1 + let value = 2;",
                 "    --- a/other.rs",
                 "    +++ b/other.rs",
-                "    @@ -1 +1 @@",
+                "⋮ ⋮   ",
                 "1   - let other = 1;",
                 "  1 + let other = 2;",
             ]
@@ -1836,14 +1878,14 @@ index 333..444 100644
                 "    index 111..222 100644",
                 "    --- a/a.rs",
                 "    +++ b/a.rs",
-                "    @@ -1 +1 @@",
+                "⋮ ⋮   ",
                 "1   - old_a",
                 "  1 + new_a",
                 "    diff --git a/b.py b/b.py",
                 "    index 333..444 100644",
                 "    --- a/b.py",
                 "    +++ b/b.py",
-                "    @@ -1 +1 @@",
+                "⋮ ⋮   ",
                 "1   - old_b",
                 "  1 + new_b",
             ]
@@ -2082,12 +2124,12 @@ index 333..444 100644
             vec![
                 "    --- a/first.rs",
                 "    +++ b/first.rs",
-                "    @@ -1 +1 @@",
+                "⋮ ⋮   ",
                 "1   - fn old() {}",
                 "  1 + fn first() { let value = 1; }",
                 "    --- a/second.py",
                 "    +++ b/second.py",
-                "    @@ -1 +1 @@",
+                "⋮ ⋮   ",
                 "1   - value = 0",
                 "  1 + value = 1",
             ]
@@ -2195,12 +2237,12 @@ metadata instead of paired new header
             vec![
                 "    --- a/one.py\t2026-07-24 10:00:00",
                 "    +++ b/one.py\t2026-07-24 10:01:00",
-                "    @@ -1 +1 @@",
+                "⋮ ⋮   ",
                 "1   - value = 0",
                 "  1 + value = 1",
                 "    --- a/two.py\t2026-07-24 10:02:00",
                 "    +++ b/two.py\t2026-07-24 10:03:00",
-                "    @@ -1 +1 @@",
+                "⋮ ⋮   ",
                 "1   - other = 0",
                 "  1 + other = 1",
             ]
