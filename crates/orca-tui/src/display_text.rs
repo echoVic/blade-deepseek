@@ -1,3 +1,4 @@
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 pub(crate) fn truncate_to_display_width(text: &str, max_width: usize) -> String {
@@ -13,13 +14,13 @@ pub(crate) fn truncate_to_display_width(text: &str, max_width: usize) -> String 
     let content_width = max_width.saturating_sub(UnicodeWidthStr::width(ellipsis));
     let mut truncated = String::new();
     let mut width = 0usize;
-    for ch in text.chars() {
-        let ch_width = UnicodeWidthStr::width(ch.to_string().as_str());
-        if width + ch_width > content_width {
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width + grapheme_width > content_width {
             break;
         }
-        truncated.push(ch);
-        width += ch_width;
+        truncated.push_str(grapheme);
+        width += grapheme_width;
     }
     truncated.push_str(ellipsis);
     truncated
@@ -55,6 +56,33 @@ mod tests {
         assert_eq!(truncate_to_display_width("目标内容很长", 5), "目标…");
         assert_eq!(truncate_to_display_width("目标", 4), "目标");
         assert_eq!(truncate_to_display_width("anything", 0), "");
+    }
+
+    #[test]
+    fn truncation_never_splits_extended_graphemes() {
+        for grapheme in ["e\u{301}", "👍🏽", "👨‍👩‍👧‍👦", "1️⃣"] {
+            let grapheme_width = unicode_width::UnicodeWidthStr::width(grapheme);
+            assert_eq!(
+                truncate_to_display_width(&format!("{grapheme}x"), grapheme_width + 1),
+                format!("{grapheme}x"),
+                "{grapheme:?}"
+            );
+            assert_eq!(
+                truncate_to_display_width(&format!("{grapheme}x"), grapheme_width),
+                "…",
+                "{grapheme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncation_keeps_combining_emoji_and_keycap_clusters_atomic() {
+        assert_eq!(truncate_to_display_width("e\u{301}x", 1), "…");
+        assert_eq!(truncate_to_display_width("e\u{301}xy", 2), "e\u{301}…");
+        assert_eq!(truncate_to_display_width("👍🏽x", 2), "…");
+        assert_eq!(truncate_to_display_width("👍🏽xy", 3), "👍🏽…");
+        assert_eq!(truncate_to_display_width("1️⃣x", 2), "…");
+        assert_eq!(truncate_to_display_width("1️⃣xy", 3), "1️⃣…");
     }
 
     #[test]
