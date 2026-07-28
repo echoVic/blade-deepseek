@@ -92,6 +92,7 @@ pub fn assemble_run_config(
         vim_mode: file.vim_mode,
         update_check: file.update_check,
         desktop_notifications,
+        terminal_notifications: file.terminal_notifications,
         auto_memory: file.auto_memory,
     })
 }

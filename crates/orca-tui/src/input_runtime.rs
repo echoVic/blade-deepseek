@@ -20,6 +20,7 @@ use crate::terminal_capabilities::{
 
 const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const INPUT_CHANNEL_CAPACITY: usize = 256;
+const FOCUS_CHANNEL_CAPACITY: usize = 8;
 const STARTUP_CHANNEL_CAPACITY: usize = 1;
 
 static PANIC_HOOK_INIT: Once = Once::new();
@@ -93,9 +94,50 @@ pub(crate) enum InputControl {
     Resumed,
 }
 
+struct InputEventSender {
+    events: mpsc::Sender<crossterm::event::Event>,
+    focus_events: Option<mpsc::Sender<crossterm::event::Event>>,
+}
+
+impl InputEventSender {
+    fn with_focus(
+        events: mpsc::Sender<crossterm::event::Event>,
+        focus_events: mpsc::Sender<crossterm::event::Event>,
+    ) -> Self {
+        Self {
+            events,
+            focus_events: Some(focus_events),
+        }
+    }
+
+    fn sender_for(
+        &self,
+        event: &crossterm::event::Event,
+    ) -> &mpsc::Sender<crossterm::event::Event> {
+        if matches!(
+            event,
+            crossterm::event::Event::FocusGained | crossterm::event::Event::FocusLost
+        ) {
+            self.focus_events.as_ref().unwrap_or(&self.events)
+        } else {
+            &self.events
+        }
+    }
+}
+
+impl From<mpsc::Sender<crossterm::event::Event>> for InputEventSender {
+    fn from(events: mpsc::Sender<crossterm::event::Event>) -> Self {
+        Self {
+            events,
+            focus_events: None,
+        }
+    }
+}
+
 pub(crate) struct InputRuntime {
     profile: TerminalProfile,
     events: mpsc::Receiver<crossterm::event::Event>,
+    focus_events: mpsc::Receiver<crossterm::event::Event>,
     controls: mpsc::Receiver<InputControl>,
     stop_tx: Option<watch::Sender<bool>>,
     join: Option<thread::JoinHandle<io::Result<()>>>,
@@ -109,6 +151,7 @@ impl InputRuntime {
 
         let color_level = system_color_level();
         let (event_tx, events) = mpsc::bounded(INPUT_CHANNEL_CAPACITY);
+        let (focus_tx, focus_events) = mpsc::bounded(FOCUS_CHANNEL_CAPACITY);
         let (control_tx, controls) = mpsc::bounded(1);
         let (startup_tx, startup_rx) = mpsc::bounded(STARTUP_CHANNEL_CAPACITY);
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -119,7 +162,7 @@ impl InputRuntime {
                     options,
                     color_level,
                     startup_tx,
-                    event_tx,
+                    InputEventSender::with_focus(event_tx, focus_tx),
                     control_tx,
                     stop_rx,
                     owner_thread,
@@ -133,6 +176,7 @@ impl InputRuntime {
             Ok(StartupMessage::Ready(profile)) => Ok(Self {
                 profile,
                 events,
+                focus_events,
                 controls,
                 stop_tx: Some(stop_tx),
                 join: Some(join),
@@ -165,6 +209,10 @@ impl InputRuntime {
         &self.events
     }
 
+    pub(crate) fn focus_events(&self) -> &mpsc::Receiver<crossterm::event::Event> {
+        &self.focus_events
+    }
+
     pub(crate) fn controls(&self) -> &mpsc::Receiver<InputControl> {
         &self.controls
     }
@@ -193,9 +241,11 @@ impl InputRuntime {
         stop_tx: watch::Sender<bool>,
         join: thread::JoinHandle<io::Result<()>>,
     ) -> Self {
+        let (_focus_tx, focus_events) = mpsc::bounded(1);
         Self {
             profile,
             events,
+            focus_events,
             controls,
             stop_tx: Some(stop_tx),
             join: Some(join),
@@ -214,7 +264,7 @@ fn input_thread(
     options: InputRuntimeOptions,
     color_level: TerminalColorLevel,
     startup_tx: mpsc::Sender<StartupMessage>,
-    event_tx: mpsc::Sender<crossterm::event::Event>,
+    event_tx: InputEventSender,
     control_tx: mpsc::Sender<InputControl>,
     stop_rx: watch::Receiver<bool>,
     owner_thread: thread::ThreadId,
@@ -465,7 +515,7 @@ async fn drive_terminal<D: TerminalDriver>(
     options: impl Into<InputRuntimeOptions>,
     color_level: TerminalColorLevel,
     startup_tx: mpsc::Sender<StartupMessage>,
-    event_tx: mpsc::Sender<crossterm::event::Event>,
+    event_tx: impl Into<InputEventSender>,
     control_tx: mpsc::Sender<InputControl>,
     mut stop_rx: watch::Receiver<bool>,
 ) -> io::Result<()> {
@@ -515,7 +565,7 @@ async fn drive_terminal<D: TerminalDriver>(
     }
 
     let mut adapter = InputAdapter::default();
-    let mut event_tx = Some(event_tx);
+    let mut event_tx = Some(event_tx.into());
     let mut control_tx = Some(control_tx);
     let mut wait_for_main_teardown = false;
     let mut suspended = false;
@@ -539,15 +589,20 @@ async fn drive_terminal<D: TerminalDriver>(
                 };
                 match activity {
                     TerminalActivity::Event(event) => {
-                        if let Some(event) = adapter.adapt(event)
-                            && !send_event_until_stopped(
-                                event_tx.as_ref().expect("event sender is live"),
+                        if let Some(event) = adapter.adapt(event) {
+                            let sender = event_tx
+                                .as_ref()
+                                .expect("event sender is live")
+                                .sender_for(&event);
+                            if !send_event_until_stopped(
+                                sender,
                                 event,
                                 &mut stop_rx,
                             )
                             .await
-                        {
-                            break Ok(());
+                            {
+                                break Ok(());
+                            }
                         }
                     }
                     TerminalActivity::Suspend => {

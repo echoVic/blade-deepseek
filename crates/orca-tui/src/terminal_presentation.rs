@@ -60,6 +60,7 @@ impl TerminalNotification {
 pub(crate) struct TerminalPresentation {
     focused: bool,
     notifications_enabled: bool,
+    output_failed: bool,
     profile: TerminalPresentationProfile,
     animation_tick: u64,
     last_title: Option<String>,
@@ -71,6 +72,7 @@ impl TerminalPresentation {
         Self {
             focused: true,
             notifications_enabled,
+            output_failed: false,
             profile,
             animation_tick: 0,
             last_title: None,
@@ -135,32 +137,53 @@ impl TerminalPresentation {
         writer: &mut W,
         status: AppStatus,
     ) -> io::Result<usize> {
-        let title = self.title(status);
-        let mut writes = 0usize;
-        if self.last_title.as_deref() != Some(title.as_str()) {
-            writer.write_all(&encode_title(&title, self.profile))?;
-            self.last_title = Some(title);
-            writes += 1;
+        if self.output_failed {
+            return Ok(0);
         }
 
-        for _ in 0..MAX_NOTIFICATIONS_PER_WRITE {
-            let Some(notification) = self.pending_notifications.pop_front() else {
-                break;
-            };
-            writer.write_all(&encode_notification(&notification.message, self.profile))?;
-            writes += 1;
+        let result = (|| {
+            let title = self.title(status);
+            let mut writes = 0usize;
+            if self.last_title.as_deref() != Some(title.as_str()) {
+                writer.write_all(&encode_title(&title, self.profile))?;
+                self.last_title = Some(title);
+                writes += 1;
+            }
+
+            for _ in 0..MAX_NOTIFICATIONS_PER_WRITE {
+                let Some(notification) = self.pending_notifications.pop_front() else {
+                    break;
+                };
+                writer.write_all(&encode_notification(&notification.message, self.profile))?;
+                writes += 1;
+            }
+            if writes > 0 {
+                writer.flush()?;
+            }
+            Ok(writes)
+        })();
+        if result.is_err() {
+            self.output_failed = true;
+            self.pending_notifications.clear();
         }
-        if writes > 0 {
-            writer.flush()?;
-        }
-        Ok(writes)
+        result
     }
 
     pub(crate) fn write_reset_title<W: Write>(&mut self, writer: &mut W) -> io::Result<usize> {
-        writer.write_all(&encode_title("Orca", self.profile))?;
-        writer.flush()?;
-        self.last_title = Some("Orca".to_string());
-        Ok(1)
+        if self.output_failed {
+            return Ok(0);
+        }
+        let result = (|| {
+            writer.write_all(&encode_title("Orca", self.profile))?;
+            writer.flush()?;
+            self.last_title = Some("Orca".to_string());
+            Ok(1)
+        })();
+        if result.is_err() {
+            self.output_failed = true;
+            self.pending_notifications.clear();
+        }
+        result
     }
 
     #[cfg(test)]
@@ -442,6 +465,33 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(writer.writes, 1);
+    }
+
+    #[test]
+    fn terminal_presentation_disables_all_output_after_first_write_error() {
+        let mut presentation = presentation(direct_profile());
+        presentation.set_focused(false);
+        presentation.enqueue(TerminalNotification::new("Approval required"));
+        let mut writer = FailingWriter { writes: 0 };
+
+        assert!(
+            presentation
+                .write_pending(&mut writer, AppStatus::Running)
+                .is_err()
+        );
+        assert_eq!(
+            presentation
+                .write_pending(&mut writer, AppStatus::Running)
+                .unwrap(),
+            0
+        );
+        assert_eq!(presentation.write_reset_title(&mut writer).unwrap(), 0);
+        assert_eq!(writer.writes, 1, "failed output must never be retried");
+        assert_eq!(
+            presentation.pending_len(),
+            0,
+            "undeliverable notifications are discarded"
+        );
     }
 
     #[test]

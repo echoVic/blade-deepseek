@@ -76,11 +76,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     })?;
     let theme = Theme::resolve(config.theme, pending_input_runtime.profile());
     let input_rx = pending_input_runtime.events().clone();
+    let focus_rx = pending_input_runtime.focus_events().clone();
     let input_control_rx = pending_input_runtime.controls().clone();
     let presentation_profile = TerminalPresentationProfile::from_identity(
         &qwertty::caps::identity_from_env(None, qwertty::caps::std_env_source),
     );
-    let mut presentation =
+    let presentation =
         TerminalPresentation::new(config.terminal_notifications, presentation_profile);
 
     const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -187,10 +188,10 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         } else {
             None
         };
-    // Declare terminal ownership after the agent runtime. Rust drops locals in
-    // reverse declaration order, so every early return first drops ratatui,
-    // then restores/joins qwertty, and only then joins the agent runtime.
-    let mut terminal_input = pending_input_runtime;
+    // Declare terminal ownership after the agent runtime. The cleanup wrapper
+    // below resets presentation output, drops ratatui, and then joins qwertty
+    // on every non-panic return from the frame loop.
+    let terminal_input = pending_input_runtime;
     let event_rx = pending_event_rx;
 
     let mut vim_state = VimState::new(config.vim_mode);
@@ -216,119 +217,172 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     // blank canvas rather than whatever the alt screen came up with.
     terminal.clear()?;
 
-    let exit_code;
+    let resources = (terminal, presentation, terminal_input);
+    let exit_code = with_terminal_presentation_cleanup(
+        resources,
+        |(terminal, presentation, _terminal_input)| {
+            let initial_status = state.status;
+            initialize_terminal_presentation(
+                terminal,
+                |terminal| {
+                    let _ = presentation
+                        .write_pending(terminal.backend_mut().inner_mut(), initial_status);
+                    Ok(())
+                },
+                |terminal| {
+                    terminal
+                        .draw(|f| ui::render(f, &mut state, &textarea, &theme))
+                        .map(|_| ())
+                },
+            )?;
+            let started_at = Instant::now();
+            let mut scheduler = FrameScheduler::new(started_at, FRAME_INTERVAL, ANIMATION_INTERVAL);
+            scheduler.did_draw(started_at);
 
-    terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
-    let started_at = Instant::now();
-    let mut scheduler = FrameScheduler::new(started_at, FRAME_INTERVAL, ANIMATION_INTERVAL);
-    scheduler.did_draw(started_at);
-
-    'main: loop {
-        let now = Instant::now();
-        poll_edit_highlight(&mut state, &mut scheduler);
-        // The copy notice and edge-drag auto-scroll count as animation so the
-        // idle loop keeps drawing frames: the notice until it expires (expiry
-        // clears it while THIS iteration still counts as animating, so
-        // `did_animate` marks the frame dirty and the final redraw removes it
-        // from the screen), and the edge drag so scrolling continues while the
-        // pointer sits still on the transcript's first/last row.
-        let animation_active = state.status == AppStatus::Running
-            || state.copy_notice.is_some()
-            || state.drag_edge_scroll.is_some()
-            || edit_highlight_animation_active(&state)
-            || presentation.animation_active(state.status);
-        if state.copy_notice.is_some() && state.copy_notice_at(now).is_none() {
-            state.copy_notice = None;
-        }
-        if animation_active && scheduler.animation_due(now) {
-            state.advance_tick();
-            presentation.advance_tick();
-            state.apply_drag_edge_scroll();
-            scheduler.did_animate(now);
-        }
-
-        let input_events = match receive_input_or_control(
-            &input_rx,
-            &input_control_rx,
-            scheduler.poll_timeout(now, animation_active),
-            MAX_INPUT_EVENTS_PER_BATCH,
-        ) {
-            Ok(InputWake::Events(events)) => events
-                .into_iter()
-                .filter(should_queue_input_event)
-                .collect(),
-            Ok(InputWake::Suspend { acknowledge }) => {
-                acknowledge.send(()).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "terminal input runtime dropped suspend acknowledgement",
-                    )
-                })?;
-                loop {
-                    match input_control_rx.recv() {
-                        Ok(InputControl::Resumed) => {
-                            resume_terminal_render(&mut terminal, &mut scheduler)?;
-                            presentation.invalidate_title();
-                            break;
-                        }
-                        Ok(InputControl::Suspend { acknowledge }) => {
-                            let _ = acknowledge.send(());
-                        }
-                        Err(_) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "terminal input runtime disconnected while suspended",
-                            ));
-                        }
-                    }
+            let exit_code = 'main: loop {
+                let now = Instant::now();
+                poll_edit_highlight(&mut state, &mut scheduler);
+                // The copy notice and edge-drag auto-scroll count as animation so the
+                // idle loop keeps drawing frames: the notice until it expires (expiry
+                // clears it while THIS iteration still counts as animating, so
+                // `did_animate` marks the frame dirty and the final redraw removes it
+                // from the screen), and the edge drag so scrolling continues while the
+                // pointer sits still on the transcript's first/last row.
+                let animation_active = state.status == AppStatus::Running
+                    || state.copy_notice.is_some()
+                    || state.drag_edge_scroll.is_some()
+                    || edit_highlight_animation_active(&state)
+                    || presentation.animation_active(state.status);
+                if state.copy_notice.is_some() && state.copy_notice_at(now).is_none() {
+                    state.copy_notice = None;
                 }
-                Vec::new()
-            }
-            Ok(InputWake::Resumed) | Err(mpsc::RecvTimeoutError::Timeout) => Vec::new(),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "terminal input runtime disconnected",
-                ));
-            }
-        };
+                if animation_active && scheduler.animation_due(now) {
+                    state.advance_tick();
+                    presentation.advance_tick();
+                    state.apply_drag_edge_scroll();
+                    scheduler.did_animate(now);
+                }
 
-        let iteration = run_event_loop_iteration(
-            &mut scheduler,
-            coalesce_input_events(input_events, 3),
-            event_rx.try_iter(),
-            MAX_INPUT_EVENTS_PER_BATCH,
-            MAX_RUNTIME_EVENTS_PER_BATCH,
-            Instant::now,
-            |event| -> io::Result<Option<i32>> {
-                match event {
-                    IterationEvent::Input(input_event) => match input_event {
-                        BatchedInputEvent::ScrollLines(lines) => {
-                            handle_scroll_lines(&mut state, lines, Instant::now());
+                let input_events = match receive_prioritized_input_or_control(
+                    &input_rx,
+                    &focus_rx,
+                    &input_control_rx,
+                    scheduler.poll_timeout(now, animation_active),
+                    MAX_INPUT_EVENTS_PER_BATCH,
+                ) {
+                    Ok(InputWake::Events(events)) => events
+                        .into_iter()
+                        .filter(should_queue_input_event)
+                        .collect(),
+                    Ok(InputWake::Suspend { acknowledge }) => {
+                        acknowledge.send(()).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "terminal input runtime dropped suspend acknowledgement",
+                            )
+                        })?;
+                        loop {
+                            match input_control_rx.recv() {
+                                Ok(InputControl::Resumed) => {
+                                    resume_terminal_render(terminal, &mut scheduler, presentation)?;
+                                    break;
+                                }
+                                Ok(InputControl::Suspend { acknowledge }) => {
+                                    let _ = acknowledge.send(());
+                                }
+                                Err(_) => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "terminal input runtime disconnected while suspended",
+                                    ));
+                                }
+                            }
                         }
-                        BatchedInputEvent::Event(ev) => {
-                            if consume_focus_event(&ev, &mut presentation) {
-                                return Ok(None);
-                            }
-                            if handle_paste_event(&ev, &mut state, &config, &mut textarea) {
-                                return Ok(None);
-                            }
-                            if handle_resize_event(&ev, &mut state) {
-                                return Ok(None);
-                            }
-                            match handle_mouse_event(&ev, &mut state, &mut textarea, Instant::now())
-                            {
-                                MouseFlow::NotMouse => {}
-                                MouseFlow::Handled => return Ok(None),
-                                MouseFlow::SyntheticEnter => {
-                                    // A click confirmed the focused row; run
-                                    // the exact same path a real Enter takes.
-                                    let enter_key =
-                                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-                                    let enter_event = Event::Key(enter_key);
+                        Vec::new()
+                    }
+                    Ok(InputWake::Resumed) | Err(mpsc::RecvTimeoutError::Timeout) => Vec::new(),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "terminal input runtime disconnected",
+                        ));
+                    }
+                };
+
+                let iteration = run_event_loop_iteration(
+                    &mut scheduler,
+                    coalesce_input_events(input_events, 3),
+                    event_rx.try_iter(),
+                    usize::MAX,
+                    MAX_RUNTIME_EVENTS_PER_BATCH,
+                    Instant::now,
+                    |event| -> io::Result<Option<i32>> {
+                        match event {
+                            IterationEvent::Input(input_event) => match input_event {
+                                BatchedInputEvent::ScrollLines(lines) => {
+                                    handle_scroll_lines(&mut state, lines, Instant::now());
+                                }
+                                BatchedInputEvent::Event(ev) => {
+                                    if consume_focus_event(&ev, presentation) {
+                                        return Ok(None);
+                                    }
+                                    if handle_paste_event(&ev, &mut state, &config, &mut textarea) {
+                                        return Ok(None);
+                                    }
+                                    if handle_resize_event(&ev, &mut state) {
+                                        return Ok(None);
+                                    }
+                                    match handle_mouse_event(
+                                        &ev,
+                                        &mut state,
+                                        &mut textarea,
+                                        Instant::now(),
+                                    ) {
+                                        MouseFlow::NotMouse => {}
+                                        MouseFlow::Handled => return Ok(None),
+                                        MouseFlow::SyntheticEnter => {
+                                            // A click confirmed the focused row; run
+                                            // the exact same path a real Enter takes.
+                                            let enter_key =
+                                                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+                                            let enter_event = Event::Key(enter_key);
+                                            if let StatusKeyFlow::Exit(code) = handle_status_key(
+                                                &enter_event,
+                                                &enter_key,
+                                                &mut state,
+                                                &mut config,
+                                                &shared_config,
+                                                &action_tx,
+                                                &preloaded_transcript,
+                                                &mut textarea,
+                                                &mut vim_state,
+                                                &theme,
+                                                initial_prompt.clone(),
+                                                || clear_terminal_scrollback(terminal),
+                                            )? {
+                                                return Ok(Some(code));
+                                            }
+                                            return Ok(None);
+                                        }
+                                    }
+                                    let Event::Key(key) = &ev else {
+                                        return Ok(None);
+                                    };
+                                    match handle_key_event_preflight(
+                                        *key,
+                                        &mut state,
+                                        &config,
+                                        &action_tx,
+                                        || clear_terminal_scrollback(terminal),
+                                    )? {
+                                        KeyEventFlow::Continue => return Ok(None),
+                                        KeyEventFlow::Exit(code) => return Ok(Some(code)),
+                                        KeyEventFlow::Unhandled => {}
+                                    }
+
                                     if let StatusKeyFlow::Exit(code) = handle_status_key(
-                                        &enter_event,
-                                        &enter_key,
+                                        &ev,
+                                        key,
                                         &mut state,
                                         &mut config,
                                         &shared_config,
@@ -338,142 +392,129 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                         &mut vim_state,
                                         &theme,
                                         initial_prompt.clone(),
-                                        || clear_terminal_scrollback(&mut terminal),
+                                        || clear_terminal_scrollback(terminal),
                                     )? {
                                         return Ok(Some(code));
                                     }
-                                    return Ok(None);
                                 }
-                            }
-                            let Event::Key(key) = &ev else {
-                                return Ok(None);
-                            };
-                            match handle_key_event_preflight(
-                                *key,
-                                &mut state,
-                                &config,
-                                &action_tx,
-                                || clear_terminal_scrollback(&mut terminal),
-                            )? {
-                                KeyEventFlow::Continue => return Ok(None),
-                                KeyEventFlow::Exit(code) => return Ok(Some(code)),
-                                KeyEventFlow::Unhandled => {}
-                            }
-
-                            if let StatusKeyFlow::Exit(code) = handle_status_key(
-                                &ev,
-                                key,
-                                &mut state,
-                                &mut config,
-                                &shared_config,
-                                &action_tx,
-                                &preloaded_transcript,
-                                &mut textarea,
-                                &mut vim_state,
-                                &theme,
-                                initial_prompt.clone(),
-                                || clear_terminal_scrollback(&mut terminal),
-                            )? {
-                                return Ok(Some(code));
-                            }
-                        }
-                    },
-                    IterationEvent::Runtime(tui_event) => match tui_event {
-                        TuiEvent::HistoryLoaded { .. } => {
-                            handle_runtime_event(
-                                tui_event,
-                                &mut state,
-                                &action_tx,
-                                &pending_workflow_notifications,
-                                &mut textarea,
-                                &mut vim_state,
-                                &theme,
-                            );
-                            if let Some(prompt) = pending_initial_prompt.take() {
-                                state.push_message(ChatMessage::User(prompt.clone()));
-                                state.enter_running();
-                                let _ = action_tx.send(UserAction::Submit(prompt));
-                            }
-                        }
-                        TuiEvent::MentionSearchDirty { generation } => {
-                            let text = textarea_text(&textarea);
-                            let cursor = textarea_cursor_byte_index(&textarea);
-                            mention_search
-                                .consume_dirty_at_cursor(generation, &text, cursor, &mut state);
-                        }
-                        TuiEvent::MentionCatalogDirty { generation } => {
-                            mention_search.consume_catalog_dirty(generation, &mut state);
-                        }
-                        TuiEvent::MentionRuntimeReady(thread) => {
-                            mention_search.install_runtime_actions(TuiSurfaceActions::new(thread));
-                        }
-                        TuiEvent::SettingsUpdated {
-                            model,
-                            reasoning_effort,
-                            approval_mode,
-                        } => {
-                            config.model = orca_core::model::ModelSelection::from_unchecked(Some(
-                                model.clone(),
-                            ));
-                            config.reasoning_effort = reasoning_effort;
-                            config.approval_mode = approval_mode;
-                            handle_runtime_event(
+                            },
+                            IterationEvent::Runtime(tui_event) => match tui_event {
+                                TuiEvent::HistoryLoaded { .. } => {
+                                    handle_runtime_event(
+                                        tui_event,
+                                        &mut state,
+                                        &action_tx,
+                                        &pending_workflow_notifications,
+                                        &mut textarea,
+                                        &mut vim_state,
+                                        &theme,
+                                        presentation,
+                                    );
+                                    if let Some(prompt) = pending_initial_prompt.take() {
+                                        state.push_message(ChatMessage::User(prompt.clone()));
+                                        state.enter_running();
+                                        let _ = action_tx.send(UserAction::Submit(prompt));
+                                    }
+                                }
+                                TuiEvent::MentionSearchDirty { generation } => {
+                                    let text = textarea_text(&textarea);
+                                    let cursor = textarea_cursor_byte_index(&textarea);
+                                    mention_search.consume_dirty_at_cursor(
+                                        generation, &text, cursor, &mut state,
+                                    );
+                                }
+                                TuiEvent::MentionCatalogDirty { generation } => {
+                                    mention_search.consume_catalog_dirty(generation, &mut state);
+                                }
+                                TuiEvent::MentionRuntimeReady(thread) => {
+                                    mention_search
+                                        .install_runtime_actions(TuiSurfaceActions::new(thread));
+                                }
                                 TuiEvent::SettingsUpdated {
                                     model,
                                     reasoning_effort,
                                     approval_mode,
-                                },
-                                &mut state,
-                                &action_tx,
-                                &pending_workflow_notifications,
-                                &mut textarea,
-                                &mut vim_state,
-                                &theme,
-                            );
+                                } => {
+                                    config.model = orca_core::model::ModelSelection::from_unchecked(
+                                        Some(model.clone()),
+                                    );
+                                    config.reasoning_effort = reasoning_effort;
+                                    config.approval_mode = approval_mode;
+                                    handle_runtime_event(
+                                        TuiEvent::SettingsUpdated {
+                                            model,
+                                            reasoning_effort,
+                                            approval_mode,
+                                        },
+                                        &mut state,
+                                        &action_tx,
+                                        &pending_workflow_notifications,
+                                        &mut textarea,
+                                        &mut vim_state,
+                                        &theme,
+                                        presentation,
+                                    );
+                                }
+                                tui_event => {
+                                    handle_runtime_event(
+                                        tui_event,
+                                        &mut state,
+                                        &action_tx,
+                                        &pending_workflow_notifications,
+                                        &mut textarea,
+                                        &mut vim_state,
+                                        &theme,
+                                        presentation,
+                                    );
+                                }
+                            },
                         }
-                        tui_event => {
-                            handle_runtime_event(
-                                tui_event,
-                                &mut state,
-                                &action_tx,
-                                &pending_workflow_notifications,
-                                &mut textarea,
-                                &mut vim_state,
-                                &theme,
-                                &mut presentation,
-                            );
-                        }
+                        Ok(None)
                     },
+                )?;
+                let mention_enabled = MentionSearchManager::is_enabled(&state);
+                mention_search
+                    .set_roots(mention_search_roots(&config, &workspace_root), &mut state);
+                let text = textarea_text(&textarea);
+                let cursor = textarea_cursor_byte_index(&textarea);
+                state.mention_bindings.reconcile(&text);
+                mention_search.sync_at_cursor(
+                    &text,
+                    cursor,
+                    mention_enabled,
+                    &mut state,
+                    Instant::now(),
+                );
+                if let Some(code) = iteration.exit_code {
+                    break 'main code;
                 }
-                Ok(None)
-            },
-        )?;
-        let mention_enabled = MentionSearchManager::is_enabled(&state);
-        mention_search.set_roots(mention_search_roots(&config, &workspace_root), &mut state);
-        let text = textarea_text(&textarea);
-        let cursor = textarea_cursor_byte_index(&textarea);
-        state.mention_bindings.reconcile(&text);
-        mention_search.sync_at_cursor(&text, cursor, mention_enabled, &mut state, Instant::now());
-        if let Some(code) = iteration.exit_code {
-            exit_code = code;
-            break 'main;
-        }
-        // A finished drag staged its text here; write it out via OSC 52 (plus
-        // pbcopy on macOS). The escape sequence is invisible to the UI, so no
-        // redraw coordination is needed.
-        if let Some(text) = state.pending_clipboard_copy.take() {
-            clipboard::copy_to_clipboard(&text);
-        }
-        let _ = presentation.write_pending(terminal.backend_mut().inner_mut(), state.status);
-        if let Some(draw_at) = iteration.draw_at {
-            terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
-            scheduler.did_draw(draw_at);
-        }
-    }
-
-    let _ = presentation.write_reset_title(terminal.backend_mut().inner_mut());
-    drop(terminal);
-    terminal_input.finish()?;
+                // A finished drag staged its text here; write it out via OSC 52 (plus
+                // pbcopy on macOS). The escape sequence is invisible to the UI, so no
+                // redraw coordination is needed.
+                if let Some(text) = state.pending_clipboard_copy.take() {
+                    clipboard::copy_to_clipboard(&text);
+                }
+                let _ =
+                    presentation.write_pending(terminal.backend_mut().inner_mut(), state.status);
+                if let Some(draw_at) = iteration.draw_at {
+                    terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
+                    scheduler.did_draw(draw_at);
+                }
+            };
+            Ok(exit_code)
+        },
+        |(terminal, mut presentation, mut terminal_input)| {
+            finish_terminal_presentation(
+                terminal,
+                |terminal| {
+                    let _ = presentation.write_reset_title(terminal.backend_mut().inner_mut());
+                    Ok(())
+                },
+                drop,
+                || terminal_input.finish(),
+            )
+        },
+    )?;
     mention_search.shutdown();
     drop(event_rx);
     agent_runtime.shutdown()?;
@@ -484,17 +525,59 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 fn resume_terminal_render(
     terminal: &mut InlineTerminal,
     scheduler: &mut FrameScheduler,
+    presentation: &mut TerminalPresentation,
 ) -> io::Result<()> {
-    complete_terminal_resume(|| terminal.clear(), || scheduler.mark_dirty())
+    complete_presentation_resume(
+        terminal,
+        Terminal::clear,
+        |_| presentation.invalidate_title(),
+        |_| scheduler.mark_dirty(),
+    )
 }
 
-fn complete_terminal_resume(
-    clear_terminal: impl FnOnce() -> io::Result<()>,
-    mark_dirty: impl FnOnce(),
+fn initialize_terminal_presentation<T>(
+    target: &mut T,
+    write_title: impl FnOnce(&mut T) -> io::Result<()>,
+    draw: impl FnOnce(&mut T) -> io::Result<()>,
 ) -> io::Result<()> {
-    clear_terminal()?;
-    mark_dirty();
+    write_title(target)?;
+    draw(target)
+}
+
+fn complete_presentation_resume<T>(
+    target: &mut T,
+    clear_terminal: impl FnOnce(&mut T) -> io::Result<()>,
+    invalidate_title: impl FnOnce(&mut T),
+    mark_dirty: impl FnOnce(&mut T),
+) -> io::Result<()> {
+    clear_terminal(target)?;
+    invalidate_title(target);
+    mark_dirty(target);
     Ok(())
+}
+
+fn finish_terminal_presentation<T>(
+    mut terminal: T,
+    reset_title: impl FnOnce(&mut T) -> io::Result<()>,
+    drop_terminal: impl FnOnce(T),
+    finish_input: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    reset_title(&mut terminal)?;
+    drop_terminal(terminal);
+    finish_input()
+}
+
+fn with_terminal_presentation_cleanup<T, R>(
+    mut resource: T,
+    body: impl FnOnce(&mut T) -> io::Result<R>,
+    cleanup: impl FnOnce(T) -> io::Result<()>,
+) -> io::Result<R> {
+    let result = body(&mut resource);
+    let cleanup_result = cleanup(resource);
+    match result {
+        Err(error) => Err(error),
+        Ok(value) => cleanup_result.map(|()| value),
+    }
 }
 
 #[cfg(test)]
@@ -526,6 +609,7 @@ enum InputWake {
     Resumed,
 }
 
+#[cfg(test)]
 fn receive_input_or_control(
     events: &mpsc::Receiver<Event>,
     controls: &mpsc::Receiver<InputControl>,
@@ -549,6 +633,55 @@ fn receive_input_or_control(
             if limit > 0 {
                 batch.push(first);
                 while batch.len() < limit {
+                    match events.try_recv() {
+                        Ok(event) => batch.push(event),
+                        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+            }
+            Ok(InputWake::Events(batch))
+        }
+        recv(timeout_rx) -> _ => Err(mpsc::RecvTimeoutError::Timeout),
+    }
+}
+
+fn receive_prioritized_input_or_control(
+    events: &mpsc::Receiver<Event>,
+    focus_events: &mpsc::Receiver<Event>,
+    controls: &mpsc::Receiver<InputControl>,
+    timeout: Duration,
+    ordinary_limit: usize,
+) -> Result<InputWake, mpsc::RecvTimeoutError> {
+    let timeout_rx = mpsc::after(timeout);
+    crossbeam_channel::select_biased! {
+        recv(controls) -> control => {
+            match control {
+                Ok(InputControl::Suspend { acknowledge }) => {
+                    Ok(InputWake::Suspend { acknowledge })
+                }
+                Ok(InputControl::Resumed) => Ok(InputWake::Resumed),
+                Err(_) => Err(mpsc::RecvTimeoutError::Disconnected),
+            }
+        }
+        recv(focus_events) -> focus => {
+            let first = focus.map_err(|_| mpsc::RecvTimeoutError::Disconnected)?;
+            let mut batch = Vec::with_capacity(focus_events.len().saturating_add(1));
+            batch.push(first);
+            batch.extend(focus_events.try_iter());
+            for _ in 0..ordinary_limit {
+                match events.try_recv() {
+                    Ok(event) => batch.push(event),
+                    Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+            Ok(InputWake::Events(batch))
+        }
+        recv(events) -> event => {
+            let first = event.map_err(|_| mpsc::RecvTimeoutError::Disconnected)?;
+            let mut batch = Vec::with_capacity(ordinary_limit.max(1).min(events.len().saturating_add(1)));
+            if ordinary_limit > 0 {
+                batch.push(first);
+                while batch.len() < ordinary_limit {
                     match events.try_recv() {
                         Ok(event) => batch.push(event),
                         Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
@@ -928,69 +1061,210 @@ mod tests {
     }
 
     #[test]
-    fn completed_resume_clears_ratatui_before_marking_the_frame_dirty() {
-        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let clear_calls = std::rc::Rc::clone(&calls);
-        let dirty_calls = std::rc::Rc::clone(&calls);
+    fn receive_input_or_control_prioritizes_focus_beyond_the_ordinary_input_cap() {
+        for focus in [Event::FocusLost, Event::FocusGained] {
+            let (event_tx, event_rx) = mpsc::bounded(128);
+            for _ in 0..65 {
+                event_tx
+                    .send(Event::Key(KeyEvent::new(
+                        KeyCode::Char('x'),
+                        KeyModifiers::NONE,
+                    )))
+                    .expect("event receiver alive");
+            }
+            let (focus_tx, focus_rx) = mpsc::bounded(8);
+            focus_tx.send(focus.clone()).expect("focus receiver alive");
+            let (_control_tx, control_rx) = mpsc::bounded(1);
 
-        complete_terminal_resume(
-            move || {
-                clear_calls.borrow_mut().push("clear");
+            let wake = receive_prioritized_input_or_control(
+                &event_rx,
+                &focus_rx,
+                &control_rx,
+                Duration::from_millis(10),
+                64,
+            )
+            .expect("queued input should be received");
+            let InputWake::Events(events) = wake else {
+                panic!("expected input events");
+            };
+
+            let started = Instant::now();
+            let mut scheduler = FrameScheduler::new(
+                started,
+                Duration::from_millis(16),
+                Duration::from_millis(80),
+            );
+            scheduler.did_draw(started);
+            let mut handled_focus = false;
+            let mut handled_keys = 0;
+            run_event_loop_iteration(
+                &mut scheduler,
+                events,
+                std::iter::empty::<()>(),
+                usize::MAX,
+                0,
+                || started,
+                |event| {
+                    if let IterationEvent::Input(event) = event {
+                        match event {
+                            Event::FocusLost | Event::FocusGained => handled_focus = true,
+                            Event::Key(_) => handled_keys += 1,
+                            _ => {}
+                        }
+                    }
+                    Ok::<Option<i32>, ()>(None)
+                },
+            )
+            .expect("prioritized iteration");
+
+            assert!(
+                handled_focus,
+                "focus changes must bypass the ordinary input cap"
+            );
+            assert_eq!(handled_keys, 64);
+            assert_eq!(event_rx.len(), 1, "ordinary overflow remains queued");
+
+            let next = receive_prioritized_input_or_control(
+                &event_rx,
+                &focus_rx,
+                &control_rx,
+                Duration::ZERO,
+                64,
+            )
+            .expect("queued overflow should be returned without waiting");
+            let InputWake::Events(next) = next else {
+                panic!("expected queued overflow");
+            };
+            assert!(matches!(next.as_slice(), [Event::Key(_)]));
+            assert!(event_rx.is_empty());
+        }
+    }
+
+    #[test]
+    fn prioritized_focus_preserves_bounded_ordinary_input_backpressure() {
+        let (event_tx, event_rx) = mpsc::bounded(128);
+        let (focus_tx, focus_rx) = mpsc::bounded(8);
+        let (_control_tx, control_rx) = mpsc::bounded(1);
+
+        for _ in 0..3 {
+            while event_tx.len() < 128 {
+                event_tx
+                    .send(Event::Key(KeyEvent::new(
+                        KeyCode::Char('x'),
+                        KeyModifiers::NONE,
+                    )))
+                    .expect("event receiver alive");
+            }
+            focus_tx
+                .send(Event::FocusLost)
+                .expect("focus receiver alive");
+            let wake = receive_prioritized_input_or_control(
+                &event_rx,
+                &focus_rx,
+                &control_rx,
+                Duration::ZERO,
+                64,
+            )
+            .expect("queued input should be received");
+            assert!(matches!(wake, InputWake::Events(_)));
+        }
+
+        assert_eq!(event_rx.len(), 64);
+        assert!(focus_rx.is_empty());
+    }
+
+    #[test]
+    fn terminal_title_writes_before_initial_draw() {
+        let mut calls = Vec::new();
+        initialize_terminal_presentation(
+            &mut calls,
+            |calls| {
+                calls.push("write-start");
                 Ok(())
             },
-            move || dirty_calls.borrow_mut().push("dirty"),
+            |calls| {
+                calls.push("draw-start");
+                Ok(())
+            },
         )
-        .expect("resume should complete");
+        .expect("startup presentation");
+        assert_eq!(calls, ["write-start", "draw-start"]);
+    }
 
-        assert_eq!(*calls.borrow(), ["clear", "dirty"]);
+    #[test]
+    fn presentation_resume_clears_invalidates_then_marks_dirty() {
+        let mut calls = Vec::new();
+        complete_presentation_resume(
+            &mut calls,
+            |calls| {
+                calls.push("clear");
+                Ok(())
+            },
+            |calls| calls.push("invalidate"),
+            |calls| calls.push("dirty"),
+        )
+        .expect("resume presentation");
+        assert_eq!(calls, ["clear", "invalidate", "dirty"]);
 
-        let dirty = std::rc::Rc::new(std::cell::Cell::new(false));
-        let dirty_after_error = std::rc::Rc::clone(&dirty);
-        let error = complete_terminal_resume(
-            || Err(io::Error::other("clear failed")),
-            move || dirty_after_error.set(true),
+        let mut calls = Vec::new();
+        let error = complete_presentation_resume(
+            &mut calls,
+            |_| Err(io::Error::other("clear failed")),
+            |calls| calls.push("invalidate"),
+            |calls| calls.push("dirty"),
         )
         .expect_err("clear failure should stop resume");
         assert_eq!(error.to_string(), "clear failed");
-        assert!(!dirty.get());
+        assert!(calls.is_empty());
     }
 
     #[test]
-    fn terminal_presentation_animation_resume_and_exit_are_wired_in_order() {
-        let production = include_str!("app.rs")
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("production source before tests");
-
-        assert!(production.contains("presentation.animation_active(state.status)"));
-        assert!(production.contains("presentation.advance_tick()"));
-
-        let resumed = production
-            .find("Ok(InputControl::Resumed)")
-            .expect("resume branch");
-        let clear = production[resumed..]
-            .find("resume_terminal_render")
-            .map(|offset| resumed + offset)
-            .expect("ratatui clear after resume");
-        let invalidate = production[resumed..]
-            .find("presentation.invalidate_title")
-            .map(|offset| resumed + offset)
-            .expect("title invalidation after resume");
-        assert!(clear < invalidate);
-
-        let reset = production
-            .rfind("presentation.write_reset_title")
-            .expect("orderly title reset");
-        let drop_terminal = production.rfind("drop(terminal)").expect("ratatui drop");
-        let finish_qwertty = production
-            .rfind("terminal_input.finish")
-            .expect("qwertty finish");
-        assert!(reset < drop_terminal);
-        assert!(drop_terminal < finish_qwertty);
+    fn presentation_exit_resets_drops_then_finishes_input() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let reset_exit = std::rc::Rc::clone(&calls);
+        let drop_exit = std::rc::Rc::clone(&calls);
+        let finish_exit = std::rc::Rc::clone(&calls);
+        finish_terminal_presentation(
+            (),
+            move |_| {
+                reset_exit.borrow_mut().push("reset");
+                Ok(())
+            },
+            move |_| drop_exit.borrow_mut().push("drop"),
+            move || {
+                finish_exit.borrow_mut().push("finish");
+                Ok(())
+            },
+        )
+        .expect("exit presentation");
+        assert_eq!(*calls.borrow(), ["reset", "drop", "finish"]);
     }
 
     #[test]
-    fn terminal_input_ownership_is_single_and_drop_ordered() {
+    fn presentation_exit_cleanup_runs_after_body_error() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let body = std::rc::Rc::clone(&calls);
+        let cleanup = std::rc::Rc::clone(&calls);
+
+        let error = with_terminal_presentation_cleanup(
+            (),
+            move |_| {
+                body.borrow_mut().push("body");
+                Err::<i32, _>(io::Error::other("body failed"))
+            },
+            move |_| {
+                cleanup.borrow_mut().push("cleanup");
+                Ok(())
+            },
+        )
+        .expect_err("body error should be preserved");
+
+        assert_eq!(error.to_string(), "body failed");
+        assert_eq!(*calls.borrow(), ["body", "cleanup"]);
+    }
+
+    #[test]
+    fn terminal_input_ownership_is_single() {
         let production = include_str!("app.rs")
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
@@ -1019,14 +1293,9 @@ mod tests {
         let terminal = production
             .find("Terminal::new")
             .expect("ratatui terminal is constructed");
-        let drop_terminal = production
-            .find("drop(terminal)")
-            .expect("ratatui terminal is explicitly dropped");
-        let finish_after_drop = production[drop_terminal..]
-            .find("terminal_input.finish")
-            .expect("qwertty input is explicitly finished");
         assert!(start < terminal);
-        assert!(finish_after_drop > 0);
+        assert_eq!(production.matches("InputRuntime::start").count(), 1);
+        assert_eq!(production.matches("Terminal::new").count(), 1);
     }
 
     #[test]
