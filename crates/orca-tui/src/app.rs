@@ -914,6 +914,22 @@ mod tests {
     };
     use tempfile::tempdir;
 
+    fn inserted_source_line<'a>(
+        lines: &'a [ratatui::text::Line<'static>],
+        source: &str,
+    ) -> &'a ratatui::text::Line<'static> {
+        lines
+            .iter()
+            .find(|line| {
+                line.to_string().contains(source)
+                    && line
+                        .spans
+                        .first()
+                        .is_some_and(|span| span.content.ends_with("+ "))
+            })
+            .unwrap_or_else(|| panic!("inserted source line containing {source:?}"))
+    }
+
     #[test]
     fn receive_input_batch_waits_drains_and_caps() {
         let (sender, receiver) = mpsc::bounded(128);
@@ -1526,11 +1542,7 @@ mod tests {
         let cold = state
             .transcript_render_cache
             .viewport(0, usize::MAX, usize::MAX);
-        let cold_insert = cold
-            .lines
-            .iter()
-            .find(|line| line.to_string().contains("+value = 2"))
-            .expect("cold inserted line");
+        let cold_insert = inserted_source_line(&cold.lines, "value = 2");
         assert!(
             cold_insert
                 .spans
@@ -1565,15 +1577,16 @@ mod tests {
         let warm = state
             .transcript_render_cache
             .viewport(0, usize::MAX, usize::MAX);
-        let warm_insert = warm
-            .lines
-            .iter()
-            .find(|line| line.to_string().contains("+value = 2"))
-            .expect("refined inserted line");
-        assert!(warm_insert.spans.iter().any(|span| {
-            span.content.as_ref() == "value = 2"
-                && span.style.fg == Some(ratatui::style::Color::Magenta)
-        }));
+        let warm_insert = inserted_source_line(&warm.lines, "value = 2");
+        assert_eq!(
+            warm_insert
+                .spans
+                .iter()
+                .filter(|span| { span.style.fg == Some(ratatui::style::Color::Magenta) })
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "value = 2"
+        );
 
         let revisions_after = state.message_revisions.clone();
         terminal

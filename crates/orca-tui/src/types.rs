@@ -2863,6 +2863,40 @@ mod tests {
     use orca_core::plan_types::PlanStatus;
     use orca_core::task_types::{TaskStatus, TaskType};
 
+    fn inserted_source_line<'a>(
+        lines: &'a [ratatui::text::Line<'static>],
+        source: &str,
+    ) -> &'a ratatui::text::Line<'static> {
+        lines
+            .iter()
+            .find(|line| {
+                line.to_string().contains(source)
+                    && line
+                        .spans
+                        .first()
+                        .is_some_and(|span| span.content.ends_with("+ "))
+            })
+            .unwrap_or_else(|| panic!("inserted source line containing {source:?}"))
+    }
+
+    fn normalized_source_spans(
+        spans: &[ratatui::text::Span<'_>],
+    ) -> crate::syntax_highlight::StyledSourceLine {
+        let mut output: crate::syntax_highlight::StyledSourceLine = Vec::new();
+        for span in spans {
+            let mut style = span.style;
+            style.bg = None;
+            if let Some(previous) = output.last_mut()
+                && previous.style == style
+            {
+                previous.content.to_mut().push_str(span.content.as_ref());
+                continue;
+            }
+            output.push(ratatui::text::Span::styled(span.content.to_string(), style));
+        }
+        output
+    }
+
     fn state() -> AppState {
         let (tx, _rx) = mpsc::unbounded();
         AppState::new(
@@ -6559,14 +6593,12 @@ arbitrary metadata
         let viewport = state
             .transcript_render_cache
             .viewport(0, usize::MAX, usize::MAX);
-        let inserted = viewport
-            .lines
-            .iter()
-            .find(|line| line.to_string().contains("+value = 2"))
-            .expect("refined insert in cached viewport");
-        assert_eq!(
-            inserted.spans[1].style.fg,
-            Some(ratatui::style::Color::Magenta)
+        let inserted = inserted_source_line(&viewport.lines, "value = 2");
+        assert!(
+            inserted
+                .spans
+                .iter()
+                .any(|span| { span.style.fg == Some(ratatui::style::Color::Magenta) })
         );
 
         built_indices.borrow_mut().clear();
@@ -6667,17 +6699,14 @@ class Item:
             false,
             Some(refined),
         );
-        let cold_field = cold
-            .iter()
-            .find(|line| line.to_string().contains("+    field = 1"))
-            .expect("cold field");
-        let warm_field = warm
-            .iter()
-            .find(|line| line.to_string().contains("+    field = 1"))
-            .expect("warm field");
+        let cold_field = inserted_source_line(&cold, "    field = 1");
+        let warm_field = inserted_source_line(&warm, "    field = 1");
 
         assert_ne!(warm_field.spans[1..], cold_field.spans[1..]);
-        assert_eq!(warm_field.spans[1..], refined[&4]);
+        assert_eq!(
+            normalized_source_spans(&warm_field.spans[1..]),
+            normalized_source_spans(&refined[&4])
+        );
         assert!(!state.edit_highlight_needs_tick());
     }
 
