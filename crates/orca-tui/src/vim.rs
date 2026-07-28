@@ -413,6 +413,24 @@ impl VimState {
         command: VimCommand,
         textarea: &mut TextArea<'_>,
     ) -> VimCommandOutcome {
+        if let VimCommand::Repeat { count } = command {
+            return self.repeat_change(textarea, count);
+        }
+        let repeatable = repeatable_change(&command);
+        let outcome = self.execute_command_without_repeat(command, textarea);
+        if outcome.text_changed
+            && let Some(change) = repeatable
+        {
+            self.last_change = Some(change);
+        }
+        outcome
+    }
+
+    fn execute_command_without_repeat(
+        &mut self,
+        command: VimCommand,
+        textarea: &mut TextArea<'_>,
+    ) -> VimCommandOutcome {
         match command {
             VimCommand::Motion { motion, count } => VimCommandOutcome {
                 redraw: execute_motion(textarea, motion, count, false),
@@ -522,9 +540,80 @@ impl VimState {
                     text_changed: changed,
                 }
             }
-            VimCommand::Repeat { .. } => VimCommandOutcome::default(),
+            VimCommand::Repeat { .. } => {
+                unreachable!("repeat is handled by execute_command")
+            }
         }
     }
+
+    fn repeat_change(
+        &mut self,
+        textarea: &mut TextArea<'_>,
+        multiplier: usize,
+    ) -> VimCommandOutcome {
+        let Some(change) = self.last_change.clone() else {
+            return VimCommandOutcome::default();
+        };
+        match change {
+            RepeatableChange::DeleteChars { count, register } => self
+                .execute_command_without_repeat(
+                    VimCommand::DeleteChars {
+                        count: multiplied_count(count, multiplier),
+                        register,
+                    },
+                    textarea,
+                ),
+            RepeatableChange::DeleteToEnd { register } => {
+                let mut outcome = VimCommandOutcome::default();
+                for _ in 0..multiplier.min(crate::vim_command::MAX_VIM_COUNT) {
+                    let next = self.execute_command_without_repeat(
+                        VimCommand::DeleteToEnd { register },
+                        textarea,
+                    );
+                    outcome.redraw |= next.redraw;
+                    outcome.text_changed |= next.text_changed;
+                    if !next.text_changed {
+                        break;
+                    }
+                }
+                outcome
+            }
+            RepeatableChange::DeleteLines { count, register } => self
+                .execute_command_without_repeat(
+                    VimCommand::DeleteLines {
+                        count: multiplied_count(count, multiplier),
+                        register,
+                    },
+                    textarea,
+                ),
+            RepeatableChange::Paste { count, register } => self.execute_command_without_repeat(
+                VimCommand::Paste {
+                    count: multiplied_count(count, multiplier),
+                    register,
+                },
+                textarea,
+            ),
+        }
+    }
+}
+
+fn repeatable_change(command: &VimCommand) -> Option<RepeatableChange> {
+    match *command {
+        VimCommand::DeleteChars { count, register } => {
+            Some(RepeatableChange::DeleteChars { count, register })
+        }
+        VimCommand::DeleteToEnd { register } => Some(RepeatableChange::DeleteToEnd { register }),
+        VimCommand::DeleteLines { count, register } => {
+            Some(RepeatableChange::DeleteLines { count, register })
+        }
+        VimCommand::Paste { count, register } => Some(RepeatableChange::Paste { count, register }),
+        _ => None,
+    }
+}
+
+fn multiplied_count(base: usize, multiplier: usize) -> usize {
+    base.saturating_mul(multiplier)
+        .min(crate::vim_command::MAX_VIM_COUNT)
 }
 
 fn move_to_line_head(textarea: &mut TextArea<'_>) {
@@ -944,6 +1033,80 @@ mod tests {
             delete_state.register_for_test(VimRegisterSelector::Named(1)),
             Some(("a", VimRegisterKind::Characterwise))
         );
+    }
+
+    #[test]
+    fn dot_repeats_x_and_counted_line_delete() {
+        let theme = Theme::named(ThemeName::Dark);
+
+        let mut x_state = VimState::new(true);
+        let mut x_area = TextArea::from(["abcd"]);
+        x_state.handle(input('x'), &mut x_area, &theme);
+        x_state.handle(input('.'), &mut x_area, &theme);
+        assert_eq!(x_area.lines(), &["cd"]);
+
+        let mut dd_state = VimState::new(true);
+        let mut dd_area = TextArea::from(["zero", "one", "two", "three", "four"]);
+        handle_sequence(&mut dd_state, &mut dd_area, &theme, "2dd.");
+        assert_eq!(dd_area.lines(), &["four"]);
+    }
+
+    #[test]
+    fn count_before_dot_multiplies_the_stored_count_with_a_bound() {
+        let theme = Theme::named(ThemeName::Dark);
+        let mut state = VimState::new(true);
+        let mut textarea = TextArea::from(["abcdefgh"]);
+        state.handle(input('x'), &mut textarea, &theme);
+        handle_sequence(&mut state, &mut textarea, &theme, "3.");
+        assert_eq!(textarea.lines(), &["efgh"]);
+    }
+
+    #[test]
+    fn failed_change_movement_yank_and_undo_do_not_replace_repeat() {
+        let theme = Theme::named(ThemeName::Dark);
+        let mut state = VimState::new(true);
+        let mut textarea = TextArea::from(["abcd"]);
+        state.handle(input('x'), &mut textarea, &theme);
+        handle_sequence(&mut state, &mut textarea, &theme, "yy");
+        state.handle(input('l'), &mut textarea, &theme);
+        move_to_line_end(&mut textarea);
+        state.handle(input('x'), &mut textarea, &theme);
+        textarea.move_cursor(CursorMove::Back);
+        state.handle(input('.'), &mut textarea, &theme);
+        assert_eq!(textarea.lines(), &["bc"]);
+
+        state.handle(input('u'), &mut textarea, &theme);
+        textarea.move_cursor(CursorMove::Back);
+        state.handle(input('.'), &mut textarea, &theme);
+        assert_eq!(textarea.lines(), &["bc"]);
+    }
+
+    #[test]
+    fn named_paste_repeat_reads_the_registers_current_value() {
+        let theme = Theme::named(ThemeName::Dark);
+        let mut state = VimState::new(true);
+        let mut textarea = TextArea::from(["abc"]);
+        handle_sequence(&mut state, &mut textarea, &theme, "\"ax");
+        textarea.move_cursor(CursorMove::End);
+        handle_sequence(&mut state, &mut textarea, &theme, "\"ap");
+        state.registers.write(
+            VimRegisterSelector::Named(0),
+            VimRegisterValue {
+                text: "Z".to_string(),
+                kind: VimRegisterKind::Characterwise,
+            },
+        );
+        state.handle(input('.'), &mut textarea, &theme);
+        assert_eq!(textarea.lines(), &["bcaZ"]);
+    }
+
+    #[test]
+    fn dot_without_a_previous_change_is_a_safe_noop() {
+        let theme = Theme::named(ThemeName::Dark);
+        let mut state = VimState::new(true);
+        let mut textarea = TextArea::from(["abc"]);
+        assert!(!state.handle(input('.'), &mut textarea, &theme));
+        assert_eq!(textarea.lines(), &["abc"]);
     }
 
     #[test]
