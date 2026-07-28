@@ -48,6 +48,7 @@ mod syntax_highlight;
 mod terminal_capabilities;
 mod terminal_presentation;
 pub mod theme;
+mod transcript_search;
 mod transcript_view;
 pub mod types;
 pub mod ui;
