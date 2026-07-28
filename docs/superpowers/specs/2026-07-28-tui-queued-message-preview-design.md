@@ -300,7 +300,8 @@ The action:
 4. restores mention bindings against visible composer text;
 5. resets history navigation;
 6. places the cursor at the end;
-7. returns Vim to insert mode using the existing post-restore convention;
+7. applies the existing post-submit/post-rejection Vim reset convention
+   (`Normal` when Vim mode is enabled, `Insert` otherwise);
 8. redraws the preview.
 
 Replacing the current composer is deliberate and matches the explicit “edit
