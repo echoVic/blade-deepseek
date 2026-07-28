@@ -327,7 +327,65 @@ mod platform {
         sandbox_command(request)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    fn resolved_windows_shell_command(script: &str, cwd: &Path) -> Command {
+        let shell = match orca_platform::shell::ShellResolver::for_current_host()
+            .resolve_from_environment()
+        {
+            Ok(shell) => shell,
+            Err(_) => {
+                let mut command = Command::new("cmd.exe");
+                command
+                    .args(["/D", "/S", "/C", "exit /b 1"])
+                    .current_dir(cwd);
+                return command;
+            }
+        };
+        let spec = shell.command(script);
+        let mut command = Command::new(spec.program);
+        command.args(spec.args).current_dir(cwd);
+        command
+    }
+
+    #[cfg(target_os = "windows")]
+    fn unsupported_windows_sandbox_command(cwd: &Path) -> Command {
+        let shell =
+            orca_platform::shell::ShellResolver::for_current_host().resolve_from_environment();
+        let script = match shell.as_ref().map(|shell| shell.kind()) {
+            Ok(orca_platform::shell::ShellKind::Cmd) => {
+                "echo Windows sandbox commands must be launched through the runtime Windows sandbox 1>&2 & exit /b 1"
+            }
+            Ok(orca_platform::shell::ShellKind::PowerShell(_)) => {
+                "Write-Error 'Windows sandbox commands must be launched through the runtime Windows sandbox'; exit 1"
+            }
+            Ok(
+                orca_platform::shell::ShellKind::Posix | orca_platform::shell::ShellKind::GitBash,
+            ) => {
+                "printf '%s\\n' 'Windows sandbox commands must be launched through the runtime Windows sandbox' >&2; exit 1"
+            }
+            Err(_) => "exit /b 1",
+        };
+        resolved_windows_shell_command(script, cwd)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn workspace_write_bash_command(
+        context: WorkspaceWriteSandboxCommandContext<'_>,
+    ) -> Command {
+        unsupported_windows_sandbox_command(context.cwd)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn read_only_bash_command(context: ReadOnlySandboxCommandContext<'_>) -> Command {
+        unsupported_windows_sandbox_command(context.cwd)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn plain_bash_command(command: &str, cwd: &Path) -> Command {
+        resolved_windows_shell_command(command, cwd)
+    }
+
+    #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
     pub fn workspace_write_bash_command(
         context: WorkspaceWriteSandboxCommandContext<'_>,
     ) -> Command {
@@ -405,13 +463,14 @@ mod platform {
         sandbox_command(request)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
     pub fn read_only_bash_command(context: ReadOnlySandboxCommandContext<'_>) -> Command {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(context.command).current_dir(context.cwd);
         cmd
     }
 
+    #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
     pub fn plain_bash_command(command: &str, cwd: &Path) -> Command {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command).current_dir(cwd);
@@ -432,5 +491,40 @@ mod platform {
     #[cfg(test)]
     pub fn seatbelt_available() -> bool {
         false
+    }
+
+    #[cfg(all(test, target_os = "windows"))]
+    mod windows_tests {
+        use super::*;
+
+        #[test]
+        fn plain_commands_use_the_resolved_windows_shell() {
+            let cwd = std::env::current_dir().expect("current directory");
+            let command = plain_bash_command("Write-Output orca", &cwd);
+            let program = command.get_program().to_string_lossy().to_ascii_lowercase();
+            assert!(!program.ends_with("\\sh"));
+            assert!(!program.ends_with("/sh"));
+            assert!(program.ends_with(".exe"));
+        }
+
+        #[test]
+        fn restricted_compatibility_commands_fail_closed() {
+            let cwd = std::env::current_dir().expect("current directory");
+            let command = workspace_write_bash_command(WorkspaceWriteSandboxCommandContext {
+                command: "Write-Output orca",
+                cwd: &cwd,
+                readable_roots: &[],
+                additional_roots: &[],
+                metadata_writable_roots: &[],
+                denied_roots: &[],
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+                allowed_unix_socket_roots: &[],
+            });
+            let program = command.get_program().to_string_lossy().to_ascii_lowercase();
+            assert!(!program.ends_with("\\sh"));
+            assert!(!program.ends_with("/sh"));
+        }
     }
 }
