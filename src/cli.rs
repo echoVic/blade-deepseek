@@ -874,6 +874,7 @@ fn run_exec(args: ExecArgs) -> i32 {
         vim_mode: file_config.vim_mode,
         update_check: file_config.update_check,
         desktop_notifications: file_config.desktop_notifications,
+        terminal_notifications: false,
         auto_memory: file_config.auto_memory,
     };
 
@@ -1604,6 +1605,7 @@ fn build_workflow_run_config(
         vim_mode: file_config.vim_mode,
         update_check: file_config.update_check,
         desktop_notifications: false,
+        terminal_notifications: false,
         auto_memory: file_config.auto_memory,
     })
 }
@@ -1658,6 +1660,7 @@ fn build_worker_run_config(
         vim_mode: file_config.vim_mode,
         update_check: file_config.update_check,
         desktop_notifications: false,
+        terminal_notifications: false,
         auto_memory: file_config.auto_memory,
     })
 }
@@ -2293,6 +2296,7 @@ fn run_placeholder(cli: Cli) -> i32 {
         vim_mode: file_config.vim_mode,
         update_check: file_config.update_check,
         desktop_notifications: file_config.desktop_notifications,
+        terminal_notifications: file_config.terminal_notifications,
         auto_memory: file_config.auto_memory,
     };
 
@@ -2564,6 +2568,7 @@ fn run_server(cli: Cli) -> i32 {
         vim_mode: file_config.vim_mode,
         update_check: file_config.update_check,
         desktop_notifications: false,
+        terminal_notifications: false,
         auto_memory: file_config.auto_memory,
     };
 
@@ -2635,6 +2640,7 @@ fn run_acp(cli: Cli) -> i32 {
         vim_mode: file_config.vim_mode,
         update_check: file_config.update_check,
         desktop_notifications: false,
+        terminal_notifications: false,
         auto_memory: file_config.auto_memory,
     };
 

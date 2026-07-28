@@ -1503,6 +1503,7 @@ mod tests {
             vim_mode: false,
             update_check: false,
             desktop_notifications: false,
+            terminal_notifications: false,
             auto_memory: false,
         }
     }

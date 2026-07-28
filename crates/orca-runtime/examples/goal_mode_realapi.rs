@@ -236,6 +236,7 @@ fn real_api_config(api_key: String, max_budget_usd: f64) -> Result<RunConfig, St
         vim_mode: false,
         update_check: false,
         desktop_notifications: false,
+        terminal_notifications: false,
         auto_memory: false,
     })
 }
