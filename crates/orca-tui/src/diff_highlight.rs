@@ -112,7 +112,11 @@ fn owned_inline_segments(
 fn cluster_inline_segments(
     entries: &[DiffHunkEntry],
     cluster: ReplacementCluster,
+    deadline: Instant,
 ) -> Option<InlineSegmentMap> {
+    if Instant::now() >= deadline {
+        return None;
+    }
     let old_lines = entries[cluster.delete_start..cluster.delete_end]
         .iter()
         .map(|entry| match entry {
@@ -134,12 +138,12 @@ fn cluster_inline_segments(
     }
 
     let diff = TextDiff::from_lines(&old_text, &new_text);
-    let deadline = Some(Instant::now() + INLINE_DIFF_DEADLINE);
+    let cooperative_deadline = Some(deadline);
     let mut segments = InlineSegmentMap::new();
     for change in diff
         .ops()
         .iter()
-        .flat_map(|op| diff.iter_inline_changes_deadline(op, deadline))
+        .flat_map(|op| diff.iter_inline_changes_deadline(op, cooperative_deadline))
     {
         match change.tag() {
             ChangeTag::Delete => {
@@ -173,6 +177,9 @@ fn cluster_inline_segments(
             }
         }
     }
+    if Instant::now() >= deadline {
+        return None;
+    }
     let expected_len = cluster
         .delete_end
         .saturating_sub(cluster.delete_start)
@@ -187,14 +194,31 @@ fn cluster_inline_segments(
     (segments.len() == expected_len && has_emphasized && has_unchanged).then_some(segments)
 }
 
-fn visible_inline_segments(entries: &[DiffHunkEntry], entry_budget: usize) -> InlineSegmentMap {
+fn visible_inline_segments(
+    entries: &[DiffHunkEntry],
+    entry_budget: usize,
+    deadline: Instant,
+) -> InlineSegmentMap {
     let visible_end = entry_budget.min(entries.len());
     let mut output = InlineSegmentMap::new();
-    for cluster in replacement_clusters(entries) {
-        if cluster.insert_end > visible_end {
+    for cluster in replacement_clusters(&entries[..visible_end]) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let continues_beyond_budget = cluster.insert_end == visible_end
+            && entries.get(visible_end).is_some_and(|entry| {
+                matches!(
+                    entry,
+                    DiffHunkEntry::Source(DiffSourceLine {
+                        kind: DiffLineKind::Insert,
+                        ..
+                    })
+                )
+            });
+        if continues_beyond_budget {
             continue;
         }
-        let Some(cluster_segments) = cluster_inline_segments(entries, cluster) else {
+        let Some(cluster_segments) = cluster_inline_segments(entries, cluster, deadline) else {
             continue;
         };
         output.extend(cluster_segments);
@@ -1099,8 +1123,11 @@ fn render_hunk_fallback(
     entry_budget: usize,
     theme: &Theme,
     gutter_width: usize,
+    inline_deadline: Option<Instant>,
 ) -> Vec<Line<'static>> {
-    let inline_segments = visible_inline_segments(&hunk.entries, entry_budget);
+    let inline_segments = inline_deadline.map_or_else(InlineSegmentMap::new, |deadline| {
+        visible_inline_segments(&hunk.entries, entry_budget, deadline)
+    });
     hunk.entries
         .iter()
         .take(entry_budget)
@@ -1125,10 +1152,11 @@ fn render_hunk_with(
     theme: &Theme,
     refined: Option<&RefinedDiffStyles>,
     gutter_width: usize,
+    inline_deadline: Instant,
     mut highlight: impl FnMut(DiffSide, &str) -> Option<StyledSourceLine>,
 ) -> Vec<Line<'static>> {
     let visible_entries = hunk.entries.iter().take(entry_budget).collect::<Vec<_>>();
-    let inline_segments = visible_inline_segments(&hunk.entries, entry_budget);
+    let inline_segments = visible_inline_segments(&hunk.entries, entry_budget, inline_deadline);
     let mut highlighted = Vec::with_capacity(visible_entries.len());
     for entry in &visible_entries {
         let DiffHunkEntry::Source(line) = entry else {
@@ -1137,7 +1165,13 @@ fn render_hunk_with(
         let spans = match line.kind {
             DiffLineKind::Context => {
                 if highlight(DiffSide::Old, &line.content).is_none() {
-                    return render_hunk_fallback(hunk, entry_budget, theme, gutter_width);
+                    return render_hunk_fallback(
+                        hunk,
+                        entry_budget,
+                        theme,
+                        gutter_width,
+                        Some(inline_deadline),
+                    );
                 }
                 highlight(DiffSide::New, &line.content)
             }
@@ -1145,7 +1179,13 @@ fn render_hunk_with(
             DiffLineKind::Delete => highlight(DiffSide::Old, &line.content),
         };
         let Some(spans) = spans else {
-            return render_hunk_fallback(hunk, entry_budget, theme, gutter_width);
+            return render_hunk_fallback(
+                hunk,
+                entry_budget,
+                theme,
+                gutter_width,
+                Some(inline_deadline),
+            );
         };
         highlighted.push(spans);
     }
@@ -1270,6 +1310,15 @@ pub(crate) fn render_parsed_diff(
     theme: &Theme,
     refined: Option<&RefinedDiffStyles>,
 ) -> Vec<Line<'static>> {
+    render_parsed_diff_at(parsed, theme, refined, None)
+}
+
+fn render_parsed_diff_at(
+    parsed: &ParsedDiff,
+    theme: &Theme,
+    refined: Option<&RefinedDiffStyles>,
+    fixed_inline_deadline: Option<Instant>,
+) -> Vec<Line<'static>> {
     if parsed.has_malformed_hunk {
         debug_assert!(
             parsed.raw_fallback.is_some(),
@@ -1278,7 +1327,7 @@ pub(crate) fn render_parsed_diff(
         return parsed.raw_fallback.as_deref().map_or_else(
             || {
                 render_parsed_diff_with(parsed, theme, |hunk, entry_budget, gutter_width| {
-                    render_hunk_fallback(hunk, entry_budget, theme, gutter_width)
+                    render_hunk_fallback(hunk, entry_budget, theme, gutter_width, None)
                 })
             },
             |raw_diff| render_raw_diff(raw_diff, theme),
@@ -1290,28 +1339,49 @@ pub(crate) fn render_parsed_diff(
         .then_some(parsed.destination_path.as_deref())
         .flatten();
     let refined = syntax_eligible.then_some(refined).flatten();
+    let mut inline_deadline = fixed_inline_deadline;
 
     render_parsed_diff_with(parsed, theme, |hunk, entry_budget, gutter_width| {
+        if inline_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return render_hunk_fallback(hunk, entry_budget, theme, gutter_width, None);
+        }
         syntax_path
             .and_then(|path| {
                 let mut old =
                     highlighter_for_path(Path::new(path), theme.syntax_theme, theme.color_level)?;
                 let mut new =
                     highlighter_for_path(Path::new(path), theme.syntax_theme, theme.color_level)?;
+                let deadline =
+                    *inline_deadline.get_or_insert_with(|| Instant::now() + INLINE_DIFF_DEADLINE);
                 Some(render_hunk_with(
                     hunk,
                     entry_budget,
                     theme,
                     refined,
                     gutter_width,
+                    deadline,
                     |side, content| match side {
                         DiffSide::Old => old.highlight_line(content),
                         DiffSide::New => new.highlight_line(content),
                     },
                 ))
             })
-            .unwrap_or_else(|| render_hunk_fallback(hunk, entry_budget, theme, gutter_width))
+            .unwrap_or_else(|| {
+                let deadline =
+                    *inline_deadline.get_or_insert_with(|| Instant::now() + INLINE_DIFF_DEADLINE);
+                render_hunk_fallback(hunk, entry_budget, theme, gutter_width, Some(deadline))
+            })
     })
+}
+
+#[cfg(test)]
+fn render_parsed_diff_with_inline_deadline(
+    parsed: &ParsedDiff,
+    theme: &Theme,
+    refined: Option<&RefinedDiffStyles>,
+    deadline: Instant,
+) -> Vec<Line<'static>> {
+    render_parsed_diff_at(parsed, theme, refined, Some(deadline))
 }
 
 pub(crate) fn render_unified_diff(
@@ -1326,6 +1396,7 @@ pub(crate) fn render_unified_diff(
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
+    use std::time::{Duration, Instant};
 
     use orca_core::config::ThemeName;
     use orca_core::tool_types::FileChangePreview;
@@ -1333,9 +1404,10 @@ mod tests {
     use ratatui::text::{Line, Span};
 
     use super::{
-        DiffHunk, DiffHunkEntry, DiffLineKind, DiffSourceLine, RefinedDiffStyles,
-        ReplacementCluster, compute_file_scoped_styles, compute_parsed_diff_file_scoped_styles,
-        parse_unified_diff, render_parsed_diff, render_unified_diff, replacement_clusters,
+        DiffHunk, DiffHunkEntry, DiffLineKind, DiffSourceLine, INLINE_DIFF_DEADLINE,
+        RefinedDiffStyles, ReplacementCluster, cluster_inline_segments, compute_file_scoped_styles,
+        compute_parsed_diff_file_scoped_styles, parse_unified_diff, render_parsed_diff,
+        render_parsed_diff_with_inline_deadline, render_unified_diff, replacement_clusters,
         visible_inline_segments,
     };
     use crate::syntax_highlight::{
@@ -2059,9 +2131,52 @@ mod tests {
         ];
 
         assert!(
-            visible_inline_segments(&entries, 2).is_empty(),
+            visible_inline_segments(&entries, 2, Instant::now() + INLINE_DIFF_DEADLINE,).is_empty(),
             "a partially visible replacement cluster must not be refined"
         );
+    }
+
+    #[test]
+    fn expired_inline_deadline_rejects_cluster_results() {
+        let parsed = parse_unified_diff(INLINE_DIFF);
+        let cluster = replacement_clusters(&parsed.hunks[0].entries)[0];
+
+        assert!(
+            cluster_inline_segments(
+                &parsed.hunks[0].entries,
+                cluster,
+                Instant::now() - Duration::from_millis(1),
+            )
+            .is_none(),
+            "cooperative timeout results must not be rendered after expiry"
+        );
+    }
+
+    #[test]
+    fn one_expired_inline_deadline_suppresses_emphasis_across_all_hunks() {
+        let diff = "\
+--- a/value.txt
++++ b/value.txt
+@@ -1 +1 @@
+-first red apple
++first green apple
+@@ -10 +10 @@
+-second blue berry
++second gold berry
+";
+        let theme = dark_theme();
+        let parsed = parse_unified_diff(diff);
+        let lines = render_parsed_diff_with_inline_deadline(
+            &parsed,
+            &theme,
+            None,
+            Instant::now() - Duration::from_millis(1),
+        );
+
+        assert!(lines.iter().flat_map(|line| &line.spans).all(|span| {
+            span.style.bg != Some(theme.diff_add_emphasis_bg)
+                && span.style.bg != Some(theme.diff_remove_emphasis_bg)
+        }));
     }
 
     #[test]
@@ -3401,6 +3516,7 @@ metadata instead of paired new header
             &theme,
             None,
             1,
+            Instant::now() + INLINE_DIFF_DEADLINE,
             |side, content| match side {
                 super::DiffSide::New => {
                     highlighted_new = true;
@@ -3445,6 +3561,7 @@ metadata instead of paired new header
                     &theme,
                     None,
                     gutter_width,
+                    Instant::now() + INLINE_DIFF_DEADLINE,
                     |_side, content| {
                         highlight_calls += 1;
                         Some(vec![Span::raw(content.to_owned())])
@@ -3499,6 +3616,7 @@ metadata instead of paired new header
             &theme,
             None,
             1,
+            Instant::now() + INLINE_DIFF_DEADLINE,
             |_side, content| {
                 highlighted_content.push(content.to_owned());
                 Some(vec![Span::raw(content.to_owned())])
