@@ -8221,6 +8221,7 @@ fn persist_surface_settings_metadata(
                         })
                         .collect(),
                 ),
+                metadata_writable_directories: None,
                 network_domain_permissions: Some(network_domain_permissions),
             },
         )

@@ -103,6 +103,7 @@ fn run_permission_respond<W: Write>(
                 runtime_workspace_roots: None,
                 permission_rules: None,
                 additional_working_directories: Some(session_grants.additional_working_directories),
+                metadata_writable_directories: Some(session_grants.metadata_writable_directories),
                 network_domain_permissions: Some(session_grants.network_domain_permissions),
             },
         );
@@ -279,6 +280,7 @@ fn run_permission_respond<W: Write>(
                 request.cwd.as_ref(),
                 &request.env,
                 &request.options,
+                Some(&permissions),
                 request.terminal,
                 request.event_id,
                 writer,

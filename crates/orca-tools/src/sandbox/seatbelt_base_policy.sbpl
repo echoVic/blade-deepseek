@@ -1,0 +1,10 @@
+(version 1)
+
+(deny default)
+
+(allow process*)
+(allow sysctl-read)
+(allow signal (target self))
+(allow signal (target children))
+
+(allow file-read* file-write* (literal "/dev/null"))

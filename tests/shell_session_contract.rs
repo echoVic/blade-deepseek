@@ -89,6 +89,39 @@ fn shell_session_applies_environment_overrides_and_unsets() {
     assert_eq!(output.stderr, "");
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn sandboxed_shell_session_cannot_override_seatbelt_marker() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let tasks = TaskRegistry::new("session-shell".to_string());
+    let mut sessions = RuntimeShellSessionManager::new(tasks);
+
+    let handle = sessions
+        .spawn(ShellSessionCommand {
+            command: "printf %s \"$ORCA_SANDBOX\"".to_string(),
+            cwd: temp.path().to_path_buf(),
+            additional_readable_directories: Vec::new(),
+            additional_working_directories: Vec::new(),
+            denied_working_directories: Vec::new(),
+            allowed_unix_socket_roots: Vec::new(),
+            env: std::collections::BTreeMap::from([(
+                "ORCA_SANDBOX".to_string(),
+                Some("spoofed".to_string()),
+            )]),
+            description: "sandbox marker".to_string(),
+            terminal: ShellTerminalMode::pipe(),
+            sandbox: ShellSandboxMode::default(),
+        })
+        .expect("spawn shell session");
+
+    let output = sessions
+        .wait(&handle.id, Duration::from_secs(5))
+        .expect("wait shell session");
+
+    assert_eq!(output.exit_code, Some(0));
+    assert_eq!(output.stdout, "seatbelt");
+}
+
 #[test]
 fn shell_session_kill_stops_running_task_and_collects_partial_output() {
     let temp = tempfile::tempdir().expect("tempdir");

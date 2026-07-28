@@ -71,6 +71,7 @@ pub(crate) fn execute_bash_with_shell_session(
             cwd,
             additional_readable_directories: Vec::new(),
             additional_working_directories: additional_roots.to_vec(),
+            metadata_writable_directories: Vec::new(),
             denied_working_directories: Vec::new(),
             allowed_unix_socket_roots: Vec::new(),
             env: Default::default(),
@@ -100,6 +101,12 @@ pub(crate) fn execute_bash_with_shell_session(
                     .or_insert(*access);
             }
         }
+    }
+    for root in permission_overlay.additional_working_directories() {
+        push_unique_path(&mut sandbox.additional_writable_roots, root.clone());
+    }
+    for root in permission_overlay.metadata_writable_directories() {
+        push_unique_path(&mut sandbox.metadata_writable_roots, root.clone());
     }
     let result = execute_bash_with_sandbox(RuntimeBashSandboxContext {
         command,
@@ -174,15 +181,11 @@ pub(crate) fn execute_bash_with_shell_session(
             }
 
             let mut retry_sandbox = sandbox;
-            if let Some(file_system) = response.permissions.file_system
-                && let Some(write_roots) = file_system.write
-            {
-                for root in write_roots {
-                    push_unique_path(&mut retry_sandbox.additional_writable_roots, root);
-                }
-            }
             for root in permission_overlay.additional_working_directories() {
                 push_unique_path(&mut retry_sandbox.additional_writable_roots, root.clone());
+            }
+            for root in permission_overlay.metadata_writable_directories() {
+                push_unique_path(&mut retry_sandbox.metadata_writable_roots, root.clone());
             }
 
             return execute_bash_with_sandbox(RuntimeBashSandboxContext {
@@ -221,6 +224,7 @@ pub(crate) fn execute_bash_with_shell_session(
                 cwd,
                 additional_readable_directories: Vec::new(),
                 additional_working_directories: additional_roots.to_vec(),
+                metadata_writable_directories: Vec::new(),
                 denied_working_directories: Vec::new(),
                 allowed_unix_socket_roots: Vec::new(),
                 env: Default::default(),
@@ -274,6 +278,7 @@ struct RuntimeBashOnceContext<'a, 'output> {
     cwd: &'a Path,
     additional_readable_directories: Vec<PathBuf>,
     additional_working_directories: Vec<PathBuf>,
+    metadata_writable_directories: Vec<PathBuf>,
     denied_working_directories: Vec<PathBuf>,
     allowed_unix_socket_roots: Vec<PathBuf>,
     env: BTreeMap<String, Option<String>>,
@@ -508,6 +513,7 @@ fn execute_bash_with_sandbox(context: RuntimeBashSandboxContext<'_, '_>) -> Bash
         cwd,
         additional_readable_directories: sandbox.additional_readable_roots.clone(),
         additional_working_directories,
+        metadata_writable_directories: sandbox.metadata_writable_roots.clone(),
         denied_working_directories: sandbox.denied_writable_roots.clone(),
         allowed_unix_socket_roots: sandbox.allowed_unix_socket_roots.clone(),
         env,
@@ -534,6 +540,7 @@ fn execute_bash_once(context: RuntimeBashOnceContext<'_, '_>) -> BashShellOutput
         cwd,
         additional_readable_directories,
         additional_working_directories,
+        metadata_writable_directories,
         denied_working_directories,
         allowed_unix_socket_roots,
         env,
@@ -544,18 +551,21 @@ fn execute_bash_once(context: RuntimeBashOnceContext<'_, '_>) -> BashShellOutput
         output_handler,
     } = context;
     let mut manager = RuntimeShellSessionManager::new(task_registry.clone());
-    let handle = match manager.spawn(ShellSessionCommand {
-        command: command.to_string(),
-        cwd: cwd.to_path_buf(),
-        additional_readable_directories,
-        additional_working_directories,
-        denied_working_directories,
-        allowed_unix_socket_roots,
-        env,
-        description: command.to_string(),
-        terminal: ShellTerminalMode::pipe(),
-        sandbox,
-    }) {
+    let handle = match manager.spawn_with_metadata_roots(
+        ShellSessionCommand {
+            command: command.to_string(),
+            cwd: cwd.to_path_buf(),
+            additional_readable_directories,
+            additional_working_directories,
+            denied_working_directories,
+            allowed_unix_socket_roots,
+            env,
+            description: command.to_string(),
+            terminal: ShellTerminalMode::pipe(),
+            sandbox,
+        },
+        metadata_writable_directories,
+    ) {
         Ok(handle) => handle,
         Err(error) => {
             return BashShellOutput {

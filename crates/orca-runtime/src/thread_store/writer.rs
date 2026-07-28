@@ -1270,6 +1270,7 @@ mod tests {
             runtime_workspace_roots: Vec::new(),
             permission_rules: PermissionRules::default(),
             additional_working_directories: Vec::new(),
+            metadata_writable_directories: Vec::new(),
             network_domain_permissions: Default::default(),
         };
         write_record(&path, &SessionRecord::Meta(meta)).expect("write metadata");

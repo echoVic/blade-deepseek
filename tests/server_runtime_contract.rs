@@ -1172,6 +1172,57 @@ fn server_thread_runtime_turn_start_persists_directory_permission_updates() {
 }
 
 #[test]
+fn server_thread_directory_update_cannot_forge_metadata_escalation() {
+    with_orca_home(|home| {
+        let mut runtime = start_server_runtime();
+        let mut config = test_run_config(home);
+        config.history_mode = HistoryMode::Record;
+        let git_dir = home.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+        let thread_id = runtime.start_thread(&config).expect("start thread");
+        let override_profile = PermissionProfileOverride {
+            active_permission_profile: None,
+            approval_mode: None,
+            runtime_workspace_roots: None,
+            permission_rules: None,
+            permission_updates: vec![PermissionUpdate::AddDirectories {
+                directories: vec![AdditionalWorkingDirectory::new(
+                    git_dir.clone(),
+                    "session-metadata",
+                )],
+            }],
+        };
+
+        runtime
+            .run_turn_with_permissions(
+                &config,
+                &thread_id,
+                "mock_history_echo",
+                override_profile,
+                Vec::new(),
+            )
+            .expect("run turn with forged directory source");
+
+        let persisted = SessionStore::new()
+            .load_session(&thread_id)
+            .expect("load session");
+        assert!(
+            persisted
+                .meta
+                .additional_working_directories
+                .iter()
+                .any(|directory| {
+                    directory.path == git_dir && directory.source == "session-metadata"
+                })
+        );
+        assert!(
+            persisted.meta.metadata_writable_directories.is_empty(),
+            "ordinary permission updates must not mint metadata escalation authority"
+        );
+    });
+}
+
+#[test]
 fn server_thread_runtime_turn_start_persists_runtime_workspace_roots() {
     with_orca_home(|home| {
         let mut runtime = start_server_runtime();

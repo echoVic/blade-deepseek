@@ -159,6 +159,7 @@ pub struct ServerThreadView {
     runtime_workspace_roots: Vec<PathBuf>,
     active_permission_profile: Option<ActivePermissionProfile>,
     additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    metadata_writable_directories: Vec<PathBuf>,
     network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
     mcp_registry: McpRegistry,
 }
@@ -166,6 +167,10 @@ pub struct ServerThreadView {
 impl ServerThreadView {
     pub fn additional_working_directories(&self) -> &[AdditionalWorkingDirectory] {
         &self.additional_working_directories
+    }
+
+    pub fn metadata_writable_directories(&self) -> &[PathBuf] {
+        &self.metadata_writable_directories
     }
 
     pub fn active_permission_profile(&self) -> Option<&ActivePermissionProfile> {
@@ -746,7 +751,14 @@ impl<W: Write> Write for LockedServerWriter<W> {
 
 struct PersistedSessionPermissionGrant {
     additional_working_directories: Vec<orca_core::config::AdditionalWorkingDirectory>,
+    metadata_writable_directories: Vec<PathBuf>,
     network_domain_permissions: HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
 }
 
 fn materialize_session_permission_grant(
@@ -758,18 +770,14 @@ fn materialize_session_permission_grant(
     let file_system = permissions.file_system.as_ref();
     let roots = file_system
         .into_iter()
-        .flat_map(|file_system| {
-            file_system
-                .write
-                .iter()
-                .flatten()
-                .chain(file_system.read.iter().flatten())
-        })
+        .flat_map(|file_system| file_system.write.iter().flatten())
         .filter(|path| !path.as_os_str().is_empty());
     let mut thread = threads.read_thread_result(thread_id, false, false)?;
     for root in roots {
         for root in materialize_workspace_roots_paths(&thread.cwd, runtime_workspace_roots, root) {
-            if !thread
+            if orca_tools::sandbox::is_protected_metadata_root(&root) {
+                push_unique_path(&mut thread.metadata_writable_directories, root);
+            } else if !thread
                 .additional_working_directories
                 .iter()
                 .any(|directory| directory.path == root)
@@ -789,6 +797,7 @@ fn materialize_session_permission_grant(
     }
     Ok(PersistedSessionPermissionGrant {
         additional_working_directories: thread.additional_working_directories,
+        metadata_writable_directories: thread.metadata_writable_directories,
         network_domain_permissions: thread.network_domain_permissions,
     })
 }
@@ -1130,6 +1139,7 @@ fn run_command_exec<W: Write>(
     cwd: Option<&PathBuf>,
     env: &protocol::CommandEnvOverrides,
     options: &protocol::CommandExecOptions,
+    approved_permissions: Option<&protocol::RequestPermissionProfile>,
     terminal: crate::shell_session::ShellTerminalMode,
     id: Value,
     writer: &mut W,
@@ -1209,6 +1219,7 @@ fn run_command_exec<W: Write>(
     let cwd = cwd.cloned().unwrap_or(server_cwd(&config.run_config)?);
     let (
         mut additional_working_directories,
+        mut metadata_writable_directories,
         thread_permission_profile,
         runtime_workspace_roots,
         thread_network_domain_permissions,
@@ -1222,6 +1233,7 @@ fn run_command_exec<W: Write>(
                         .iter()
                         .map(|directory| directory.path.clone())
                         .collect(),
+                    thread.metadata_writable_directories().to_vec(),
                     thread.active_permission_profile().cloned(),
                     thread.runtime_workspace_roots().to_vec(),
                     thread.network_domain_permissions().clone(),
@@ -1236,6 +1248,7 @@ fn run_command_exec<W: Write>(
             }
         }
         None => (
+            Vec::new(),
             Vec::new(),
             None,
             config
@@ -1275,6 +1288,24 @@ fn run_command_exec<W: Write>(
         }
     }
     additional_working_directories.extend(effective_sandbox.additional_writable_roots.clone());
+    metadata_writable_directories.extend(effective_sandbox.metadata_writable_roots.clone());
+    if let Some(file_system) =
+        approved_permissions.and_then(|permissions| permissions.file_system.as_ref())
+    {
+        for requested in file_system.write.iter().flatten() {
+            for root in materialize_workspace_roots_paths(
+                &cwd.display().to_string(),
+                &runtime_workspace_roots,
+                requested,
+            ) {
+                if orca_tools::sandbox::is_protected_metadata_root(&root) {
+                    push_unique_path(&mut metadata_writable_directories, root);
+                } else {
+                    push_unique_path(&mut additional_working_directories, root);
+                }
+            }
+        }
+    }
     let denied_writable_directories = effective_sandbox.denied_writable_roots.clone();
     if let protocol::CommandSandboxPolicy::WorkspaceWrite { writable_roots, .. } =
         &options.sandbox_policy
@@ -1362,7 +1393,7 @@ fn run_command_exec<W: Write>(
             command_env.insert(key.to_string(), None);
         }
     }
-    let handle = match state.shells.spawn(
+    let handle = match state.shells.spawn_with_metadata_roots(
         &cwd,
         ShellSessionCommand {
             command: command_text.clone(),
@@ -1376,6 +1407,7 @@ fn run_command_exec<W: Write>(
             terminal,
             sandbox: effective_sandbox.mode,
         },
+        metadata_writable_directories,
         None,
     ) {
         Ok(handle) => handle,
@@ -3525,18 +3557,19 @@ enabled = true
         });
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn command_exec_filesystem_sandbox_denial_requests_permission_and_retries() {
-        if !std::process::Command::new("sandbox-exec")
-            .arg("-p")
-            .arg("(version 1) (allow default)")
-            .arg("true")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-        {
-            return;
-        }
+        assert!(
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .arg("-p")
+                .arg("(version 1) (allow default)")
+                .arg("true")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false),
+            "macOS Seatbelt is required for command/exec sandbox tests"
+        );
 
         with_orca_home(|home| {
             let repo = home.join("repo");
@@ -3631,23 +3664,43 @@ enabled = true
                 read.meta
                     .additional_working_directories
                     .iter()
-                    .any(|directory| directory.path == git_dir)
+                    .all(|directory| directory.path != git_dir)
+            );
+            assert_eq!(read.meta.metadata_writable_directories, vec![git_dir]);
+
+            let session_target = repo.join(".git").join("session.lock");
+            let session_request = format!(
+                r#"{{"id":"cmd-fs-session","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc",{}],"timeoutMs":5000}}}}"#,
+                serde_json::to_string(&format!("printf persisted > {}", session_target.display()))
+                    .expect("session command json")
+            );
+            handle_line(
+                &server_config,
+                &mut state,
+                &session_request,
+                Arc::clone(&writer),
+            )
+            .expect("session metadata command");
+            assert_eq!(
+                std::fs::read_to_string(session_target).expect("session metadata write"),
+                "persisted"
             );
         });
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn command_exec_pathless_sandbox_denial_requests_unsandboxed_permission_and_retries() {
-        if !std::process::Command::new("sandbox-exec")
-            .arg("-p")
-            .arg("(version 1) (allow default)")
-            .arg("true")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-        {
-            return;
-        }
+        assert!(
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .arg("-p")
+                .arg("(version 1) (allow default)")
+                .arg("true")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false),
+            "macOS Seatbelt is required for command/exec sandbox tests"
+        );
 
         with_orca_home(|home| {
             let parent = sandbox_test_parent("server-unsandboxed-");
@@ -3740,19 +3793,20 @@ enabled = true
         });
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn command_exec_streaming_pathless_sandbox_denial_requests_unsandboxed_permission_and_retries()
     {
-        if !std::process::Command::new("sandbox-exec")
-            .arg("-p")
-            .arg("(version 1) (allow default)")
-            .arg("true")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-        {
-            return;
-        }
+        assert!(
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .arg("-p")
+                .arg("(version 1) (allow default)")
+                .arg("true")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false),
+            "macOS Seatbelt is required for command/exec sandbox tests"
+        );
 
         with_orca_home(|home| {
             let parent = sandbox_test_parent("server-unsandboxed-stream-");
@@ -3832,18 +3886,19 @@ enabled = true
         });
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn command_exec_streaming_filesystem_sandbox_denial_requests_permission_and_retries() {
-        if !std::process::Command::new("sandbox-exec")
-            .arg("-p")
-            .arg("(version 1) (allow default)")
-            .arg("true")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-        {
-            return;
-        }
+        assert!(
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .arg("-p")
+                .arg("(version 1) (allow default)")
+                .arg("true")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false),
+            "macOS Seatbelt is required for command/exec sandbox tests"
+        );
 
         with_orca_home(|home| {
             let repo = home.join("repo-stream");
@@ -4472,6 +4527,50 @@ enabled = true
         assert!(sandbox.additional_readable_roots.contains(&root));
         assert_includes_platform_default_read_roots(&sandbox.additional_readable_roots);
         assert_eq!(sandbox.additional_writable_roots, vec![root]);
+    }
+
+    #[test]
+    fn command_exec_sandbox_keeps_exact_metadata_profile_roots_separate() {
+        let workspace = std::env::current_dir()
+            .unwrap()
+            .join("metadata-profile-workspace");
+        let git_dir = workspace.join(".git");
+        let git_config = git_dir.join("config");
+        let mut config = test_run_config();
+        config.permission_profiles.insert(
+            "metadata".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some(":workspace".to_string()),
+                filesystem: std::collections::HashMap::from([
+                    (
+                        git_dir.clone(),
+                        orca_core::config::PermissionProfileFileAccess::Write,
+                    ),
+                    (
+                        git_config.clone(),
+                        orca_core::config::PermissionProfileFileAccess::Write,
+                    ),
+                    (
+                        workspace.clone(),
+                        orca_core::config::PermissionProfileFileAccess::Write,
+                    ),
+                ])
+                .into(),
+                ..Default::default()
+            },
+        );
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("metadata".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox = command_exec_sandbox_mode(&config, &options, None, &workspace, &[], None)
+            .expect("metadata profile");
+
+        assert_eq!(sandbox.metadata_writable_roots, vec![git_dir]);
+        assert_eq!(sandbox.additional_writable_roots.len(), 2);
+        assert!(sandbox.additional_writable_roots.contains(&git_config));
+        assert!(sandbox.additional_writable_roots.contains(&workspace));
     }
 
     #[test]
