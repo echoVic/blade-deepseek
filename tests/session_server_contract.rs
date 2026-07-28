@@ -203,7 +203,7 @@ fn server_mode_clean_eof_waits_for_slow_stateless_submit_terminal() {
 }
 
 #[test]
-fn server_mode_clean_eof_fails_stateless_submit_waiting_for_client_input() {
+fn server_mode_clean_eof_terminalizes_stateless_submit_waiting_for_client_input() {
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -237,16 +237,12 @@ fn server_mode_clean_eof_fails_stateless_submit_waiting_for_client_input() {
     );
 
     let events = parse_jsonl(&output.stdout);
-    assert!(
-        events.iter().any(|event| {
-            event["id"] == "input-submit" && event["event"] == "user_input_request"
-        })
-    );
     let completed = events
         .iter()
-        .find(|event| event["id"] == "input-submit" && event["event"] == "turn_completed")
-        .expect("turn_completed event");
-    assert_eq!(completed["status"], "failed", "events={events:?}");
+        .filter(|event| event["id"] == "input-submit" && event["event"] == "turn_completed")
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 1, "events={events:?}");
+    assert_eq!(completed[0]["status"], "cancelled", "events={events:?}");
 }
 
 #[test]

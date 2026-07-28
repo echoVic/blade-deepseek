@@ -183,10 +183,22 @@ cargo test --locked --offline --test session_server_contract
 
 ## Task 6: Prove Failure And Shutdown Cleanup
 
-**Status: Completed.** EOF, output failure, provider failure, workflow
-cancellation, and host shutdown are covered by behavioral cleanup tests. A
-clean EOF has a bounded completion harvest only while no interaction route is
-awaiting client input.
+**Status: Completed after follow-up re-validation.** Post-integration full-gate
+validation reproduced a lifecycle boundary defect: after a
+`user_input_request` had been physically published, clean EOF could retire its
+direct route and immediately shut down the host without first delivering
+`Cancel` to the runtime. The result was nondeterministically missing
+`turn_completed`. The supervisor now resolves unreachable direct routes through
+the same typed response/repair path, then permits the operation to terminalize
+and join only when all direct routes settled, no permission route was live, and
+the deferred repair report is healthy. Otherwise, the existing single host
+shutdown barrier owns cancellation and reclamation.
+
+The connection admission-to-route-ledger handoff is also now serialized through
+the same registration barrier as ingress closure. This removes the final race
+where a projector could obtain an admission before EOF, register after the
+supervisor's route snapshot, and create an unreachable interaction that no
+settlement owned.
 
 **User value:** Closing a terminal or losing output cannot leave an invisible
 model/tool task running after the JSONL client is gone.
@@ -209,14 +221,26 @@ single behavioral proof instead of relying on source-shape assertions.
 - [x] Replace any new source-string assertion with behavior/state evidence. Keep
       unrelated legacy shape tests unchanged in this slice.
 - [x] Run all JSONL and surface focused tests.
+- [x] Add a deterministic EOF-after-`user_input_request` regression: the
+      supervisor must commit `UserInput::Cancel` through its direct-route owner,
+      emit one cancelled terminal, retire the route through the committed/repair
+      ledger, and join the one-shot actor. A pending permission route or degraded
+      direct repair must skip completion waiting and enter the single host
+      shutdown barrier. Do not add a grace-period sleep or a second shutdown rail.
+- [x] Add a deterministic registration-barrier regression: a direct interaction
+      whose projector begins registration while connection close owns the
+      barrier is rejected after ingress closure and leaves no live admission,
+      repair permit, or route outside the EOF settlement snapshot.
 
 ## Task 7: Gates, Review, Commit, And Rebase
 
-**Status: Implemented and verified on the feature branch.** The final focused
-suites, raw single-threaded workspace gate, non-strict Clippy, package-level
-Rust API checks, and isolated real DeepSeek stateless smoke are green. Strict
-Clippy remains a recorded `origin/main` baseline blocker rather than a claimed
-pass. The branch is intentionally not integrated or published.
+**Status: Re-validated after the clean-EOF direct-route follow-up.** The final
+focused suites, raw single-threaded workspace gate, non-strict Clippy, and
+package-level Rust API checks are green. Strict Clippy remains a recorded
+`origin/main` baseline blocker rather than a claimed pass. The earlier isolated
+real DeepSeek stateless smoke remains applicable because this follow-up changes
+only JSONL connection-supervisor cleanup, not the provider transport. The
+branch is intentionally not integrated or published.
 
 **User value:** Delivers one independently reviewable reliability improvement,
 not a transitional dual-owner state.
@@ -230,6 +254,14 @@ and public API boundaries together.
 
 - [x] Run formatting and diff checks.
 - [x] Run all focused tests from the specification.
+- [x] Re-run the deterministic direct-publication and clean-EOF wait-predicate
+      tests, `orca-runtime` server tests (89/89), JSONL interaction tests, and
+      the session server contract after the follow-up. The clean EOF external
+      regression passed repeatedly (10/10).
+- [x] Re-run the full workspace, non-strict Clippy, and all three package API
+      checks after the final registration-barrier repair. The tests and Clippy
+      command exited 0; `cargo-semver-checks` again passed 223 checks for each
+      of `orca-core`, `orca-runtime`, and `orca-tui`.
 - [x] Run full workspace tests. The final raw single-threaded workspace command
       passed without exclusions, including `orca-runtime` 1051/1051 and
       `orca-tui` 457/457.

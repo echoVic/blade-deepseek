@@ -6,10 +6,13 @@ use super::lock_error;
 use super::opaque_permission_router::{
     JsonlCommittedReplay, JsonlConnectionAdmission, JsonlLiveRequestAdmission,
     JsonlRequestTombstone, JsonlResponseDigest, JsonlRetiredRequestOwner,
-    JsonlRetiredRequestSettlement,
+    JsonlRetiredRequestSettlement, jsonl_response_digest,
 };
-use crate::unstable_surface::DeferredMutation;
-use crate::unstable_surface::{RuntimeSurfaceClientHandle, SurfaceInteractionId};
+use crate::unstable_surface::{
+    DeferredMutation, MutationReply, RuntimeSurfaceClientHandle, SurfaceClientInteractionAnswer,
+    SurfaceInteractionId, SurfaceMcpElicitationDecision, SurfaceRequestId,
+    SurfaceUserInputDecision,
+};
 
 #[derive(Clone)]
 pub(super) enum JsonlDirectInteractionRoute {
@@ -46,8 +49,8 @@ struct JsonlDirectInteractionEntry<T> {
 #[derive(Clone, Copy)]
 enum JsonlDirectPublicationState {
     Registered,
-    Writing { frame_digest: JsonlResponseDigest },
-    Published { frame_digest: JsonlResponseDigest },
+    Writing,
+    Published,
 }
 
 #[derive(Clone)]
@@ -68,13 +71,6 @@ impl<T: Clone> JsonlDirectInteractionAdapter<T> {
         }
     }
 
-    pub(super) fn has_live_routes(&self) -> bool {
-        self.routes
-            .lock()
-            .map(|routes| !routes.is_empty())
-            .unwrap_or(true)
-    }
-
     pub(super) fn register(
         &self,
         preferred_request_id: String,
@@ -87,32 +83,34 @@ impl<T: Clone> JsonlDirectInteractionAdapter<T> {
                 JsonlRetiredRequestOwner::DirectMcpElicitation
             }
         };
-        let admission = self
-            .admission
-            .register(&preferred_request_id, owner)
-            .map_err(|reason| {
-                io::Error::other(format!(
-                    "JSONL direct interaction admission failed: {reason:?}"
-                ))
-            })?;
-        let request_id = admission.opaque_request_id.clone();
-        let mut routes = self.routes.lock().map_err(lock_error)?;
-        if routes
-            .insert(
-                request_id.clone(),
-                JsonlDirectInteractionEntry {
-                    admission: Some(admission),
-                    kind,
-                    publication: JsonlDirectPublicationState::Registered,
-                    state: JsonlDirectInteractionState::Routed,
-                    route,
-                },
-            )
-            .is_some()
-        {
-            return Err(io::Error::other("JSONL direct interaction route collision"));
-        }
-        Ok(request_id)
+        self.admission.with_route_registration_barrier(|| {
+            let admission = self
+                .admission
+                .register(&preferred_request_id, owner)
+                .map_err(|reason| {
+                    io::Error::other(format!(
+                        "JSONL direct interaction admission failed: {reason:?}"
+                    ))
+                })?;
+            let request_id = admission.opaque_request_id.clone();
+            let mut routes = self.routes.lock().map_err(lock_error)?;
+            if routes
+                .insert(
+                    request_id.clone(),
+                    JsonlDirectInteractionEntry {
+                        admission: Some(admission),
+                        kind,
+                        publication: JsonlDirectPublicationState::Registered,
+                        state: JsonlDirectInteractionState::Routed,
+                        route,
+                    },
+                )
+                .is_some()
+            {
+                return Err(io::Error::other("JSONL direct interaction route collision"));
+            }
+            Ok(request_id)
+        })
     }
 
     pub(super) fn route(
@@ -147,18 +145,15 @@ impl<T: Clone> JsonlDirectInteractionAdapter<T> {
             .get(request_id)
             .filter(|entry| {
                 entry.kind == expected_kind
-                    && matches!(
-                        entry.publication,
-                        JsonlDirectPublicationState::Published { .. }
-                    )
+                    && matches!(entry.publication, JsonlDirectPublicationState::Published)
             })
             .map(|entry| entry.route.clone()))
     }
 
-    pub(super) fn mark_writing(
+    pub(super) fn publish(
         &self,
         request_id: &str,
-        frame_digest: JsonlResponseDigest,
+        write_frame: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
         let mut routes = self.routes.lock().map_err(lock_error)?;
         let entry = routes
@@ -166,43 +161,14 @@ impl<T: Clone> JsonlDirectInteractionAdapter<T> {
             .ok_or_else(|| io::Error::other("JSONL direct route is no longer live"))?;
         match entry.publication {
             JsonlDirectPublicationState::Registered => {
-                entry.publication = JsonlDirectPublicationState::Writing { frame_digest };
+                entry.publication = JsonlDirectPublicationState::Writing;
+                write_frame()?;
+                entry.publication = JsonlDirectPublicationState::Published;
                 Ok(())
             }
-            JsonlDirectPublicationState::Writing {
-                frame_digest: existing,
-            } if existing == frame_digest => Ok(()),
-            JsonlDirectPublicationState::Writing { .. }
-            | JsonlDirectPublicationState::Published { .. } => Err(io::Error::other(
-                "JSONL direct frame entered writing with a different digest",
-            )),
-        }
-    }
-
-    pub(super) fn mark_published(
-        &self,
-        request_id: &str,
-        frame_digest: JsonlResponseDigest,
-    ) -> io::Result<()> {
-        let mut routes = self.routes.lock().map_err(lock_error)?;
-        let entry = routes
-            .get_mut(request_id)
-            .ok_or_else(|| io::Error::other("JSONL direct route is no longer live"))?;
-        match entry.publication {
-            JsonlDirectPublicationState::Writing {
-                frame_digest: existing,
-            } if existing == frame_digest => {
-                entry.publication = JsonlDirectPublicationState::Published { frame_digest };
-                Ok(())
-            }
-            JsonlDirectPublicationState::Published {
-                frame_digest: existing,
-            } if existing == frame_digest => Ok(()),
-            JsonlDirectPublicationState::Registered
-            | JsonlDirectPublicationState::Writing { .. }
-            | JsonlDirectPublicationState::Published { .. } => Err(io::Error::other(
-                "JSONL direct frame publication has no matching writing witness",
-            )),
+            JsonlDirectPublicationState::Writing | JsonlDirectPublicationState::Published => Err(
+                io::Error::other("JSONL direct frame publication already has a witness"),
+            ),
         }
     }
 
@@ -384,6 +350,101 @@ impl<T: Clone> JsonlDirectInteractionAdapter<T> {
     }
 }
 
+impl JsonlDirectInteractionAdapter<JsonlDirectInteractionRoute> {
+    pub(super) fn settle_unreachable_routes(&self) -> JsonlUnreachableDirectRouteSettlement {
+        let routes = self.routes.lock().map_err(lock_error).map(|routes| {
+            routes
+                .iter()
+                .filter(|(_, entry)| matches!(entry.state, JsonlDirectInteractionState::Routed))
+                .map(|(request_id, entry)| (request_id.clone(), entry.route.clone()))
+                .collect::<Vec<_>>()
+        });
+        let routes = match routes {
+            Ok(routes) => routes,
+            Err(error) => {
+                return JsonlUnreachableDirectRouteSettlement::unresolved(vec![error.to_string()]);
+            }
+        };
+        let mut unresolved = Vec::new();
+        for (request_id, route) in routes {
+            let result = (|| -> io::Result<()> {
+                let (client, interaction_id, answer, response_digest) = match route {
+                    JsonlDirectInteractionRoute::UserInput {
+                        client,
+                        interaction_id,
+                    } => (
+                        client,
+                        interaction_id,
+                        SurfaceClientInteractionAnswer::UserInput {
+                            decision: SurfaceUserInputDecision::Cancel,
+                        },
+                        jsonl_response_digest(&serde_json::json!({ "answer": null }))?,
+                    ),
+                    JsonlDirectInteractionRoute::McpElicitation {
+                        client,
+                        interaction_id,
+                    } => (
+                        client,
+                        interaction_id,
+                        SurfaceClientInteractionAnswer::McpElicitation {
+                            decision: SurfaceMcpElicitationDecision::Decline,
+                        },
+                        jsonl_response_digest(&serde_json::json!({
+                            "accepted": false,
+                            "content": null,
+                        }))?,
+                    ),
+                };
+                match client.respond_interaction_by_id(
+                    SurfaceRequestId::new(),
+                    interaction_id,
+                    answer,
+                ) {
+                    Ok(MutationReply::Committed { .. }) => {
+                        self.settle_committed(&request_id, response_digest)?;
+                    }
+                    Ok(MutationReply::Deferred { mutation, .. }) => {
+                        self.mark_committed_pending(&request_id, &mutation, response_digest)?;
+                    }
+                    Ok(MutationReply::Uncommitted { .. }) => {
+                        return Err(io::Error::other(
+                            "runtime did not commit direct interaction",
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(io::Error::other(format!(
+                            "runtime rejected direct interaction: {error:?}"
+                        )));
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                unresolved.push(format!("{request_id}: {error}"));
+            }
+        }
+        JsonlUnreachableDirectRouteSettlement::unresolved(unresolved)
+    }
+}
+
+pub(super) struct JsonlUnreachableDirectRouteSettlement {
+    unresolved: Vec<String>,
+}
+
+impl JsonlUnreachableDirectRouteSettlement {
+    fn unresolved(unresolved: Vec<String>) -> Self {
+        Self { unresolved }
+    }
+
+    pub(super) fn is_complete(&self) -> bool {
+        self.unresolved.is_empty()
+    }
+
+    pub(super) fn describe(&self) -> String {
+        self.unresolved.join("; ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,7 +521,9 @@ mod tests {
     }
 
     #[test]
-    fn direct_route_is_kind_bound_and_requires_physical_publication() {
+    fn direct_route_publication_holds_the_route_ledger_until_the_frame_is_written() {
+        use std::sync::mpsc;
+
         let adapter = JsonlDirectInteractionAdapter::new(admission());
         adapter
             .register(
@@ -469,16 +532,22 @@ mod tests {
                 "route".to_string(),
             )
             .unwrap();
-        let digest =
-            crate::server::opaque_permission_router::jsonl_response_digest(&"frame").unwrap();
-        assert!(
-            adapter
-                .published_route("user-input", JsonlDirectInteractionKind::UserInput)
-                .unwrap()
-                .is_none()
-        );
-        adapter.mark_writing("user-input", digest).unwrap();
-        adapter.mark_published("user-input", digest).unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (finish_tx, finish_rx) = mpsc::sync_channel(1);
+        let publisher = {
+            let adapter = adapter.clone();
+            std::thread::spawn(move || {
+                adapter.publish("user-input", || {
+                    started_tx.send(()).unwrap();
+                    finish_rx.recv().unwrap();
+                    Ok(())
+                })
+            })
+        };
+        started_rx.recv().unwrap();
+        assert!(adapter.routes.try_lock().is_err());
+        finish_tx.send(()).unwrap();
+        publisher.join().unwrap().unwrap();
         assert_eq!(
             adapter
                 .published_route("user-input", JsonlDirectInteractionKind::UserInput)
@@ -492,5 +561,44 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn direct_registration_cannot_outlive_connection_close_barrier() {
+        use std::sync::mpsc;
+
+        let admission = admission();
+        let adapter = JsonlDirectInteractionAdapter::new(admission.clone());
+        let (barrier_ready_tx, barrier_ready_rx) = mpsc::sync_channel(1);
+        let (close_tx, close_rx) = mpsc::sync_channel(1);
+        let closer = {
+            let admission = admission.clone();
+            std::thread::spawn(move || {
+                admission
+                    .with_route_registration_barrier(|| {
+                        barrier_ready_tx.send(()).unwrap();
+                        close_rx.recv().unwrap();
+                        admission.close_ingress()
+                    })
+                    .unwrap();
+            })
+        };
+        barrier_ready_rx.recv().unwrap();
+
+        let (registration_started_tx, registration_started_rx) = mpsc::sync_channel(1);
+        let registration = std::thread::spawn(move || {
+            registration_started_tx.send(()).unwrap();
+            adapter.register(
+                "late-user-input".to_string(),
+                JsonlDirectInteractionKind::UserInput,
+                "route".to_string(),
+            )
+        });
+        registration_started_rx.recv().unwrap();
+        close_tx.send(()).unwrap();
+        closer.join().unwrap();
+
+        assert!(registration.join().unwrap().is_err());
+        assert_eq!(admission.counts(), (0, 0, 0));
     }
 }

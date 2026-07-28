@@ -157,9 +157,6 @@ impl JsonlConnectionSupervisor {
     ) -> JsonlSupervisorCloseResult {
         self.state = JsonlSupervisorState::IngressClosed;
         let mut cleanup_errors = Vec::new();
-        if let Err(error) = self.admission.close_ingress() {
-            cleanup_errors.push(format!("close JSONL ingress: {error}"));
-        }
 
         let JsonlConnectionServices {
             mut threads,
@@ -169,14 +166,40 @@ impl JsonlConnectionSupervisor {
             mention_searches,
         } = services;
 
-        if let Err(error) = self.permission_routes.close_routes_by_owner() {
-            cleanup_errors.push(format!("retire permission routes: {error}"));
-        }
-        if let Err(error) = self
-            .direct_routes
-            .close_routes(JsonlOwnerSettlement::InteractionRecoveryRetained)
-        {
-            cleanup_errors.push(format!("retire direct interaction routes: {error}"));
+        let clean_eof = matches!(
+            &trigger,
+            JsonlSupervisorCloseTrigger::NonIo(JsonlNonIoCloseTrigger::EndOfFile)
+        );
+        let mut had_permission_routes = true;
+        let mut direct_routes_settled = false;
+        if let Err(error) = self.admission.with_route_registration_barrier(|| {
+            self.admission.close_ingress()?;
+            had_permission_routes = self.permission_routes.has_live_routes();
+            if let Err(error) = self.permission_routes.close_routes_by_owner() {
+                cleanup_errors.push(format!("retire permission routes: {error}"));
+            }
+            direct_routes_settled = true;
+            if clean_eof {
+                let direct_settlement = self.direct_routes.settle_unreachable_routes();
+                if !direct_settlement.is_complete() {
+                    cleanup_errors.push(format!(
+                        "unresolved direct interaction routes at clean EOF: {}",
+                        direct_settlement.describe()
+                    ));
+                    direct_routes_settled = false;
+                }
+            }
+            if let Err(error) = self
+                .direct_routes
+                .close_routes(JsonlOwnerSettlement::InteractionRecoveryRetained)
+            {
+                cleanup_errors.push(format!("retire direct interaction routes: {error}"));
+            }
+            Ok(())
+        }) {
+            cleanup_errors.push(format!(
+                "close JSONL ingress and route registration: {error}"
+            ));
         }
         let repair_deadline =
             Instant::now() + Duration::from_millis(JSONL_COMMITTED_REPAIR_DRAIN_DEADLINE_MS);
@@ -186,6 +209,33 @@ impl JsonlConnectionSupervisor {
             repair_deadline,
         );
         self.state = JsonlSupervisorState::RoutesRetired;
+
+        let direct_repairs_healthy = repairs.direct_interaction.is_healthy();
+        let wait_clean_eof_one_shots = should_wait_clean_eof_one_shots(
+            &trigger,
+            had_permission_routes,
+            direct_routes_settled,
+            direct_repairs_healthy,
+        );
+        if clean_eof && !wait_clean_eof_one_shots {
+            if had_permission_routes {
+                cleanup_errors.push(
+                    "skip clean EOF one-shot completion while permission routes remain unresolved"
+                        .to_string(),
+                );
+            }
+            if !direct_repairs_healthy {
+                cleanup_errors.push(
+                    "skip clean EOF one-shot completion after direct repair settlement degraded"
+                        .to_string(),
+                );
+            }
+        }
+        if wait_clean_eof_one_shots {
+            if let Err(error) = threads.wait_clean_eof_one_shots() {
+                cleanup_errors.push(format!("wait clean EOF one-shot terminals: {error}"));
+            }
+        }
 
         let service_deadline =
             Instant::now() + Duration::from_millis(JSONL_SUPERVISOR_JOIN_DEADLINE_MS);
@@ -229,6 +279,20 @@ impl JsonlConnectionSupervisor {
             },
         }
     }
+}
+
+fn should_wait_clean_eof_one_shots(
+    trigger: &JsonlSupervisorCloseTrigger,
+    had_permission_routes: bool,
+    direct_routes_settled: bool,
+    direct_repairs_healthy: bool,
+) -> bool {
+    matches!(
+        trigger,
+        JsonlSupervisorCloseTrigger::NonIo(JsonlNonIoCloseTrigger::EndOfFile)
+    ) && !had_permission_routes
+        && direct_routes_settled
+        && direct_repairs_healthy
 }
 
 fn settle_services(
@@ -344,6 +408,21 @@ impl JsonlSupervisorCloseResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_eof_wait_requires_no_permission_routes_and_a_healthy_direct_repair() {
+        let eof = JsonlSupervisorCloseTrigger::NonIo(JsonlNonIoCloseTrigger::EndOfFile);
+        assert!(should_wait_clean_eof_one_shots(&eof, false, true, true));
+        assert!(!should_wait_clean_eof_one_shots(&eof, true, true, true));
+        assert!(!should_wait_clean_eof_one_shots(&eof, false, false, true));
+        assert!(!should_wait_clean_eof_one_shots(&eof, false, true, false));
+        assert!(!should_wait_clean_eof_one_shots(
+            &JsonlSupervisorCloseTrigger::NonIo(JsonlNonIoCloseTrigger::SupervisorShutdown),
+            false,
+            true,
+            true,
+        ));
+    }
 
     #[test]
     fn four_fixed_service_fields_are_required_for_clean_close() {

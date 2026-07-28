@@ -161,6 +161,7 @@ pub(super) struct JsonlRequestTombstone {
 #[derive(Clone)]
 pub(super) struct JsonlConnectionAdmission {
     state: Arc<Mutex<JsonlConnectionAdmissionState>>,
+    route_registration_gate: Arc<Mutex<()>>,
 }
 
 struct JsonlConnectionAdmissionState {
@@ -198,7 +199,16 @@ impl JsonlConnectionAdmission {
                 used_opaque_ids: HashSet::new(),
                 tombstones: HashMap::new(),
             })),
+            route_registration_gate: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub(super) fn with_route_registration_barrier<T>(
+        &self,
+        operation: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        let _gate = self.route_registration_gate.lock().map_err(lock_error)?;
+        operation()
     }
 
     pub(super) fn register(
@@ -293,7 +303,7 @@ impl JsonlConnectionAdmission {
     }
 
     #[cfg(test)]
-    fn counts(&self) -> (u64, u64, usize) {
+    pub(super) fn counts(&self) -> (u64, u64, usize) {
         let state = self.state.lock().unwrap();
         (
             state.live_count,
@@ -400,18 +410,18 @@ enum JsonlPermissionRouteState {
 }
 
 impl<T: Clone> JsonlOpaquePermissionRouter<T> {
-    pub(super) fn new(admission: JsonlConnectionAdmission) -> Self {
-        Self {
-            admission,
-            routes: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
     pub(super) fn has_live_routes(&self) -> bool {
         self.routes
             .lock()
             .map(|routes| !routes.is_empty())
             .unwrap_or(true)
+    }
+
+    pub(super) fn new(admission: JsonlConnectionAdmission) -> Self {
+        Self {
+            admission,
+            routes: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub(super) fn register(
@@ -420,29 +430,31 @@ impl<T: Clone> JsonlOpaquePermissionRouter<T> {
         owner: JsonlRetiredRequestOwner,
         route: T,
     ) -> io::Result<String> {
-        let admission = self
-            .admission
-            .register(&preferred_request_id, owner)
-            .map_err(|reason| {
-                io::Error::other(format!("JSONL permission admission failed: {reason:?}"))
-            })?;
-        let request_id = admission.opaque_request_id.clone();
-        let mut routes = self.routes.lock().map_err(lock_error)?;
-        if routes
-            .insert(
-                request_id.clone(),
-                JsonlOpaquePermissionEntry {
-                    admission: Some(admission),
-                    publication: JsonlPermissionPublicationState::Registered,
-                    state: JsonlPermissionRouteState::Routed,
-                    route,
-                },
-            )
-            .is_some()
-        {
-            return Err(io::Error::other("JSONL permission route collision"));
-        }
-        Ok(request_id)
+        self.admission.with_route_registration_barrier(|| {
+            let admission = self
+                .admission
+                .register(&preferred_request_id, owner)
+                .map_err(|reason| {
+                    io::Error::other(format!("JSONL permission admission failed: {reason:?}"))
+                })?;
+            let request_id = admission.opaque_request_id.clone();
+            let mut routes = self.routes.lock().map_err(lock_error)?;
+            if routes
+                .insert(
+                    request_id.clone(),
+                    JsonlOpaquePermissionEntry {
+                        admission: Some(admission),
+                        publication: JsonlPermissionPublicationState::Registered,
+                        state: JsonlPermissionRouteState::Routed,
+                        route,
+                    },
+                )
+                .is_some()
+            {
+                return Err(io::Error::other("JSONL permission route collision"));
+            }
+            Ok(request_id)
+        })
     }
 
     pub(super) fn route(&self, request_id: &str) -> io::Result<Option<T>> {

@@ -419,20 +419,8 @@ fn run_with_io<R: BufRead, W: Write + Send + 'static>(
             }
             line.clear();
         }
-        // A clean pipe close means no more commands, not cancellation of an
-        // already-committed stateless submit. Recorded turns still fall through
-        // to the connection shutdown barrier, and an unreachable interaction
-        // waiter ends this completion lease immediately.
-        loop {
-            state.threads.prune_finished_turns();
-            if !state.threads.has_pending_clean_eof_one_shots()
-                || state.permission_routes.has_live_routes()
-                || state.direct_interactions.has_live_routes()
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        // The connection supervisor owns clean-EOF one-shot completion after it
+        // settles any now-unreachable interaction routes.
         Ok(())
     })();
     let shutdown = state.shutdown(close_trigger);
@@ -5761,6 +5749,48 @@ enabled = true
             1,
             "clean EOF must preserve one successful terminal: {events:?}"
         );
+    }
+
+    #[test]
+    fn stateless_submit_clean_eof_cancels_published_user_input_before_shutdown() {
+        let output = SharedVecWriter::default();
+        let input = EofAfterEventReader::new(
+            r#"{"id":"input","op":"submit","prompt":"ask Continue?"}"#,
+            "user_input_request",
+            output.clone(),
+        );
+
+        run_with_io(
+            ServerConfig {
+                run_config: test_run_config(),
+            },
+            input,
+            output.clone(),
+        )
+        .expect("server resolves published user input at clean EOF");
+
+        assert_eq!(
+            Arc::strong_count(&output.0),
+            1,
+            "EOF shutdown retained the stateless projection writer"
+        );
+        let events = parse_jsonl(&output.bytes());
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "user_input_request"),
+            "the reader must close only after physical interaction publication: {events:?}"
+        );
+        let completed = events
+            .iter()
+            .filter(|event| event["event"] == "turn_completed")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completed.len(),
+            1,
+            "clean EOF must project exactly one terminal after cancelling user input: {events:?}"
+        );
+        assert_eq!(completed[0]["status"], "cancelled");
     }
 
     #[test]

@@ -1352,11 +1352,20 @@ impl JsonlSurfaceAdapter {
         self.transport_turns = pending;
     }
 
-    pub(crate) fn has_pending_clean_eof_one_shots(&self) -> bool {
-        self.transport_turns.iter().any(|turn| {
-            turn.clean_eof_policy == JsonlCleanEofPolicy::CompleteEphemeralOneShot
-                && !turn.is_finished()
-        })
+    pub(crate) fn wait_clean_eof_one_shots(&mut self) -> io::Result<()> {
+        let mut pending = Vec::with_capacity(self.transport_turns.len());
+        let mut completion_error = None;
+        for mut turn in self.transport_turns.drain(..) {
+            if turn.clean_eof_policy == JsonlCleanEofPolicy::CompleteEphemeralOneShot {
+                if let Err(error) = turn.wait_terminal() {
+                    completion_error.get_or_insert(error);
+                }
+            } else {
+                pending.push(turn);
+            }
+        }
+        self.transport_turns = pending;
+        completion_error.map_or(Ok(()), Err)
     }
 
     #[cfg(test)]
@@ -2435,17 +2444,15 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
                         "question": question.as_str(),
                         "choices": suggestions.iter().map(DisplayText::as_str).collect::<Vec<_>>(),
                     });
-                    let frame_digest =
-                        super::opaque_permission_router::jsonl_response_digest(&payload)?;
-                    transport.direct.mark_writing(&request_id, frame_digest)?;
-                    write_runtime_event(
-                        writer,
-                        "surface.user_input.requested",
-                        &projector.thread_id,
-                        payload,
-                    )?;
-                    writer.flush()?;
-                    transport.direct.mark_published(&request_id, frame_digest)?;
+                    transport.direct.publish(&request_id, || {
+                        write_runtime_event(
+                            writer,
+                            "surface.user_input.requested",
+                            &projector.thread_id,
+                            payload,
+                        )?;
+                        writer.flush()
+                    })?;
                 }
                 SurfaceInteractionRequest::McpElicitation {
                     server_name,
@@ -2505,17 +2512,15 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
                         "url": url,
                         "requested_schema": requested_schema,
                     });
-                    let frame_digest =
-                        super::opaque_permission_router::jsonl_response_digest(&payload)?;
-                    transport.direct.mark_writing(&request_id, frame_digest)?;
-                    write_runtime_event(
-                        writer,
-                        "surface.mcp_elicitation.requested",
-                        &projector.thread_id,
-                        payload,
-                    )?;
-                    writer.flush()?;
-                    transport.direct.mark_published(&request_id, frame_digest)?;
+                    transport.direct.publish(&request_id, || {
+                        write_runtime_event(
+                            writer,
+                            "surface.mcp_elicitation.requested",
+                            &projector.thread_id,
+                            payload,
+                        )?;
+                        writer.flush()
+                    })?;
                 }
                 _ => {}
             }

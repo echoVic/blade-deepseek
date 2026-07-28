@@ -1,9 +1,11 @@
 # JSONL Stateless Submit Runtime Surface Specification
 
-**Status:** Implemented and verified on the feature branch. The runtime
-ownership replacement, public API compatibility repair, clean-EOF lifecycle,
-and real DeepSeek stateless path are complete. The branch remains unintegrated
-and unpublished.
+**Status:** The runtime ownership replacement and its clean-EOF direct-route
+follow-up are re-verified. A published unreachable `user_input_request` is now
+settled through its typed negative response before the operation terminal is
+waited; publication, permission-route, deferred-repair, and host-shutdown
+boundaries have explicit ownership. The branch remains unpublished pending the
+local integration step.
 
 **Base:** `origin/main@d6f98b0ac9eafc9228594096db5390f0d3f860e9`
 
@@ -256,14 +258,30 @@ normal connection-close cancellation policy and do not extend that wait. There
 is no guessed wall-clock grace period: provider, tool, turn-budget, and runtime
 operation bounds remain the owners of execution deadlines.
 
-The wait rechecks permission and direct-interaction routes. If an ephemeral
-turn begins waiting for client input after EOF, the server stops waiting and
-enters the normal host shutdown barrier, which cancels, terminalizes, joins, and
-reclaims the operation. The legacy wire terminal may be `failed` when the
-unreachable interaction itself resolves as a foreground failure. This preserves
+The wait rechecks permission and direct-interaction routes. If a permission
+route is still unresolved at clean EOF, the supervisor retains its transport
+retirement evidence and immediately enters the host shutdown barrier rather
+than waiting for a terminal that needs a client decision. For a direct route
+that is still unreachable when clean EOF closes ingress, the connection
+supervisor, as the sole shutdown owner, delivers the route's typed negative
+answer (`UserInput::Cancel` or `McpElicitation::Decline`) before retiring its
+admission. The response commits or enters the existing committed-repair ledger;
+the owning actor then terminalizes and the projection worker emits the normal
+terminal. A cancelled user-input interaction emits the released `cancelled`
+terminal status. A deferred direct response must first complete the existing
+repair settlement; otherwise the supervisor also enters the host shutdown
+barrier rather than waiting indefinitely. Only a route that cannot be committed
+is transport-retired for the runtime shutdown barrier. This preserves
 released pipe/`execFile` submit behavior without allowing an unreachable
 interaction waiter or persistent thread turn to keep the sole-connection server
 alive.
+
+Admission-to-ledger registration for both permission and direct routes is held
+behind the same connection registration barrier as EOF ingress closure and
+route retirement. A projector that starts registration before close either
+finishes its ledger entry before the close snapshot or is rejected after ingress
+is closed; it cannot obtain a live admission and publish an interaction outside
+the supervisor's typed settlement set.
 
 ### Process crash and restart
 
@@ -346,8 +364,9 @@ worktree are not part of rollback.
   the released JSONL lifecycle events.
 - The JSONL projector associates thread-scoped workflow facts by their typed
   parent fence and cannot cross-project concurrent operations.
-- EOF closes ingress, emits no post-trigger frames, cancels and joins active
-  work, and returns within the supervisor deadline.
+- EOF closes ingress, actively settles each unreachable direct interaction with
+  its typed negative answer, emits one terminal for the owning one-shot, then
+  joins active work within the supervisor deadline.
 - The v0.2.50 stateless fixture remains byte-compatible after deterministic
   identity normalization, including event order and trailing newlines.
 - Focused runtime, surface, JSONL interaction, workflow, and shutdown tests pass;
