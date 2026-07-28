@@ -25,6 +25,10 @@ pub struct Theme {
     pub markdown_inline_code: Color,
     pub diff_add: Color,
     pub diff_remove: Color,
+    pub diff_add_bg: Color,
+    pub diff_remove_bg: Color,
+    pub diff_add_emphasis_bg: Color,
+    pub diff_remove_emphasis_bg: Color,
     /// Background for the mouse text selection in the transcript.
     pub selection_bg: Color,
     pub(crate) syntax_theme: SyntaxTheme,
@@ -65,6 +69,10 @@ impl Theme {
                 markdown_inline_code: Color::Rgb(64, 170, 170),
                 diff_add: Color::Rgb(47, 177, 112),
                 diff_remove: Color::Rgb(214, 81, 81),
+                diff_add_bg: Color::Rgb(0x21, 0x3a, 0x2b),
+                diff_remove_bg: Color::Rgb(0x4a, 0x22, 0x1d),
+                diff_add_emphasis_bg: Color::Rgb(0x31, 0x5c, 0x40),
+                diff_remove_emphasis_bg: Color::Rgb(0x71, 0x35, 0x2a),
                 // Muted brand blue: keeps every foreground legible.
                 selection_bg: Color::Rgb(46, 62, 132),
                 syntax_theme,
@@ -87,6 +95,10 @@ impl Theme {
                 markdown_inline_code: Color::Rgb(0, 102, 102),
                 diff_add: Color::Rgb(31, 142, 86),
                 diff_remove: Color::Rgb(196, 52, 52),
+                diff_add_bg: Color::Rgb(0xdc, 0xfc, 0xe7),
+                diff_remove_bg: Color::Rgb(0xfe, 0xe2, 0xe2),
+                diff_add_emphasis_bg: Color::Rgb(0x86, 0xef, 0xac),
+                diff_remove_emphasis_bg: Color::Rgb(0xfc, 0xa5, 0xa5),
                 selection_bg: Color::Rgb(198, 210, 250),
                 syntax_theme,
                 color_level: TerminalColorLevel::TrueColor,
@@ -108,6 +120,10 @@ impl Theme {
                 markdown_inline_code: Color::Rgb(211, 54, 130),
                 diff_add: Color::Rgb(133, 153, 0),
                 diff_remove: Color::Rgb(220, 50, 47),
+                diff_add_bg: Color::Rgb(0x16, 0x3c, 0x3a),
+                diff_remove_bg: Color::Rgb(0x4c, 0x2a, 0x2a),
+                diff_add_emphasis_bg: Color::Rgb(0x24, 0x5b, 0x52),
+                diff_remove_emphasis_bg: Color::Rgb(0x71, 0x3c, 0x35),
                 // base02, Solarized's canonical selection background.
                 selection_bg: Color::Rgb(7, 54, 66),
                 syntax_theme,
@@ -130,6 +146,10 @@ impl Theme {
                 markdown_inline_code: Color::Rgb(245, 194, 231),
                 diff_add: Color::Rgb(166, 227, 161),
                 diff_remove: Color::Rgb(243, 139, 168),
+                diff_add_bg: Color::Rgb(0x29, 0x44, 0x36),
+                diff_remove_bg: Color::Rgb(0x4a, 0x30, 0x3a),
+                diff_add_emphasis_bg: Color::Rgb(0x3d, 0x65, 0x4d),
+                diff_remove_emphasis_bg: Color::Rgb(0x70, 0x45, 0x55),
                 // surface2 from the Mocha palette.
                 selection_bg: Color::Rgb(88, 91, 112),
                 syntax_theme,
@@ -168,6 +188,10 @@ impl Theme {
         theme.markdown_inline_code = adapt(theme.markdown_inline_code);
         theme.diff_add = adapt(theme.diff_add);
         theme.diff_remove = adapt(theme.diff_remove);
+        theme.diff_add_bg = adapt(theme.diff_add_bg);
+        theme.diff_remove_bg = adapt(theme.diff_remove_bg);
+        theme.diff_add_emphasis_bg = adapt(theme.diff_add_emphasis_bg);
+        theme.diff_remove_emphasis_bg = adapt(theme.diff_remove_emphasis_bg);
         theme.selection_bg = adapt(theme.selection_bg);
         theme.color_level = profile.color_level;
         theme.syntax_theme_revision =
@@ -193,7 +217,7 @@ mod tests {
     use crate::syntax_highlight::SyntaxTheme;
     use crate::terminal_capabilities::{TerminalBackground, TerminalColorLevel, TerminalProfile};
 
-    fn theme_colors(theme: Theme) -> [Color; 16] {
+    fn theme_colors(theme: Theme) -> [Color; 20] {
         [
             theme.border,
             theme.text,
@@ -210,6 +234,10 @@ mod tests {
             theme.markdown_inline_code,
             theme.diff_add,
             theme.diff_remove,
+            theme.diff_add_bg,
+            theme.diff_remove_bg,
+            theme.diff_add_emphasis_bg,
+            theme.diff_remove_emphasis_bg,
             theme.selection_bg,
         ]
     }
@@ -262,6 +290,10 @@ mod tests {
                     Color::Rgb(64, 170, 170),
                     Color::Rgb(47, 177, 112),
                     Color::Rgb(214, 81, 81),
+                    Color::Rgb(0x21, 0x3a, 0x2b),
+                    Color::Rgb(0x4a, 0x22, 0x1d),
+                    Color::Rgb(0x31, 0x5c, 0x40),
+                    Color::Rgb(0x71, 0x35, 0x2a),
                     Color::Rgb(46, 62, 132),
                 ],
             ),
@@ -283,6 +315,10 @@ mod tests {
                     Color::Rgb(0, 102, 102),
                     Color::Rgb(31, 142, 86),
                     Color::Rgb(196, 52, 52),
+                    Color::Rgb(0xdc, 0xfc, 0xe7),
+                    Color::Rgb(0xfe, 0xe2, 0xe2),
+                    Color::Rgb(0x86, 0xef, 0xac),
+                    Color::Rgb(0xfc, 0xa5, 0xa5),
                     Color::Rgb(198, 210, 250),
                 ],
             ),
@@ -304,6 +340,10 @@ mod tests {
                     Color::Rgb(211, 54, 130),
                     Color::Rgb(133, 153, 0),
                     Color::Rgb(220, 50, 47),
+                    Color::Rgb(0x16, 0x3c, 0x3a),
+                    Color::Rgb(0x4c, 0x2a, 0x2a),
+                    Color::Rgb(0x24, 0x5b, 0x52),
+                    Color::Rgb(0x71, 0x3c, 0x35),
                     Color::Rgb(7, 54, 66),
                 ],
             ),
@@ -325,6 +365,10 @@ mod tests {
                     Color::Rgb(245, 194, 231),
                     Color::Rgb(166, 227, 161),
                     Color::Rgb(243, 139, 168),
+                    Color::Rgb(0x29, 0x44, 0x36),
+                    Color::Rgb(0x4a, 0x30, 0x3a),
+                    Color::Rgb(0x3d, 0x65, 0x4d),
+                    Color::Rgb(0x70, 0x45, 0x55),
                     Color::Rgb(88, 91, 112),
                 ],
             ),
@@ -333,6 +377,15 @@ mod tests {
         for (name, expected) in cases {
             assert_eq!(theme_colors(Theme::named(name)), expected, "{name:?}");
         }
+    }
+
+    #[test]
+    fn dark_diff_backgrounds_match_the_review_palette() {
+        let theme = Theme::named(ThemeName::Dark);
+        assert_eq!(theme.diff_add_bg, Color::Rgb(0x21, 0x3a, 0x2b));
+        assert_eq!(theme.diff_remove_bg, Color::Rgb(0x4a, 0x22, 0x1d));
+        assert_eq!(theme.diff_add_emphasis_bg, Color::Rgb(0x31, 0x5c, 0x40));
+        assert_eq!(theme.diff_remove_emphasis_bg, Color::Rgb(0x71, 0x35, 0x2a));
     }
 
     #[test]
