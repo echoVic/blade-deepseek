@@ -89,7 +89,11 @@ pub(crate) fn handle_runtime_event(
         state.status == AppStatus::Running,
     );
 
+    let previous_status = state.status;
     state.update(tui_event);
+    if state.status != previous_status {
+        vim_state.cancel_pending_command();
+    }
     if let Some(notification) = terminal_notification {
         presentation.enqueue(notification);
     }
@@ -705,5 +709,65 @@ mod tests {
 
             assert_eq!(presentation.pending_len_for_test(), expected_pending);
         }
+    }
+
+    #[test]
+    fn runtime_status_transitions_clear_pending_vim_commands_but_streaming_does_not() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let pending = bridge::PendingWorkflowNotifications::new();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut presentation = test_presentation();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.enter_running();
+        let mut textarea = TextArea::from(["draft"]);
+        let mut vim = VimState::new(true);
+        vim.seed_pending_count_for_test();
+
+        handle_runtime_event(
+            TuiEvent::MessageDelta("streaming".to_string()),
+            &mut state,
+            &action_tx,
+            &pending,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut presentation,
+        );
+
+        assert!(vim.has_pending_command_for_test());
+
+        handle_runtime_event(
+            TuiEvent::UserInputRequested {
+                key: interaction_key(TuiInteractionKind::UserInput, "input"),
+                question: "question".to_string(),
+                choices: Vec::new(),
+            },
+            &mut state,
+            &action_tx,
+            &pending,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut presentation,
+        );
+
+        assert_eq!(state.status, AppStatus::WaitingUserInput);
+        assert!(!vim.has_pending_command_for_test());
+        vim.handle(
+            tui_textarea::Input {
+                key: tui_textarea::Key::Char('i'),
+                ctrl: false,
+                alt: false,
+                shift: false,
+            },
+            &mut textarea,
+            &theme,
+        );
+        assert_eq!(vim.mode, crate::vim::VimMode::Insert);
     }
 }

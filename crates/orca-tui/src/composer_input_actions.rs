@@ -70,6 +70,7 @@ pub(crate) fn apply_composer_key_input(
 ) -> bool {
     let normalized_event = normalize_windows_altgr_event(ev);
     let changed = if key.code == KeyCode::Tab {
+        vim_state.cancel_pending_command();
         let text = textarea_text(textarea);
         let cursor = textarea_cursor_byte_index(textarea);
         let candidates = state
@@ -189,5 +190,55 @@ mod tests {
 
         assert_eq!(textarea_text(&textarea), "/compact");
         assert!(state.slash_menu.is_none());
+    }
+
+    #[test]
+    fn tab_clears_pending_vim_prefix_before_direct_textarea_input() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut config = crate::test_support::test_run_config();
+        config.vim_mode = true;
+        let theme = Theme::named(ThemeName::Dark);
+        let mut expected_vim = VimState::new(true);
+        let mut expected = make_textarea_with_text("abcd", &expected_vim, &theme);
+        expected.move_cursor(tui_textarea::CursorMove::Head);
+        let mut vim = VimState::new(true);
+        let mut textarea = make_textarea_with_text("abcd", &vim, &theme);
+        textarea.move_cursor(tui_textarea::CursorMove::Head);
+
+        for code in [KeyCode::Tab, KeyCode::Char('x')] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            apply_composer_key_input(
+                &Event::Key(key),
+                &key,
+                &mut state,
+                &config,
+                &mut expected,
+                &mut expected_vim,
+                &theme,
+            );
+        }
+
+        for code in [KeyCode::Char('2'), KeyCode::Tab, KeyCode::Char('x')] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            apply_composer_key_input(
+                &Event::Key(key),
+                &key,
+                &mut state,
+                &config,
+                &mut textarea,
+                &mut vim,
+                &theme,
+            );
+        }
+
+        assert_eq!(textarea_text(&textarea), textarea_text(&expected));
+        assert_eq!(textarea.cursor(), expected.cursor());
+        assert!(!vim.has_pending_command_for_test());
     }
 }

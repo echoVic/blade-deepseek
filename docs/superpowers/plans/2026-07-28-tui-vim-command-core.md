@@ -69,8 +69,14 @@ Co-authored-by: TRAE CLI <noreply@bytedance.com>
 - `crates/orca-tui/src/idle_navigation_actions.rs`
   - cancel the pending parser state only when `ExpandToolOutput` actually
     consumes the key; preserve it when the key falls through to Vim.
+- `crates/orca-tui/src/composer_input_actions.rs`
+  - cancel pending parser state before Tab bypasses Vim for direct textarea
+    input or mention completion.
 - `crates/orca-tui/src/queued_input_actions.rs`
   - cancel parser state after running menu/shortcut consumption.
+- `crates/orca-tui/src/runtime_event_actions.rs`
+  - cancel pending parser state when a runtime event changes the application
+    status without interrupting prefixes during ordinary streaming updates.
 - `crates/orca-tui/src/app.rs`
   - pass `VimState` into preflight;
   - cancel at paste, mouse, synthetic-enter, and wheel boundaries;
@@ -2288,11 +2294,16 @@ cargo test -p orca-tui line_positioning_avoids_composer_sized_iteration --lib --
 cargo test -p orca-tui line_commands_handle_twenty_thousand_columns_and_rows --lib -- --test-threads=1
 cargo test -p orca-tui linewise_paste_counts_the_leading_newline_in_the_one_mib_bound --lib -- --test-threads=1
 cargo test -p orca-tui compacting_keys_clear_only_pending_vim_command_state --lib -- --test-threads=1
+cargo test -p orca-tui runtime_status_transitions_clear_pending_vim_commands_but_streaming_does_not --lib -- --test-threads=1
+cargo test -p orca-tui tab_clears_pending_vim_prefix_before_direct_textarea_input --lib -- --test-threads=1
+cargo test -p orca-tui zero_width_visual_commands_do_not_copy_stale_yank_text --lib -- --test-threads=1
+cargo test -p orca-tui dd_deletes_a_seventy_thousand_character_only_line_atomically --lib -- --test-threads=1
 ```
 
 Expected: large composers avoid document-sized cursor loops, the complete
-linewise payload stays within 1 MiB, and every Compacting key clears only the
-pending parser state.
+linewise payload stays within 1 MiB, runtime/Tab boundaries clear only the
+pending parser state, zero-width Visual commands cannot copy stale yank text,
+and `dd` removes an ultra-long only line atomically.
 
 - [ ] **Step 4: Run package gates on committed HEAD**
 
