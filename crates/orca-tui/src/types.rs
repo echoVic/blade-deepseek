@@ -24,6 +24,7 @@ use crate::edit_highlight_worker::DrainResults;
 use crate::edit_highlight_worker::{
     EditHighlightJob, EditHighlightOutcome, EditHighlightResult, EditHighlightRuntime,
 };
+use crate::streaming_markdown::{StreamingMarkdownAction, StreamingMarkdownAssembler};
 use crate::syntax_highlight::{SyntaxTheme, highlighter_for_path};
 use crate::terminal_capabilities::{TerminalColorLevel, syntax_style_revision};
 use crate::transcript_view::TranscriptRenderCache;
@@ -501,6 +502,10 @@ pub enum ChatMessage {
     User(String),
     Reasoning(String),
     Assistant(String),
+    AssistantChunk {
+        text: String,
+        trailing_blank: bool,
+    },
     ProposedPlan(String),
     ToolCall {
         id: String,
@@ -779,6 +784,8 @@ pub struct AppState {
     pub mention_bindings: MentionBindings,
     pub current_plan: Option<(Option<String>, Vec<PlanItem>)>,
     proposed_plan_parser: ProposedPlanStreamParser,
+    assistant_stream: StreamingMarkdownAssembler,
+    assistant_stream_tail: Option<usize>,
     /// The most recent update_plan call failed, so `current_plan` may be
     /// showing outdated statuses. Cleared by the next successful update.
     pub plan_update_failed: bool,
@@ -921,6 +928,8 @@ impl AppState {
             mention_bindings: MentionBindings::default(),
             current_plan: None,
             proposed_plan_parser: ProposedPlanStreamParser::default(),
+            assistant_stream: StreamingMarkdownAssembler::default(),
+            assistant_stream_tail: None,
             plan_update_failed: false,
             current_goal: None,
             recoverable_operation_id: None,
@@ -1454,6 +1463,7 @@ impl AppState {
             })
             == Some(&notice);
         if !duplicate {
+            self.finish_assistant_stream();
             self.push_message(ChatMessage::System(notice));
         }
     }
@@ -1507,6 +1517,7 @@ impl AppState {
     }
 
     pub(crate) fn replace_messages(&mut self, messages: impl IntoIterator<Item = ChatMessage>) {
+        self.reset_assistant_stream();
         self.messages = messages.into_iter().collect();
         self.applied_diff_highlights.clear();
         self.clear_pending_edit_highlights();
@@ -1518,6 +1529,7 @@ impl AppState {
     }
 
     pub(crate) fn clear_messages(&mut self) {
+        self.reset_assistant_stream();
         self.messages.clear();
         self.message_revisions.clear();
         self.transcript_render_cache.clear();
@@ -1530,6 +1542,12 @@ impl AppState {
     }
 
     pub(crate) fn truncate_messages(&mut self, len: usize) {
+        if self
+            .assistant_stream_tail
+            .is_none_or(|tail_index| tail_index >= len)
+        {
+            self.reset_assistant_stream();
+        }
         self.reconcile_message_tracking();
         if len < self.messages.len() {
             self.invalidate_selection();
@@ -1592,6 +1610,8 @@ impl AppState {
         self.reconcile_message_tracking();
         let messages = std::mem::take(&mut self.messages);
         let revisions = std::mem::take(&mut self.message_revisions);
+        let active_tail = self.assistant_stream_tail;
+        let mut retained_tail = None;
         let finalized_count = self.finalized_count.min(messages.len());
         let flushed_count = self.flushed_count.min(messages.len());
         let mut retained_finalized = 0;
@@ -1602,6 +1622,9 @@ impl AppState {
             let retain = keep(&message);
             retained_mask.push(retain);
             if retain {
+                if active_tail == Some(index) {
+                    retained_tail = Some(self.messages.len());
+                }
                 retained_finalized += usize::from(index < finalized_count);
                 retained_flushed += usize::from(index < flushed_count);
                 self.messages.push(message);
@@ -1611,6 +1634,13 @@ impl AppState {
             }
         }
         self.transcript_render_cache.retain(&retained_mask);
+        if active_tail.is_some() {
+            if retained_tail.is_some() {
+                self.assistant_stream_tail = retained_tail;
+            } else {
+                self.reset_assistant_stream();
+            }
+        }
         self.finalized_count = retained_finalized;
         self.flushed_count = retained_flushed;
         if retained_mask.iter().any(|retain| !retain) {
@@ -2048,6 +2078,7 @@ impl AppState {
                 if self.suppress_background_main_session_output {
                     return;
                 }
+                self.finish_assistant_stream();
                 let last = self.messages.len().saturating_sub(1);
                 if matches!(self.messages.last(), Some(ChatMessage::Reasoning(_))) {
                     self.mutate_message(last, |message| {
@@ -2098,6 +2129,7 @@ impl AppState {
                     });
                     return;
                 }
+                self.finish_assistant_stream();
                 self.push_message(ChatMessage::ToolCall {
                     id,
                     name,
@@ -2147,6 +2179,7 @@ impl AppState {
                         *output = progress_output;
                     });
                 } else {
+                    self.finish_assistant_stream();
                     self.push_message(ChatMessage::ToolCall {
                         id,
                         name: name.unwrap_or_else(|| "tool".to_string()),
@@ -2234,6 +2267,7 @@ impl AppState {
                     });
                     index
                 } else {
+                    self.finish_assistant_stream();
                     let index = self.messages.len();
                     self.push_message(ChatMessage::ToolCall {
                         id: id.clone(),
@@ -2273,6 +2307,7 @@ impl AppState {
                 if self.suppress_background_main_session_output {
                     return;
                 }
+                self.finish_assistant_stream();
                 self.push_message(ChatMessage::Subagent {
                     id,
                     description,
@@ -2316,6 +2351,7 @@ impl AppState {
                         *existing_error = error;
                     });
                 } else {
+                    self.finish_assistant_stream();
                     self.push_message(ChatMessage::Subagent {
                         id,
                         description,
@@ -2383,6 +2419,7 @@ impl AppState {
                 if self
                     .push_pending_workflow_notification(PendingWorkflowNotification { id, prompt })
                 {
+                    self.finish_assistant_stream();
                     self.push_message(ChatMessage::System(format!("Workflow {status}. {summary}")));
                 }
             }
@@ -2434,6 +2471,7 @@ impl AppState {
             } => {
                 self.set_status(AppStatus::WaitingUserInput);
                 self.pending_input = Some(PendingTuiInput::UserInput(key));
+                self.finish_assistant_stream();
                 let mut message = question;
                 if !choices.is_empty() {
                     message.push_str("\nChoices: ");
@@ -2451,6 +2489,7 @@ impl AppState {
             } => {
                 self.set_status(AppStatus::WaitingUserInput);
                 self.pending_input = Some(PendingTuiInput::McpElicitation(key));
+                self.finish_assistant_stream();
                 let mut lines = vec![format!("MCP {server_name} requests input: {message}")];
                 match mode {
                     RuntimeMcpElicitationMode::Form => {
@@ -2476,15 +2515,18 @@ impl AppState {
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::OperationRejected(message) => {
+                self.reset_assistant_stream();
                 self.clear_receiving_tool_progress();
                 self.push_message(ChatMessage::Error(message));
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::Error(msg) => {
+                self.finish_assistant_stream();
                 self.clear_receiving_tool_progress();
                 self.push_message(ChatMessage::Error(msg));
             }
             TuiEvent::Notice(msg) => {
+                self.finish_assistant_stream();
                 self.push_message(ChatMessage::System(msg));
             }
             TuiEvent::RecoveryAvailable { operation_id } => {
@@ -2533,6 +2575,7 @@ impl AppState {
                 self.pending_input = None;
                 self.clear_receiving_tool_progress();
                 self.flush_proposed_plan_parser();
+                self.finish_assistant_stream();
                 self.promote_trailing_reasoning();
                 self.archive_current_plan();
                 if was_backgrounded {
@@ -2553,6 +2596,7 @@ impl AppState {
                 collapsed_messages,
                 status_text,
             } => {
+                self.finish_assistant_stream();
                 self.push_message(ChatMessage::System(format_compaction_notice(
                     &reason,
                     &strategy,
@@ -2575,6 +2619,7 @@ impl AppState {
             }
             TuiEvent::GoalCleared => {
                 self.current_goal = None;
+                self.finish_assistant_stream();
                 self.push_message(ChatMessage::System("Goal cleared.".to_string()));
                 self.set_status(AppStatus::Idle);
             }
@@ -2588,8 +2633,12 @@ impl AppState {
                         let notice = format_goal_notice(&goal);
                         self.push_goal_notice(notice);
                     }
-                    None => self
-                        .push_message(ChatMessage::System("No goal is currently set.".to_string())),
+                    None => {
+                        self.finish_assistant_stream();
+                        self.push_message(ChatMessage::System(
+                            "No goal is currently set.".to_string(),
+                        ));
+                    }
                 }
                 if !should_keep_running {
                     self.set_status(AppStatus::Idle);
@@ -2664,26 +2713,110 @@ impl AppState {
 
     fn push_proposed_plan_segment(&mut self, segment: ProposedPlanSegment) {
         match segment {
-            ProposedPlanSegment::Agent(text) => self.push_assistant_delta(text),
-            ProposedPlanSegment::Plan(text) => self.push_proposed_plan_delta(text),
+            ProposedPlanSegment::Agent(text) => {
+                let actions = self.assistant_stream.push(&text);
+                self.apply_streaming_markdown_actions(actions);
+            }
+            ProposedPlanSegment::Plan(text) => {
+                self.finish_assistant_stream();
+                self.push_proposed_plan_delta(text);
+            }
         }
     }
 
-    fn push_assistant_delta(&mut self, text: String) {
-        if text.is_empty() {
-            return;
+    fn apply_streaming_markdown_actions(&mut self, actions: Vec<StreamingMarkdownAction>) {
+        for action in actions {
+            match action {
+                StreamingMarkdownAction::UpdateTail(text) => {
+                    if let Some(index) = self.assistant_stream_tail {
+                        self.mutate_message(index, |message| {
+                            let ChatMessage::Assistant(existing) = message else {
+                                unreachable!();
+                            };
+                            *existing = text;
+                        });
+                    } else {
+                        let index = self.messages.len();
+                        self.push_message(ChatMessage::Assistant(text));
+                        self.assistant_stream_tail = Some(index);
+                    }
+                }
+                StreamingMarkdownAction::FreezeTail {
+                    text,
+                    trailing_blank,
+                } => {
+                    if let Some(index) = self.assistant_stream_tail {
+                        self.replace_message(
+                            index,
+                            ChatMessage::AssistantChunk {
+                                text,
+                                trailing_blank,
+                            },
+                        );
+                    } else {
+                        self.push_message(ChatMessage::AssistantChunk {
+                            text,
+                            trailing_blank,
+                        });
+                    }
+                }
+                StreamingMarkdownAction::AppendFrozen {
+                    text,
+                    trailing_blank,
+                } => self.push_message(ChatMessage::AssistantChunk {
+                    text,
+                    trailing_blank,
+                }),
+                StreamingMarkdownAction::ClearTail => {
+                    self.assistant_stream_tail = None;
+                }
+                StreamingMarkdownAction::FinishTail(suffix) => {
+                    if let Some(index) = self.assistant_stream_tail {
+                        if !suffix.is_empty() {
+                            self.mutate_message(index, |message| {
+                                let ChatMessage::Assistant(existing) = message else {
+                                    unreachable!();
+                                };
+                                existing.push_str(&suffix);
+                            });
+                        }
+                    } else if !suffix.is_empty() {
+                        self.push_message(ChatMessage::Assistant(suffix));
+                    }
+                    self.assistant_stream_tail = None;
+                }
+            }
         }
-        let last = self.messages.len().saturating_sub(1);
-        if matches!(self.messages.last(), Some(ChatMessage::Assistant(_))) {
-            self.mutate_message(last, |message| {
-                let ChatMessage::Assistant(existing) = message else {
+    }
+
+    fn finish_assistant_stream(&mut self) {
+        let actions = self.assistant_stream.finish();
+        self.apply_streaming_markdown_actions(actions);
+        self.assistant_stream = StreamingMarkdownAssembler::default();
+        self.assistant_stream_tail = None;
+        let Some(index) = self.messages.len().checked_sub(1) else {
+            return;
+        };
+        let needs_separator = matches!(
+            self.messages.get(index),
+            Some(ChatMessage::AssistantChunk {
+                trailing_blank: false,
+                ..
+            })
+        );
+        if needs_separator {
+            self.mutate_message(index, |message| {
+                let ChatMessage::AssistantChunk { trailing_blank, .. } = message else {
                     unreachable!();
                 };
-                existing.push_str(&text);
+                *trailing_blank = true;
             });
-        } else {
-            self.push_message(ChatMessage::Assistant(text));
         }
+    }
+
+    fn reset_assistant_stream(&mut self) {
+        self.assistant_stream = StreamingMarkdownAssembler::default();
+        self.assistant_stream_tail = None;
     }
 
     fn push_proposed_plan_delta(&mut self, text: String) {
@@ -2830,7 +2963,8 @@ impl AppState {
             ChatMessage::Reasoning(_)
             | ChatMessage::Assistant(_)
             | ChatMessage::ProposedPlan(_) => turn_ended || !is_last,
-            ChatMessage::User(_)
+            ChatMessage::AssistantChunk { .. }
+            | ChatMessage::User(_)
             | ChatMessage::Error(_)
             | ChatMessage::System(_)
             | ChatMessage::PlanUpdate { .. } => true,
@@ -3868,6 +4002,178 @@ mod tests {
     }
 
     #[test]
+    fn complete_lines_mutate_only_the_active_assistant_tail_revision() {
+        let mut state = state();
+        state.update(TuiEvent::MessageDelta("first line\n".to_string()));
+        let first_revision = state.message_revisions[0];
+        state.update(TuiEvent::MessageDelta("second line\n".to_string()));
+        assert_eq!(state.messages.len(), 1);
+        assert_ne!(state.message_revisions[0], first_revision);
+
+        let revisions = state.message_revisions.clone();
+        state.update(TuiEvent::MessageDelta("hidden half".to_string()));
+        assert_eq!(state.message_revisions, revisions);
+    }
+
+    #[test]
+    fn blank_boundary_freezes_tail_revision_and_new_block_uses_new_tail() {
+        let mut state = state();
+        state.update(TuiEvent::MessageDelta("first\n\n".to_string()));
+        assert!(matches!(
+            &state.messages[..],
+            [ChatMessage::AssistantChunk {
+                text,
+                trailing_blank: true,
+            }] if text == "first\n\n"
+        ));
+        let frozen_revision = state.message_revisions[0];
+
+        state.update(TuiEvent::MessageDelta("second\n".to_string()));
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::Assistant(text)) if text == "second\n"
+        ));
+        assert_eq!(state.message_revisions[0], frozen_revision);
+    }
+
+    fn assistant_projection_text(messages: &[ChatMessage]) -> String {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::Assistant(text) | ChatMessage::AssistantChunk { text, .. } => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn assistant_stream_completion_flushes_partial_unicode_once() {
+        let mut state = state();
+        for delta in ["中", "文👍🏽e\u{301}", "\n尾", "行"] {
+            state.update(TuiEvent::MessageDelta(delta.to_string()));
+        }
+        assert_eq!(
+            assistant_projection_text(&state.messages),
+            "中文👍🏽e\u{301}\n"
+        );
+
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+        assert_eq!(
+            assistant_projection_text(&state.messages),
+            "中文👍🏽e\u{301}\n尾行"
+        );
+        let revisions = state.message_revisions.clone();
+
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+        assert_eq!(
+            assistant_projection_text(&state.messages),
+            "中文👍🏽e\u{301}\n尾行"
+        );
+        assert_eq!(state.message_revisions, revisions);
+    }
+
+    #[test]
+    fn proposed_plan_boundaries_preserve_agent_source_order() {
+        let mut state = state();
+        state.update(TuiEvent::MessageDelta("Intro\n<proposed".to_string()));
+        state.update(TuiEvent::MessageDelta(
+            "_plan>\n# Plan\n- inspect\n</proposed_plan>\nOutro".to_string(),
+        ));
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+
+        let plan_index = state
+            .messages
+            .iter()
+            .position(|message| matches!(message, ChatMessage::ProposedPlan(_)))
+            .expect("proposed plan message");
+        assert_eq!(
+            assistant_projection_text(&state.messages[..plan_index]),
+            "Intro\n"
+        );
+        assert_eq!(
+            assistant_projection_text(&state.messages[plan_index + 1..]),
+            "\nOutro"
+        );
+        assert!(matches!(
+            &state.messages[plan_index],
+            ChatMessage::ProposedPlan(text) if text == "# Plan\n- inspect\n"
+        ));
+    }
+
+    #[test]
+    fn tool_boundary_finishes_hidden_assistant_text_before_tool_row() {
+        let mut state = state();
+        state.update(TuiEvent::MessageDelta("hidden tail".to_string()));
+        state.update(TuiEvent::ToolRequested {
+            id: "tool-1".to_string(),
+            name: "grep".to_string(),
+            target: None,
+        });
+
+        assert!(matches!(
+            &state.messages[..],
+            [
+                ChatMessage::Assistant(text),
+                ChatMessage::ToolCall { id, .. }
+            ] if text == "hidden tail" && id == "tool-1"
+        ));
+    }
+
+    #[test]
+    fn transcript_reset_discards_hidden_assistant_text() {
+        let mut state = state();
+        state.update(TuiEvent::MessageDelta("discard me".to_string()));
+        assert!(state.messages.is_empty());
+
+        state.clear_messages();
+        state.update(TuiEvent::MessageDelta("visible\n".to_string()));
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+
+        assert_eq!(assistant_projection_text(&state.messages), "visible\n");
+    }
+
+    #[test]
+    fn retaining_messages_reindexes_the_active_assistant_tail() {
+        let mut state = state();
+        state.push_message(ChatMessage::System("remove".to_string()));
+        state.update(TuiEvent::MessageDelta("first\n".to_string()));
+        state.retain_messages(
+            |message| !matches!(message, ChatMessage::System(text) if text == "remove"),
+        );
+
+        state.update(TuiEvent::MessageDelta("second\n".to_string()));
+
+        assert_eq!(state.messages.len(), 1);
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::Assistant(text)) if text == "first\nsecond\n"
+        ));
+    }
+
+    #[test]
+    fn system_notice_finishes_hidden_assistant_text_before_notice() {
+        let mut state = state();
+        state.update(TuiEvent::MessageDelta("hidden tail".to_string()));
+        state.update(TuiEvent::Notice("notice".to_string()));
+
+        assert!(matches!(
+            &state.messages[..],
+            [ChatMessage::Assistant(text), ChatMessage::System(notice)]
+                if text == "hidden tail" && notice == "notice"
+        ));
+    }
+
+    #[test]
     fn session_completion_without_receiving_tools_preserves_populated_render_cache() {
         let mut state = state();
         state.push_message(ChatMessage::Assistant("stable markdown".to_string()));
@@ -4104,15 +4410,20 @@ mod tests {
     }
 
     #[test]
-    fn flushable_prefix_holds_back_the_streaming_tail_until_turn_end() {
+    fn flushable_prefix_excludes_hidden_partial_until_completion_flushes_it() {
         let mut state = state();
         state.messages.push(ChatMessage::User("hi".to_string()));
         state.update(TuiEvent::MessageDelta("partial".to_string()));
 
-        // The trailing assistant block is still growing, so mid-turn only the user
-        // prompt is flushable.
+        // The partial source line is still hidden, so only the user prompt exists.
         assert_eq!(state.flushable_prefix_end(false), 1);
-        // When the turn ends the tail is settled and the whole prefix can flush.
+        assert_eq!(state.flushable_prefix_end(true), 1);
+
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+
+        // Completion flushes the hidden line as a finalized assistant message.
         assert_eq!(state.flushable_prefix_end(true), 2);
     }
 
@@ -5036,12 +5347,12 @@ mod tests {
             task: None,
         });
         state.update(TuiEvent::MessageDelta(
-            "visible foreground output".to_string(),
+            "visible foreground output\n".to_string(),
         ));
 
         assert!(matches!(
             state.messages.last(),
-            Some(ChatMessage::Assistant(text)) if text == "visible foreground output"
+            Some(ChatMessage::Assistant(text)) if text == "visible foreground output\n"
         ));
     }
 

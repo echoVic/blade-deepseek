@@ -1433,11 +1433,13 @@ fn append_message_lines(
             ]));
         }
         ChatMessage::Assistant(text) => {
-            let md_lines = render_markdown(text, width, theme);
-            for line in md_lines {
-                lines.push(line);
-            }
-            lines.push(Line::from(""));
+            append_assistant_markdown(lines, text, width, theme, true);
+        }
+        ChatMessage::AssistantChunk {
+            text,
+            trailing_blank,
+        } => {
+            append_assistant_markdown(lines, text, width, theme, *trailing_blank);
         }
         ChatMessage::ProposedPlan(text) => {
             append_proposed_plan_lines(lines, text, width, theme);
@@ -1541,6 +1543,19 @@ fn append_message_lines(
             )));
             lines.push(Line::from(""));
         }
+    }
+}
+
+fn append_assistant_markdown(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    width: usize,
+    theme: &Theme,
+    trailing_blank: bool,
+) {
+    lines.extend(render_markdown(text, width, theme));
+    if trailing_blank {
+        lines.push(Line::from(""));
     }
 }
 
@@ -4127,6 +4142,54 @@ mod tests {
             build_lines_for_message(&assistant, &theme, 80, 0, false, Some(&irrelevant)),
             build_lines_for_message(&assistant, &theme, 80, 0, false, None)
         );
+    }
+
+    #[test]
+    fn adjacent_assistant_chunks_preserve_only_source_blank_rows() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let first = ChatMessage::AssistantChunk {
+            text: "first paragraph\n\n".to_string(),
+            trailing_blank: true,
+        };
+        let second = ChatMessage::AssistantChunk {
+            text: "```rust\nfn main() {}\n```\n".to_string(),
+            trailing_blank: false,
+        };
+        let tail = ChatMessage::Assistant("tail".to_string());
+
+        let first_lines = build_lines_for_message(&first, &theme, 80, 0, false, None);
+        let second_lines = build_lines_for_message(&second, &theme, 80, 0, false, None);
+        let tail_lines = build_lines_for_message(&tail, &theme, 80, 0, false, None);
+
+        assert_eq!(
+            first_lines.last().map(ToString::to_string),
+            Some(String::new())
+        );
+        assert_ne!(
+            second_lines.last().map(ToString::to_string),
+            Some(String::new())
+        );
+        assert_eq!(
+            tail_lines.last().map(ToString::to_string),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn frozen_fenced_code_preserves_syntax_foregrounds() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let chunk = ChatMessage::AssistantChunk {
+            text: "```rust\nfn main() { let value = 1; }\n```\n".to_string(),
+            trailing_blank: false,
+        };
+
+        let lines = build_lines_for_message(&chunk, &theme, 80, 0, false, None);
+        let code_line = lines
+            .iter()
+            .find(|line| line.to_string().contains("fn main"))
+            .expect("frozen fenced source");
+
+        assert!(foregrounds(code_line).len() >= 2);
     }
 
     #[test]
@@ -7673,13 +7736,18 @@ mod tests {
     }
 
     #[test]
-    fn assistant_delta_advances_only_the_tail_message_revision() {
+    fn complete_assistant_line_advances_only_the_tail_message_revision() {
         let mut state = test_state();
         state.push_message(ChatMessage::User("prompt".to_string()));
-        state.push_message(ChatMessage::Assistant("alpha bravo charlie".to_string()));
+        state.update(TuiEvent::MessageDelta("alpha bravo charlie\n".to_string()));
         let before = state.message_revisions.clone();
 
         state.update(TuiEvent::MessageDelta(" delta".to_string()));
+
+        assert_eq!(state.message_revisions[0], before[0]);
+        assert_eq!(state.message_revisions[1], before[1]);
+
+        state.update(TuiEvent::MessageDelta("\n".to_string()));
 
         assert_eq!(state.message_revisions[0], before[0]);
         assert_ne!(state.message_revisions[1], before[1]);

@@ -134,9 +134,10 @@ impl StreamingMarkdownAssembler {
         } else if plausible_table_header(line) {
             self.pipe_candidate = Some(line.to_owned());
         } else {
+            let had_content = !self.current_block.trim().is_empty();
             self.current_block.push_str(line);
             *current_block_changed = true;
-            if line_is_blank(line) {
+            if line_is_blank(line) && had_content {
                 self.freeze_current_block(actions, true);
                 *current_block_changed = false;
             }
@@ -352,14 +353,22 @@ mod tests {
                 },
                 StreamingMarkdownAction::ClearTail,
                 StreamingMarkdownAction::UpdateTail("\n".to_string()),
-                StreamingMarkdownAction::FreezeTail {
-                    text: "\n".to_string(),
-                    trailing_blank: true,
-                },
-                StreamingMarkdownAction::ClearTail,
             ]
         );
         assert_eq!(reconstructed_action_text(&actions), "paragraph\n\n\n");
+    }
+
+    #[test]
+    fn leading_blank_line_stays_with_following_tail_content() {
+        let mut assembler = StreamingMarkdownAssembler::default();
+        assert_eq!(
+            assembler.push("\nOutro"),
+            vec![StreamingMarkdownAction::UpdateTail("\n".to_string())]
+        );
+        assert_eq!(
+            assembler.finish(),
+            vec![StreamingMarkdownAction::FinishTail("Outro".to_string())]
+        );
     }
 
     #[test]
