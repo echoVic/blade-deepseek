@@ -265,6 +265,56 @@ impl Keymap {
     fn sequences_for_action(&self, action: ShortcutAction) -> Vec<KeySequence> {
         sequences_for(&self.bindings, action)
     }
+
+    pub(super) fn cancel_action(&self, event: KeyEvent) -> Option<ShortcutAction> {
+        self.resolve_in(ShortcutContext::Global, event)
+            .filter(|action| *action == ShortcutAction::Global(GlobalShortcut::Cancel))
+    }
+
+    pub(super) fn matching_sequences(
+        &self,
+        context: ShortcutContext,
+        prefix: &[KeyStroke],
+    ) -> Vec<(KeySequence, ShortcutAction)> {
+        let mut matches = self
+            .bindings
+            .get(&ShortcutContext::Global)
+            .into_iter()
+            .flatten()
+            .chain(
+                (context != ShortcutContext::Global)
+                    .then(|| self.bindings.get(&context))
+                    .flatten()
+                    .into_iter()
+                    .flatten(),
+            )
+            .filter(|(sequence, _)| sequence.0.starts_with(prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|(sequence, action)| {
+            (
+                sequence.to_string(),
+                action.configurable_id().unwrap_or("").to_string(),
+            )
+        });
+        matches
+    }
+}
+
+impl KeyStroke {
+    pub(super) fn from_event(event: KeyEvent) -> Option<Self> {
+        if !matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return None;
+        }
+        let (code, modifiers) = normalize_key_parts(event.code, event.modifiers);
+        Some(Self { code, modifiers })
+    }
+}
+
+impl KeySequence {
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 #[derive(Debug)]

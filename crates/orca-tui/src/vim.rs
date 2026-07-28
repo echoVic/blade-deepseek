@@ -106,7 +106,7 @@ pub(crate) enum VimTranscriptSearchIntent {
     Previous,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum VimMode {
     Insert,
     Normal,
