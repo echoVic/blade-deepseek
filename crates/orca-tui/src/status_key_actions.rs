@@ -45,6 +45,7 @@ where
     F: FnOnce() -> io::Result<()>,
 {
     if state.status == AppStatus::Setup {
+        vim_state.cancel_pending_command();
         return match handle_setup_key(
             ev,
             key,
@@ -63,6 +64,7 @@ where
     }
 
     if state.status == AppStatus::SessionPicker {
+        vim_state.cancel_pending_command();
         handle_session_picker_key(
             key,
             state,
@@ -75,6 +77,7 @@ where
     }
 
     if state.status == AppStatus::WaitingApproval {
+        vim_state.cancel_pending_command();
         handle_approval_dialog_key(key, state, action_tx);
         return Ok(StatusKeyFlow::Continue);
     }
@@ -100,6 +103,7 @@ where
             _ => false,
         };
         if handled {
+            vim_state.cancel_pending_command();
             return Ok(StatusKeyFlow::Continue);
         }
     }
@@ -568,6 +572,47 @@ mod tests {
             assert_eq!(textarea.lines(), &["draft".to_string()]);
             assert_eq!(operation.call_count(), 0);
         }
+    }
+
+    #[test]
+    fn vim_search_intent_clears_pending_prefix_before_opening_search() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut config = config();
+        config.vim_mode = true;
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let operation = TestOperationInterrupt::default();
+        let preloaded = Arc::new(Mutex::new(None));
+        let mut textarea = TextArea::from(["draft"]);
+        let mut vim = VimState::new(true);
+        vim.seed_pending_count_for_test();
+        let theme = Theme::named(ThemeName::Dark);
+        let key = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE);
+
+        handle_status_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &operation,
+            &preloaded,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(state.transcript_search.open);
+        assert!(!vim.has_pending_command_for_test());
     }
 
     #[test]

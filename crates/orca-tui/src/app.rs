@@ -351,6 +351,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         match event {
                             IterationEvent::Input(input_event) => match input_event {
                                 BatchedInputEvent::ScrollLines(lines) => {
+                                    vim_state.cancel_pending_command();
                                     handle_scroll_lines(&mut state, lines, Instant::now());
                                 }
                                 BatchedInputEvent::Event(ev) => {
@@ -358,6 +359,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                         return Ok(None);
                                     }
                                     if handle_paste_event(&ev, &mut state, &config, &mut textarea) {
+                                        vim_state.cancel_pending_command();
                                         return Ok(None);
                                     }
                                     if handle_resize_event(&ev, &mut state) {
@@ -370,8 +372,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                         Instant::now(),
                                     ) {
                                         MouseFlow::NotMouse => {}
-                                        MouseFlow::Handled => return Ok(None),
+                                        MouseFlow::Handled => {
+                                            vim_state.cancel_pending_command();
+                                            return Ok(None);
+                                        }
                                         MouseFlow::SyntheticEnter => {
+                                            vim_state.cancel_pending_command();
                                             // A click confirmed the focused row; run
                                             // the exact same path a real Enter takes.
                                             let enter_key =
@@ -407,6 +413,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                         &shared_config,
                                         &action_tx,
                                         agent_runtime.controller(),
+                                        &mut vim_state,
                                         || clear_terminal_scrollback(terminal),
                                     )? {
                                         KeyEventFlow::Continue => return Ok(None),
@@ -1241,6 +1248,24 @@ mod tests {
     }
 
     #[test]
+    fn non_composer_input_boundaries_cancel_pending_vim_commands() {
+        let production = include_str!("app.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production app source");
+
+        assert!(
+            production
+                .matches("vim_state.cancel_pending_command()")
+                .count()
+                >= 4
+        );
+        assert!(production.contains(
+            "&mut vim_state,\n                                        || clear_terminal_scrollback"
+        ));
+    }
+
+    #[test]
     fn startup_captures_workspace_status_once_before_frame_loop() {
         let production = include_str!("app.rs")
             .split("\n#[cfg(test)]\nmod tests {")
@@ -2035,6 +2060,7 @@ mod tests {
         let shared_config = Arc::new(Mutex::new(config.clone()));
         let (action_tx, _action_rx) = mpsc::unbounded();
         let operation = crate::test_support::TestOperationInterrupt::default();
+        let mut vim = VimState::new(false);
 
         let pos = crate::selection::SelectionPos { row: 0, col: 0 };
         let head = crate::selection::SelectionPos { row: 2, col: 5 };
@@ -2053,6 +2079,7 @@ mod tests {
             &shared_config,
             &action_tx,
             &operation,
+            &mut vim,
             || Ok(()),
         )
         .expect("preflight");
@@ -2068,6 +2095,7 @@ mod tests {
             &shared_config,
             &action_tx,
             &operation,
+            &mut vim,
             || Ok(()),
         )
         .expect("preflight");
@@ -5403,6 +5431,7 @@ mod tests {
         let mut config = test_config(HistoryMode::Record);
         let shared = Arc::new(Mutex::new(config.clone()));
         let (action_tx, action_rx) = mpsc::unbounded();
+        let mut vim = VimState::new(false);
 
         assert!(handle_paste_event(
             &Event::Paste("alpha\r\nbeta".to_string()),
@@ -5422,6 +5451,7 @@ mod tests {
             &shared,
             &action_tx,
             &operation,
+            &mut vim,
             || Ok(()),
         )
         .unwrap();
@@ -5429,7 +5459,6 @@ mod tests {
         assert_eq!(operation.call_count(), 0);
 
         let preloaded = Arc::new(Mutex::new(None));
-        let mut vim = VimState::new(false);
         let theme = Theme::named(ThemeName::Dark);
         handle_status_key(
             &Event::Key(esc),
