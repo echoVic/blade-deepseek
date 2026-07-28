@@ -240,14 +240,14 @@ fn plausible_table_header(line: &str) -> bool {
     let Some(cells) = unescaped_pipe_cells(line) else {
         return false;
     };
-    cells.len() >= 2 && cells.iter().any(|cell| !cell.trim().is_empty()) && !table_delimiter(line)
+    !cells.is_empty() && cells.iter().any(|cell| !cell.trim().is_empty()) && !table_delimiter(line)
 }
 
 fn table_delimiter(line: &str) -> bool {
     let Some(cells) = unescaped_pipe_cells(line) else {
         return false;
     };
-    cells.len() >= 2
+    !cells.is_empty()
         && cells.iter().all(|cell| {
             let trimmed = cell.trim();
             let without_left = trimmed.strip_prefix(':').unwrap_or(trimmed);
@@ -258,7 +258,7 @@ fn table_delimiter(line: &str) -> bool {
 
 fn table_row(line: &str) -> bool {
     unescaped_pipe_cells(line)
-        .is_some_and(|cells| cells.len() >= 2 && cells.iter().any(|cell| !cell.trim().is_empty()))
+        .is_some_and(|cells| !cells.is_empty() && cells.iter().any(|cell| !cell.trim().is_empty()))
 }
 
 #[cfg(test)]
@@ -502,6 +502,19 @@ ordinary
             aligned
                 .push("| Left | Center | Right |\n|:---|:---:|---:|\n")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn single_column_table_with_structural_pipes_is_held_and_released() {
+        let mut assembler = StreamingMarkdownAssembler::default();
+        assert!(assembler.push("| Name |\n|---|\n| A |\n").is_empty());
+        assert_eq!(
+            assembler.finish(),
+            vec![StreamingMarkdownAction::AppendFrozen {
+                text: "| Name |\n|---|\n| A |\n".to_string(),
+                trailing_blank: false,
+            }]
         );
     }
 
