@@ -13,6 +13,14 @@ use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, PanelMode, UserAction};
 use crate::vim::VimState;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueuedDispatch {
+    Started,
+    None,
+    Blocked,
+    Failed,
+}
+
 pub(crate) fn enqueue_composer_follow_up(
     state: &mut AppState,
     textarea: &mut TextArea,
@@ -70,6 +78,35 @@ pub(crate) fn restore_latest_queued_message(
     state.pending_pastes = composer.pending_pastes;
     state.reset_history_navigation();
     true
+}
+
+pub(crate) fn dispatch_next_queued_user_message(
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+) -> QueuedDispatch {
+    if state.queued_submission_in_flight.is_some() {
+        return QueuedDispatch::Blocked;
+    }
+    let Some(action) = state.begin_next_queued_message() else {
+        return QueuedDispatch::None;
+    };
+
+    match action_tx.try_send(action) {
+        Ok(()) => {
+            state.commit_queued_submission_admission();
+            QueuedDispatch::Started
+        }
+        Err(mpsc::TrySendError::Full(_)) => {
+            state.rollback_queued_submission();
+            state.queued_input_error = Some("follow-up action queue is full".to_string());
+            QueuedDispatch::Failed
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            state.rollback_queued_submission();
+            state.queued_input_error = Some("follow-up action channel is closed".to_string());
+            QueuedDispatch::Failed
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -221,5 +258,65 @@ mod tests {
             "first"
         );
         assert!(state.queued_input_error.is_none());
+    }
+
+    #[test]
+    fn queued_dispatch_sends_one_fifo_item_nonblocking() {
+        let (action_tx, action_rx) = mpsc::bounded(1);
+        let mut state = state();
+        state.enqueue_user_message(queued("first")).unwrap();
+        state.enqueue_user_message(queued("second")).unwrap();
+        state.set_status(AppStatus::Idle);
+
+        assert_eq!(
+            dispatch_next_queued_user_message(&mut state, &action_tx),
+            QueuedDispatch::Started
+        );
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "first"
+        ));
+        assert_eq!(state.queued_user_messages.len(), 1);
+        assert_eq!(state.queued_user_messages[0].visible_text(), "second");
+        assert!(state.queued_submission_in_flight.is_some());
+        assert_eq!(
+            state.input_history.last().map(String::as_str),
+            Some("first")
+        );
+    }
+
+    #[test]
+    fn full_and_disconnected_action_channels_restore_queue_front() {
+        for disconnected in [false, true] {
+            let (action_tx, action_rx) = mpsc::bounded(1);
+            if disconnected {
+                drop(action_rx);
+            } else {
+                action_tx
+                    .send(UserAction::Remember("occupy".to_string()))
+                    .unwrap();
+            }
+            let mut state = state();
+            state.enqueue_user_message(queued("first")).unwrap();
+            state.set_status(AppStatus::Idle);
+
+            assert_eq!(
+                dispatch_next_queued_user_message(&mut state, &action_tx),
+                QueuedDispatch::Failed,
+                "disconnected={disconnected}"
+            );
+            assert_eq!(state.status, AppStatus::Idle);
+            assert_eq!(state.queued_user_messages.len(), 1);
+            assert_eq!(state.queued_user_messages[0].visible_text(), "first");
+            assert!(state.queued_submission_in_flight.is_none());
+            assert!(
+                !state
+                    .messages
+                    .iter()
+                    .any(|message| matches!(message, ChatMessage::User(text) if text == "first"))
+            );
+            assert!(!state.input_history.iter().any(|entry| entry == "first"));
+            assert!(state.queued_input_error.is_some());
+        }
     }
 }

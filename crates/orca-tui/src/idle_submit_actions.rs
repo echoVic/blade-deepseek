@@ -62,6 +62,7 @@ pub(crate) fn handle_idle_submit(
             let _ = action_tx.send(UserAction::RespondToInteraction { key, response });
         }
     } else {
+        state.resume_queued_follow_up_autosend();
         state.record_prompt(text.clone());
         state.push_message(ChatMessage::User(visible_text.trim().to_string()));
         state.enter_running();
@@ -81,4 +82,45 @@ pub(crate) fn handle_idle_submit(
 fn reset_composer_after_submit(textarea: &mut TextArea, vim_state: &mut VimState, theme: &Theme) {
     vim_state.reset_insert(textarea, theme);
     *textarea = make_textarea(vim_state, theme);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::composer_textarea::make_textarea_with_text;
+    use crate::test_support::test_run_config;
+    use orca_core::config::ThemeName;
+
+    #[test]
+    fn idle_submit_resumes_queued_autosend() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.suspend_queued_follow_up_autosend();
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("new foreground", &vim, &theme);
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+        ));
+        assert!(state.queued_follow_up_autosend);
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SubmitWithMentions { prompt, .. })
+                if prompt == "new foreground"
+        ));
+    }
 }

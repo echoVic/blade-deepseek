@@ -28,6 +28,7 @@ where
                     | AppStatus::WaitingApproval
                     | AppStatus::WaitingUserInput
             ) {
+                state.suspend_queued_follow_up_autosend();
                 let _ = action_tx.send(UserAction::Interrupt);
                 return Ok(GlobalShortcutFlow::Continue);
             }
@@ -88,6 +89,7 @@ mod tests {
             .expect("cancel compaction");
 
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+        assert!(!state.queued_follow_up_autosend);
     }
 
     #[test]
