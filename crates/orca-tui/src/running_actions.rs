@@ -112,7 +112,7 @@ mod tests {
         ));
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "follow up"
+            Ok(UserAction::SubmitQueued { prompt, .. }) if prompt == "follow up"
         ));
         assert!(state.queued_submission_in_flight.is_some());
         assert_eq!(operation.call_count(), 0);

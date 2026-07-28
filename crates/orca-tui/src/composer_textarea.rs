@@ -154,6 +154,26 @@ pub(crate) fn expand_pending_pastes(
     expanded
 }
 
+pub(crate) fn expand_pending_pastes_with_bindings(
+    visible_text: &str,
+    pending_pastes: &[(String, String)],
+    bindings: &mut orca_runtime::mentions::MentionBindings,
+) -> String {
+    let mut replacements = locate_pending_pastes(visible_text, pending_pastes)
+        .into_iter()
+        .map(|(start, end, index)| (start, end, pending_pastes[index].1.as_str()))
+        .collect::<Vec<_>>();
+    replacements.sort_unstable_by_key(|(start, _, _)| *start);
+
+    let mut expanded = visible_text.to_string();
+    bindings.reconcile(&expanded);
+    for (start, end, actual) in replacements.into_iter().rev() {
+        expanded.replace_range(start..end, actual);
+        bindings.reconcile(&expanded);
+    }
+    expanded
+}
+
 pub(crate) fn retain_active_pending_pastes(
     visible_text: &str,
     pending_pastes: &mut Vec<(String, String)>,

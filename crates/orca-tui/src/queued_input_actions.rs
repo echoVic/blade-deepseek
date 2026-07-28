@@ -122,6 +122,9 @@ pub(crate) fn handle_running_key(
     vim_state: &mut VimState,
     theme: &Theme,
 ) -> bool {
+    if state.show_shortcuts {
+        return true;
+    }
     if state.panel_mode == PanelMode::Conversation
         && (!state.mention.candidates.is_empty()
             || (state.mention.phase.is_some() && key.code == KeyCode::Esc))
@@ -287,7 +290,7 @@ mod tests {
         );
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "first"
+            Ok(UserAction::SubmitQueued { prompt, .. }) if prompt == "first"
         ));
         assert_eq!(state.queued_user_messages.len(), 1);
         assert_eq!(state.queued_user_messages[0].visible_text(), "second");
@@ -358,6 +361,39 @@ mod tests {
         ));
         assert!(state.queued_user_messages.is_empty());
         assert_eq!(textarea_text(&textarea), "hidden draft");
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn shortcuts_overlay_blocks_running_composer_edit_and_submit() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state();
+        state.show_shortcuts = true;
+        let config = crate::test_support::test_run_config();
+        let operation = crate::test_support::TestOperationInterrupt::default();
+        let theme = theme();
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("draft", &vim, &theme);
+
+        for key in [
+            KeyEvent::new(KeyCode::Char('x'), crossterm::event::KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
+        ] {
+            assert!(handle_running_key(
+                &Event::Key(key),
+                &key,
+                &mut state,
+                &config,
+                &action_tx,
+                &operation,
+                &mut textarea,
+                &mut vim,
+                &theme,
+            ));
+        }
+
+        assert_eq!(textarea_text(&textarea), "draft");
+        assert!(state.queued_user_messages.is_empty());
         assert!(action_rx.try_recv().is_err());
     }
 }

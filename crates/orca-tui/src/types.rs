@@ -292,6 +292,9 @@ pub enum TuiEvent {
         turn: u32,
         task: Option<TuiTaskLifecycle>,
     },
+    QueuedSubmissionStarted {
+        id: u64,
+    },
     ReasoningDelta(String),
     MessageDelta(String),
     ToolRequested {
@@ -383,6 +386,7 @@ pub enum TuiEvent {
         generation: u64,
     },
     SubmissionRejected {
+        queued_id: Option<u64>,
         prompt: String,
         message: String,
     },
@@ -417,6 +421,11 @@ pub enum TuiEvent {
 pub enum UserAction {
     Submit(String),
     SubmitWithMentions {
+        prompt: String,
+        bindings: MentionBindings,
+    },
+    SubmitQueued {
+        id: u64,
         prompt: String,
         bindings: MentionBindings,
     },
@@ -742,6 +751,7 @@ pub struct AppState {
     pub(crate) queued_submission_in_flight: Option<QueuedUserMessage>,
     pub(crate) queued_follow_up_autosend: bool,
     pub(crate) queued_input_error: Option<String>,
+    next_queued_submission_id: u64,
     pub history_cursor: Option<usize>,
     pub draft_before_history: Option<String>,
     pub last_ctrl_c: Option<Instant>,
@@ -891,6 +901,7 @@ impl AppState {
             queued_submission_in_flight: None,
             queued_follow_up_autosend: true,
             queued_input_error: None,
+            next_queued_submission_id: 1,
             history_cursor: None,
             draft_before_history: None,
             last_ctrl_c: None,
@@ -1950,11 +1961,13 @@ fn append_input_history(prompt: &str) {
 impl AppState {
     pub(crate) fn enqueue_user_message(
         &mut self,
-        message: QueuedUserMessage,
+        mut message: QueuedUserMessage,
     ) -> Result<(), QueuedUserMessage> {
         if self.queued_user_messages.len() >= crate::channels::USER_ACTION_CAPACITY {
             return Err(message);
         }
+        message.assign_id(self.next_queued_submission_id);
+        self.next_queued_submission_id = self.next_queued_submission_id.wrapping_add(1).max(1);
         self.queued_user_messages.push_back(message);
         self.queued_input_error = None;
         Ok(())
@@ -1981,7 +1994,8 @@ impl AppState {
         self.scroll_to_bottom();
         self.queued_submission_in_flight = Some(message.clone());
         self.queued_input_error = None;
-        Some(UserAction::SubmitWithMentions {
+        Some(UserAction::SubmitQueued {
+            id: message.id(),
             prompt: message.submission_text().to_string(),
             bindings: message.submission_bindings().clone(),
         })
@@ -2025,11 +2039,18 @@ impl AppState {
         !self.queued_user_messages.is_empty() || self.queued_submission_in_flight.is_some()
     }
 
+    pub(crate) fn queued_submission_matches_id(&self, id: u64) -> bool {
+        self.queued_submission_in_flight
+            .as_ref()
+            .is_some_and(|message| message.id() == id)
+    }
+
     pub(crate) fn reset_queued_user_messages(&mut self) {
         self.queued_user_messages.clear();
         self.queued_submission_in_flight = None;
         self.queued_follow_up_autosend = true;
         self.queued_input_error = None;
+        self.next_queued_submission_id = 1;
     }
 
     pub fn record_prompt(&mut self, prompt: String) {
@@ -2177,7 +2198,12 @@ impl AppState {
         match event {
             TuiEvent::TurnStarted { .. } => {
                 self.suppress_background_main_session_output = false;
-                self.queued_submission_in_flight = None;
+                self.enter_running();
+            }
+            TuiEvent::QueuedSubmissionStarted { id } => {
+                if self.queued_submission_matches_id(id) {
+                    self.queued_submission_in_flight = None;
+                }
                 self.enter_running();
             }
             TuiEvent::ReasoningDelta(text) => {
@@ -2609,7 +2635,17 @@ impl AppState {
                 }
                 self.push_message(ChatMessage::System(lines.join("\n")));
             }
-            TuiEvent::SubmissionRejected { message, .. } => {
+            TuiEvent::SubmissionRejected {
+                queued_id,
+                prompt: _,
+                message,
+            } => {
+                if queued_id.is_some()
+                    && !queued_id.is_some_and(|id| self.queued_submission_matches_id(id))
+                {
+                    self.push_message(ChatMessage::Error(message));
+                    return;
+                }
                 self.remove_after_last_user();
                 self.mention_bindings.clear();
                 self.clear_receiving_tool_progress();
@@ -3243,7 +3279,7 @@ mod tests {
         let action = state.begin_next_queued_message().expect("first action");
         assert!(matches!(
             action,
-            UserAction::SubmitWithMentions { prompt, .. } if prompt == "first"
+            UserAction::SubmitQueued { prompt, .. } if prompt == "first"
         ));
         assert_eq!(state.queued_user_messages.len(), 2);
         assert!(state.queued_submission_in_flight.is_some());
@@ -3263,6 +3299,9 @@ mod tests {
             turn: 1,
             task: None,
         });
+        assert!(state.queued_submission_in_flight.is_some());
+        let id = state.queued_submission_in_flight.as_ref().unwrap().id();
+        state.update(TuiEvent::QueuedSubmissionStarted { id });
         assert!(state.queued_submission_in_flight.is_none());
         assert_eq!(
             state.pop_latest_queued_message().unwrap().visible_text(),
@@ -3315,6 +3354,7 @@ mod tests {
 
         state.begin_next_queued_message().unwrap();
         state.update(TuiEvent::SubmissionRejected {
+            queued_id: Some(state.queued_submission_in_flight.as_ref().unwrap().id()),
             prompt: "first".to_string(),
             message: "rejected".to_string(),
         });
@@ -3323,6 +3363,27 @@ mod tests {
         assert!(state.queued_submission_in_flight.is_none());
         assert!(!state.queued_follow_up_autosend);
         assert!(state.queued_user_messages.is_empty());
+    }
+
+    #[test]
+    fn unrelated_turn_start_and_rejection_do_not_consume_queued_admission_fence() {
+        let mut state = state();
+        state.enqueue_user_message(queued("queued prompt")).unwrap();
+        state.set_status(AppStatus::Idle);
+        state.begin_next_queued_message().unwrap();
+
+        state.update(TuiEvent::TurnStarted {
+            turn: 1,
+            task: None,
+        });
+        assert!(state.queued_submission_in_flight.is_some());
+
+        state.update(TuiEvent::SubmissionRejected {
+            queued_id: Some(u64::MAX),
+            prompt: "other prompt".to_string(),
+            message: "other rejection".to_string(),
+        });
+        assert!(state.queued_submission_in_flight.is_some());
     }
 
     #[test]
@@ -4631,6 +4692,7 @@ mod tests {
         });
 
         state.update(TuiEvent::SubmissionRejected {
+            queued_id: None,
             prompt: "review @gone.txt".to_string(),
             message: "bound file is no longer available".to_string(),
         });

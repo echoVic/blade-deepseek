@@ -1,5 +1,4 @@
 use crossbeam_channel as mpsc;
-use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1891,13 +1890,16 @@ mod tests {
 
         send_submission_error(
             &event_tx,
+            None,
             Some("review @gone.txt"),
             "bound file is no longer available".to_string(),
         );
 
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(TuiEvent::SubmissionRejected { prompt, message })
+            Ok(TuiEvent::SubmissionRejected {
+                prompt, message, ..
+            })
                 if prompt == "review @gone.txt"
                     && message == "bound file is no longer available"
         ));
@@ -1939,9 +1941,59 @@ mod tests {
                 harness.recv_until(|event| matches!(event, TuiEvent::SubmissionRejected { .. }));
             assert!(matches!(
                 rejection,
-                TuiEvent::SubmissionRejected { prompt, message }
+                TuiEvent::SubmissionRejected {
+                    prompt, message, ..
+                }
                     if prompt == "review @gone.txt"
                         && message.contains("failed to resolve bound @gone.txt")
+            ));
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn queued_stale_bound_file_rejection_preserves_queued_identity() {
+        with_orca_home(|_| {
+            let root = tempdir().expect("workspace root");
+            let root_path = root
+                .path()
+                .canonicalize()
+                .expect("canonical workspace root");
+            let mut config = test_config(HistoryMode::Disabled);
+            config.cwd = Some(root_path.clone());
+            config.runtime_workspace_roots = Some(vec![root_path.clone()]);
+            let prompt = "review @gone.txt";
+            let bindings = orca_runtime::mentions::MentionBindings::from_bindings(
+                prompt,
+                vec![orca_runtime::mentions::MentionBinding {
+                    start: 7,
+                    end: prompt.len(),
+                    visible: "@gone.txt".to_string(),
+                    target: orca_runtime::mentions::MentionTarget::File {
+                        root: root_path,
+                        path: "gone.txt".to_string(),
+                        kind: orca_runtime::mentions::MentionFileKind::File,
+                    },
+                }],
+            );
+            let mut harness = HostedTuiHarness::start(config, None);
+
+            harness.send(UserAction::SubmitQueued {
+                id: 42,
+                prompt: prompt.to_string(),
+                bindings,
+            });
+
+            let rejection =
+                harness.recv_until(|event| matches!(event, TuiEvent::SubmissionRejected { .. }));
+            assert!(matches!(
+                rejection,
+                TuiEvent::SubmissionRejected {
+                    queued_id: Some(42),
+                    prompt,
+                    message,
+                } if prompt == "review @gone.txt"
+                    && message.contains("failed to resolve bound @gone.txt")
             ));
             harness.shutdown();
         });
@@ -1951,7 +2003,7 @@ mod tests {
     fn workflow_submission_error_remains_generic() {
         let (event_tx, event_rx) = mpsc::unbounded();
 
-        send_submission_error(&event_tx, None, "workflow failed".to_string());
+        send_submission_error(&event_tx, None, None, "workflow failed".to_string());
 
         assert!(matches!(
             event_rx.try_recv(),
@@ -3028,7 +3080,9 @@ mod tests {
 
             assert!(matches!(
                 event_rx.recv_timeout(Duration::from_secs(1)),
-                Ok(TuiEvent::SubmissionRejected { prompt, message })
+                Ok(TuiEvent::SubmissionRejected {
+                    prompt, message, ..
+                })
                     if prompt == "retry me"
                         && message.contains("failed to initialize conversation history")
             ));
@@ -3060,12 +3114,96 @@ mod tests {
                 cfg,
                 &controller,
                 &event_tx,
+                None,
             );
 
             assert!(result.is_err());
             assert!(matches!(
                 event_rx.recv_timeout(Duration::from_secs(1)),
                 Ok(TuiEvent::SessionCompleted { status }) if status == "failed"
+            ));
+            host.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn queued_operation_controller_install_failure_preserves_queued_identity() {
+        with_orca_home(|_| {
+            let cfg = test_config(HistoryMode::Record);
+            let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+            let runtime_thread = host
+                .start_thread(cfg.clone(), "queued install failure")
+                .unwrap();
+            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            controller.shutdown();
+            let (event_tx, event_rx) = mpsc::unbounded();
+
+            let result = run_hosted_operation(
+                &runtime_thread,
+                HostedTurnRequest::new("restore queued prompt"),
+                cfg,
+                &controller,
+                &event_tx,
+                Some(42),
+            );
+
+            assert!(result.is_err());
+            let events = event_rx.try_iter().collect::<Vec<_>>();
+            let acknowledged = events
+                .iter()
+                .any(|event| matches!(event, TuiEvent::QueuedSubmissionStarted { id: 42 }));
+            let rejected = events.iter().any(|event| {
+                matches!(
+                    event,
+                    TuiEvent::SubmissionRejected {
+                        queued_id: Some(42),
+                        prompt,
+                        message,
+                    } if prompt == "restore queued prompt"
+                        && message.contains("controller is shutting down")
+                )
+            });
+            assert_ne!(
+                acknowledged, rejected,
+                "queued identity must be acknowledged or rejected exactly once: {events:?}"
+            );
+            host.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn queued_goal_preflight_failure_preserves_queued_identity() {
+        with_orca_home(|_| {
+            let cfg = test_config(HistoryMode::Disabled);
+            let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+            let runtime_thread = host
+                .start_thread(cfg.clone(), "queued preflight failure")
+                .unwrap();
+            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let (event_tx, event_rx) = mpsc::unbounded();
+
+            run_hosted_goal_run(
+                &cfg,
+                &runtime_thread,
+                SubmittedTurn::queued_user_with_mentions(
+                    42,
+                    "restore queued prompt".to_string(),
+                    orca_runtime::mentions::MentionBindings::new("restore queued prompt"),
+                ),
+                orca_core::goal_runtime::GoalTurnOrigin::User,
+                &event_tx,
+                &controller,
+                Some(42),
+            );
+
+            assert!(matches!(
+                event_rx.recv_timeout(Duration::from_secs(1)),
+                Ok(TuiEvent::SubmissionRejected {
+                    queued_id: Some(42),
+                    prompt,
+                    message,
+                }) if prompt == "restore queued prompt"
+                    && message.contains("persistent goals require recorded history")
             ));
             host.shutdown().unwrap();
         });
@@ -5089,7 +5227,7 @@ mod tests {
 
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "foo!"
+            Ok(UserAction::SubmitQueued { prompt, .. }) if prompt == "foo!"
         ));
         assert!(matches!(
             state.messages.last(),
@@ -5144,7 +5282,7 @@ mod tests {
             );
 
             let mut terminal_event = first_terminal;
-            for (turn, expected_count) in [(2, 2usize), (3, 3usize)] {
+            for expected_count in [2usize, 3usize] {
                 handle_runtime_event(
                     terminal_event,
                     &mut state,
@@ -5155,8 +5293,12 @@ mod tests {
                     &theme,
                     &mut presentation,
                 );
-                harness.recv_until(|event| matches!(event, TuiEvent::TurnStarted { .. }));
-                state.update(TuiEvent::TurnStarted { turn, task: None });
+                let queued_started = harness
+                    .recv_until(|event| matches!(event, TuiEvent::QueuedSubmissionStarted { .. }));
+                state.update(queued_started);
+                let turn_started =
+                    harness.recv_until(|event| matches!(event, TuiEvent::TurnStarted { .. }));
+                state.update(turn_started);
                 let delta = harness.recv_until(|event| {
                     matches!(
                         event,
@@ -6040,11 +6182,13 @@ fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
 
 fn send_submission_error(
     event_tx: &mpsc::Sender<TuiEvent>,
+    queued_id: Option<u64>,
     rejection_prompt: Option<&str>,
     message: String,
 ) {
     if let Some(prompt) = rejection_prompt {
         let _ = event_tx.send(TuiEvent::SubmissionRejected {
+            queued_id,
             prompt: prompt.to_string(),
             message,
         });
@@ -6066,13 +6210,10 @@ fn hosted_tui_controller_loop(
 ) {
     let mut thread: Option<RuntimeThreadHandle> = None;
     let mut pending_pinned_context = Vec::new();
-    let mut pending_actions = VecDeque::new();
 
     loop {
         let action = if controller.is_shutdown() {
             Ok(UserAction::Cancel)
-        } else if let Some(action) = pending_actions.pop_front() {
-            Ok(action)
         } else {
             action_rx.recv()
         };
@@ -6092,6 +6233,24 @@ fn hosted_tui_controller_loop(
             Ok(UserAction::SubmitWithMentions { prompt, bindings }) => {
                 handle_hosted_submitted_turn(
                     SubmittedTurn::user_with_mentions(prompt, bindings),
+                    &config,
+                    &preloaded,
+                    &mut thread,
+                    &mut pending_pinned_context,
+                    &event_tx,
+                    &controller,
+                    &pending_workflow_notifications,
+                    &mcp_registry,
+                    &host,
+                );
+            }
+            Ok(UserAction::SubmitQueued {
+                id,
+                prompt,
+                bindings,
+            }) => {
+                handle_hosted_submitted_turn(
+                    SubmittedTurn::queued_user_with_mentions(id, prompt, bindings),
                     &config,
                     &preloaded,
                     &mut thread,
@@ -6186,7 +6345,7 @@ fn hosted_tui_controller_loop(
                     .with_operation_kind(HostedOperationKind::ManualCompaction);
                 let cfg = config.lock().unwrap().clone();
                 if let Err(error) =
-                    run_hosted_operation(runtime_thread, request, cfg, &controller, &event_tx)
+                    run_hosted_operation(runtime_thread, request, cfg, &controller, &event_tx, None)
                 {
                     let _ = event_tx.send(TuiEvent::Error(format!(
                         "manual compaction failed: {error}"
@@ -6236,18 +6395,15 @@ fn hosted_tui_controller_loop(
                             task_id: continuation.task_id().to_string(),
                         })
                         .with_goal_usage_tracking(true);
-                    match run_hosted_operation(runtime_thread, request, cfg, &controller, &event_tx)
-                    {
-                        Ok(TuiHostedOperationOutcome::Turn { status }) => {
-                            if status == "success"
-                                && let Some(notification) =
-                                    pending_workflow_notifications.pop_notification()
-                            {
-                                pending_actions.push_front(UserAction::SubmitWorkflowNotification(
-                                    notification,
-                                ));
-                            }
-                        }
+                    match run_hosted_operation(
+                        runtime_thread,
+                        request,
+                        cfg,
+                        &controller,
+                        &event_tx,
+                        None,
+                    ) {
+                        Ok(TuiHostedOperationOutcome::Turn { .. }) => {}
                         Ok(TuiHostedOperationOutcome::ManualCompaction) => {}
                         Err(error) => {
                             let _ = event_tx.send(TuiEvent::Error(error.to_string()));
@@ -6329,6 +6485,7 @@ fn hosted_tui_controller_loop(
                                 orca_core::goal_runtime::GoalTurnOrigin::User,
                                 &event_tx,
                                 &controller,
+                                None,
                             );
                         }
                     }
@@ -6467,6 +6624,7 @@ fn hosted_tui_controller_loop(
                         orca_core::goal_runtime::GoalTurnOrigin::Resume,
                         &event_tx,
                         &controller,
+                        None,
                     );
                 }
             }
@@ -6532,6 +6690,7 @@ fn handle_hosted_submitted_turn(
     host: &RuntimeHostHandle,
 ) {
     let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
+    let queued_id = submitted_turn.queued_id();
     let cfg = config.lock().unwrap().clone();
     let cwd = cfg
         .cwd
@@ -6548,7 +6707,7 @@ fn handle_hosted_submitted_turn(
         pending_pinned_context,
         event_tx,
     ) {
-        send_submission_error(event_tx, rejection_prompt.as_deref(), error);
+        send_submission_error(event_tx, queued_id, rejection_prompt.as_deref(), error);
         return;
     }
     let runtime_thread = thread.as_ref().expect("hosted thread initialized");
@@ -6564,7 +6723,7 @@ fn handle_hosted_submitted_turn(
     ) {
         Ok(prompt) => prompt,
         Err(error) => {
-            send_submission_error(event_tx, rejection_prompt.as_deref(), error);
+            send_submission_error(event_tx, queued_id, rejection_prompt.as_deref(), error);
             return;
         }
     };
@@ -6575,6 +6734,7 @@ fn handle_hosted_submitted_turn(
         orca_core::goal_runtime::GoalTurnOrigin::User,
         event_tx,
         controller,
+        queued_id,
     );
     if cfg.desktop_notifications {
         let _ = orca_runtime::notify::notify("Orca", "Task completed");
@@ -6587,9 +6747,13 @@ fn run_hosted_operation(
     config: RunConfig,
     controller: &TuiOperationController,
     event_tx: &mpsc::Sender<TuiEvent>,
+    queued_id: Option<u64>,
 ) -> io::Result<TuiHostedOperationOutcome> {
     let operation_kind = request.operation_kind().clone();
-    let observer = Arc::new(TuiHostedEventObserver::new(event_tx.clone()));
+    let observer = Arc::new(TuiHostedEventObserver::new_with_queued_id(
+        event_tx.clone(),
+        queued_id,
+    ));
     let pending_interactions =
         orca_runtime::runtime_pending_interaction::RuntimePendingInteractionStore::default();
     let generation_pending_interactions = pending_interactions.clone();
@@ -6623,10 +6787,19 @@ fn run_hosted_operation(
                         .with_pending_interactions(generation_pending_interactions.clone()),
                 ))
         });
+    let rejection_prompt = queued_id.map(|_| request.prompt().to_string());
     let operation = match thread.start_turn_with_config(request, io::sink(), config) {
         Ok(operation) => Arc::new(operation),
         Err(error) => {
-            send_hosted_operation_terminal_failure(event_tx, &operation_kind);
+            if let Some(id) = queued_id {
+                let _ = event_tx.send(TuiEvent::SubmissionRejected {
+                    queued_id: Some(id),
+                    prompt: rejection_prompt.unwrap_or_default(),
+                    message: error.to_string(),
+                });
+            } else {
+                send_hosted_operation_terminal_failure(event_tx, &operation_kind);
+            }
             return Err(io::Error::other(error.to_string()));
         }
     };
@@ -6635,8 +6808,19 @@ fn run_hosted_operation(
         let _ = operation.interrupt();
         let _ = operation.wait();
         controller.complete_hosted(operation_id);
-        let _ = observer.finish_foreground();
-        send_hosted_operation_terminal_failure(event_tx, &operation_kind);
+        if let Some(id) = queued_id
+            && !observer.queued_submission_started()
+        {
+            let _ = event_tx.send(TuiEvent::SubmissionRejected {
+                queued_id: Some(id),
+                prompt: rejection_prompt.unwrap_or_default(),
+                message: error.to_string(),
+            });
+        }
+        let terminal_published = observer.finish_foreground().unwrap_or(false);
+        if queued_id.is_none() && !terminal_published {
+            send_hosted_operation_terminal_failure(event_tx, &operation_kind);
+        }
         return Err(error);
     }
     let terminal = operation.wait();
@@ -6687,22 +6871,51 @@ fn run_hosted_goal_run(
     origin: orca_core::goal_runtime::GoalTurnOrigin,
     event_tx: &mpsc::Sender<TuiEvent>,
     controller: &TuiOperationController,
+    queued_id: Option<u64>,
 ) {
+    let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
     let Some(session_id) = thread.session_id().map(str::to_string) else {
-        send_goal_history_error(event_tx);
+        if queued_id.is_some() {
+            send_submission_error(
+                event_tx,
+                queued_id,
+                rejection_prompt.as_deref(),
+                goal_history_error_message().to_string(),
+            );
+        } else {
+            send_goal_history_error(event_tx);
+        }
         return;
     };
     let runtime = match thread.goal_runtime() {
         Ok(runtime) => runtime,
         Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+            if queued_id.is_some() {
+                send_submission_error(
+                    event_tx,
+                    queued_id,
+                    rejection_prompt.as_deref(),
+                    error.to_string(),
+                );
+            } else {
+                let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+            }
             return;
         }
     };
     let active_goal = match runtime.project_thread_goal(&session_id) {
         Ok(goal) => goal.filter(|goal| goal.status.should_continue()),
         Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+            if queued_id.is_some() {
+                send_submission_error(
+                    event_tx,
+                    queued_id,
+                    rejection_prompt.as_deref(),
+                    error.to_string(),
+                );
+            } else {
+                let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+            }
             return;
         }
     };
@@ -6717,7 +6930,14 @@ fn run_hosted_goal_run(
     } else {
         request
     };
-    let status = match run_hosted_operation(thread, request, config.clone(), controller, event_tx) {
+    let status = match run_hosted_operation(
+        thread,
+        request,
+        config.clone(),
+        controller,
+        event_tx,
+        queued_id,
+    ) {
         Ok(TuiHostedOperationOutcome::Turn { status }) => status,
         Ok(TuiHostedOperationOutcome::ManualCompaction) => {
             let _ = event_tx.send(TuiEvent::Error(
@@ -6858,9 +7078,11 @@ fn show_hosted_goal(
 }
 
 fn send_goal_history_error(event_tx: &mpsc::Sender<TuiEvent>) {
-    let _ = event_tx.send(TuiEvent::Error(
-        "persistent goals require recorded history; enable history before using /goal".to_string(),
-    ));
+    let _ = event_tx.send(TuiEvent::Error(goal_history_error_message().to_string()));
+}
+
+fn goal_history_error_message() -> &'static str {
+    "persistent goals require recorded history; enable history before using /goal"
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6978,6 +7200,7 @@ fn resume_latest_active_goal_hosted(
             orca_core::goal_runtime::GoalTurnOrigin::Resume,
             event_tx,
             controller,
+            None,
         );
     }
 }

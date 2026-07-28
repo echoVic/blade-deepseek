@@ -1,10 +1,11 @@
 use orca_runtime::mentions::MentionBindings;
 use std::collections::VecDeque;
 
-use crate::composer_textarea::{expand_pending_pastes, retain_active_pending_pastes};
+use crate::composer_textarea::{expand_pending_pastes_with_bindings, retain_active_pending_pastes};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct QueuedUserMessage {
+    id: u64,
     visible_text: String,
     submission_text: String,
     composer_bindings: MentionBindings,
@@ -89,16 +90,20 @@ impl QueuedUserMessage {
         let mut composer_bindings = mention_bindings.clone();
         composer_bindings.reconcile(&trimmed_visible);
 
-        let expanded = expand_pending_pastes(&visible_text, &pending_pastes);
-        let submission_text = expanded.trim().to_string();
         let mut submission_bindings = mention_bindings;
-        submission_bindings.reconcile(&expanded);
+        let expanded = expand_pending_pastes_with_bindings(
+            &visible_text,
+            &pending_pastes,
+            &mut submission_bindings,
+        );
+        let submission_text = expanded.trim().to_string();
         submission_bindings.reconcile(&submission_text);
 
         let mut pending_pastes = pending_pastes;
         retain_active_pending_pastes(&trimmed_visible, &mut pending_pastes);
 
         Some(Self {
+            id: 0,
             visible_text: trimmed_visible,
             submission_text,
             composer_bindings,
@@ -109,6 +114,14 @@ impl QueuedUserMessage {
 
     pub(crate) fn visible_text(&self) -> &str {
         &self.visible_text
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn assign_id(&mut self, id: u64) {
+        self.id = id;
     }
 
     pub(crate) fn submission_text(&self) -> &str {
@@ -282,6 +295,46 @@ mod tests {
         assert_eq!(
             restored.pending_pastes,
             vec![(suffixed.to_string(), "second payload".to_string())]
+        );
+    }
+
+    #[test]
+    fn queued_message_preserves_mention_between_multiple_paste_replacements() {
+        let first = "[Pasted Content 1001 chars]";
+        let second = "[Pasted Content 1001 chars] #2";
+        let visible = format!("{first} review @item.rs {second}");
+        let mention_start = visible.find("@item.rs").unwrap();
+        let message = QueuedUserMessage::from_composer(
+            visible.clone(),
+            vec![
+                (first.to_string(), "first payload".to_string()),
+                (second.to_string(), "second payload".to_string()),
+            ],
+            MentionBindings::from_bindings(
+                &visible,
+                vec![MentionBinding {
+                    start: mention_start,
+                    end: mention_start + "@item.rs".len(),
+                    visible: "@item.rs".to_string(),
+                    target: MentionTarget::File {
+                        root: PathBuf::from("/workspace"),
+                        path: "item.rs".to_string(),
+                        kind: MentionFileKind::File,
+                    },
+                }],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(message.submission_bindings().bindings().len(), 1);
+        assert_eq!(
+            message.submission_bindings().bindings()[0].visible,
+            "@item.rs"
+        );
+        assert_eq!(
+            &message.submission_text()[message.submission_bindings().bindings()[0].start
+                ..message.submission_bindings().bindings()[0].end],
+            "@item.rs"
         );
     }
 }

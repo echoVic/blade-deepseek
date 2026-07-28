@@ -199,7 +199,18 @@ fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
     let message = "TUI command queue is full; command rejected".to_string();
     match action {
         UserAction::Submit(prompt) | UserAction::SubmitWithMentions { prompt, .. } => {
-            let _ = event_tx.try_send(TuiEvent::SubmissionRejected { prompt, message });
+            let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
+                queued_id: None,
+                prompt,
+                message,
+            });
+        }
+        UserAction::SubmitQueued { id, prompt, .. } => {
+            let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
+                queued_id: Some(id),
+                prompt,
+                message,
+            });
         }
         UserAction::SubmitWorkflowNotification(_)
         | UserAction::RunWorkflow { .. }
@@ -379,7 +390,9 @@ mod tests {
 
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(TuiEvent::SubmissionRejected { prompt, message })
+            Ok(TuiEvent::SubmissionRejected {
+                prompt, message, ..
+            })
                 if prompt == "third" && message.contains("queue is full")
         ));
         dispatcher.shutdown().expect("shutdown dispatcher");

@@ -68,8 +68,13 @@ pub(crate) fn handle_runtime_event(
         return;
     }
 
-    let queued_submission_rejected = matches!(tui_event, TuiEvent::SubmissionRejected { .. })
-        && state.queued_submission_in_flight.is_some();
+    let queued_submission_rejected = match &tui_event {
+        TuiEvent::SubmissionRejected {
+            queued_id: Some(id),
+            ..
+        } => state.queued_submission_matches_id(*id),
+        _ => false,
+    };
     let restored_prompt = match &tui_event {
         TuiEvent::Backtracked { prompt } => Some(prompt.clone()),
         TuiEvent::SubmissionRejected { prompt, .. } if !queued_submission_rejected => {
@@ -204,7 +209,7 @@ mod tests {
 
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "first"
+            Ok(UserAction::SubmitQueued { prompt, .. }) if prompt == "first"
         ));
         assert_eq!(state.pending_workflow_notifications.len(), 1);
     }
@@ -321,7 +326,7 @@ mod tests {
             );
             assert!(matches!(
                 action_rx.try_recv(),
-                Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == status
+                Ok(UserAction::SubmitQueued { prompt, .. }) if prompt == status
             ));
         }
     }
@@ -343,7 +348,7 @@ mod tests {
         );
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "first"
+            Ok(UserAction::SubmitQueued { prompt, .. }) if prompt == "first"
         ));
         state.set_status(AppStatus::Idle);
         let pending = bridge::PendingWorkflowNotifications::new();
@@ -409,7 +414,7 @@ mod tests {
             QueuedDispatch::Started
         );
         let prompt = match action_rx.try_recv().unwrap() {
-            UserAction::SubmitWithMentions { prompt, .. } => prompt,
+            UserAction::SubmitQueued { prompt, .. } => prompt,
             other => panic!("unexpected action: {other:?}"),
         };
         let pending = bridge::PendingWorkflowNotifications::new();
@@ -420,6 +425,7 @@ mod tests {
 
         handle_runtime_event(
             TuiEvent::SubmissionRejected {
+                queued_id: Some(state.queued_submission_in_flight.as_ref().unwrap().id()),
                 prompt,
                 message: "rejected".to_string(),
             },
@@ -442,6 +448,50 @@ mod tests {
                 .iter()
                 .any(|message| matches!(message, ChatMessage::User(text) if text == visible))
         );
+    }
+
+    #[test]
+    fn unrelated_submission_rejection_does_not_restore_queued_fence() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        queue_text(&mut state, "queued prompt");
+        assert_eq!(
+            dispatch_next_queued_user_message(&mut state, &action_tx),
+            QueuedDispatch::Started
+        );
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SubmitQueued { prompt, .. })
+                if prompt == "queued prompt"
+        ));
+        let pending = bridge::PendingWorkflowNotifications::new();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut textarea = TextArea::default();
+        let mut vim = VimState::new(false);
+        let mut presentation = test_presentation();
+
+        handle_runtime_event(
+            TuiEvent::SubmissionRejected {
+                queued_id: Some(u64::MAX),
+                prompt: "other prompt".to_string(),
+                message: "other rejection".to_string(),
+            },
+            &mut state,
+            &action_tx,
+            &pending,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut presentation,
+        );
+
+        assert!(state.queued_submission_in_flight.is_some());
+        assert_eq!(textarea_text(&textarea), "other prompt");
     }
 
     #[test]
@@ -471,6 +521,7 @@ mod tests {
 
         handle_runtime_event(
             TuiEvent::SubmissionRejected {
+                queued_id: None,
                 prompt: "review @gone.txt".to_string(),
                 message: "bound file is no longer available".to_string(),
             },
