@@ -19,9 +19,11 @@ use orca_file_search::SearchPhase;
 use orca_runtime::history::SessionSummary;
 
 use crate::display_text::{compact_long_text, truncate_to_display_width};
+use crate::selection::{TranscriptSelection, apply_style_to_line_range};
 use crate::shortcuts::{self, ShortcutScope};
 use crate::syntax_highlight::highlight_code;
 use crate::theme::Theme;
+use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::{TranscriptRenderContext, viewport_paragraph};
 use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, CopyNotice, PanelMode};
 
@@ -420,12 +422,32 @@ fn highlight_match(text: &str, needle: &str, base: Style, theme: &Theme) -> Vec<
 /// (PageUp, k/j, etc.) `auto_scroll` clears and the pane honours `scroll_offset`.
 /// Overlay the mouse selection on materialized transcript rows. The render
 /// caches stay selection-agnostic so highlighting never invalidates them.
-fn apply_selection_overlay(
-    lines: Vec<ratatui::text::Line<'static>>,
-    selection: Option<crate::selection::TranscriptSelection>,
+fn apply_transcript_overlays(
+    mut lines: Vec<ratatui::text::Line<'static>>,
+    search: &TranscriptSearchState,
+    selection: Option<TranscriptSelection>,
     base_row: usize,
     theme: &Theme,
 ) -> Vec<ratatui::text::Line<'static>> {
+    let end_row = base_row.saturating_add(lines.len());
+    for (index, found) in search.visible_matches(base_row, end_row) {
+        let style = if search.active_index() == Some(index) {
+            theme.search_match_active_style()
+        } else {
+            theme.search_match_style()
+        };
+        for absolute_row in found.start.row..=found.last_covered_row() {
+            let Some(line) = lines.get_mut(absolute_row.saturating_sub(base_row)) else {
+                continue;
+            };
+            let Some((col_start, col_end)) = found.cols_on_row(absolute_row) else {
+                continue;
+            };
+            let current = std::mem::take(line);
+            *line = apply_style_to_line_range(current, col_start, col_end, style);
+        }
+    }
+
     let Some(selection) = selection else {
         return lines;
     };
@@ -434,12 +456,9 @@ fn apply_selection_overlay(
         .enumerate()
         .map(
             |(index, line)| match selection.cols_on_row(base_row + index) {
-                Some((col_start, col_end)) => crate::selection::apply_selection_to_line(
-                    line,
-                    col_start,
-                    col_end,
-                    theme.selection_style(),
-                ),
+                Some((col_start, col_end)) => {
+                    apply_style_to_line_range(line, col_start, col_end, theme.selection_style())
+                }
                 None => line,
             },
         )
@@ -484,8 +503,13 @@ pub(crate) fn render_live_messages(
         state.visible_height = visible_height;
         state.scroll_offset = viewport.scroll_offset;
         state.viewport_base_row = viewport.base_row;
-        let lines =
-            apply_selection_overlay(viewport.lines, state.selection, viewport.base_row, theme);
+        let lines = apply_transcript_overlays(
+            viewport.lines,
+            &state.transcript_search,
+            state.selection,
+            viewport.base_row,
+            theme,
+        );
         frame.render_widget(viewport_paragraph(lines), area);
         return;
     }
@@ -518,7 +542,13 @@ pub(crate) fn render_live_messages(
 
     // Overlay the mouse selection on the materialized rows; the render cache
     // itself stays selection-agnostic so highlighting never invalidates it.
-    let lines = apply_selection_overlay(viewport.lines, state.selection, viewport.base_row, theme);
+    let lines = apply_transcript_overlays(
+        viewport.lines,
+        &state.transcript_search,
+        state.selection,
+        viewport.base_row,
+        theme,
+    );
 
     frame.render_widget(viewport_paragraph(lines), area);
 
@@ -4141,6 +4171,63 @@ mod tests {
         assert_eq!(
             build_lines_for_message(&assistant, &theme, 80, 0, false, Some(&irrelevant)),
             build_lines_for_message(&assistant, &theme, 80, 0, false, None)
+        );
+    }
+
+    #[test]
+    fn search_overlay_styles_only_visible_matches_and_selection_wins() {
+        use crate::selection::{SelectionGranularity, SelectionPos, TranscriptSelection};
+        use crate::transcript_search::{
+            TranscriptLineIdentity, TranscriptSearchMatch, TranscriptSearchState,
+        };
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let lines = vec![Line::from("alpha beta"), Line::from("tail")];
+        let mut search = TranscriptSearchState::default();
+        search.open_new();
+        search.replace_query("alpha");
+        search.refresh_with(1, 0, |_| {
+            vec![
+                TranscriptSearchMatch::new(
+                    SelectionPos { row: 0, col: 0 },
+                    SelectionPos { row: 0, col: 5 },
+                    TranscriptLineIdentity {
+                        message_revision: 1,
+                        line_index: 0,
+                    },
+                    0..5,
+                ),
+                TranscriptSearchMatch::new(
+                    SelectionPos { row: 100, col: 0 },
+                    SelectionPos { row: 100, col: 4 },
+                    TranscriptLineIdentity {
+                        message_revision: 2,
+                        line_index: 0,
+                    },
+                    0..4,
+                ),
+            ]
+        });
+        let mut selection = TranscriptSelection::unit(
+            SelectionGranularity::Cell,
+            SelectionPos { row: 0, col: 1 },
+            SelectionPos { row: 0, col: 2 },
+        );
+        selection.dragging = false;
+
+        let overlaid = apply_transcript_overlays(lines, &search, Some(selection), 0, &theme);
+        assert_eq!(search.visible_matches(0, 2).count(), 1);
+        assert!(
+            overlaid[0]
+                .spans
+                .iter()
+                .any(|span| { span.style.bg == theme.search_match_active_style().bg })
+        );
+        assert!(
+            overlaid[0]
+                .spans
+                .iter()
+                .any(|span| { span.style.bg == theme.selection_style().bg })
         );
     }
 

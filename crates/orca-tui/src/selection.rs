@@ -201,6 +201,15 @@ pub fn apply_selection_to_line(
     col_end: Option<usize>,
     selection_style: Style,
 ) -> Line<'static> {
+    apply_style_to_line_range(line, col_start, col_end, selection_style)
+}
+
+pub(crate) fn apply_style_to_line_range(
+    line: Line<'static>,
+    col_start: usize,
+    col_end: Option<usize>,
+    overlay: Style,
+) -> Line<'static> {
     let col_end = col_end.unwrap_or(usize::MAX);
     if col_start >= col_end {
         return line;
@@ -231,7 +240,7 @@ pub fn apply_selection_to_line(
                     &mut run,
                     style,
                     run_selected == Some(true),
-                    selection_style,
+                    overlay,
                 );
             }
             run_selected = Some(selected);
@@ -243,7 +252,7 @@ pub fn apply_selection_to_line(
             &mut run,
             style,
             run_selected == Some(true),
-            selection_style,
+            overlay,
         );
     }
 
@@ -305,8 +314,8 @@ mod tests {
 
     use super::{
         SelectionGranularity, SelectionPos, TranscriptSelection, apply_selection_to_line,
-        osc52_copy_sequence, screen_to_selection_pos, screen_to_selection_pos_clamped,
-        slice_row_by_columns, tmux_passthrough,
+        apply_style_to_line_range, osc52_copy_sequence, screen_to_selection_pos,
+        screen_to_selection_pos_clamped, slice_row_by_columns, tmux_passthrough,
     };
 
     const SEL_BG: Color = Color::Rgb(46, 62, 132);
@@ -449,6 +458,50 @@ mod tests {
                 ("d".to_string(), true, Some(Color::Blue)),
                 ("ef".to_string(), false, Some(Color::Blue)),
             ]
+        );
+    }
+
+    #[test]
+    fn generic_range_overlay_preserves_foregrounds_and_selection_wins() {
+        let search_bg = Color::Rgb(78, 67, 31);
+        let selection_bg = Color::Rgb(46, 62, 132);
+        let line = Line::from(vec![
+            Span::styled("let", Style::default().fg(Color::Magenta)),
+            Span::styled(" 中", Style::default().fg(Color::Green)),
+        ]);
+
+        let searched = apply_style_to_line_range(line, 0, Some(3), Style::default().bg(search_bg));
+        assert!(searched.spans.iter().all(|span| span.style.fg.is_some()));
+        assert!(
+            searched
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(search_bg))
+        );
+
+        let selected =
+            apply_style_to_line_range(searched, 1, Some(4), Style::default().bg(selection_bg));
+        assert!(
+            selected
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(selection_bg))
+        );
+    }
+
+    #[test]
+    fn generic_range_overlay_uses_wide_character_leading_columns() {
+        let highlighted = apply_style_to_line_range(
+            Line::from("A中B"),
+            1,
+            Some(3),
+            Style::default().bg(Color::Blue),
+        );
+        assert!(
+            highlighted
+                .spans
+                .iter()
+                .any(|span| { span.content == "中" && span.style.bg == Some(Color::Blue) })
         );
     }
 
