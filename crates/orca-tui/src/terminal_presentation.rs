@@ -156,6 +156,13 @@ impl TerminalPresentation {
         Ok(writes)
     }
 
+    pub(crate) fn write_reset_title<W: Write>(&mut self, writer: &mut W) -> io::Result<usize> {
+        writer.write_all(&encode_title("Orca", self.profile))?;
+        writer.flush()?;
+        self.last_title = Some("Orca".to_string());
+        Ok(1)
+    }
+
     #[cfg(test)]
     fn pending_len(&self) -> usize {
         self.pending_notifications.len()
@@ -435,5 +442,22 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(writer.writes, 1);
+    }
+
+    #[test]
+    fn terminal_presentation_reset_title_writes_orca_even_after_orca_was_cached() {
+        let mut presentation = presentation(direct_profile());
+        let mut output = Vec::new();
+        presentation
+            .write_pending(&mut output, AppStatus::Idle)
+            .unwrap();
+        let before_reset = output.len();
+
+        assert_eq!(presentation.write_reset_title(&mut output).unwrap(), 1);
+        assert_eq!(
+            &output[before_reset..],
+            b"\x1b]0;Orca\x1b\\",
+            "orderly exit always reasserts the safe title"
+        );
     }
 }
