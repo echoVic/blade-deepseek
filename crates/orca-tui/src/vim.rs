@@ -324,21 +324,28 @@ impl VimState {
                     VimVisualCommand::Delete(register) => (register, false, true),
                     VimVisualCommand::Change(register) => (register, true, true),
                 };
-                let changed = if delete {
+                let has_selection = textarea
+                    .selection_range()
+                    .is_some_and(|(start, end)| start != end);
+                let changed = if !has_selection {
+                    false
+                } else if delete {
                     textarea.cut()
                 } else {
                     textarea.copy();
                     false
                 };
-                let text = textarea.yank_text();
-                if !text.is_empty() {
-                    self.registers.write(
-                        register,
-                        VimRegisterValue {
-                            text,
-                            kind: VimRegisterKind::Characterwise,
-                        },
-                    );
+                if has_selection {
+                    let text = textarea.yank_text();
+                    if !text.is_empty() {
+                        self.registers.write(
+                            register,
+                            VimRegisterValue {
+                                text,
+                                kind: VimRegisterKind::Characterwise,
+                            },
+                        );
+                    }
                 }
                 textarea.cancel_selection();
                 self.mode = if change {
@@ -705,7 +712,10 @@ fn delete_lines(textarea: &mut TextArea<'_>, count: usize) -> Option<String> {
     let reaches_end = start_row + count == textarea.lines().len();
 
     if start_row == 0 && reaches_end {
-        textarea.select_all();
+        textarea.move_cursor(CursorMove::Head);
+        textarea.start_selection();
+        textarea.move_cursor(CursorMove::Bottom);
+        textarea.move_cursor(CursorMove::End);
     } else if reaches_end {
         textarea.move_cursor(CursorMove::Head);
         textarea.move_cursor(CursorMove::Up);
@@ -1001,6 +1011,24 @@ mod tests {
     }
 
     #[test]
+    fn dd_deletes_a_seventy_thousand_character_only_line_atomically() {
+        let theme = Theme::named(ThemeName::Dark);
+        let mut state = VimState::new(true);
+        let line = "x".repeat(70_000);
+        let mut textarea = TextArea::from([line.as_str()]);
+
+        handle_sequence(&mut state, &mut textarea, &theme, "dd");
+
+        assert_eq!(textarea.lines(), &[""]);
+        assert_eq!(
+            state.register_for_test(VimRegisterSelector::Unnamed),
+            Some((line.as_str(), VimRegisterKind::Linewise))
+        );
+        assert!(textarea.undo());
+        assert_eq!(textarea.lines(), &[line]);
+    }
+
+    #[test]
     fn yy_and_named_registers_preserve_linewise_text() {
         let theme = Theme::named(ThemeName::Dark);
         let mut state = VimState::new(true);
@@ -1161,6 +1189,33 @@ mod tests {
             delete_state.register_for_test(VimRegisterSelector::Named(1)),
             Some(("a", VimRegisterKind::Characterwise))
         );
+    }
+
+    #[test]
+    fn zero_width_visual_commands_do_not_copy_stale_yank_text() {
+        let theme = Theme::named(ThemeName::Dark);
+        for command in ['y', 'd', 'c'] {
+            let mut state = VimState::new(true);
+            state.registers.write(
+                VimRegisterSelector::Named(1),
+                VimRegisterValue {
+                    text: "saved".to_string(),
+                    kind: VimRegisterKind::Characterwise,
+                },
+            );
+            let mut textarea = TextArea::from(["abcd"]);
+            textarea.set_yank_text("stale".to_string());
+
+            state.handle(input('v'), &mut textarea, &theme);
+            handle_sequence(&mut state, &mut textarea, &theme, &format!("\"b{command}"));
+
+            assert_eq!(
+                state.register_for_test(VimRegisterSelector::Named(1)),
+                Some(("saved", VimRegisterKind::Characterwise)),
+                "{command}"
+            );
+            assert_eq!(textarea.lines(), &["abcd"], "{command}");
+        }
     }
 
     #[test]
