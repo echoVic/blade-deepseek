@@ -50,6 +50,8 @@ pub struct FileConfig {
     pub update_check: bool,
     #[serde(default)]
     pub desktop_notifications: bool,
+    #[serde(default = "default_true")]
+    pub terminal_notifications: bool,
     #[serde(default)]
     pub auto_memory: bool,
 }
@@ -92,6 +94,8 @@ struct RawFileConfig {
     pub update_check: bool,
     #[serde(default)]
     pub desktop_notifications: bool,
+    #[serde(default = "default_true")]
+    pub terminal_notifications: bool,
     #[serde(default)]
     pub auto_memory: bool,
 }
@@ -116,6 +120,7 @@ impl Default for FileConfig {
             vim_mode: false,
             update_check: true,
             desktop_notifications: false,
+            terminal_notifications: true,
             auto_memory: false,
         }
     }
@@ -148,6 +153,7 @@ impl From<RawFileConfig> for FileConfig {
             vim_mode: raw.vim_mode,
             update_check: raw.update_check,
             desktop_notifications: raw.desktop_notifications,
+            terminal_notifications: raw.terminal_notifications,
             auto_memory: raw.auto_memory,
         }
     }
@@ -1099,6 +1105,17 @@ auto_memory = true
         assert!(!config.update_check);
         assert!(config.desktop_notifications);
         assert!(config.auto_memory);
+    }
+
+    #[test]
+    fn terminal_notifications_default_on_and_parse_explicit_values() {
+        let omitted: FileConfig = toml::from_str("").unwrap();
+        let enabled: FileConfig = toml::from_str("terminal_notifications = true").unwrap();
+        let disabled: FileConfig = toml::from_str("terminal_notifications = false").unwrap();
+
+        assert!(omitted.terminal_notifications);
+        assert!(enabled.terminal_notifications);
+        assert!(!disabled.terminal_notifications);
     }
 
     #[test]

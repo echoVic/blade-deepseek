@@ -287,6 +287,7 @@ pub struct RunConfig {
     pub vim_mode: bool,
     pub update_check: bool,
     pub desktop_notifications: bool,
+    pub terminal_notifications: bool,
     pub auto_memory: bool,
 }
 
@@ -551,6 +552,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "vim_mode = {}\n",
             "update_check = {}\n",
             "desktop_notifications = {}\n",
+            "terminal_notifications = {}\n",
             "auto_memory = {}\n",
             "\n",
             "[runtime]\n",
@@ -608,6 +610,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
         config.vim_mode,
         config.update_check,
         config.desktop_notifications,
+        config.terminal_notifications,
         config.auto_memory,
         runtime.approval,
         runtime.filesystem,
@@ -762,6 +765,7 @@ mod tests {
             vim_mode: true,
             update_check: false,
             desktop_notifications: true,
+            terminal_notifications: false,
             auto_memory: true,
         };
 
@@ -779,6 +783,8 @@ mod tests {
         assert!(shown.contains("approval = \"full-auto\""));
         assert!(shown.contains("history = \"disabled\""));
         assert!(shown.contains("theme = \"auto\""));
+        assert!(shown.contains("desktop_notifications = true"));
+        assert!(shown.contains("terminal_notifications = false"));
         assert!(shown.contains("api_key = \"<redacted>\""));
         assert!(!shown.contains("sk-secret"));
     }
