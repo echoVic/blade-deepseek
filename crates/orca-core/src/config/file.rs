@@ -3,6 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use clap::ValueEnum;
 use serde::Deserialize;
 use toml::Value;
 
@@ -263,6 +264,51 @@ pub fn load_layered_config(cwd: &Path) -> FileConfig {
     load_layered_config_from_optional_paths(Some(&dir.join("config.toml")), cwd)
 }
 
+pub fn load_effective_config(cwd: &Path, cli: ConfigOverrides) -> Result<FileConfig, String> {
+    let file = load_layered_config(cwd);
+    let env = environment_overrides()?;
+    Ok(apply_override_layers(file, env, cli))
+}
+
+pub fn environment_overrides() -> Result<ConfigOverrides, String> {
+    Ok(ConfigOverrides {
+        model: std::env::var("ORCA_MODEL")
+            .ok()
+            .or_else(|| std::env::var("DEEPSEEK_MODEL").ok()),
+        mode: std::env::var("ORCA_MODE")
+            .ok()
+            .map(|mode| parse_approval_mode_value(&mode))
+            .transpose()?,
+        api_key: std::env::var("ORCA_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()),
+        base_url: std::env::var("ORCA_BASE_URL")
+            .ok()
+            .or_else(|| std::env::var("DEEPSEEK_BASE_URL").ok()),
+        reasoning_effort: std::env::var("ORCA_REASONING_EFFORT")
+            .ok()
+            .or_else(|| std::env::var("DEEPSEEK_REASONING_EFFORT").ok())
+            .map(|effort| parse_reasoning_effort(&effort))
+            .transpose()?,
+    })
+}
+
+pub fn parse_approval_mode_value(mode: &str) -> Result<ApprovalMode, String> {
+    ApprovalMode::from_str(mode, true).map_err(|_| {
+        format!("unsupported mode '{mode}'. Use suggest, auto-edit, full-auto, or plan")
+    })
+}
+
+fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort, String> {
+    match value {
+        "high" => Ok(ReasoningEffort::High),
+        "max" => Ok(ReasoningEffort::Max),
+        other => Err(format!(
+            "unsupported reasoning_effort '{other}'. Use high or max"
+        )),
+    }
+}
+
 #[cfg(test)]
 fn load_layered_config_from_paths(user_path: &Path, project_root: &Path) -> FileConfig {
     load_layered_config_from_optional_paths(Some(user_path), project_root)
@@ -447,11 +493,60 @@ fn save_api_key_checked_to_dir(dir: &Path, api_key: &str) -> io::Result<PathBuf>
 mod tests {
     use super::*;
 
+    static EFFECTIVE_CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn load_toml(path: &Path) -> FileConfig {
         let Ok(content) = fs::read_to_string(path) else {
             return FileConfig::default();
         };
         toml::from_str(&content).unwrap_or_default()
+    }
+
+    #[test]
+    fn effective_config_applies_file_environment_and_cli_in_order() {
+        let _guard = EFFECTIVE_CONFIG_ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("config.toml"), "model = 'file-model'\n").unwrap();
+        unsafe {
+            std::env::set_var("ORCA_HOME", temp.path());
+            std::env::set_var("ORCA_MODEL", "env-model");
+        }
+
+        let config = load_effective_config(
+            temp.path(),
+            ConfigOverrides {
+                model: Some("cli-model".to_string()),
+                ..ConfigOverrides::default()
+            },
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::remove_var("ORCA_MODEL");
+            std::env::remove_var("ORCA_HOME");
+        }
+        assert_eq!(config.model.as_deref(), Some("cli-model"));
+    }
+
+    #[test]
+    fn effective_config_rejects_invalid_environment_mode() {
+        let _guard = EFFECTIVE_CONFIG_ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("ORCA_HOME", temp.path());
+            std::env::set_var("ORCA_MODE", "reckless");
+        }
+
+        let error = load_effective_config(temp.path(), ConfigOverrides::default()).unwrap_err();
+
+        unsafe {
+            std::env::remove_var("ORCA_MODE");
+            std::env::remove_var("ORCA_HOME");
+        }
+        assert_eq!(
+            error,
+            "unsupported mode 'reckless'. Use suggest, auto-edit, full-auto, or plan"
+        );
     }
 
     #[test]

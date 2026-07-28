@@ -1,3 +1,4 @@
+pub mod command;
 pub mod draft;
 pub mod host;
 pub(crate) mod ipc;
