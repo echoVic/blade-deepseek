@@ -33,7 +33,7 @@ use crate::memory::MemoryBlock;
 use crate::provider_stream::RuntimeProviderSuspensionControl;
 use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
 use crate::runtime_state::RuntimeTurnReducer;
-use crate::runtime_surface::RuntimeProviderResponseIngress;
+use crate::runtime_surface::{RuntimeProviderResponseIngress, RuntimeWorkflowLifecycleIngress};
 use crate::runtime_tool_call::{
     RuntimeNormalToolInteractions, RuntimeNormalToolInvocation, RuntimeToolCallRuntime,
 };
@@ -157,6 +157,8 @@ pub(crate) struct RuntimeTurnContext<'a> {
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
     pub(crate) provider_suspension_control: Option<&'a dyn RuntimeProviderSuspensionControl>,
     pub(crate) provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
+    pub(crate) workflow_lifecycle_ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
+    pub(crate) wait_for_background_workflows: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -985,6 +987,19 @@ impl<'a> AgentLoopContext<'a> {
         self
     }
 
+    pub(crate) fn with_workflow_lifecycle_ingress(
+        mut self,
+        ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
+    ) -> Self {
+        self.turn_context = self.turn_context.with_workflow_lifecycle_ingress(ingress);
+        self
+    }
+
+    pub(crate) fn with_wait_for_background_workflows(mut self, wait: bool) -> Self {
+        self.turn_context = self.turn_context.with_wait_for_background_workflows(wait);
+        self
+    }
+
     #[allow(dead_code)]
     pub(crate) fn with_initial_response(mut self, response: ProviderResponse) -> Self {
         let turn_id = self.turn_context.turn_id.clone();
@@ -1105,6 +1120,8 @@ impl<'a> RuntimeTurnContext<'a> {
             steer_handle: None,
             provider_suspension_control: None,
             provider_response_ingress: None,
+            workflow_lifecycle_ingress: None,
+            wait_for_background_workflows: true,
         }
     }
 
@@ -1143,6 +1160,25 @@ impl<'a> RuntimeTurnContext<'a> {
         &self,
     ) -> Option<&'a dyn RuntimeProviderResponseIngress> {
         self.provider_response_ingress
+    }
+
+    pub(crate) fn with_workflow_lifecycle_ingress(
+        mut self,
+        ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
+    ) -> Self {
+        self.workflow_lifecycle_ingress = ingress;
+        self
+    }
+
+    pub(crate) fn workflow_lifecycle_ingress(
+        &self,
+    ) -> Option<&'a dyn RuntimeWorkflowLifecycleIngress> {
+        self.workflow_lifecycle_ingress
+    }
+
+    pub(crate) fn with_wait_for_background_workflows(mut self, wait: bool) -> Self {
+        self.wait_for_background_workflows = wait;
+        self
     }
 
     #[cfg(test)]

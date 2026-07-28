@@ -42,6 +42,15 @@ pub struct TaskRegistry {
     inner: Arc<Mutex<HashMap<String, TaskRecord>>>,
     typed_provider_outcomes: Arc<Mutex<HashMap<String, DurableTypedProviderOutcome>>>,
     persistence: Option<Arc<TaskPersistence>>,
+    artifact_storage: Arc<TaskArtifactStorage>,
+}
+
+#[derive(Debug)]
+enum TaskArtifactStorage {
+    Recorded,
+    ProcessLocal {
+        scratch: Mutex<Option<tempfile::TempDir>>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -243,6 +252,9 @@ impl TaskRegistry {
             inner: Arc::new(Mutex::new(HashMap::new())),
             typed_provider_outcomes: Arc::new(Mutex::new(HashMap::new())),
             persistence: None,
+            artifact_storage: Arc::new(TaskArtifactStorage::ProcessLocal {
+                scratch: Mutex::new(None),
+            }),
         }
     }
 
@@ -264,16 +276,64 @@ impl TaskRegistry {
             inner: Arc::new(Mutex::new(records)),
             typed_provider_outcomes: Arc::new(Mutex::new(typed_provider_outcomes)),
             persistence: Some(persistence),
+            artifact_storage: Arc::new(TaskArtifactStorage::Recorded),
         })
     }
 
-    pub fn new_for_cwd(session_id: String, _cwd: &Path) -> Self {
+    pub fn new_for_cwd(session_id: String, cwd: &Path) -> Self {
         let Some(root) = task_sessions_root() else {
-            return Self::new(session_id);
+            let mut registry = Self::new(session_id);
+            registry.artifact_storage = Arc::new(TaskArtifactStorage::Recorded);
+            return registry;
         };
-        let legacy_root = legacy_project_task_sessions_root(_cwd);
+        let legacy_root = legacy_project_task_sessions_root(cwd);
         let _ = migrate_legacy_task_sessions(&legacy_root, &root);
-        Self::new_persistent(session_id.clone(), root).unwrap_or_else(|_| Self::new(session_id))
+        Self::new_persistent(session_id.clone(), root).unwrap_or_else(|_| {
+            let mut registry = Self::new(session_id);
+            registry.artifact_storage = Arc::new(TaskArtifactStorage::Recorded);
+            registry
+        })
+    }
+
+    pub(crate) fn is_process_local(&self) -> bool {
+        matches!(
+            self.artifact_storage.as_ref(),
+            TaskArtifactStorage::ProcessLocal { .. }
+        )
+    }
+
+    pub(crate) fn workflow_session_dir(&self, cwd: &Path) -> io::Result<PathBuf> {
+        match self.artifact_storage.as_ref() {
+            TaskArtifactStorage::Recorded => Ok(cwd
+                .join(".orca")
+                .join("workflow-sessions")
+                .join(self.session_id())),
+            TaskArtifactStorage::ProcessLocal { scratch } => {
+                let mut scratch = scratch
+                    .lock()
+                    .map_err(|_| io::Error::other("runtime artifact storage lock poisoned"))?;
+                if scratch.is_none() {
+                    *scratch = Some(
+                        tempfile::Builder::new()
+                            .prefix("orca-ephemeral-runtime-")
+                            .tempdir()?,
+                    );
+                }
+                Ok(scratch
+                    .as_ref()
+                    .expect("process-local scratch was initialized")
+                    .path()
+                    .join("workflow-session"))
+            }
+        }
+    }
+
+    pub(crate) fn release_process_local_artifacts(&self) {
+        if let TaskArtifactStorage::ProcessLocal { scratch } = self.artifact_storage.as_ref()
+            && let Ok(mut scratch) = scratch.lock()
+        {
+            *scratch = None;
+        }
     }
 
     pub fn session_id(&self) -> &str {
@@ -2245,6 +2305,42 @@ mod tests {
     }
 
     #[test]
+    fn process_local_workflow_storage_is_shared_and_explicitly_released() {
+        let registry = TaskRegistry::new("ephemeral-thread".to_string());
+        let clone = registry.clone();
+        let cwd = tempfile::tempdir().unwrap();
+        let session_dir = registry.workflow_session_dir(cwd.path()).unwrap();
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join("state.json"), "ephemeral state").unwrap();
+
+        assert!(registry.is_process_local());
+        assert_eq!(clone.workflow_session_dir(cwd.path()).unwrap(), session_dir);
+        assert!(session_dir.join("state.json").is_file());
+
+        clone.release_process_local_artifacts();
+        assert!(!session_dir.exists());
+        let replacement = registry.workflow_session_dir(cwd.path()).unwrap();
+        assert_ne!(replacement, session_dir);
+        registry.release_process_local_artifacts();
+        assert!(!replacement.exists());
+    }
+
+    #[test]
+    fn recorded_workflow_storage_preserves_workspace_path() {
+        let cwd = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_for_cwd("recorded-thread".to_string(), cwd.path());
+
+        assert!(!registry.is_process_local());
+        assert_eq!(
+            registry.workflow_session_dir(cwd.path()).unwrap(),
+            cwd.path()
+                .join(".orca")
+                .join("workflow-sessions")
+                .join("recorded-thread")
+        );
+    }
+
+    #[test]
     fn legacy_pending_provider_response_gets_one_typed_migration_identity() {
         let response = PersistedProviderResponse {
             steps: Vec::new(),
@@ -2351,6 +2447,34 @@ mod tests {
                     .exists(),
                 "migrated task index should be written under ORCA_HOME"
             );
+        });
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("ORCA_HOME", previous);
+            } else {
+                std::env::remove_var("ORCA_HOME");
+            }
+        }
+        result.unwrap();
+    }
+
+    #[test]
+    fn cwd_constructor_persists_new_tasks_under_orca_home_without_project_storage() {
+        let _guard = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe {
+            std::env::set_var("ORCA_HOME", home.path());
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let registry = TaskRegistry::new_for_cwd("new-session".to_string(), cwd.path());
+            registry.create_subagent("new async task".to_string(), Some("general".to_string()));
+
+            assert!(home.path().join("task-sessions/task-index.json").exists());
+            assert!(!cwd.path().join(".orca/task-sessions").exists());
         });
 
         unsafe {

@@ -310,6 +310,10 @@ impl<W: Write> ServerRequestWriter<W> {
         }
         Ok(())
     }
+
+    fn write_server_event(&mut self, event: ServerEvent) -> io::Result<()> {
+        protocol::write_server_event(&mut self.inner, &self.id, event)
+    }
 }
 
 impl<W: Write> Write for ServerRequestWriter<W> {
@@ -414,6 +418,20 @@ fn run_with_io<R: BufRead, W: Write + Send + 'static>(
                 }
             }
             line.clear();
+        }
+        // A clean pipe close means no more commands, not cancellation of an
+        // already-committed stateless submit. Recorded turns still fall through
+        // to the connection shutdown barrier, and an unreachable interaction
+        // waiter ends this completion lease immediately.
+        loop {
+            state.threads.prune_finished_turns();
+            if !state.threads.has_pending_clean_eof_one_shots()
+                || state.permission_routes.has_live_routes()
+                || state.direct_interactions.has_live_routes()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
         Ok(())
     })();
@@ -611,6 +629,10 @@ impl<W: Write> SharedServerRequestWriter<W> {
     fn flush_remaining(&mut self) -> io::Result<()> {
         self.writer.flush_remaining()
     }
+
+    fn write_server_event(&mut self, event: ServerEvent) -> io::Result<()> {
+        self.writer.write_server_event(event)
+    }
 }
 
 impl<W: Write> Write for SharedServerRequestWriter<W> {
@@ -687,6 +709,16 @@ impl<W: Write + Send + 'static> Write for ServerTurnOutput<W> {
 impl<W: Write + Send + 'static> HostedOperationWriter for ServerTurnOutput<W> {
     fn finish_generation(&mut self, commit_terminal: bool) -> io::Result<()> {
         self.finish(commit_terminal)
+    }
+}
+
+impl<W: Write + Send + 'static> surface_adapter::JsonlSurfaceOutput for ServerTurnOutput<W> {
+    fn write_server_event(&mut self, event: ServerEvent) -> io::Result<()> {
+        self.inner.write_server_event(event)
+    }
+
+    fn supports_direct_server_events(&self) -> bool {
+        true
     }
 }
 
@@ -2425,18 +2457,26 @@ fn run_thread_metadata_update<W: Write>(
     }
 }
 
-fn run_submit<W: Write>(
+fn run_stateless_submit_async<W: Write + Send + 'static>(
     config: &ServerConfig,
+    state: &mut ServerState,
     id: Value,
     op: ClientOp,
-    writer: &mut W,
+    writer: Arc<Mutex<W>>,
 ) -> io::Result<()> {
     let mut run_config = config.run_config.clone();
-    let (mut prompt, bindings) = match op {
-        ClientOp::Submit { prompt, .. } => (prompt, None),
+    let (mut prompt, bindings, permissions) = match op {
+        ClientOp::Submit {
+            thread_id: None,
+            prompt,
+            permissions,
+        } => (prompt, None, permissions),
         ClientOp::SubmitWithMentions {
-            prompt, bindings, ..
-        } => (prompt, Some(bindings)),
+            thread_id: None,
+            prompt,
+            bindings,
+            permissions,
+        } => (prompt, Some(bindings), permissions),
         _ => return Ok(()),
     };
     if let Some(bindings) = bindings {
@@ -2452,26 +2492,41 @@ fn run_submit<W: Write>(
             {
                 Ok(prompt) => prompt,
                 Err(error) => {
-                    return protocol::write_server_event(writer, &id, ServerEvent::error(error));
+                    return write_locked_event(&writer, &id, ServerEvent::error(error));
                 }
             };
     }
-    run_config.prompt = prompt;
-    // Defensive: force JSONL output and disable history regardless of config file settings.
     run_config.output_format = OutputFormat::Jsonl;
     run_config.history_mode = HistoryMode::Disabled;
     run_config.show_session_picker = false;
     run_config.desktop_notifications = false;
-
-    let mut streaming_writer = ServerRequestWriter::new(id, writer);
-    let _exit_code = crate::controller::run_to_writer_with_options(
-        run_config,
-        &mut streaming_writer,
-        crate::controller::ControllerRunOptions {
-            wait_for_background_workflows: true,
-        },
-    );
-    streaming_writer.flush_remaining()
+    let prepared = match state.threads.prepare_stateless_turn_with_interactions(
+        &run_config,
+        &prompt,
+        permissions,
+        &id,
+        surface_adapter::JsonlInteractionTransport::new(
+            state.permission_routes.clone(),
+            state.direct_interactions.clone(),
+        ),
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return write_locked_event(&writer, &id, ServerEvent::error(error.to_string()));
+        }
+    };
+    let active_thread_id = prepared.thread_id().to_string();
+    let operation =
+        match prepared.start_with_output(ServerTurnOutput::new(id.clone(), Arc::clone(&writer))) {
+            Ok(operation) => operation,
+            Err(error) => {
+                return write_locked_event(&writer, &id, ServerEvent::error(error.to_string()));
+            }
+        };
+    debug_assert_eq!(operation.thread_id(), active_thread_id);
+    state.threads.register_transport_turn(operation);
+    state.prune_finished_turns();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2555,6 +2610,58 @@ mod tests {
     struct ErrorAfterPendingUserInputReader {
         phase: u8,
         output: SharedVecWriter,
+    }
+
+    struct EofAfterEventReader {
+        line: String,
+        awaited_event: &'static str,
+        output: SharedVecWriter,
+        submitted: bool,
+    }
+
+    impl EofAfterEventReader {
+        fn new(
+            line: impl Into<String>,
+            awaited_event: &'static str,
+            output: SharedVecWriter,
+        ) -> Self {
+            Self {
+                line: line.into(),
+                awaited_event,
+                output,
+                submitted: false,
+            }
+        }
+    }
+
+    impl Read for EofAfterEventReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl BufRead for EofAfterEventReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Ok(&[])
+        }
+
+        fn consume(&mut self, _amount: usize) {}
+
+        fn read_line(&mut self, buffer: &mut String) -> io::Result<usize> {
+            if !self.submitted {
+                self.submitted = true;
+                buffer.push_str(&self.line);
+                buffer.push('\n');
+                return Ok(self.line.len() + 1);
+            }
+            wait_for_event(&self.output.0, Duration::from_secs(2), |event| {
+                event["event"] == self.awaited_event
+            })
+            .ok_or_else(|| {
+                io::Error::other(format!("{} was not emitted before EOF", self.awaited_event))
+            })?;
+            Ok(0)
+        }
     }
 
     impl Read for ErrorAfterPendingUserInputReader {
@@ -5269,7 +5376,8 @@ enabled = true
         assert!(
             events
                 .iter()
-                .any(|event| event["event"] == "workflow_started")
+                .any(|event| event["event"] == "workflow_started"),
+            "workflow start was not projected: {events:#?}"
         );
         assert!(events.iter().any(|event| {
             event["event"] == "workflow_result_available" && event["result"] == "done"
@@ -5548,8 +5656,12 @@ enabled = true
 
     #[test]
     fn workflow_submit_streams_background_result() {
-        let input = Cursor::new(br#"{"id":7,"op":"submit","prompt":"workflow inline"}"#.to_vec());
         let output = SharedVecWriter::default();
+        let input = EofAfterEventReader::new(
+            r#"{"id":7,"op":"submit","prompt":"workflow inline"}"#,
+            "turn_completed",
+            output.clone(),
+        );
 
         run_with_io(
             ServerConfig {
@@ -5570,7 +5682,8 @@ enabled = true
         assert!(
             events
                 .iter()
-                .any(|event| event["event"] == "workflow_started")
+                .any(|event| event["event"] == "workflow_started"),
+            "workflow start was not projected: {events:#?}"
         );
         let workflow_started = events
             .iter()
@@ -5578,24 +5691,238 @@ enabled = true
             .expect("workflow started event");
         assert_eq!(workflow_started["task"]["kind"], "workflow");
         assert_eq!(workflow_started["task"]["status"], "running");
+        let turn_completed = events
+            .iter()
+            .position(|event| event["event"] == "turn_completed")
+            .expect("turn completed event");
+        for required in [
+            "workflow_started",
+            "workflow_completed",
+            "workflow_result_available",
+        ] {
+            let position = events
+                .iter()
+                .position(|event| event["event"] == required)
+                .unwrap_or_else(|| panic!("missing {required}: {events:#?}"));
+            assert!(
+                position < turn_completed,
+                "{required} must be projected before turn_completed"
+            );
+        }
+        let item_completed = events
+            .iter()
+            .position(|event| {
+                event["event"] == "item_completed" && event["item"]["type"] == "workflow"
+            })
+            .expect("workflow item completion");
         assert!(
+            item_completed < turn_completed,
+            "workflow item must complete before turn_completed"
+        );
+    }
+
+    #[test]
+    fn stateless_submit_clean_eof_waits_for_terminal_and_joins_the_actor() {
+        let output = SharedVecWriter::default();
+        let input = EofAfterEventReader::new(
+            r#"{"id":8,"op":"submit","prompt":"mock_stream_delay_ms 2500"}"#,
+            "turn_started",
+            output.clone(),
+        );
+        let started_at = std::time::Instant::now();
+
+        run_with_io(
+            ServerConfig {
+                run_config: test_run_config(),
+            },
+            input,
+            output.clone(),
+        )
+        .expect("server clean EOF completion");
+
+        assert!(
+            started_at.elapsed() >= Duration::from_secs(2),
+            "clean EOF returned before the slow stateless actor reached terminal"
+        );
+        assert_eq!(
+            Arc::strong_count(&output.0),
+            1,
+            "EOF shutdown retained the stateless projection writer"
+        );
+        let events = parse_jsonl(&output.bytes());
+        assert!(events.iter().any(|event| event["event"] == "turn_started"));
+        assert_eq!(
             events
                 .iter()
-                .any(|event| event["event"] == "turn_completed")
+                .filter(|event| {
+                    event["event"] == "turn_completed" && event["status"] == "success"
+                })
+                .count(),
+            1,
+            "clean EOF must preserve one successful terminal: {events:?}"
         );
-        assert!(
-            events
+    }
+
+    #[test]
+    fn stateless_provider_failure_emits_one_failed_terminal_and_reaps_runtime_resources() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"provider-failure","op":"submit","prompt":"mock_provider_error"}"#,
+                Arc::clone(&writer),
+            )
+            .expect("start stateless provider failure");
+            state.join_active_turns();
+
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let turn_started = events
                 .iter()
-                .any(|event| event["event"] == "workflow_result_available")
-        );
-        assert!(
-            events
+                .find(|event| event["id"] == "provider-failure" && event["event"] == "turn_started")
+                .expect("stateless turn started");
+            let task_id = turn_started["task"]["task_id"]
+                .as_str()
+                .expect("ephemeral task id");
+            let thread_id = task_id
+                .rsplit_once(":task-")
+                .map(|(thread_id, _)| thread_id)
+                .expect("task id binds the ephemeral thread");
+            let terminal = events
                 .iter()
-                .any(|event| event["event"] == "workflow_completed")
-        );
-        assert!(events.iter().any(|event| {
-            event["event"] == "item_completed" && event["item"]["type"] == "workflow"
-        }));
+                .filter(|event| {
+                    event["id"] == "provider-failure" && event["event"] == "turn_completed"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(terminal.len(), 1, "provider failure must have one terminal");
+            assert_eq!(terminal[0]["status"], "failed");
+            let provider_errors = events
+                .iter()
+                .filter(|event| event["id"] == "provider-failure" && event["event"] == "error")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                provider_errors.len(),
+                1,
+                "provider failure must preserve one error event: {events:#?}"
+            );
+            let error_index = events
+                .iter()
+                .position(|event| event == provider_errors[0])
+                .expect("provider error remains in event stream");
+            let terminal_index = events
+                .iter()
+                .position(|event| event == terminal[0])
+                .expect("terminal remains in event stream");
+            assert!(
+                error_index < terminal_index,
+                "provider error must precede its terminal: {events:#?}"
+            );
+            let provider_error = provider_errors[0]["message"]
+                .as_str()
+                .expect("provider error message");
+            assert_eq!(
+                provider_error, "mock provider error: api_key=<redacted>",
+                "provider failure must preserve a redacted diagnostic"
+            );
+            assert!(
+                !provider_error.contains("super-secret"),
+                "provider error leaked a secret: {events:#?}"
+            );
+            assert!(
+                state.threads.jsonl_surface(thread_id).is_none(),
+                "terminal transport must release the ephemeral runtime actor"
+            );
+            assert_eq!(
+                Arc::strong_count(&writer),
+                1,
+                "terminal transport worker retained its projection writer"
+            );
+            assert_stateless_storage_is_empty(&state, home);
+
+            state
+                .shutdown(JsonlSupervisorCloseTrigger::NonIo(
+                    JsonlNonIoCloseTrigger::SupervisorShutdown,
+                ))
+                .expect("shutdown server after provider failure");
+        });
+    }
+
+    #[test]
+    fn stateless_adapter_shutdown_cancels_joins_and_reaps_the_in_flight_turn() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"shutdown","op":"submit","prompt":"mock_stream_delay_ms 30000"}"#,
+                Arc::clone(&writer),
+            )
+            .expect("start slow stateless turn");
+            let started = wait_for_event(&writer, Duration::from_secs(2), |event| {
+                event["id"] == "shutdown" && event["event"] == "turn_started"
+            })
+            .expect("stateless turn started");
+            let task_id = started["task"]["task_id"]
+                .as_str()
+                .expect("ephemeral task id");
+            let thread_id = task_id
+                .rsplit_once(":task-")
+                .map(|(thread_id, _)| thread_id)
+                .expect("task id binds the ephemeral thread")
+                .to_string();
+            assert!(state.threads.jsonl_surface(&thread_id).is_some());
+            assert_stateless_storage_is_empty(&state, home);
+
+            let shutdown_started = std::time::Instant::now();
+            state
+                .threads
+                .shutdown()
+                .expect("shutdown JSONL runtime adapter");
+
+            assert!(
+                shutdown_started.elapsed() < Duration::from_secs(3),
+                "adapter shutdown did not cancel the slow stateless actor promptly"
+            );
+            assert!(
+                state.threads.jsonl_surface(&thread_id).is_none(),
+                "adapter shutdown returned before the ephemeral actor was reaped"
+            );
+            assert_eq!(
+                Arc::strong_count(&writer),
+                1,
+                "adapter shutdown returned before the transport worker released its writer"
+            );
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let terminals = events
+                .iter()
+                .filter(|event| event["id"] == "shutdown" && event["event"] == "turn_completed")
+                .collect::<Vec<_>>();
+            assert_eq!(terminals.len(), 1, "shutdown must emit one terminal");
+            assert_eq!(terminals[0]["status"], "cancelled");
+            assert_eq!(
+                persisted_files_under(home),
+                Vec::<std::path::PathBuf>::new(),
+                "adapter shutdown materialized persisted state under ORCA_HOME"
+            );
+
+            state
+                .shutdown(JsonlSupervisorCloseTrigger::NonIo(
+                    JsonlNonIoCloseTrigger::SupervisorShutdown,
+                ))
+                .expect("close supervisor after adapter shutdown");
+        });
     }
 
     #[test]
@@ -5631,6 +5958,244 @@ enabled = true
                 .unwrap()
                 .contains(":task-1")
         );
+    }
+
+    #[test]
+    fn stateless_submit_uses_non_catalogued_one_shot_surface() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let mut state = ServerState::default();
+
+            let prepared = state
+                .threads
+                .prepare_stateless_turn_with_interactions(
+                    &config,
+                    "reply once",
+                    PermissionProfileOverride::default(),
+                    &serde_json::json!("stateless-submit"),
+                    surface_adapter::JsonlInteractionTransport::new(
+                        state.permission_routes.clone(),
+                        state.direct_interactions.clone(),
+                    ),
+                )
+                .expect("prepare stateless typed turn");
+            let ephemeral_thread_id = prepared.thread_id().to_string();
+
+            assert!(
+                !state.threads.has_thread(&ephemeral_thread_id),
+                "stateless submit must not enter the recorded thread catalog"
+            );
+            assert!(
+                state
+                    .threads
+                    .read_session(&ephemeral_thread_id, true, true)
+                    .is_err(),
+                "stateless submit must not materialize persisted history"
+            );
+
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let operation = prepared
+                .start_with_output(ServerTurnOutput::new(
+                    serde_json::json!("stateless-submit"),
+                    Arc::clone(&output),
+                ))
+                .expect("start stateless typed turn");
+            state.threads.register_transport_turn(operation);
+            state.join_active_turns();
+
+            let events = parse_jsonl(&output.lock().expect("output").clone());
+            assert!(events.iter().any(|event| {
+                event["id"] == "stateless-submit" && event["event"] == "turn_started"
+            }));
+            assert!(events.iter().any(|event| {
+                event["id"] == "stateless-submit" && event["event"] == "turn_completed"
+            }));
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["event"] != "thread_started"),
+                "stateless submit must not publish recorded-thread lifecycle"
+            );
+        });
+    }
+
+    #[test]
+    fn stateless_submit_wire_route_stays_out_of_thread_catalog() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let mut output = Vec::new();
+
+            handle_line_for_test(
+                &config,
+                &mut state,
+                r#"{"id":"wire-stateless","op":"submit","prompt":"reply once"}"#,
+                &mut output,
+            )
+            .expect("route stateless wire submit");
+
+            let events = parse_jsonl(&output);
+            assert!(events.iter().any(|event| {
+                event["id"] == "wire-stateless" && event["event"] == "turn_started"
+            }));
+            assert!(events.iter().any(|event| {
+                event["id"] == "wire-stateless" && event["event"] == "turn_completed"
+            }));
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["event"] != "thread_started")
+            );
+            assert!(
+                state
+                    .threads
+                    .list_threads(
+                        None,
+                        usize::MAX,
+                        ThreadListFilters::active(),
+                        ThreadSortKey::UpdatedAt,
+                        SortDirection::Desc,
+                        None,
+                    )
+                    .expect("list recorded threads")
+                    .data
+                    .is_empty(),
+                "wire stateless submit must not create a recorded catalog entry"
+            );
+        });
+    }
+
+    #[test]
+    fn stateless_submit_can_be_interrupted_by_admitted_turn_id() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"stateless-wait","op":"submit","prompt":"ask Continue?"}"#,
+                Arc::clone(&writer),
+            )
+            .expect("start stateless interactive turn");
+            let started = wait_for_event(&writer, Duration::from_secs(2), |event| {
+                event["event"] == "turn_started"
+            })
+            .expect("stateless turn started");
+            let turn_id = started["turnId"]
+                .as_str()
+                .expect("canonical stateless turn id")
+                .to_string();
+            wait_for_event(&writer, Duration::from_secs(2), |event| {
+                event["event"] == "user_input_request"
+            })
+            .expect("stateless turn paused for input");
+
+            handle_line(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"stateless-interrupt","method":"turn/interrupt","params":{{"turnId":"{turn_id}"}}}}"#
+                ),
+                Arc::clone(&writer),
+            )
+            .expect("interrupt stateless turn");
+            state.join_active_turns();
+
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            assert!(events.iter().any(|event| {
+                event["id"] == "stateless-interrupt"
+                    && event["event"] == "turn_controlled"
+                    && event["turnId"] == turn_id
+                    && event["status"] == "interrupted"
+            }));
+            assert!(
+                state
+                    .threads
+                    .list_threads(
+                        None,
+                        usize::MAX,
+                        ThreadListFilters::active(),
+                        ThreadSortKey::UpdatedAt,
+                        SortDirection::Desc,
+                        None,
+                    )
+                    .expect("list recorded threads")
+                    .data
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn stateless_submit_user_input_response_resumes_one_shot_turn() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"stateless-input","op":"submit","prompt":"ask Continue?"}"#,
+                Arc::clone(&writer),
+            )
+            .expect("start stateless interactive turn");
+            let request = wait_for_event(&writer, Duration::from_secs(2), |event| {
+                event["event"] == "user_input_request"
+            })
+            .expect("stateless user input request");
+            let request_id = request["requestId"]
+                .as_str()
+                .expect("request id")
+                .to_string();
+
+            handle_line(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"stateless-input-response","method":"user_input/respond","params":{{"requestId":"{request_id}","answer":"yes"}}}}"#
+                ),
+                Arc::clone(&writer),
+            )
+            .expect("respond to stateless user input");
+            state.join_active_turns();
+
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            assert!(events.iter().any(|event| {
+                event["id"] == "stateless-input-response"
+                    && event["event"] == "user_input_resolved"
+                    && event["answered"] == true
+            }));
+            assert!(events.iter().any(|event| {
+                event["id"] == "stateless-input" && event["event"] == "turn_completed"
+            }));
+            assert!(
+                state
+                    .threads
+                    .list_threads(
+                        None,
+                        usize::MAX,
+                        ThreadListFilters::active(),
+                        ThreadSortKey::UpdatedAt,
+                        SortDirection::Desc,
+                        None,
+                    )
+                    .expect("list recorded threads")
+                    .data
+                    .is_empty()
+            );
+        });
     }
 
     #[test]
@@ -7034,6 +7599,51 @@ rl.on("line", (line) => {
             desktop_notifications: false,
             auto_memory: false,
         }
+    }
+
+    fn assert_stateless_storage_is_empty(state: &ServerState, home: &std::path::Path) {
+        assert!(
+            state
+                .threads
+                .list_threads(
+                    None,
+                    usize::MAX,
+                    ThreadListFilters::active(),
+                    ThreadSortKey::UpdatedAt,
+                    SortDirection::Desc,
+                    None,
+                )
+                .expect("list recorded threads")
+                .data
+                .is_empty(),
+            "stateless submit entered the recorded thread catalog"
+        );
+        assert_eq!(
+            persisted_files_under(home),
+            Vec::<std::path::PathBuf>::new(),
+            "stateless submit materialized persisted state under ORCA_HOME"
+        );
+    }
+
+    fn persisted_files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut pending = vec![root.to_path_buf()];
+        let mut files = Vec::new();
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries {
+                let entry = entry.expect("read ORCA_HOME entry");
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
     }
 
     fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {

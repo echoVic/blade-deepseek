@@ -2206,11 +2206,13 @@ fn tool_actor_context_executes_workflow_draft_preview() {
     assert_eq!(output["estimatedAgentCount"], 1);
     assert_eq!(output["maxConfiguredConcurrentAgents"], 3);
     assert_eq!(output["sourceMutationRisk"], "read_only_likely");
+    let script_path = std::path::Path::new(output["scriptPath"].as_str().expect("script path"));
+    assert!(script_path.ends_with("script.js"));
     assert!(
-        output["scriptPath"]
-            .as_str()
-            .expect("script path")
-            .ends_with("script.js")
+        script_path.starts_with(
+            temp.path()
+                .join(".orca/workflow-sessions/session-1/workflow-drafts")
+        )
     );
 }
 

@@ -157,6 +157,9 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         runtime.events,
         runtime.sink,
         &mut background_workflows,
+        &task_registry,
+        runtime.cancel,
+        None,
     )?;
     Ok(ChildAgentResult {
         status: child.status,

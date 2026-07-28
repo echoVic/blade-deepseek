@@ -295,6 +295,14 @@ impl RuntimeSurfaceThreadHandle {
         self.runtime.session_id()
     }
 
+    pub fn is_available(&self) -> bool {
+        self.runtime.is_available()
+    }
+
+    pub(crate) fn shutdown(&self) -> Result<(), RuntimeHostError> {
+        self.runtime.shutdown()
+    }
+
     pub fn surface(&self) -> RuntimeSurfaceHandle {
         self.runtime.surface()
     }

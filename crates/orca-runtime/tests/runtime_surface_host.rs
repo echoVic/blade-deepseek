@@ -1,13 +1,18 @@
 use orca_core::approval_types::ActionKind;
 use orca_core::approval_types::ApprovalMode;
+use orca_core::cancel::CancelToken;
 use orca_core::config::{
     AdditionalWorkingDirectory, HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind,
     RunConfig, ThemeName, ToolConfig, WorkflowConfig,
 };
+use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::model::ModelSelection;
 use orca_core::subagent_config::SubagentConfig;
 use orca_core::task_types::{PendingToolCallSummary, TaskStatus};
-use orca_runtime::runtime_host::{RuntimeHost, RuntimeThreadStartRequest};
+use orca_runtime::runtime_host::{
+    GenerationContext, HostedTurnRequest, RuntimeHost, RuntimeThreadStartRequest,
+    ThreadOperationExecutor, ThreadOperationOutcome,
+};
 use orca_runtime::surface::{
     AttachResult, CompactionState, DisplayText, FreshAttachRequest, MutationDisposition,
     MutationReply, NonEmptyText, OperationTerminal, PinnedContextAction, PinnedContextRevision,
@@ -19,11 +24,45 @@ use orca_runtime::surface::{
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::sync::Mutex;
+use std::io;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
+use orca_runtime::unstable_surface::{
+    FirstOperationCompletionPolicy, NonReplayableReason, OperationIngressCorrelation,
+    OperationKind, OperationRequestIntent, OperationSettingsPreparation, ReplayabilityRequest,
+    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceSubscriptionSealReason,
+    ThreadPersistence,
+};
+
 static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
+const EPHEMERAL_CONFIG_CHILD_ENV: &str = "ORCA_RUNTIME_SURFACE_EPHEMERAL_CONFIG_CHILD";
+const EPHEMERAL_CONFIG_CWD_ENV: &str = "ORCA_RUNTIME_SURFACE_EPHEMERAL_CONFIG_CWD";
+
+struct ObserveAutoMemoryExecutor {
+    observed: mpsc::SyncSender<bool>,
+}
+
+impl ThreadOperationExecutor for ObserveAutoMemoryExecutor {
+    fn run_turn(
+        &self,
+        thread: &mut orca_runtime::thread::RuntimeThread,
+        _request: &HostedTurnRequest,
+        generation: &GenerationContext,
+        _events: &mut EventFactory,
+        _writer: &mut (dyn io::Write + Send),
+        _cancel: &CancelToken,
+    ) -> io::Result<ThreadOperationOutcome> {
+        self.observed
+            .send(generation.config().auto_memory)
+            .map_err(|_| io::Error::other("auto-memory observer closed"))?;
+        thread.lifecycle_mut().finish_task(RunStatus::Success);
+        Ok(RunStatus::Success.into())
+    }
+}
 
 #[test]
 fn closed_host_facade_starts_a_typed_thread_surface() {
@@ -53,6 +92,246 @@ fn closed_host_facade_starts_a_typed_thread_surface() {
     .expect("surface thread id");
     assert_eq!(attachment.baseline.snapshot.thread.thread_id, thread_id);
 
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn explicit_history_disabled_one_shot_starts_an_ephemeral_typed_surface() {
+    if std::env::var_os(EPHEMERAL_CONFIG_CHILD_ENV).is_none() {
+        let home = tempdir().expect("temporary ORCA_HOME");
+        let cwd = tempdir().expect("temp cwd");
+        let output = Command::new(std::env::current_exe().expect("runtime surface test binary"))
+            .args([
+                "--exact",
+                "explicit_history_disabled_one_shot_starts_an_ephemeral_typed_surface",
+                "--nocapture",
+            ])
+            .env(EPHEMERAL_CONFIG_CHILD_ENV, "1")
+            .env(EPHEMERAL_CONFIG_CWD_ENV, cwd.path())
+            .env("ORCA_HOME", home.path())
+            .output()
+            .expect("run isolated ephemeral runtime test");
+        assert!(
+            output.status.success(),
+            "isolated ephemeral runtime test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !directory_tree_has_files(home.path()),
+            "ephemeral one-shot wrote persistent ORCA_HOME state"
+        );
+        assert!(
+            !directory_tree_has_files(&cwd.path().join(".orca")),
+            "ephemeral one-shot wrote persistent workspace state"
+        );
+        return;
+    }
+
+    let cwd =
+        PathBuf::from(std::env::var_os(EPHEMERAL_CONFIG_CWD_ENV).expect("isolated ephemeral cwd"));
+    let (observed_tx, observed_rx) = mpsc::sync_channel(1);
+    let host = RuntimeHost::start_with_executor(Arc::new(ObserveAutoMemoryExecutor {
+        observed: observed_tx,
+    }))
+    .expect("runtime host");
+    let mut config = test_config(cwd.clone());
+    config.history_mode = HistoryMode::Disabled;
+    config.auto_memory = true;
+    let thread = host
+        .surface_handle()
+        .start_thread_with_request(
+            RuntimeThreadStartRequest::new(config, "stateless submit")
+                .with_ephemeral_non_catalogued_one_shot(FirstOperationCompletionPolicy::Terminal),
+        )
+        .expect("ephemeral typed thread");
+
+    assert!(thread.session_id().is_none());
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::SubmitOperation,
+            SurfaceCapability::ControlBoundOperation,
+        ]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        _ => panic!("ephemeral surface must be attachable"),
+    };
+    assert_eq!(
+        attachment.baseline.snapshot.thread.persistence,
+        ThreadPersistence::EphemeralNonCataloguedOneShot {
+            close_after: FirstOperationCompletionPolicy::Terminal,
+        }
+    );
+    assert!(matches!(
+        attachment.baseline.snapshot.cursor.source_revision,
+        orca_runtime::surface::CursorSourceRevision::Ephemeral { live_revision }
+            if live_revision.get() == 1
+    ));
+    assert_eq!(
+        attachment.baseline.snapshot.thread.thread_id.as_bytes(),
+        uuid::Uuid::parse_str(thread.thread_id())
+            .expect("runtime thread id is UUIDv7")
+            .as_bytes()
+    );
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .expect("ephemeral subscription");
+    let snapshot = attachment.baseline.snapshot;
+    let reserved = match attachment
+        .client
+        .reserve_operation(
+            SurfaceRequestId::new(),
+            ephemeral_one_shot_intent(&snapshot, "finish one-shot"),
+        )
+        .expect("reserve ephemeral operation")
+    {
+        MutationReply::Committed { value, .. } => value,
+        _ => panic!("ephemeral reservation must commit"),
+    };
+    let _ = attachment
+        .client
+        .admit_reserved(
+            SurfaceRequestId::new(),
+            reserved.operation_id.clone(),
+            reserved.lease.lease_id,
+        )
+        .expect("admit ephemeral operation");
+    assert_eq!(
+        observed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("observe effective actor config"),
+        false,
+        "ephemeral actor retained caller auto-memory configuration"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut terminal_visible = false;
+    let mut sealed = false;
+    while Instant::now() < deadline {
+        match subscription.recv_timeout(Duration::from_millis(20)) {
+            Some(SurfaceSubscriptionItem::Batch { batch }) => {
+                terminal_visible |= batch.events.as_slice().iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        SurfaceEvent::Operation(
+                            orca_runtime::surface::OperationPatch::Terminal { record }
+                        ) if record.operation_id == reserved.operation_id
+                    )
+                });
+            }
+            Some(SurfaceSubscriptionItem::Sealed {
+                reason: SurfaceSubscriptionSealReason::ThreadClosed,
+            }) => {
+                sealed = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(terminal_visible, "one-shot terminal was not published");
+    assert!(sealed, "one-shot subscription was not sealed");
+    while thread.is_available() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(!thread.is_available(), "one-shot actor remained available");
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn not_admitted_one_shot_closes_and_rejects_reuse() {
+    let cwd = tempdir().expect("temp cwd");
+    let host = RuntimeHost::start().expect("runtime host");
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.history_mode = HistoryMode::Disabled;
+    let thread = host
+        .surface_handle()
+        .start_thread_with_request(
+            RuntimeThreadStartRequest::new(config, "cancelled stateless submit")
+                .with_ephemeral_non_catalogued_one_shot(
+                    FirstOperationCompletionPolicy::NotAdmitted,
+                ),
+        )
+        .expect("ephemeral typed thread");
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::SubmitOperation,
+            SurfaceCapability::ControlBoundOperation,
+        ]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        _ => panic!("ephemeral surface must be attachable"),
+    };
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .expect("ephemeral subscription");
+    let snapshot = attachment.baseline.snapshot;
+    let reserved = match attachment
+        .client
+        .reserve_operation(
+            SurfaceRequestId::new(),
+            ephemeral_one_shot_intent(&snapshot, "cancel before admission"),
+        )
+        .expect("reserve ephemeral operation")
+    {
+        MutationReply::Committed { value, .. } => value,
+        _ => panic!("ephemeral reservation must commit"),
+    };
+    let _ = attachment
+        .client
+        .cancel_operation(SurfaceRequestId::new(), reserved.operation_id.clone())
+        .expect("cancel reservation");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut saw_not_admitted = false;
+    let mut sealed = false;
+    while Instant::now() < deadline {
+        match subscription.recv_timeout(Duration::from_millis(20)) {
+            Some(SurfaceSubscriptionItem::Batch { batch }) => {
+                saw_not_admitted |= batch.events.as_slice().iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        SurfaceEvent::Operation(
+                            orca_runtime::surface::OperationPatch::Terminal { record }
+                        ) if record.operation_id == reserved.operation_id
+                            && matches!(record.terminal, OperationTerminal::NotAdmitted { .. })
+                    )
+                });
+            }
+            Some(SurfaceSubscriptionItem::Sealed {
+                reason: SurfaceSubscriptionSealReason::ThreadClosed,
+            }) => {
+                sealed = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_not_admitted, "reservation terminal was not published");
+    assert!(sealed, "cancelled one-shot subscription was not sealed");
+    while thread.is_available() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(
+        !thread.is_available(),
+        "cancelled one-shot remained available"
+    );
+    assert!(matches!(
+        attachment.client.reserve_operation(
+            SurfaceRequestId::new(),
+            ephemeral_one_shot_intent(&snapshot, "must not be reused"),
+        ),
+        Err(orca_runtime::surface::SurfaceClientCommandError::RuntimeUnavailable)
+    ));
     host.shutdown().expect("shutdown runtime host");
 }
 
@@ -1546,4 +1825,39 @@ fn test_config(cwd: std::path::PathBuf) -> RunConfig {
         desktop_notifications: false,
         auto_memory: false,
     }
+}
+
+fn ephemeral_one_shot_intent(
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+    text: &str,
+) -> OperationRequestIntent {
+    OperationRequestIntent {
+        correlation: OperationIngressCorrelation::TuiUser,
+        kind: OperationKind::UserTurn,
+        input: Some(SurfaceInputRequest {
+            blocks: orca_runtime::surface::NonEmptyVec::try_new(vec![
+                SurfaceInputRequestBlock::Text {
+                    text: DisplayText::new(text),
+                },
+            ])
+            .expect("one-shot input"),
+        }),
+        replayability: ReplayabilityRequest::NonReplayable {
+            reason: NonReplayableReason::HistoryDisabled,
+        },
+        settings_preparation: OperationSettingsPreparation::UseCurrent {
+            expected_settings_revision: snapshot.settings.thread_revision,
+            expected_policy_epoch: snapshot.settings.effective.policy_epoch,
+        },
+    }
+}
+
+fn directory_tree_has_files(path: &std::path::Path) -> bool {
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        path.is_file() || (path.is_dir() && directory_tree_has_files(&path))
+    })
 }

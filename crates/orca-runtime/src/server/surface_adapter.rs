@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +16,10 @@ use super::{
     PermissionProfileOverride, ServerThreadSubmissionContext, ServerThreadView,
     apply_permission_override,
 };
-use crate::runtime_host::{HostedOperationWriter, RuntimeHost, RuntimeHostError};
+use crate::protocol::ServerEvent;
+use crate::runtime_host::{
+    HostedOperationWriter, RuntimeHost, RuntimeHostError, RuntimeThreadStartRequest,
+};
 use crate::thread_store::{
     SortDirection, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchPage,
     StoredThreadSummaryPage, StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch,
@@ -32,7 +35,8 @@ use crate::unstable_surface::{
     SurfaceCommitBatch, SurfaceEvent, SurfaceInputRequest, SurfaceInputRequestBlock,
     SurfaceInteractionKind, SurfaceInteractionRequest, SurfaceInteractionRoute, SurfaceOperationId,
     SurfaceRequestId, SurfaceScope, SurfaceSubscriptionItem, SurfaceSubscriptionReceiver,
-    SurfaceToolRequest, SurfaceToolResultKind, ToolPatch, ToolTerminalSource, UncommittedMutation,
+    SurfaceToolRequest, SurfaceToolResultKind, SurfaceWorkflowResultStatus, ToolPatch,
+    ToolTerminalSource, UncommittedMutation, WorkflowPatch,
 };
 
 #[derive(Clone)]
@@ -57,6 +61,7 @@ pub struct JsonlSurfaceAdapter {
     host: Option<RuntimeHost>,
     surface_host: RuntimeSurfaceHostHandle,
     threads: HashMap<String, JsonlThreadBinding>,
+    ephemeral_threads: Arc<Mutex<HashMap<String, RuntimeSurfaceThreadHandle>>>,
     transport_turns: Vec<JsonlTransportTurn>,
 }
 
@@ -66,7 +71,7 @@ struct JsonlThreadBinding {
 
 pub(crate) struct PreparedJsonlTurn {
     thread_id: String,
-    turn_id: TurnId,
+    expected_turn_id: Option<TurnId>,
     surface: RuntimeSurfaceHandle,
     client: RuntimeSurfaceClientHandle,
     operation_id: SurfaceOperationId,
@@ -74,12 +79,69 @@ pub(crate) struct PreparedJsonlTurn {
     subscription: SurfaceSubscriptionReceiver,
     interactions: Option<JsonlInteractionTransport>,
     runtime_workspace_roots: Vec<std::path::PathBuf>,
+    ephemeral_thread: Option<EphemeralRuntimeThread>,
+    clean_eof_policy: JsonlCleanEofPolicy,
 }
 
 pub(crate) struct JsonlTransportTurn {
     thread_id: String,
     turn_id: TurnId,
+    clean_eof_policy: JsonlCleanEofPolicy,
     worker: Option<std::thread::JoinHandle<io::Result<()>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonlCleanEofPolicy {
+    CancelOnConnectionClose,
+    CompleteEphemeralOneShot,
+}
+
+pub(crate) trait JsonlSurfaceOutput: HostedOperationWriter {
+    fn write_server_event(&mut self, _event: ServerEvent) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "JSONL surface output does not support direct protocol events",
+        ))
+    }
+
+    fn supports_direct_server_events(&self) -> bool {
+        false
+    }
+}
+
+struct EphemeralRuntimeThread {
+    thread: Option<RuntimeSurfaceThreadHandle>,
+    thread_id: String,
+    registry: Arc<Mutex<HashMap<String, RuntimeSurfaceThreadHandle>>>,
+}
+
+impl EphemeralRuntimeThread {
+    fn register(
+        thread: RuntimeSurfaceThreadHandle,
+        registry: Arc<Mutex<HashMap<String, RuntimeSurfaceThreadHandle>>>,
+    ) -> io::Result<Self> {
+        let thread_id = thread.thread_id().to_string();
+        registry
+            .lock()
+            .map_err(|_| io::Error::other("ephemeral runtime registry lock poisoned"))?
+            .insert(thread_id.clone(), thread.clone());
+        Ok(Self {
+            thread: Some(thread),
+            thread_id,
+            registry,
+        })
+    }
+}
+
+impl Drop for EphemeralRuntimeThread {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = self.registry.lock() {
+            registry.remove(&self.thread_id);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.shutdown();
+        }
+    }
 }
 
 impl JsonlSurfaceAdapter {
@@ -90,6 +152,7 @@ impl JsonlSurfaceAdapter {
             host: Some(host),
             surface_host,
             threads: HashMap::new(),
+            ephemeral_threads: Arc::new(Mutex::new(HashMap::new())),
             transport_turns: Vec::new(),
         })
     }
@@ -215,12 +278,27 @@ impl JsonlSurfaceAdapter {
         self.threads
             .get(thread_id)
             .map(|binding| binding.thread.mcp_registry())
+            .or_else(|| {
+                self.ephemeral_thread(thread_id)
+                    .map(|thread| thread.mcp_registry())
+            })
     }
 
     pub(crate) fn jsonl_surface(&self, thread_id: &str) -> Option<RuntimeSurfaceHandle> {
         self.threads
             .get(thread_id)
             .and_then(|binding| binding.thread.jsonl_surface())
+            .or_else(|| {
+                self.ephemeral_thread(thread_id)
+                    .and_then(|thread| thread.jsonl_surface())
+            })
+    }
+
+    fn ephemeral_thread(&self, thread_id: &str) -> Option<RuntimeSurfaceThreadHandle> {
+        self.ephemeral_threads
+            .lock()
+            .ok()
+            .and_then(|threads| threads.get(thread_id).cloned())
     }
 
     pub(crate) fn accepts_turn(&self, thread_id: &str, turn_id: &str) -> bool {
@@ -248,13 +326,19 @@ impl JsonlSurfaceAdapter {
             .chain(snapshot.operation_history.iter())
             .any(|operation| {
                 (!active_only || operation.terminal.is_none())
-                    && matches!(
-                        &operation.intent.origin,
+                    && match &operation.intent.origin {
                         crate::unstable_surface::OperationOrigin::JsonlThreadTurn {
                             legacy_turn_id,
                             ..
-                        } if legacy_turn_id.0.as_str() == turn_id
-                    )
+                        } => legacy_turn_id.0.as_str() == turn_id,
+                        crate::unstable_surface::OperationOrigin::JsonlStatelessSubmit {
+                            ..
+                        } => operation
+                            .initial_logical_turn_id
+                            .as_ref()
+                            .is_some_and(|logical_turn_id| logical_turn_id.to_string() == turn_id),
+                        _ => false,
+                    }
             });
         let _ = surface.detach(
             &attachment.client,
@@ -266,7 +350,7 @@ impl JsonlSurfaceAdapter {
     }
 
     pub(crate) fn resolve_turn_thread_id(&self, turn_id: &str) -> Option<String> {
-        let mut thread_ids = self.threads.keys().cloned().collect::<Vec<_>>();
+        let mut thread_ids = self.control_thread_ids();
         thread_ids.sort();
         thread_ids
             .into_iter()
@@ -274,7 +358,7 @@ impl JsonlSurfaceAdapter {
     }
 
     pub(crate) fn resolve_known_turn_thread_id(&self, turn_id: &str) -> Option<String> {
-        let mut thread_ids = self.threads.keys().cloned().collect::<Vec<_>>();
+        let mut thread_ids = self.control_thread_ids();
         thread_ids.sort();
         thread_ids
             .into_iter()
@@ -392,20 +476,16 @@ impl JsonlSurfaceAdapter {
         let candidate_ids = match thread_id {
             Some(thread_id) => vec![thread_id.to_string()],
             None => {
-                let mut ids = self.threads.keys().cloned().collect::<Vec<_>>();
+                let mut ids = self.control_thread_ids();
                 ids.sort();
                 ids
             }
         };
         let legacy_turn_id = LegacyTurnId(DisplayText::new(turn_id));
         for candidate_id in candidate_ids {
-            let Some(binding) = self.threads.get(&candidate_id) else {
+            let Some(surface) = self.jsonl_surface(&candidate_id) else {
                 continue;
             };
-            let surface = binding
-                .thread
-                .jsonl_surface()
-                .ok_or_else(|| io::Error::other("JSONL runtime surface unavailable"))?;
             let mut transient_attachment = None;
             let client = if let Some(client) = preferred_client
                 .as_ref()
@@ -488,6 +568,16 @@ impl JsonlSurfaceAdapter {
                 legacy_input: None,
             },
         })
+    }
+
+    fn control_thread_ids(&self) -> Vec<String> {
+        let mut ids = self.threads.keys().cloned().collect::<Vec<_>>();
+        if let Ok(ephemeral) = self.ephemeral_threads.lock() {
+            ids.extend(ephemeral.keys().cloned());
+        }
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     fn prepare_turn_inner(
@@ -576,7 +666,7 @@ impl JsonlSurfaceAdapter {
 
         Ok(PreparedJsonlTurn {
             thread_id: thread_id.to_string(),
-            turn_id,
+            expected_turn_id: Some(turn_id),
             surface,
             client: attachment.client,
             operation_id,
@@ -584,6 +674,123 @@ impl JsonlSurfaceAdapter {
             subscription,
             interactions,
             runtime_workspace_roots,
+            ephemeral_thread: None,
+            clean_eof_policy: JsonlCleanEofPolicy::CancelOnConnectionClose,
+        })
+    }
+
+    pub(crate) fn prepare_stateless_turn_with_interactions(
+        &self,
+        config: &RunConfig,
+        prompt: &str,
+        permissions: PermissionProfileOverride,
+        rpc_id: &serde_json::Value,
+        interactions: JsonlInteractionTransport,
+    ) -> io::Result<PreparedJsonlTurn> {
+        let mut config = config.clone();
+        config.output_format = OutputFormat::Jsonl;
+        config.history_mode = HistoryMode::Disabled;
+        config.show_session_picker = false;
+        config.desktop_notifications = false;
+        apply_permission_override(&mut config, permissions.clone());
+
+        let thread = self
+            .surface_host
+            .start_thread_with_request(
+                RuntimeThreadStartRequest::new(config.clone(), "(stateless submit)")
+                    .with_ephemeral_non_catalogued_one_shot(
+                        crate::unstable_surface::FirstOperationCompletionPolicy::Terminal,
+                    ),
+            )
+            .map_err(runtime_host_error)?;
+        let ephemeral_thread =
+            EphemeralRuntimeThread::register(thread, Arc::clone(&self.ephemeral_threads))?;
+        let runtime_thread = ephemeral_thread
+            .thread
+            .as_ref()
+            .expect("ephemeral runtime thread is retained until transport completion");
+        let thread_id = runtime_thread.thread_id().to_string();
+        let surface = runtime_thread
+            .jsonl_surface()
+            .ok_or_else(|| io::Error::other("JSONL ephemeral runtime surface unavailable"))?;
+        let attachment = match surface.attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::new(),
+            role: SurfaceAttachmentRole::Jsonl,
+            requested_capabilities: BTreeSet::from([
+                SurfaceCapability::ReadSnapshot,
+                SurfaceCapability::SubmitOperation,
+                SurfaceCapability::ControlBoundOperation,
+                SurfaceCapability::RespondGrantedInteraction,
+            ]),
+            interaction_capabilities: BTreeSet::from([
+                SurfaceInteractionKind::PermissionRequest,
+                SurfaceInteractionKind::UserInput,
+                SurfaceInteractionKind::McpElicitation,
+            ]),
+        }) {
+            AttachResult::FreshAttached { attachment } => attachment,
+            _ => {
+                return Err(io::Error::other(
+                    "JSONL ephemeral runtime surface attach failed",
+                ));
+            }
+        };
+        let baseline = &attachment.baseline.snapshot;
+        let runtime_workspace_roots =
+            permissions
+                .runtime_workspace_roots
+                .clone()
+                .unwrap_or_else(|| {
+                    baseline
+                        .settings
+                        .effective
+                        .workspace_roots
+                        .iter()
+                        .map(|root| root.as_path().to_path_buf())
+                        .collect()
+                });
+        let input = SurfaceInputRequest {
+            blocks: NonEmptyVec::try_new(vec![SurfaceInputRequestBlock::Text {
+                text: DisplayText::new(prompt),
+            }])
+            .map_err(|error| io::Error::other(error.to_string()))?,
+        };
+        let rpc_id_digest = Sha256Digest::new(Sha256::digest(rpc_id.to_string().as_bytes()).into());
+        let intent = OperationRequestIntent {
+            correlation: OperationIngressCorrelation::JsonlStatelessSubmit { rpc_id_digest },
+            kind: OperationKind::UserTurn,
+            input: Some(input),
+            replayability: ReplayabilityRequest::NonReplayable {
+                reason: crate::unstable_surface::NonReplayableReason::HistoryDisabled,
+            },
+            settings_preparation: settings_preparation(
+                &config,
+                PermissionProfileOverride::default(),
+                baseline,
+            )?,
+        };
+        let reserved = committed(
+            attachment
+                .client
+                .reserve_operation(SurfaceRequestId::new(), intent),
+            "JSONL stateless surface reserve",
+        )?;
+        let subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .ok_or_else(|| io::Error::other("JSONL stateless surface subscription unavailable"))?;
+
+        Ok(PreparedJsonlTurn {
+            thread_id,
+            expected_turn_id: None,
+            surface,
+            client: attachment.client,
+            operation_id: reserved.operation_id,
+            admission_lease_id: reserved.lease.lease_id,
+            subscription,
+            interactions: Some(interactions),
+            runtime_workspace_roots,
+            ephemeral_thread: Some(ephemeral_thread),
+            clean_eof_policy: JsonlCleanEofPolicy::CompleteEphemeralOneShot,
         })
     }
 
@@ -748,6 +955,8 @@ impl JsonlSurfaceAdapter {
                 "JSONL session permission settings update",
             )
             .map(|_| ())
+        } else if self.ephemeral_thread(thread_id).is_some() {
+            Ok(())
         } else {
             self.surface_host
                 .jsonl_update_session_metadata(
@@ -924,6 +1133,8 @@ impl HostedOperationWriter for SharedTurnOutput {
     }
 }
 
+impl JsonlSurfaceOutput for SharedTurnOutput {}
+
 impl JsonlSurfaceAdapter {
     pub fn additional_working_directories(
         &self,
@@ -950,6 +1161,17 @@ impl JsonlSurfaceAdapter {
     }
 
     pub fn thread(&self, thread_id: &str) -> Option<ServerThreadView> {
+        if let Some(thread) = self.ephemeral_thread(thread_id) {
+            let projection = thread.jsonl_read_live_projection(false, false).ok()?;
+            return Some(ServerThreadView {
+                cwd: projection.cwd,
+                runtime_workspace_roots: projection.runtime_workspace_roots,
+                active_permission_profile: projection.active_permission_profile,
+                additional_working_directories: projection.additional_working_directories,
+                network_domain_permissions: projection.network_domain_permissions,
+                mcp_registry: thread.mcp_registry(),
+            });
+        }
         let thread = self.read_session(thread_id, false, false).ok()?;
         Some(ServerThreadView {
             cwd: thread.cwd,
@@ -1130,6 +1352,13 @@ impl JsonlSurfaceAdapter {
         self.transport_turns = pending;
     }
 
+    pub(crate) fn has_pending_clean_eof_one_shots(&self) -> bool {
+        self.transport_turns.iter().any(|turn| {
+            turn.clean_eof_policy == JsonlCleanEofPolicy::CompleteEphemeralOneShot
+                && !turn.is_finished()
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn wait_active_turns(&mut self) {
         for turn in &mut self.transport_turns {
@@ -1231,12 +1460,14 @@ impl PreparedJsonlTurn {
     }
 
     pub(crate) fn turn_id(&self) -> &TurnId {
-        &self.turn_id
+        self.expected_turn_id
+            .as_ref()
+            .expect("recorded JSONL turns provide their legacy turn id before admission")
     }
 
     pub(crate) fn start<W>(self, writer: W) -> io::Result<JsonlTransportTurn>
     where
-        W: HostedOperationWriter + Send + 'static,
+        W: JsonlSurfaceOutput + Send + 'static,
     {
         committed(
             self.client.admit_reserved_with_output(
@@ -1247,16 +1478,23 @@ impl PreparedJsonlTurn {
             ),
             "JSONL surface admission",
         )?;
+        let mut subscription = self.subscription;
+        let (turn_id, prefetched) =
+            receive_admitted_turn(&mut subscription, &self.operation_id, self.expected_turn_id)?;
         let thread_id = self.thread_id.clone();
-        let turn_id = self.turn_id.clone();
+        let transport_turn_id = turn_id.clone();
+        let clean_eof_policy = self.clean_eof_policy;
+        let ephemeral_thread = self.ephemeral_thread;
         let worker = std::thread::spawn(move || {
+            let _ephemeral_thread = ephemeral_thread;
             drain_jsonl_surface(
                 self.surface,
                 self.client,
-                self.subscription,
+                subscription,
+                prefetched,
                 self.operation_id,
                 self.thread_id,
-                self.turn_id,
+                turn_id,
                 self.interactions,
                 self.runtime_workspace_roots,
                 writer,
@@ -1264,16 +1502,75 @@ impl PreparedJsonlTurn {
         });
         Ok(JsonlTransportTurn {
             thread_id,
-            turn_id,
+            turn_id: transport_turn_id,
+            clean_eof_policy,
             worker: Some(worker),
         })
     }
 
     pub(crate) fn start_with_output<W>(self, writer: W) -> io::Result<JsonlTransportTurn>
     where
-        W: HostedOperationWriter + Send + 'static,
+        W: JsonlSurfaceOutput + Send + 'static,
     {
         self.start(writer)
+    }
+}
+
+fn receive_admitted_turn(
+    subscription: &mut SurfaceSubscriptionReceiver,
+    operation_id: &SurfaceOperationId,
+    expected_turn_id: Option<TurnId>,
+) -> io::Result<(TurnId, VecDeque<SurfaceSubscriptionItem>)> {
+    let mut prefetched = VecDeque::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let Some(item) = subscription.recv_timeout(std::time::Duration::from_millis(100)) else {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::other(
+                    "JSONL surface admission event unavailable",
+                ));
+            }
+            continue;
+        };
+        let admitted_turn_id =
+            match &item {
+                SurfaceSubscriptionItem::Batch { batch } => batch
+                    .events
+                    .as_slice()
+                    .iter()
+                    .find_map(|envelope| match &envelope.event {
+                        SurfaceEvent::Operation(OperationPatch::Admitted {
+                            operation_id: admitted_operation_id,
+                            logical_turn_id,
+                            ..
+                        }) if admitted_operation_id == operation_id => {
+                            Some(logical_turn_id.clone())
+                        }
+                        _ => None,
+                    }),
+                SurfaceSubscriptionItem::Gap { .. } => {
+                    return Err(io::Error::other(
+                        "JSONL surface snapshot required before admission was observed",
+                    ));
+                }
+                SurfaceSubscriptionItem::Sealed { .. } => {
+                    return Err(io::Error::other(
+                        "JSONL surface sealed before admission was observed",
+                    ));
+                }
+            };
+        prefetched.push_back(item);
+        if let Some(turn_id) = admitted_turn_id {
+            if expected_turn_id
+                .as_ref()
+                .is_some_and(|expected| expected != &turn_id)
+            {
+                return Err(io::Error::other(
+                    "JSONL surface admitted a different logical turn id",
+                ));
+            }
+            return Ok((turn_id, prefetched));
+        }
     }
 }
 
@@ -1325,6 +1622,7 @@ fn drain_jsonl_surface<W>(
     surface: RuntimeSurfaceHandle,
     client: RuntimeSurfaceClientHandle,
     mut subscription: SurfaceSubscriptionReceiver,
+    mut prefetched: VecDeque<SurfaceSubscriptionItem>,
     operation_id: SurfaceOperationId,
     thread_id: String,
     turn_id: TurnId,
@@ -1333,8 +1631,9 @@ fn drain_jsonl_surface<W>(
     mut writer: W,
 ) -> io::Result<()>
 where
-    W: HostedOperationWriter,
+    W: JsonlSurfaceOutput,
 {
+    let _detach = SurfaceDetachGuard::new(surface.clone(), client.clone());
     let mut projector = JsonlSurfaceProjector::new(
         surface.clone(),
         thread_id,
@@ -1345,8 +1644,14 @@ where
         runtime_workspace_roots,
     );
     let result = loop {
-        let Some(item) = subscription.recv_timeout(std::time::Duration::from_millis(100)) else {
-            continue;
+        let item = if let Some(item) = prefetched.pop_front() {
+            item
+        } else {
+            let Some(item) = subscription.recv_timeout(std::time::Duration::from_millis(100))
+            else {
+                continue;
+            };
+            item
         };
         match item {
             SurfaceSubscriptionItem::Batch { batch } => {
@@ -1375,13 +1680,29 @@ where
             }
         }
     };
-    let _ = surface.detach(
-        &client,
-        DetachRequest {
-            request_id: SurfaceRequestId::new(),
-        },
-    );
     result
+}
+
+struct SurfaceDetachGuard {
+    surface: RuntimeSurfaceHandle,
+    client: RuntimeSurfaceClientHandle,
+}
+
+impl SurfaceDetachGuard {
+    fn new(surface: RuntimeSurfaceHandle, client: RuntimeSurfaceClientHandle) -> Self {
+        Self { surface, client }
+    }
+}
+
+impl Drop for SurfaceDetachGuard {
+    fn drop(&mut self) {
+        let _ = self.surface.detach(
+            &self.client,
+            DetachRequest {
+                request_id: SurfaceRequestId::new(),
+            },
+        );
+    }
 }
 
 struct JsonlSurfaceProjector {
@@ -1390,7 +1711,9 @@ struct JsonlSurfaceProjector {
     turn_id: TurnId,
     operation_id: SurfaceOperationId,
     streams: HashMap<String, SurfaceAssistantStream>,
+    started_assistant_items: HashSet<String>,
     tools: HashMap<String, SurfaceToolRequest>,
+    workflows: HashMap<String, JsonlProjectedWorkflow>,
     client: RuntimeSurfaceClientHandle,
     interactions: Option<JsonlInteractionTransport>,
     runtime_workspace_roots: Vec<std::path::PathBuf>,
@@ -1412,7 +1735,9 @@ impl JsonlSurfaceProjector {
             turn_id,
             operation_id,
             streams: HashMap::new(),
+            started_assistant_items: HashSet::new(),
             tools: HashMap::new(),
+            workflows: HashMap::new(),
             client,
             interactions,
             runtime_workspace_roots,
@@ -1420,13 +1745,26 @@ impl JsonlSurfaceProjector {
     }
 }
 
-fn project_surface_batch<W: Write>(
+#[derive(Clone)]
+struct JsonlProjectedWorkflow {
+    task_id: String,
+    run_id: String,
+    workflow_name: String,
+    tool_call_id: Option<String>,
+    terminal_status: Option<SurfaceWorkflowResultStatus>,
+}
+
+fn project_surface_batch<W: JsonlSurfaceOutput>(
     projector: &mut JsonlSurfaceProjector,
     batch: &SurfaceCommitBatch,
     writer: &mut W,
 ) -> io::Result<bool> {
     for envelope in batch.events.as_slice() {
-        if !scope_belongs_to_operation(&envelope.scope, &projector.operation_id) {
+        if !surface_event_belongs_to_operation(
+            &envelope.scope,
+            &envelope.event,
+            &projector.operation_id,
+        ) {
             continue;
         }
         if project_surface_event(projector, &envelope.event, writer)? {
@@ -1434,6 +1772,48 @@ fn project_surface_batch<W: Write>(
         }
     }
     Ok(false)
+}
+
+fn surface_event_belongs_to_operation(
+    scope: &SurfaceScope,
+    event: &SurfaceEvent,
+    operation_id: &SurfaceOperationId,
+) -> bool {
+    match scope {
+        SurfaceScope::Thread => match event {
+            SurfaceEvent::Plan(plan) => plan
+                .causative_generation
+                .as_ref()
+                .is_some_and(|fence| &fence.operation_id == operation_id),
+            SurfaceEvent::Workflow(WorkflowPatch::Started { workflow }) => workflow
+                .parent
+                .as_ref()
+                .is_some_and(|fence| &fence.operation_id == operation_id),
+            SurfaceEvent::Workflow(
+                WorkflowPatch::Resumed { fence, .. }
+                | WorkflowPatch::PhaseStarted { fence, .. }
+                | WorkflowPatch::PhaseCompleted { fence, .. }
+                | WorkflowPatch::AgentStarted { fence, .. }
+                | WorkflowPatch::AgentCached { fence, .. }
+                | WorkflowPatch::AgentCompleted { fence, .. }
+                | WorkflowPatch::AgentFailed { fence, .. }
+                | WorkflowPatch::AgentCancelled { fence, .. }
+                | WorkflowPatch::Paused { fence, .. }
+                | WorkflowPatch::Stopping { fence, .. }
+                | WorkflowPatch::Stopped { fence, .. }
+                | WorkflowPatch::AsyncLaunched { fence, .. }
+                | WorkflowPatch::Completed { fence, .. }
+                | WorkflowPatch::Failed { fence, .. }
+                | WorkflowPatch::Cancelled { fence, .. }
+                | WorkflowPatch::ResultReady { fence, .. },
+            ) => fence
+                .parent
+                .as_ref()
+                .is_some_and(|parent| &parent.operation_id == operation_id),
+            _ => false,
+        },
+        _ => scope_belongs_to_operation(scope, operation_id),
+    }
 }
 
 fn scope_belongs_to_operation(scope: &SurfaceScope, operation_id: &SurfaceOperationId) -> bool {
@@ -1453,26 +1833,43 @@ fn scope_belongs_to_operation(scope: &SurfaceScope, operation_id: &SurfaceOperat
     }
 }
 
-fn project_surface_event<W: Write>(
+fn ensure_assistant_item_started<W: JsonlSurfaceOutput>(
+    projector: &mut JsonlSurfaceProjector,
+    writer: &mut W,
+    item_id: String,
+    item: serde_json::Value,
+) -> io::Result<()> {
+    if projector.started_assistant_items.insert(item_id) {
+        writer.write_server_event(ServerEvent::ItemStarted {
+            thread_id: serde_json::Value::from(projector.thread_id.clone()),
+            turn_id: serde_json::Value::from(projector.turn_id.to_string()),
+            item,
+        })?;
+    }
+    Ok(())
+}
+
+fn project_surface_event<W: JsonlSurfaceOutput>(
     projector: &mut JsonlSurfaceProjector,
     event: &SurfaceEvent,
     writer: &mut W,
 ) -> io::Result<bool> {
     match event {
         SurfaceEvent::Operation(OperationPatch::AgentLoopTurnStarted { turn }) => {
+            let legacy_turn_number = turn.ordinal.saturating_add(1);
+            let legacy_task_id = format!("{}:task-{legacy_turn_number}", projector.thread_id);
             write_runtime_event(
                 writer,
                 "turn.started",
                 &projector.thread_id,
                 serde_json::json!({
                     "turn_id": projector.turn_id.to_string(),
-                    "turn": {
-                        "turn_id": projector.turn_id.to_string(),
-                        "ordinal": turn.ordinal,
-                    },
+                    "turn": legacy_turn_number,
                     "task": {
-                        "task_id": turn.task_id.as_str(),
+                        "task_id": legacy_task_id,
+                        "kind": "agent",
                         "status": "running",
+                        "turn": legacy_turn_number,
                     },
                 }),
             )?;
@@ -1486,6 +1883,14 @@ fn project_surface_event<W: Write>(
                     request_id: SurfaceRequestId::new(),
                 },
             );
+            if let OperationTerminal::Failed { message, .. } = &record.terminal {
+                write_runtime_event(
+                    writer,
+                    "error",
+                    &projector.thread_id,
+                    serde_json::json!({ "message": message.as_str() }),
+                )?;
+            }
             write_runtime_event(
                 writer,
                 "session.completed",
@@ -1502,86 +1907,214 @@ fn project_surface_event<W: Write>(
         SurfaceEvent::Assistant(AssistantPatch::Delta {
             stream_id, text, ..
         }) => {
-            let Some(stream) = projector.streams.get(&serialized_id(stream_id)) else {
+            let Some(stream) = projector.streams.get(&serialized_id(stream_id)).cloned() else {
                 return Ok(false);
             };
-            let event_type = match stream.channel {
-                AssistantChannel::Message => "assistant.message.delta",
-                AssistantChannel::Reasoning => "assistant.reasoning.delta",
-                AssistantChannel::Plan => "assistant.message.delta",
-            };
-            let text = match stream.channel {
-                AssistantChannel::Plan => {
-                    format!("<proposed_plan>{}</proposed_plan>", text.as_str())
+            if !writer.supports_direct_server_events() {
+                let event_type = match stream.channel {
+                    AssistantChannel::Message => "assistant.message.delta",
+                    AssistantChannel::Reasoning => "assistant.reasoning.delta",
+                    AssistantChannel::Plan => "assistant.message.delta",
+                };
+                let text = match stream.channel {
+                    AssistantChannel::Plan => {
+                        format!("<proposed_plan>{}</proposed_plan>", text.as_str())
+                    }
+                    _ => text.as_str().to_string(),
+                };
+                let payload = match stream.channel {
+                    AssistantChannel::Reasoning => serde_json::json!({
+                        "turn_id": projector.turn_id.to_string(),
+                        "item_id": stream.item_id.to_string(),
+                        "text": text,
+                    }),
+                    _ => serde_json::json!({
+                        "turn_id": projector.turn_id.to_string(),
+                        "agent_message_item_id": stream.item_id.to_string(),
+                        "plan_item_id": stream.item_id.to_string(),
+                        "text": text,
+                    }),
+                };
+                write_runtime_event(writer, event_type, &projector.thread_id, payload)?;
+                return Ok(false);
+            }
+            match stream.channel {
+                AssistantChannel::Message => {
+                    // Message streams can contain provider-local proposed-plan markup. Wait for
+                    // the typed completed response so plan and message items retain their IDs.
                 }
-                _ => text.as_str().to_string(),
-            };
-            let payload = match stream.channel {
-                AssistantChannel::Reasoning => serde_json::json!({
-                    "turn_id": projector.turn_id.to_string(),
-                    "item_id": stream.item_id.to_string(),
-                    "text": text,
-                }),
-                _ => serde_json::json!({
-                    "turn_id": projector.turn_id.to_string(),
-                    "agent_message_item_id": stream.item_id.to_string(),
-                    "plan_item_id": stream.item_id.to_string(),
-                    "text": text,
-                }),
-            };
-            write_runtime_event(writer, event_type, &projector.thread_id, payload)?;
+                AssistantChannel::Reasoning => {
+                    let item_id = stream.item_id.to_string();
+                    ensure_assistant_item_started(
+                        projector,
+                        writer,
+                        item_id.clone(),
+                        serde_json::json!({
+                            "type": "reasoning",
+                            "id": item_id,
+                            "summary": "",
+                            "content": "",
+                        }),
+                    )?;
+                    writer.write_server_event(ServerEvent::ItemReasoningDelta {
+                        item_id: serde_json::Value::from(stream.item_id.to_string()),
+                        delta: serde_json::Value::from(text.as_str().to_string()),
+                    })?;
+                    writer.write_server_event(ServerEvent::ReasoningDelta {
+                        text: serde_json::Value::from(text.as_str().to_string()),
+                    })?;
+                }
+                AssistantChannel::Plan => {
+                    let item_id = stream.item_id.to_string();
+                    ensure_assistant_item_started(
+                        projector,
+                        writer,
+                        item_id.clone(),
+                        serde_json::json!({ "type": "plan", "id": item_id, "text": "" }),
+                    )?;
+                    writer.write_server_event(ServerEvent::ItemPlanDelta {
+                        item_id: serde_json::Value::from(stream.item_id.to_string()),
+                        delta: serde_json::Value::from(text.as_str().to_string()),
+                    })?;
+                }
+            }
         }
         SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted { response }) => {
-            let message_id = response
-                .message_item
-                .as_ref()
-                .map(|item| item.id.clone())
-                .unwrap_or_else(orca_core::thread_identity::ConversationItemId::new);
-            let plan_id = response
-                .plan_item
-                .as_ref()
-                .map(|item| item.id.clone())
-                .unwrap_or_else(orca_core::thread_identity::ConversationItemId::new);
-            let reasoning_id = response
-                .reasoning_item
-                .as_ref()
-                .map(|item| item.id.clone())
-                .unwrap_or_else(orca_core::thread_identity::ConversationItemId::new);
-            let mut assistant_content = response
-                .message_item
-                .as_ref()
-                .map(|item| item.text.as_str().to_string())
-                .unwrap_or_default();
-            if let Some(plan) = response.plan_item.as_ref() {
-                assistant_content.push_str("<proposed_plan>");
-                assistant_content.push_str(plan.text.as_str());
-                assistant_content.push_str("</proposed_plan>");
-            }
-            let assistant_reasoning = response.reasoning_item.as_ref().map(|item| {
-                if item.content.as_str().is_empty() {
-                    item.summary.as_str().to_string()
-                } else {
-                    item.content.as_str().to_string()
+            if !writer.supports_direct_server_events() {
+                let message_id = response
+                    .message_item
+                    .as_ref()
+                    .map(|item| item.id.clone())
+                    .unwrap_or_else(orca_core::thread_identity::ConversationItemId::new);
+                let plan_id = response
+                    .plan_item
+                    .as_ref()
+                    .map(|item| item.id.clone())
+                    .unwrap_or_else(orca_core::thread_identity::ConversationItemId::new);
+                let reasoning_id = response
+                    .reasoning_item
+                    .as_ref()
+                    .map(|item| item.id.clone())
+                    .unwrap_or_else(orca_core::thread_identity::ConversationItemId::new);
+                let mut assistant_content = response
+                    .message_item
+                    .as_ref()
+                    .map(|item| item.text.as_str().to_string())
+                    .unwrap_or_default();
+                if let Some(plan) = response.plan_item.as_ref() {
+                    assistant_content.push_str("<proposed_plan>");
+                    assistant_content.push_str(plan.text.as_str());
+                    assistant_content.push_str("</proposed_plan>");
                 }
-            });
-            write_runtime_event(
-                writer,
-                "model.response.completed",
-                &projector.thread_id,
-                serde_json::json!({
-                    "identity": {
-                        "turn_id": projector.turn_id.to_string(),
-                        "item_ids": {
-                            "conversation_item_id": message_id.to_string(),
-                            "plan_item_id": plan_id.to_string(),
-                            "reasoning_item_id": reasoning_id.to_string(),
+                let assistant_reasoning = response.reasoning_item.as_ref().map(|item| {
+                    if item.content.as_str().is_empty() {
+                        item.summary.as_str().to_string()
+                    } else {
+                        item.content.as_str().to_string()
+                    }
+                });
+                write_runtime_event(
+                    writer,
+                    "model.response.completed",
+                    &projector.thread_id,
+                    serde_json::json!({
+                        "identity": {
+                            "turn_id": projector.turn_id.to_string(),
+                            "item_ids": {
+                                "conversation_item_id": message_id.to_string(),
+                                "plan_item_id": plan_id.to_string(),
+                                "reasoning_item_id": reasoning_id.to_string(),
+                            },
                         },
-                    },
-                    "assistant_content": (!assistant_content.is_empty()).then_some(assistant_content),
-                    "assistant_reasoning": assistant_reasoning,
-                    "tool_calls": [],
-                }),
-            )?;
+                        "assistant_content": (!assistant_content.is_empty()).then_some(assistant_content),
+                        "assistant_reasoning": assistant_reasoning,
+                        "tool_calls": [],
+                    }),
+                )?;
+                return Ok(false);
+            }
+            if let Some(message) = response.message_item.as_ref() {
+                let item_id = message.id.to_string();
+                ensure_assistant_item_started(
+                    projector,
+                    writer,
+                    item_id.clone(),
+                    serde_json::json!({ "type": "agent_message", "id": item_id, "text": "" }),
+                )?;
+                if !message.text.as_str().is_empty() {
+                    writer.write_server_event(ServerEvent::ItemMessageDelta {
+                        item_id: serde_json::Value::from(message.id.to_string()),
+                        delta: serde_json::Value::from(message.text.as_str().to_string()),
+                    })?;
+                    writer.write_server_event(ServerEvent::MessageDelta {
+                        text: serde_json::Value::from(message.text.as_str().to_string()),
+                    })?;
+                }
+                writer.write_server_event(ServerEvent::ItemCompleted {
+                    thread_id: serde_json::Value::from(projector.thread_id.clone()),
+                    turn_id: serde_json::Value::from(projector.turn_id.to_string()),
+                    item: serde_json::json!({
+                        "type": "agent_message",
+                        "id": message.id.to_string(),
+                        "text": message.text.as_str(),
+                    }),
+                })?;
+            }
+            if let Some(plan) = response.plan_item.as_ref() {
+                let item_id = plan.id.to_string();
+                ensure_assistant_item_started(
+                    projector,
+                    writer,
+                    item_id.clone(),
+                    serde_json::json!({ "type": "plan", "id": item_id, "text": "" }),
+                )?;
+                if !plan.text.as_str().is_empty() {
+                    writer.write_server_event(ServerEvent::ItemPlanDelta {
+                        item_id: serde_json::Value::from(plan.id.to_string()),
+                        delta: serde_json::Value::from(plan.text.as_str().to_string()),
+                    })?;
+                }
+                writer.write_server_event(ServerEvent::ItemCompleted {
+                    thread_id: serde_json::Value::from(projector.thread_id.clone()),
+                    turn_id: serde_json::Value::from(projector.turn_id.to_string()),
+                    item: serde_json::json!({
+                        "type": "plan",
+                        "id": plan.id.to_string(),
+                        "text": plan.text.as_str(),
+                    }),
+                })?;
+            }
+            if let Some(reasoning) = response.reasoning_item.as_ref() {
+                let item_id = reasoning.id.to_string();
+                let (summary, content) = if reasoning.summary.as_str().is_empty()
+                    && !reasoning.content.as_str().is_empty()
+                {
+                    (reasoning.content.as_str(), "")
+                } else {
+                    (reasoning.summary.as_str(), reasoning.content.as_str())
+                };
+                ensure_assistant_item_started(
+                    projector,
+                    writer,
+                    item_id.clone(),
+                    serde_json::json!({
+                        "type": "reasoning",
+                        "id": item_id,
+                        "summary": "",
+                        "content": "",
+                    }),
+                )?;
+                writer.write_server_event(ServerEvent::ItemCompleted {
+                    thread_id: serde_json::Value::from(projector.thread_id.clone()),
+                    turn_id: serde_json::Value::from(projector.turn_id.to_string()),
+                    item: serde_json::json!({
+                        "type": "reasoning",
+                        "id": reasoning.id.to_string(),
+                        "summary": summary,
+                        "content": content,
+                    }),
+                })?;
+            }
         }
         SurfaceEvent::Assistant(AssistantPatch::StreamDiscarded { stream_id, .. }) => {
             projector.streams.remove(&serialized_id(stream_id));
@@ -1626,6 +2159,120 @@ fn project_surface_event<W: Write>(
                 }),
             )?;
         }
+        SurfaceEvent::Workflow(WorkflowPatch::Started { workflow }) => {
+            let run_id = workflow.workflow_run_id.as_str().to_string();
+            let projected = JsonlProjectedWorkflow {
+                task_id: workflow.task_id.as_str().to_string(),
+                run_id: run_id.clone(),
+                workflow_name: workflow.name.as_str().to_string(),
+                tool_call_id: None,
+                terminal_status: None,
+            };
+            write_runtime_event(
+                writer,
+                "workflow.started",
+                &projector.thread_id,
+                serde_json::json!({
+                    "taskId": projected.task_id,
+                    "runId": projected.run_id,
+                    "workflowName": projected.workflow_name,
+                    "phases": workflow.phases.iter().map(|phase| phase.name.as_str()).collect::<Vec<_>>(),
+                    "task": jsonl_workflow_task(&projected.run_id, "running"),
+                }),
+            )?;
+            projector.workflows.insert(run_id, projected);
+        }
+        SurfaceEvent::Workflow(WorkflowPatch::Completed { fence, .. }) => {
+            let run_id = fence.workflow_run_id.as_str();
+            let Some(workflow) = projector.workflows.get_mut(run_id) else {
+                return Ok(false);
+            };
+            workflow.terminal_status = Some(SurfaceWorkflowResultStatus::Success);
+            let workflow = workflow.clone();
+            write_runtime_event(
+                writer,
+                "workflow.completed",
+                &projector.thread_id,
+                serde_json::json!({
+                    "taskId": workflow.task_id,
+                    "runId": workflow.run_id,
+                    "workflowName": workflow.workflow_name,
+                    "task": jsonl_workflow_task(&workflow.run_id, "succeeded"),
+                }),
+            )?;
+        }
+        SurfaceEvent::Workflow(WorkflowPatch::Failed { fence, error, .. }) => {
+            let run_id = fence.workflow_run_id.as_str();
+            let Some(workflow) = projector.workflows.get_mut(run_id) else {
+                return Ok(false);
+            };
+            workflow.terminal_status = Some(SurfaceWorkflowResultStatus::Failed);
+            let workflow = workflow.clone();
+            write_runtime_event(
+                writer,
+                "workflow.failed",
+                &projector.thread_id,
+                serde_json::json!({
+                    "taskId": workflow.task_id,
+                    "runId": workflow.run_id,
+                    "workflowName": workflow.workflow_name,
+                    "toolUseId": workflow.tool_call_id,
+                    "status": "failed",
+                    "error": error.as_str(),
+                    "task": jsonl_workflow_task(&workflow.run_id, "failed"),
+                }),
+            )?;
+        }
+        SurfaceEvent::Workflow(WorkflowPatch::Cancelled { fence, reason, .. }) => {
+            let run_id = fence.workflow_run_id.as_str();
+            let Some(workflow) = projector.workflows.get_mut(run_id) else {
+                return Ok(false);
+            };
+            workflow.terminal_status = Some(SurfaceWorkflowResultStatus::Failed);
+            let workflow = workflow.clone();
+            write_runtime_event(
+                writer,
+                "workflow.failed",
+                &projector.thread_id,
+                serde_json::json!({
+                    "taskId": workflow.task_id,
+                    "runId": workflow.run_id,
+                    "workflowName": workflow.workflow_name,
+                    "toolUseId": workflow.tool_call_id,
+                    "status": "failed",
+                    "error": reason.as_str(),
+                    "task": jsonl_workflow_task(&workflow.run_id, "cancelled"),
+                }),
+            )?;
+        }
+        SurfaceEvent::Workflow(WorkflowPatch::ResultReady { fence, result, .. }) => {
+            let run_id = fence.workflow_run_id.as_str();
+            let Some(mut workflow) = projector.workflows.remove(run_id) else {
+                return Ok(false);
+            };
+            workflow.tool_call_id = result
+                .tool_use_id
+                .as_ref()
+                .map(|tool_call_id| tool_call_id.as_str().to_string());
+            if result.status == SurfaceWorkflowResultStatus::Success
+                && workflow.terminal_status == Some(SurfaceWorkflowResultStatus::Success)
+            {
+                write_runtime_event(
+                    writer,
+                    "workflow.result.available",
+                    &projector.thread_id,
+                    serde_json::json!({
+                        "taskId": workflow.task_id,
+                        "runId": workflow.run_id,
+                        "workflowName": workflow.workflow_name,
+                        "toolUseId": workflow.tool_call_id,
+                        "status": "completed",
+                        "result": result.content.as_str(),
+                        "task": jsonl_workflow_task(&workflow.run_id, "succeeded"),
+                    }),
+                )?;
+            }
+        }
         SurfaceEvent::Plan(plan) => {
             let items = plan
                 .items
@@ -1641,15 +2288,26 @@ fn project_surface_event<W: Write>(
                     })
                 })
                 .collect::<Vec<_>>();
-            write_runtime_event(
-                writer,
-                "plan.updated",
-                &projector.thread_id,
-                serde_json::json!({
-                    "explanation": plan.explanation.as_ref().map(DisplayText::as_str),
-                    "plan": items,
-                }),
-            )?;
+            if writer.supports_direct_server_events() {
+                writer.write_server_event(ServerEvent::TurnPlanUpdated {
+                    thread_id: serde_json::Value::Null,
+                    turn_id: serde_json::Value::Null,
+                    explanation: serde_json::to_value(
+                        plan.explanation.as_ref().map(DisplayText::as_str),
+                    )?,
+                    plan: serde_json::Value::Array(items),
+                })?;
+            } else {
+                write_runtime_event(
+                    writer,
+                    "plan.updated",
+                    &projector.thread_id,
+                    serde_json::json!({
+                        "explanation": plan.explanation.as_ref().map(DisplayText::as_str),
+                        "plan": items,
+                    }),
+                )?;
+            }
         }
         SurfaceEvent::Interaction(InteractionPatch::Requested { interaction })
             if routes_interaction(&projector.client, &interaction.route) =>
@@ -2029,6 +2687,15 @@ fn serialized_id<T: serde::Serialize>(value: &T) -> String {
         .unwrap_or_default()
 }
 
+fn jsonl_workflow_task(run_id: &str, status: &str) -> serde_json::Value {
+    serde_json::json!({
+        "task_id": format!("{run_id}:task-1"),
+        "kind": "workflow",
+        "status": status,
+        "turn": 0,
+    })
+}
+
 fn terminal_status(terminal: &OperationTerminal) -> &'static str {
     match terminal {
         OperationTerminal::Succeeded { .. } => "success",
@@ -2236,4 +2903,216 @@ fn jsonl_thread_config(config: &RunConfig) -> RunConfig {
 
 fn runtime_host_error(error: RuntimeHostError) -> io::Error {
     io::Error::other(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+    use std::time::Duration;
+
+    use orca_core::approval_types::ApprovalMode;
+    use orca_core::cancel::CancelToken;
+    use orca_core::config::{
+        HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, ThemeName, ToolConfig,
+        WorkflowConfig,
+    };
+    use orca_core::event_schema::{EventFactory, RunStatus};
+    use orca_core::model::ModelSelection;
+    use orca_core::subagent_config::SubagentConfig;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::runtime_host::{
+        GenerationContext, HostedTurnRequest, ThreadOperationExecutor, ThreadOperationOutcome,
+    };
+    use crate::server::opaque_permission_router::JsonlConnectionAdmission;
+    use crate::thread::RuntimeThread;
+
+    const PROJECTION_FAILURE: &str = "injected JSONL projection disconnect";
+
+    struct CancelAwareExecutor {
+        entered: SyncSender<()>,
+        cancel_observed: SyncSender<()>,
+        completed: SyncSender<()>,
+    }
+
+    impl ThreadOperationExecutor for CancelAwareExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            _generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            self.entered
+                .send(())
+                .map_err(|_| io::Error::other("projection test entry receiver closed"))?;
+            while !cancel.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.cancel_observed
+                .send(())
+                .map_err(|_| io::Error::other("projection test cancel receiver closed"))?;
+            thread.lifecycle_mut().finish_task(RunStatus::Cancelled);
+            self.completed
+                .send(())
+                .map_err(|_| io::Error::other("projection test completion receiver closed"))?;
+            Ok(RunStatus::Cancelled.into())
+        }
+    }
+
+    struct BrokenProjectionWriter;
+
+    impl Write for BrokenProjectionWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                PROJECTION_FAILURE,
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl HostedOperationWriter for BrokenProjectionWriter {
+        fn finish_generation(&mut self, _commit_terminal: bool) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl JsonlSurfaceOutput for BrokenProjectionWriter {}
+
+    #[test]
+    fn projection_write_failure_is_returned_after_worker_and_ephemeral_actor_cleanup() {
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (cancel_tx, cancel_rx) = sync_channel(1);
+        let (completed_tx, completed_rx) = sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(CancelAwareExecutor {
+            entered: entered_tx,
+            cancel_observed: cancel_tx,
+            completed: completed_tx,
+        }))
+        .expect("start projection failure runtime host");
+        let surface_host = host.surface_handle().bind_new_connection();
+        let mut adapter = JsonlSurfaceAdapter {
+            host: Some(host),
+            surface_host,
+            threads: HashMap::new(),
+            ephemeral_threads: Arc::new(Mutex::new(HashMap::new())),
+            transport_turns: Vec::new(),
+        };
+        let cwd = tempdir().expect("projection test cwd");
+        let config = test_run_config(cwd.path().to_path_buf());
+        let prepared = adapter
+            .prepare_stateless_turn_with_interactions(
+                &config,
+                "wait for projection disconnect",
+                PermissionProfileOverride::default(),
+                &serde_json::json!("projection-failure"),
+                test_interactions(),
+            )
+            .expect("prepare stateless projection failure turn");
+        let thread_id = prepared.thread_id().to_string();
+        let ephemeral_handle = adapter
+            .ephemeral_thread(&thread_id)
+            .expect("ephemeral runtime is registered while its projection is active");
+        let mut turn = prepared
+            .start_with_output(BrokenProjectionWriter)
+            .expect("admit projection failure turn");
+
+        expect_signal(entered_rx, "generation did not start");
+        let error = turn
+            .wait_terminal()
+            .expect_err("projection disconnect must be returned to the transport owner");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), PROJECTION_FAILURE);
+        assert!(turn.worker.is_none(), "projection worker was not joined");
+        expect_signal(
+            cancel_rx,
+            "generation did not observe projection cancellation",
+        );
+        expect_signal(completed_rx, "generation was not joined after cancellation");
+        assert!(
+            adapter
+                .ephemeral_threads
+                .lock()
+                .expect("registry")
+                .is_empty(),
+            "projection failure retained an ephemeral registry entry"
+        );
+        assert!(
+            ephemeral_handle
+                .jsonl_read_live_projection(false, false)
+                .is_err(),
+            "projection failure left its ephemeral actor available"
+        );
+
+        let (shutdown_tx, shutdown_rx) = sync_channel(1);
+        let shutdown_worker = std::thread::spawn(move || {
+            let _ = shutdown_tx.send(adapter.shutdown());
+        });
+        let shutdown = shutdown_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("runtime host shutdown hung after projection failure");
+        assert!(
+            shutdown.is_ok(),
+            "runtime host shutdown failed: {shutdown:?}"
+        );
+        shutdown_worker.join().expect("join runtime host shutdown");
+    }
+
+    fn expect_signal(receiver: Receiver<()>, failure: &str) {
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_else(|_| panic!("{failure}"));
+    }
+
+    fn test_interactions() -> JsonlInteractionTransport {
+        let admission = JsonlConnectionAdmission::new_ephemeral();
+        JsonlInteractionTransport::new(
+            JsonlOpaquePermissionRouter::new(admission.clone()),
+            JsonlDirectInteractionAdapter::new(admission),
+        )
+    }
+
+    fn test_run_config(cwd: std::path::PathBuf) -> RunConfig {
+        RunConfig {
+            app_version: "test".to_string(),
+            prompt: String::new(),
+            cwd: Some(cwd),
+            output_format: OutputFormat::Jsonl,
+            approval_mode: ApprovalMode::Suggest,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::parse(None).expect("test model"),
+            model_runtime: ModelRuntimeConfig::default(),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            api_key: None,
+            base_url: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            external_tools: Vec::new(),
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: HashMap::new(),
+            runtime_workspace_roots: None,
+            permission_rules: Default::default(),
+            additional_working_directories: Vec::new(),
+            max_budget_usd: None,
+            subagents: SubagentConfig::default(),
+            tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
+            theme: ThemeName::default(),
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
+        }
+    }
 }

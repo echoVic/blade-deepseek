@@ -923,6 +923,16 @@ pub struct SurfaceBackgroundFence {
     pub background_owner_token: SurfaceBackgroundOwnerToken,
 }
 
+impl std::fmt::Debug for SurfaceBackgroundFence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SurfaceBackgroundFence")
+            .field("operation_fence", &self.operation_fence)
+            .field("background_owner_token", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceGoalFence {
     pub goal_id: SurfaceGoalId,
@@ -930,7 +940,7 @@ pub struct SurfaceGoalFence {
     pub goal_owner_epoch: GoalOwnerEpoch,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SurfaceTaskFence {
     pub task_id: SurfaceTaskId,
     pub task_revision: TaskRevision,

@@ -153,6 +153,103 @@ fn server_mode_accepts_submit_and_streams_protocol_events() {
 }
 
 #[test]
+fn server_mode_clean_eof_waits_for_slow_stateless_submit_terminal() {
+    let workspace = tempdir().expect("workspace");
+    let home = workspace.path().join("home");
+    write_sleep_hook_config(&home, 2.5);
+    let mut child = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.path().to_str().unwrap(),
+        ])
+        .env("ORCA_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+
+    writeln!(
+        child.stdin_mut(),
+        r#"{{"id":"slow-submit","op":"submit","prompt":"slow stateless submit"}}"#
+    )
+    .expect("write submit request");
+
+    let output = child.wait_with_output().expect("wait for server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = parse_jsonl(&output.stdout);
+    let completed = events
+        .iter()
+        .find(|event| event["id"] == "slow-submit" && event["event"] == "turn_completed")
+        .expect("turn_completed event");
+    assert_eq!(completed["status"], "success", "events={events:?}");
+    assert!(has_event(&events, "message_delta"));
+    assert!(
+        events
+            .iter()
+            .all(|event| event["event"] != "thread_started"),
+        "stateless submit exposed a recorded thread"
+    );
+}
+
+#[test]
+fn server_mode_clean_eof_fails_stateless_submit_waiting_for_client_input() {
+    let workspace = tempdir().expect("workspace");
+    let mut child = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+
+    writeln!(
+        child.stdin_mut(),
+        r#"{{"id":"input-submit","op":"submit","prompt":"ask Continue?"}}"#
+    )
+    .expect("write submit request");
+    child.close_stdin();
+
+    let output = wait_for_child_output_with_timeout(child, Duration::from_secs(5))
+        .expect("server exited after unreachable stateless input waiter failed");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = parse_jsonl(&output.stdout);
+    assert!(
+        events.iter().any(|event| {
+            event["id"] == "input-submit" && event["event"] == "user_input_request"
+        })
+    );
+    let completed = events
+        .iter()
+        .find(|event| event["id"] == "input-submit" && event["event"] == "turn_completed")
+        .expect("turn_completed event");
+    assert_eq!(completed["status"], "failed", "events={events:?}");
+}
+
+#[test]
 fn server_mode_accepts_turn_start_method_and_streams_protocol_events() {
     let mut child = orca_command()
         .args(["--mode", "server", "--provider", "mock"])

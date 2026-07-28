@@ -32,7 +32,7 @@ tokio-util = { workspace = true }
 async-trait = { workspace = true }
 agent-client-protocol = { workspace = true }
 futures = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 orca-mcp = { path = "../orca-mcp", features = ["test-utils"] }
-tempfile = { workspace = true }

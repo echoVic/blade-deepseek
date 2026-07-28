@@ -1,6 +1,6 @@
 use super::{
-    CommitClass, CommitProbe, DurableBatchReceipt, ExclusiveOwnerLease, JsonlSurfaceCommitLedger,
-    PreparedSurfaceCommit, RetryLocalProjectionToken, RetryProjectionToken, SurfaceCommitBatch,
+    CommitClass, CommitProbe, ExclusiveOwnerLease, JsonlSurfaceCommitLedger, PreparedSurfaceCommit,
+    RetryLocalProjectionToken, RetryProjectionToken, SurfaceBatchReceipt, SurfaceCommitBatch,
     SurfaceCommitBatchPreflightResult, SurfaceCommitId, SurfaceCommitLedger, SurfaceFactFamily,
     SurfaceLedgerError, SurfacePublisherPermit, SurfaceReduceMode, SurfaceReduceResult,
     SurfaceReducerError, SurfaceReducerState, SurfaceScope, ThreadOwnerEpoch, preflight_batch,
@@ -489,7 +489,7 @@ pub struct SurfaceProjectionContext {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SurfaceCommitApplied {
-    pub receipt: DurableBatchReceipt,
+    pub receipt: SurfaceBatchReceipt,
 }
 
 struct ColdOwnerTakeoverAuthority {
@@ -1810,6 +1810,29 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
 
     pub fn ledger_mut(&mut self) -> &mut L {
         &mut self.ledger
+    }
+
+    pub(crate) fn map_ledger<M>(
+        self,
+        map: impl FnOnce(L) -> M,
+    ) -> RuntimeCommitCoordinator<'owner, M> {
+        RuntimeCommitCoordinator {
+            ledger: map(self.ledger),
+            state: self.state,
+            surface_hub: self.surface_hub,
+            recovered_publications: self.recovered_publications,
+            owner_lease: self.owner_lease,
+            owner_epoch: self.owner_epoch,
+            actor_control_permit: self.actor_control_permit,
+            issued_permits: self.issued_permits,
+            next_sequence: self.next_sequence,
+            incomplete: self.incomplete,
+            recovered_prepared: self.recovered_prepared,
+            cold_takeover_authority: self.cold_takeover_authority,
+            pending_projection: self.pending_projection,
+            #[cfg(test)]
+            projection_failure_injected: self.projection_failure_injected,
+        }
     }
 
     pub fn state(&self) -> &SurfaceReducerState {
@@ -9674,6 +9697,7 @@ pub fn select_shutdown_cause(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_surface::DurableBatchReceipt;
     use crate::runtime_surface::reducer::tests::{
         digest, reducer_snapshot, thread_id, uuid_v7_bytes,
     };
@@ -9681,14 +9705,14 @@ mod tests {
     #[derive(Default)]
     struct TestLedger {
         writes: usize,
-        receipt: Option<DurableBatchReceipt>,
+        receipt: Option<SurfaceBatchReceipt>,
     }
 
     impl SurfaceCommitLedger for TestLedger {
         fn append_complete_batch(
             &mut self,
             batch: &SurfaceCommitBatch,
-        ) -> Result<DurableBatchReceipt, SurfaceLedgerError> {
+        ) -> Result<SurfaceBatchReceipt, SurfaceLedgerError> {
             self.writes += 1;
             let CommitClass::Recorded {
                 commit_id,
@@ -9705,11 +9729,12 @@ mod tests {
                 batch_digest: batch.batch_digest.clone(),
                 cursor_after: batch.cursor_after.clone(),
             };
+            let receipt = SurfaceBatchReceipt::Recorded(receipt);
             self.receipt = Some(receipt.clone());
             Ok(receipt)
         }
 
-        fn checkpoint(&mut self, _receipt: &DurableBatchReceipt) -> Result<(), SurfaceLedgerError> {
+        fn checkpoint(&mut self, _receipt: &SurfaceBatchReceipt) -> Result<(), SurfaceLedgerError> {
             self.writes += 1;
             Ok(())
         }

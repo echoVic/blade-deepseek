@@ -191,6 +191,123 @@ fn batch(seed: u8) -> SurfaceCommitBatch {
     batch
 }
 
+fn ephemeral_cursor(next_seq: u64, live_revision: u64) -> SurfaceCursor {
+    SurfaceCursor {
+        thread_id: SurfaceThreadId::try_from_bytes(uuid(81)).unwrap(),
+        incarnation: SurfaceIncarnation::try_from_bytes(uuid(82)).unwrap(),
+        next_seq: SequenceNumber::new(next_seq),
+        source_revision: CursorSourceRevision::Ephemeral {
+            live_revision: LiveRevision::try_new(live_revision).unwrap(),
+        },
+    }
+}
+
+fn ephemeral_batch(seed: u8) -> SurfaceCommitBatch {
+    let cursor_before = ephemeral_cursor(0, 1);
+    let live_revision = LiveRevision::try_new(2).unwrap();
+    let class = CommitClass::Ephemeral {
+        incarnation: cursor_before.incarnation.clone(),
+        live_revision,
+        commit_id: SurfaceCommitId::try_from_bytes(uuid(seed)).unwrap(),
+    };
+    let event = SurfaceEventEnvelope {
+        ordinal: 0,
+        event_id: SurfaceEventId::try_from_bytes(uuid(seed.wrapping_add(1))).unwrap(),
+        commit_class: class.clone(),
+        scope: SurfaceScope::Thread,
+        event: SurfaceEvent::Session(SessionPatch::RuntimeFault {
+            class: FailureClass::RuntimeInvariant,
+            message: DisplayText::new("ephemeral fact"),
+            causative_generation: None,
+        }),
+    };
+    let mut batch = SurfaceCommitBatch {
+        cursor_before: cursor_before.clone(),
+        cursor_after: SurfaceCursor {
+            next_seq: SequenceNumber::new(1),
+            source_revision: CursorSourceRevision::Ephemeral { live_revision },
+            ..cursor_before
+        },
+        commit_class: class,
+        event_count: 1,
+        batch_digest: digest(0),
+        events: NonEmptyVec::try_new(vec![event]).unwrap(),
+    };
+    batch.batch_digest = canonical_batch_digest(&batch);
+    batch
+}
+
+#[test]
+fn in_memory_ledger_commits_ephemeral_batches_without_fabricating_durability() {
+    let initial = ephemeral_cursor(0, 1);
+    let mut ledger = InMemorySurfaceCommitLedger::new(initial);
+    let batch = ephemeral_batch(83);
+
+    let receipt = ledger
+        .append_complete_batch(&batch)
+        .expect("append ephemeral batch");
+    assert_eq!(
+        receipt,
+        SurfaceBatchReceipt::Ephemeral(EphemeralBatchReceipt {
+            commit_id: SurfaceCommitId::try_from_bytes(uuid(83)).unwrap(),
+            live_revision: LiveRevision::try_new(2).unwrap(),
+            event_count: 1,
+            batch_digest: batch.batch_digest.clone(),
+            cursor_after: batch.cursor_after.clone(),
+        })
+    );
+    ledger.checkpoint(&receipt).expect("checkpoint in memory");
+    assert_eq!(
+        ledger.probe_commit(
+            match &batch.commit_class {
+                CommitClass::Ephemeral { commit_id, .. } => commit_id,
+                CommitClass::Recorded { .. } => unreachable!(),
+            },
+            &batch.batch_digest,
+        ),
+        CommitProbe::Present(receipt.clone())
+    );
+    assert_eq!(ledger.append_complete_batch(&batch), Ok(receipt));
+}
+
+#[test]
+fn in_memory_ledger_rejects_recorded_wrong_cursor_and_conflicting_identity() {
+    let initial = ephemeral_cursor(0, 1);
+    let mut recorded_ledger = InMemorySurfaceCommitLedger::new(initial.clone());
+    assert_eq!(
+        recorded_ledger.append_complete_batch(&batch(84)),
+        Err(SurfaceLedgerError::CommitIdentityConflict)
+    );
+
+    let mut wrong_cursor = ephemeral_batch(85);
+    wrong_cursor.cursor_before.next_seq = SequenceNumber::new(7);
+    wrong_cursor.batch_digest = canonical_batch_digest(&wrong_cursor);
+    let mut cursor_ledger = InMemorySurfaceCommitLedger::new(initial.clone());
+    assert_eq!(
+        cursor_ledger.append_complete_batch(&wrong_cursor),
+        Err(SurfaceLedgerError::CommitIdentityConflict)
+    );
+
+    let mut ledger = InMemorySurfaceCommitLedger::new(initial);
+    let original = ephemeral_batch(86);
+    ledger
+        .append_complete_batch(&original)
+        .expect("append original batch");
+    let mut conflict = original.clone();
+    let mut event = conflict.events.as_slice()[0].clone();
+    event.event = SurfaceEvent::Session(SessionPatch::RuntimeFault {
+        class: FailureClass::RuntimeInvariant,
+        message: DisplayText::new("different fact"),
+        causative_generation: None,
+    });
+    conflict.events = NonEmptyVec::try_new(vec![event]).unwrap();
+    conflict.batch_digest = canonical_batch_digest(&conflict);
+    assert_eq!(
+        ledger.append_complete_batch(&conflict),
+        Err(SurfaceLedgerError::CommitIdentityConflict)
+    );
+}
+
 fn reservation(operation_id: &SurfaceOperationId, seed: u8) -> ReservationLease {
     serde_json::from_value(serde_json::json!({
         "lease_id": SurfaceAdmissionLeaseId::try_from_bytes(uuid(seed)).unwrap(),
@@ -443,14 +560,14 @@ enum LedgerEvent {
 struct FakeLedger {
     fault: Option<Fault>,
     events: Vec<LedgerEvent>,
-    receipt: Option<DurableBatchReceipt>,
+    receipt: Option<SurfaceBatchReceipt>,
 }
 
 impl SurfaceCommitLedger for FakeLedger {
     fn append_complete_batch(
         &mut self,
         batch: &SurfaceCommitBatch,
-    ) -> Result<DurableBatchReceipt, SurfaceLedgerError> {
+    ) -> Result<SurfaceBatchReceipt, SurfaceLedgerError> {
         self.events.push(LedgerEvent::Append);
         if matches!(self.fault, Some(Fault::Partial)) {
             return Err(SurfaceLedgerError::PartialAppend);
@@ -473,11 +590,12 @@ impl SurfaceCommitLedger for FakeLedger {
             batch_digest: batch.batch_digest.clone(),
             cursor_after: batch.cursor_after.clone(),
         };
+        let receipt = SurfaceBatchReceipt::Recorded(receipt);
         self.receipt = Some(receipt.clone());
         Ok(receipt)
     }
 
-    fn checkpoint(&mut self, _receipt: &DurableBatchReceipt) -> Result<(), SurfaceLedgerError> {
+    fn checkpoint(&mut self, _receipt: &SurfaceBatchReceipt) -> Result<(), SurfaceLedgerError> {
         self.events.push(LedgerEvent::Checkpoint);
         Ok(())
     }
@@ -1090,7 +1208,8 @@ fn jsonl_ledger_recovers_exact_prepared_and_committed_identity() {
     let reopened = JsonlSurfaceCommitLedger::new(&path, cursor(0));
     assert!(matches!(
         reopened.probe_commit(commit_id, &batch.batch_digest),
-        CommitProbe::Present(receipt) if receipt.batch_digest == batch.batch_digest
+        CommitProbe::Present(SurfaceBatchReceipt::Recorded(receipt))
+            if receipt.batch_digest == batch.batch_digest
     ));
 }
 
@@ -3580,6 +3699,38 @@ fn thread_and_policy_owner_leases_fail_closed_and_wall_rollback_has_no_authority
     )
     .unwrap();
     assert!(successor.owner_epoch() > old_epoch);
+}
+
+#[test]
+fn process_local_thread_owner_is_exclusive_and_never_creates_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock {
+        clock_id: HostMonotonicClockId::try_from_bytes(uuid(73)).unwrap(),
+        tick: 1,
+        wall_ms: 1,
+    };
+    let thread_id = SurfaceThreadId::try_from_bytes(uuid(74)).unwrap();
+    let other_thread_id = SurfaceThreadId::try_from_bytes(uuid(75)).unwrap();
+
+    let owner = ExclusiveOwnerLease::acquire_process_local_thread(thread_id.clone(), &clock)
+        .expect("acquire process-local owner");
+    assert_eq!(owner.owner_epoch(), 1);
+    assert_eq!(owner.kind(), OwnerLeaseKind::Thread);
+    assert!(owner.has_authority(&clock));
+    assert!(matches!(
+        ExclusiveOwnerLease::acquire_process_local_thread(thread_id.clone(), &clock),
+        Err(OwnerLeaseError::AlreadyOwned)
+    ));
+    let other = ExclusiveOwnerLease::acquire_process_local_thread(other_thread_id, &clock)
+        .expect("different process-local thread has independent authority");
+    assert!(other.has_authority(&clock));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+    drop(owner);
+    let reacquired = ExclusiveOwnerLease::acquire_process_local_thread(thread_id, &clock)
+        .expect("released process-local authority can be reacquired");
+    assert!(reacquired.has_authority(&clock));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
 #[cfg(unix)]

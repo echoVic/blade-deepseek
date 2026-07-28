@@ -26,7 +26,7 @@ use crate::lifecycle::{
     run_status_from_tool_status,
 };
 use crate::memory::MemoryBlock;
-use crate::runtime_surface::RuntimeProviderResponseIngress;
+use crate::runtime_surface::{RuntimeProviderResponseIngress, RuntimeWorkflowLifecycleIngress};
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::{
     ToolInvocation, apply_pre_tool_outcome, approval_request_for_invocation,
@@ -92,6 +92,8 @@ pub(crate) struct ToolExecutionContext<'a> {
     user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
     provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
+    workflow_lifecycle_ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
+    wait_for_background_workflows: bool,
     extension_registry: Option<&'a ExtensionRegistry>,
     extension_stores: Option<RuntimeExtensionStores<'a>>,
     goal_runtime: Option<GoalRuntimeHandle>,
@@ -186,6 +188,8 @@ impl<'a> ToolExecutionContext<'a> {
             user_input_handler: None,
             mcp_elicitation_handler: None,
             provider_response_ingress: None,
+            workflow_lifecycle_ingress: None,
+            wait_for_background_workflows: true,
             extension_registry: None,
             extension_stores: None,
             goal_runtime: None,
@@ -257,6 +261,16 @@ impl<'a> ToolExecutionContext<'a> {
         provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
     ) -> Self {
         self.provider_response_ingress = provider_response_ingress;
+        self
+    }
+
+    pub(crate) fn with_workflow_lifecycle(
+        mut self,
+        ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
+        wait_for_background_workflows: bool,
+    ) -> Self {
+        self.workflow_lifecycle_ingress = ingress;
+        self.wait_for_background_workflows = wait_for_background_workflows;
         self
     }
 
@@ -476,6 +490,8 @@ impl ToolExecutionActor {
             user_input_handler,
             mcp_elicitation_handler,
             provider_response_ingress,
+            workflow_lifecycle_ingress,
+            wait_for_background_workflows,
             extension_registry,
             extension_stores,
             goal_runtime,
@@ -700,6 +716,8 @@ impl ToolExecutionActor {
                 event_error: &mut dispatch_event_error,
                 subagent_child_executor,
                 workflow_child_executor,
+                workflow_lifecycle_ingress,
+                wait_for_background_workflows,
             },
         ) {
             Ok(output) => output,
@@ -1032,10 +1050,19 @@ impl ToolExecutionActor {
                 && result.status == tool_types::ToolStatus::Completed
             {
                 match orca_tools::update_plan::parse_args(execution_request) {
-                    Ok(update) => retain_first_io_error(
-                        &mut event_error,
-                        sink.emit(events.plan_updated(&update)),
-                    ),
+                    Ok(update) => {
+                        if let Some(ingress) = provider_response_ingress {
+                            retain_first_io_error(
+                                &mut event_error,
+                                ingress.commit_plan_update(&update),
+                            );
+                        } else {
+                            retain_first_io_error(
+                                &mut event_error,
+                                sink.emit(events.plan_updated(&update)),
+                            );
+                        }
+                    }
                     Err(error) => retain_first_io_error(
                         &mut event_error,
                         sink.emit(events.error(&format!("failed to render plan update: {error}"))),

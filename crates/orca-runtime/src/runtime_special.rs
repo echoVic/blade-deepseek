@@ -556,19 +556,53 @@ impl RuntimeToolActorContext {
         if !draft_request.workflows_enabled {
             return Ok(ToolResult::failed(request, "workflows are disabled", None));
         }
-        let script = workflow_draft_script_arg(request)?;
         let session_dir = draft_request
             .cwd
             .join(".orca")
             .join("workflow-sessions")
             .join(draft_request.session_id);
-        let draft_store = WorkflowDraftStore::new(session_dir.join("workflow-drafts"));
-        let draft = draft_store.create_from_script(
-            draft_request.session_id,
+        self.execute_workflow_draft_tool_at(
+            request,
             draft_request.cwd,
-            &script,
+            draft_request.session_id,
             draft_request.max_concurrent_agents,
-        )?;
+            &session_dir,
+        )
+    }
+
+    pub(crate) fn execute_workflow_draft_tool_with_registry(
+        &mut self,
+        request: &ToolRequest,
+        workflows_enabled: bool,
+        cwd: &Path,
+        task_registry: &TaskRegistry,
+        max_concurrent_agents: usize,
+    ) -> io::Result<ToolResult> {
+        if !workflows_enabled {
+            return Ok(ToolResult::failed(request, "workflows are disabled", None));
+        }
+        let session_dir = task_registry.workflow_session_dir(cwd)?;
+        self.execute_workflow_draft_tool_at(
+            request,
+            cwd,
+            task_registry.session_id(),
+            max_concurrent_agents,
+            &session_dir,
+        )
+    }
+
+    fn execute_workflow_draft_tool_at(
+        &mut self,
+        request: &ToolRequest,
+        cwd: &Path,
+        session_id: &str,
+        max_concurrent_agents: usize,
+        session_dir: &Path,
+    ) -> io::Result<ToolResult> {
+        let script = workflow_draft_script_arg(request)?;
+        let draft_store = WorkflowDraftStore::new(session_dir.join("workflow-drafts"));
+        let draft =
+            draft_store.create_from_script(session_id, cwd, &script, max_concurrent_agents)?;
         let output = serde_json::to_string(&draft)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         Ok(ToolResult::completed(request, output, false))
@@ -784,6 +818,44 @@ mod tests {
         assert_eq!(summary["pendingToolCall"]["name"], "task_list");
         assert_eq!(summary["pendingToolCall"]["action"], "read");
         assert_eq!(summary["pendingToolCall"]["arguments"], "{}");
+    }
+
+    #[test]
+    fn workflow_draft_registry_entrypoint_uses_releasable_process_local_storage() {
+        let cwd = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new("ephemeral-thread".to_string());
+        let request = ToolRequest {
+            id: "draft".to_string(),
+            name: ToolName::WorkflowDraft,
+            action: ActionKind::Write,
+            target: Some("preview workflow".to_string()),
+            raw_arguments: Some(
+                json!({
+                    "script": "export const meta = { name: 'ephemeral', description: 'Ephemeral draft', phases: ['main'] };\nexport default 'done';"
+                })
+                .to_string(),
+            ),
+        };
+        let mut context = RuntimeToolActorContext::new("test-run", 2);
+
+        let result = context
+            .execute_workflow_draft_tool_with_registry(&request, true, cwd.path(), &registry, 3)
+            .unwrap();
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        let output: Value = serde_json::from_str(result.output.as_deref().unwrap()).unwrap();
+        let script_path = Path::new(output["scriptPath"].as_str().unwrap());
+        assert!(script_path.is_file());
+        assert!(!script_path.starts_with(cwd.path()));
+        assert!(!cwd.path().join(".orca").exists());
+
+        let session_dir = script_path
+            .parent()
+            .and_then(Path::parent)
+            .expect("workflow session directory")
+            .to_path_buf();
+        registry.release_process_local_artifacts();
+        assert!(!session_dir.exists());
     }
 
     #[test]

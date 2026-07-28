@@ -193,6 +193,8 @@ impl<'a> RuntimeTurnRequestContext<'a> {
             steer_handle: self.turn_context.steer_handle,
             provider_suspension_control: self.turn_context.provider_suspension_control,
             provider_response_ingress: self.turn_context.provider_response_ingress,
+            workflow_lifecycle_ingress: self.turn_context.workflow_lifecycle_ingress,
+            wait_for_background_workflows: self.turn_context.wait_for_background_workflows,
         };
         Self { turn_context }
     }

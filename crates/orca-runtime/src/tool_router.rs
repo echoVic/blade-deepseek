@@ -21,9 +21,9 @@ use crate::lifecycle::{
 use crate::memory::MemoryBlock;
 use crate::runtime_special::{
     RuntimeGoalToolOutcome, RuntimeGoalToolRequest, RuntimeSpecialToolDispatch,
-    RuntimeWorkflowDraftRequest,
 };
 use crate::runtime_state::RuntimeTurnReducer;
+use crate::runtime_surface::RuntimeWorkflowLifecycleIngress;
 use crate::runtime_tool_call::{
     RuntimeNormalToolInteractions, RuntimeNormalToolInvocation, RuntimeToolCallRuntime,
 };
@@ -63,6 +63,8 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) event_error: &'a mut Option<io::Error>,
     pub(crate) subagent_child_executor: ChildAgentExecutor<io::Sink>,
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+    pub(crate) workflow_lifecycle_ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
+    pub(crate) wait_for_background_workflows: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +150,8 @@ impl<'a> RuntimeToolRouter<'a> {
             event_error,
             subagent_child_executor,
             workflow_child_executor,
+            workflow_lifecycle_ingress,
+            wait_for_background_workflows,
         } = context;
 
         let result = match self.runtime.classify_dispatch(execution_request, goal_mode) {
@@ -178,15 +182,15 @@ impl<'a> RuntimeToolRouter<'a> {
                     },
                 );
             }
-            RuntimeSpecialToolDispatch::WorkflowDraft => self.runtime.execute_workflow_draft_tool(
-                execution_request,
-                RuntimeWorkflowDraftRequest {
-                    workflows_enabled: config.workflows.enabled,
+            RuntimeSpecialToolDispatch::WorkflowDraft => {
+                self.runtime.execute_workflow_draft_tool_with_registry(
+                    execution_request,
+                    config.workflows.enabled,
                     cwd,
-                    session_id: task_registry.session_id(),
-                    max_concurrent_agents: config.workflows.max_concurrent_agents,
-                },
-            ),
+                    task_registry,
+                    config.workflows.max_concurrent_agents,
+                )
+            }
             RuntimeSpecialToolDispatch::WorkflowDraftAction => execute_workflow_draft_action_tool(
                 config,
                 cwd,
@@ -197,6 +201,8 @@ impl<'a> RuntimeToolRouter<'a> {
                 task_registry,
                 background_workflows,
                 workflow_child_executor,
+                wait_for_background_workflows,
+                workflow_lifecycle_ingress,
             ),
             RuntimeSpecialToolDispatch::Workflow => execute_workflow_tool(
                 config,
@@ -208,6 +214,8 @@ impl<'a> RuntimeToolRouter<'a> {
                 task_registry,
                 background_workflows,
                 workflow_child_executor,
+                wait_for_background_workflows,
+                workflow_lifecycle_ingress,
             ),
             RuntimeSpecialToolDispatch::Subagent => execute_subagent_tool(
                 config,

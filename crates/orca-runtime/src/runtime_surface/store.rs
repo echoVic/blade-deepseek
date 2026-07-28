@@ -1,13 +1,12 @@
 use super::*;
 use crate::thread_store::JsonlThreadStore;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,6 +27,21 @@ pub struct DurableBatchReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EphemeralBatchReceipt {
+    pub commit_id: SurfaceCommitId,
+    pub live_revision: LiveRevision,
+    pub event_count: u32,
+    pub batch_digest: Sha256Digest,
+    pub cursor_after: SurfaceCursor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SurfaceBatchReceipt {
+    Recorded(DurableBatchReceipt),
+    Ephemeral(EphemeralBatchReceipt),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedSurfaceCommit {
     pub commit_id: SurfaceCommitId,
     pub event_count: u32,
@@ -40,7 +54,7 @@ pub struct PreparedSurfaceCommit {
 pub enum CommitProbe {
     Absent,
     Prepared(PreparedSurfaceCommit),
-    Present(DurableBatchReceipt),
+    Present(SurfaceBatchReceipt),
     Conflict,
 }
 
@@ -48,11 +62,180 @@ pub trait SurfaceCommitLedger {
     fn append_complete_batch(
         &mut self,
         batch: &SurfaceCommitBatch,
-    ) -> Result<DurableBatchReceipt, SurfaceLedgerError>;
+    ) -> Result<SurfaceBatchReceipt, SurfaceLedgerError>;
 
-    fn checkpoint(&mut self, receipt: &DurableBatchReceipt) -> Result<(), SurfaceLedgerError>;
+    fn checkpoint(&mut self, receipt: &SurfaceBatchReceipt) -> Result<(), SurfaceLedgerError>;
 
     fn probe_commit(&self, commit_id: &SurfaceCommitId, digest: &Sha256Digest) -> CommitProbe;
+}
+
+pub struct InMemorySurfaceCommitLedger {
+    cursor: SurfaceCursor,
+    receipts: BTreeMap<SurfaceCommitId, EphemeralBatchReceipt>,
+    committed: Vec<SurfaceCommitBatch>,
+}
+
+impl InMemorySurfaceCommitLedger {
+    pub fn new(cursor: SurfaceCursor) -> Self {
+        Self {
+            cursor,
+            receipts: BTreeMap::new(),
+            committed: Vec::new(),
+        }
+    }
+
+    pub fn recover_batches(&self) -> RecoveredSurfaceBatches {
+        RecoveredSurfaceBatches {
+            committed: self.committed.clone(),
+            prepared: None,
+        }
+    }
+
+    fn receipt_for(
+        &self,
+        commit_id: &SurfaceCommitId,
+        digest: &Sha256Digest,
+    ) -> Result<Option<EphemeralBatchReceipt>, SurfaceLedgerError> {
+        let Some(receipt) = self.receipts.get(commit_id) else {
+            return Ok(None);
+        };
+        if &receipt.batch_digest != digest {
+            return Err(SurfaceLedgerError::CommitIdentityConflict);
+        }
+        Ok(Some(receipt.clone()))
+    }
+}
+
+impl SurfaceCommitLedger for InMemorySurfaceCommitLedger {
+    fn append_complete_batch(
+        &mut self,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceBatchReceipt, SurfaceLedgerError> {
+        let (incarnation, live_revision, commit_id) = match &batch.commit_class {
+            CommitClass::Ephemeral {
+                incarnation,
+                live_revision,
+                commit_id,
+            } => (incarnation, *live_revision, commit_id),
+            CommitClass::Recorded { .. } => {
+                return Err(SurfaceLedgerError::CommitIdentityConflict);
+            }
+        };
+        if let Some(receipt) = self.receipt_for(commit_id, &batch.batch_digest)? {
+            return (receipt.cursor_after == batch.cursor_after
+                && receipt.event_count == batch.event_count)
+                .then_some(SurfaceBatchReceipt::Ephemeral(receipt))
+                .ok_or(SurfaceLedgerError::CommitIdentityConflict);
+        }
+        let next_live_revision = match self.cursor.source_revision {
+            CursorSourceRevision::Ephemeral { live_revision } => LiveRevision::try_new(
+                live_revision
+                    .get()
+                    .checked_add(1)
+                    .ok_or(SurfaceLedgerError::CommitIdentityConflict)?,
+            )
+            .map_err(|_| SurfaceLedgerError::CommitIdentityConflict)?,
+            CursorSourceRevision::Recorded { .. } => {
+                return Err(SurfaceLedgerError::CommitIdentityConflict);
+            }
+        };
+        let cursor_revision_matches = matches!(
+            batch.cursor_after.source_revision,
+            CursorSourceRevision::Ephemeral { live_revision: cursor_revision }
+                if cursor_revision == live_revision
+        );
+        let envelopes_match = batch.events.as_slice().iter().all(|event| {
+            event.commit_class == batch.commit_class && event.ordinal < batch.event_count
+        });
+        if batch.cursor_before != self.cursor
+            || batch.cursor_after.thread_id != self.cursor.thread_id
+            || batch.cursor_after.incarnation != self.cursor.incarnation
+            || incarnation != &self.cursor.incarnation
+            || live_revision != next_live_revision
+            || !cursor_revision_matches
+            || batch.cursor_after.next_seq.get()
+                != self
+                    .cursor
+                    .next_seq
+                    .get()
+                    .checked_add(u64::from(batch.event_count))
+                    .ok_or(SurfaceLedgerError::CommitIdentityConflict)?
+            || batch.event_count != batch.events.as_slice().len() as u32
+            || !envelopes_match
+            || canonical_batch_digest(batch) != batch.batch_digest
+        {
+            return Err(SurfaceLedgerError::CommitIdentityConflict);
+        }
+        let receipt = EphemeralBatchReceipt {
+            commit_id: commit_id.clone(),
+            live_revision,
+            event_count: batch.event_count,
+            batch_digest: batch.batch_digest.clone(),
+            cursor_after: batch.cursor_after.clone(),
+        };
+        self.cursor = batch.cursor_after.clone();
+        self.receipts.insert(commit_id.clone(), receipt.clone());
+        self.committed.push(batch.clone());
+        Ok(SurfaceBatchReceipt::Ephemeral(receipt))
+    }
+
+    fn checkpoint(&mut self, receipt: &SurfaceBatchReceipt) -> Result<(), SurfaceLedgerError> {
+        let SurfaceBatchReceipt::Ephemeral(receipt) = receipt else {
+            return Err(SurfaceLedgerError::CommitIdentityConflict);
+        };
+        self.receipt_for(&receipt.commit_id, &receipt.batch_digest)?
+            .filter(|stored| stored == receipt)
+            .map(|_| ())
+            .ok_or(SurfaceLedgerError::CommitIdentityConflict)
+    }
+
+    fn probe_commit(&self, commit_id: &SurfaceCommitId, digest: &Sha256Digest) -> CommitProbe {
+        match self.receipt_for(commit_id, digest) {
+            Ok(Some(receipt)) => CommitProbe::Present(SurfaceBatchReceipt::Ephemeral(receipt)),
+            Ok(None) => CommitProbe::Absent,
+            Err(_) => CommitProbe::Conflict,
+        }
+    }
+}
+
+pub(crate) enum RuntimeSurfaceCommitLedger {
+    Recorded(JsonlSurfaceCommitLedger),
+    Ephemeral(InMemorySurfaceCommitLedger),
+}
+
+impl RuntimeSurfaceCommitLedger {
+    pub(crate) fn recover_batches(&self) -> Result<RecoveredSurfaceBatches, SurfaceLedgerError> {
+        match self {
+            Self::Recorded(ledger) => ledger.recover_batches(),
+            Self::Ephemeral(ledger) => Ok(ledger.recover_batches()),
+        }
+    }
+}
+
+impl SurfaceCommitLedger for RuntimeSurfaceCommitLedger {
+    fn append_complete_batch(
+        &mut self,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceBatchReceipt, SurfaceLedgerError> {
+        match self {
+            Self::Recorded(ledger) => ledger.append_complete_batch(batch),
+            Self::Ephemeral(ledger) => ledger.append_complete_batch(batch),
+        }
+    }
+
+    fn checkpoint(&mut self, receipt: &SurfaceBatchReceipt) -> Result<(), SurfaceLedgerError> {
+        match self {
+            Self::Recorded(ledger) => ledger.checkpoint(receipt),
+            Self::Ephemeral(ledger) => ledger.checkpoint(receipt),
+        }
+    }
+
+    fn probe_commit(&self, commit_id: &SurfaceCommitId, digest: &Sha256Digest) -> CommitProbe {
+        match self {
+            Self::Recorded(ledger) => ledger.probe_commit(commit_id, digest),
+            Self::Ephemeral(ledger) => ledger.probe_commit(commit_id, digest),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -3626,7 +3809,7 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
     fn append_complete_batch(
         &mut self,
         batch: &SurfaceCommitBatch,
-    ) -> Result<DurableBatchReceipt, SurfaceLedgerError> {
+    ) -> Result<SurfaceBatchReceipt, SurfaceLedgerError> {
         #[cfg(test)]
         if self.take_terminal_append_failure(batch) {
             return Err(SurfaceLedgerError::AppendFailed);
@@ -3689,13 +3872,13 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
                 return Err(SurfaceLedgerError::CommitIdentityConflict);
             }
             let _ = committed;
-            return Ok(DurableBatchReceipt {
+            return Ok(SurfaceBatchReceipt::Recorded(DurableBatchReceipt {
                 commit_id,
                 durable_revision,
                 event_count: batch.event_count,
                 batch_digest: batch.batch_digest.clone(),
                 cursor_after: batch.cursor_after.clone(),
-            });
+            }));
         }
         self.store
             .append_surface_commit_prepared(
@@ -3753,10 +3936,13 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
                     .or_insert(count);
             }
         }
-        Ok(receipt)
+        Ok(SurfaceBatchReceipt::Recorded(receipt))
     }
 
-    fn checkpoint(&mut self, receipt: &DurableBatchReceipt) -> Result<(), SurfaceLedgerError> {
+    fn checkpoint(&mut self, receipt: &SurfaceBatchReceipt) -> Result<(), SurfaceLedgerError> {
+        let SurfaceBatchReceipt::Recorded(receipt) = receipt else {
+            return Err(SurfaceLedgerError::CommitIdentityConflict);
+        };
         #[cfg(test)]
         if self.take_pending_terminal_checkpoint_failure() {
             return Err(SurfaceLedgerError::CheckpointFailed);
@@ -3835,13 +4021,13 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
             ..self.cursor_template.clone()
         };
         if committed {
-            CommitProbe::Present(DurableBatchReceipt {
+            CommitProbe::Present(SurfaceBatchReceipt::Recorded(DurableBatchReceipt {
                 commit_id: commit_id.clone(),
                 durable_revision,
                 event_count,
                 batch_digest: digest.clone(),
                 cursor_after: cursor,
-            })
+            }))
         } else {
             CommitProbe::Prepared(PreparedSurfaceCommit {
                 commit_id: commit_id.clone(),
@@ -3940,9 +4126,19 @@ pub enum OwnerLeaseError {
     IdentityMismatch,
 }
 
+enum OwnerLeaseBackend {
+    Durable {
+        lock_file: File,
+        epoch_path: PathBuf,
+    },
+    ProcessLocalThread,
+}
+
+static PROCESS_LOCAL_THREAD_OWNERS: OnceLock<Mutex<BTreeSet<super::SurfaceThreadId>>> =
+    OnceLock::new();
+
 pub struct ExclusiveOwnerLease {
-    lock_file: File,
-    epoch_path: PathBuf,
+    backend: OwnerLeaseBackend,
     owner_epoch: u64,
     kind: OwnerLeaseKind,
     thread_id: Option<super::SurfaceThreadId>,
@@ -3974,6 +4170,29 @@ impl ExclusiveOwnerLease {
             Some(thread_id),
             clock,
         )
+    }
+
+    pub fn acquire_process_local_thread(
+        thread_id: super::SurfaceThreadId,
+        clock: &impl InjectedRuntimeClock,
+    ) -> Result<Self, OwnerLeaseError> {
+        let mut owners = PROCESS_LOCAL_THREAD_OWNERS
+            .get_or_init(|| Mutex::new(BTreeSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !owners.insert(thread_id.clone()) {
+            return Err(OwnerLeaseError::AlreadyOwned);
+        }
+        drop(owners);
+        Ok(Self {
+            backend: OwnerLeaseBackend::ProcessLocalThread,
+            owner_epoch: 1,
+            kind: OwnerLeaseKind::Thread,
+            thread_id: Some(thread_id),
+            diagnostic_clock_id: clock.clock_id(),
+            diagnostic_tick: clock.monotonic_tick(),
+            diagnostic_wall_ms: clock.wall_clock_ms(),
+        })
     }
 
     fn acquire_bound(
@@ -4009,8 +4228,10 @@ impl ExclusiveOwnerLease {
             }
         };
         Ok(Self {
-            lock_file,
-            epoch_path,
+            backend: OwnerLeaseBackend::Durable {
+                lock_file,
+                epoch_path,
+            },
             owner_epoch,
             kind,
             thread_id,
@@ -4033,7 +4254,20 @@ impl ExclusiveOwnerLease {
     }
 
     pub(crate) fn has_current_authority(&self) -> bool {
-        read_owner_epoch(&self.epoch_path).is_ok_and(|epoch| epoch == self.owner_epoch)
+        match &self.backend {
+            OwnerLeaseBackend::Durable { epoch_path, .. } => {
+                read_owner_epoch(epoch_path).is_ok_and(|epoch| epoch == self.owner_epoch)
+            }
+            OwnerLeaseBackend::ProcessLocalThread => {
+                self.thread_id.as_ref().is_some_and(|thread_id| {
+                    PROCESS_LOCAL_THREAD_OWNERS
+                        .get_or_init(|| Mutex::new(BTreeSet::new()))
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .contains(thread_id)
+                })
+            }
+        }
     }
 
     pub(crate) fn authorizes_thread(&self, thread_id: &super::SurfaceThreadId) -> bool {
@@ -4053,7 +4287,18 @@ impl ExclusiveOwnerLease {
 
 impl Drop for ExclusiveOwnerLease {
     fn drop(&mut self) {
-        unlock_exclusive(&self.lock_file);
+        match &self.backend {
+            OwnerLeaseBackend::Durable { lock_file, .. } => unlock_exclusive(lock_file),
+            OwnerLeaseBackend::ProcessLocalThread => {
+                if let Some(thread_id) = self.thread_id.as_ref() {
+                    PROCESS_LOCAL_THREAD_OWNERS
+                        .get_or_init(|| Mutex::new(BTreeSet::new()))
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(thread_id);
+                }
+            }
+        }
     }
 }
 

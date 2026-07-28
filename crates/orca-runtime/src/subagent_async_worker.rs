@@ -203,6 +203,16 @@ pub(crate) fn launch_async_subagent(
         subagent_depth,
         task_registry,
     } = context;
+    if task_registry.is_process_local() {
+        return AsyncSubagentLaunchOutput {
+            result: tool_types::ToolResult::failed(
+                tool_request,
+                "async subagents require persistent task ownership; use sync mode for a history-disabled run",
+                None,
+            ),
+            task: None,
+        };
+    }
     let agent_type = serde_json::to_value(&request.subagent_type)
         .ok()
         .and_then(|value| value.as_str().map(str::to_string));
@@ -452,8 +462,95 @@ pub(crate) fn async_subagent_result_payload(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use orca_core::approval_types::{ActionKind, ApprovalMode};
+    use orca_core::config::{
+        HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, ReasoningEffort, RunConfig,
+        ThemeName, ToolConfig, WorkflowConfig,
+    };
+    use orca_core::model::ModelSelection;
+    use orca_core::subagent_config::SubagentConfig;
+    use orca_core::tool_types::{ToolName, ToolRequest, ToolStatus};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn process_local_registry_rejects_async_subagent_before_spawn() {
+        let cwd = tempfile::tempdir().unwrap();
+        let config = async_test_config(cwd.path().to_path_buf());
+        let tool_request = ToolRequest {
+            id: "ephemeral-async".to_string(),
+            name: ToolName::Subagent,
+            action: ActionKind::Agent,
+            target: Some("inspect later".to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "inspect later",
+                    "prompt": "inspect later",
+                    "mode": "async"
+                })
+                .to_string(),
+            ),
+        };
+        let request = subagent::create_subagent_request(&tool_request);
+        let registry = TaskRegistry::new("ephemeral-thread".to_string());
+
+        let output = launch_async_subagent(AsyncSubagentLaunchContext {
+            config: &config,
+            cwd: cwd.path(),
+            tool_request: &tool_request,
+            request,
+            subagent_depth: 0,
+            task_registry: &registry,
+        });
+
+        assert_eq!(output.result.status, ToolStatus::Failed);
+        assert!(
+            output
+                .result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("use sync mode"))
+        );
+        assert!(output.task.is_none());
+        assert!(registry.list().is_empty());
+        assert!(!cwd.path().join(".orca").exists());
+    }
+
+    fn async_test_config(cwd: PathBuf) -> RunConfig {
+        RunConfig {
+            app_version: "test".to_string(),
+            prompt: String::new(),
+            cwd: Some(cwd),
+            output_format: OutputFormat::Jsonl,
+            approval_mode: ApprovalMode::Suggest,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::parse(None).unwrap(),
+            model_runtime: ModelRuntimeConfig::default(),
+            reasoning_effort: ReasoningEffort::Max,
+            api_key: None,
+            base_url: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            external_tools: Vec::new(),
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
+            permission_rules: Default::default(),
+            additional_working_directories: Vec::new(),
+            max_budget_usd: None,
+            subagents: SubagentConfig::default(),
+            tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
+            theme: ThemeName::Dark,
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
+        }
+    }
 
     #[test]
     fn async_subagent_worker_command_hides_key_and_owns_process_group() {

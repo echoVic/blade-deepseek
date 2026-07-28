@@ -114,6 +114,35 @@ impl WorkflowBackgroundLaunch {
     pub fn join(self) -> thread::Result<io::Result<WorkflowLaunchResult>> {
         self.handle.join()
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        task_id: String,
+        run_id: String,
+        workflow_name: String,
+        phases: Vec<String>,
+        handle: thread::JoinHandle<io::Result<WorkflowLaunchResult>>,
+    ) -> Self {
+        let output = WorkflowOutput {
+            status: "async_launched".to_string(),
+            task_id: task_id.clone(),
+            task_type: Some("local_workflow".to_string()),
+            workflow_name: Some(workflow_name.clone()),
+            run_id: Some(run_id.clone()),
+            summary: Some("Workflow launched".to_string()),
+            transcript_dir: None,
+            script_path: None,
+            session_url: None,
+        };
+        Self {
+            task_id,
+            run_id,
+            workflow_name,
+            phases,
+            output,
+            handle,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

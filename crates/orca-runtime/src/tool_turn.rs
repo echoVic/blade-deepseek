@@ -27,7 +27,7 @@ use crate::runtime_readonly_tool_turn::{
     RuntimeReadonlyToolTurnContext, RuntimeReadonlyToolTurnIo, RuntimeReadonlyToolTurnRequest,
     RuntimeReadonlyToolTurnServices, run_readonly_tool_turn,
 };
-use crate::runtime_surface::RuntimeProviderResponseIngress;
+use crate::runtime_surface::{RuntimeProviderResponseIngress, RuntimeWorkflowLifecycleIngress};
 use crate::runtime_tool_scheduler::{RuntimeToolDispatch, RuntimeToolDispatchScheduler};
 use crate::session::record_tool_result_for_agent;
 use crate::step_context::{
@@ -131,6 +131,8 @@ pub(crate) struct RuntimeNormalToolTurnRuntime<'a> {
     pub(crate) cancel: &'a CancelToken,
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
+    pub(crate) workflow_lifecycle_ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
+    pub(crate) wait_for_background_workflows: bool,
 }
 
 pub(crate) struct RuntimeNormalToolTurnInteractions<'a> {
@@ -209,6 +211,8 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let subagent_depth = step_snapshot.turn_context.subagent_depth;
     let emit_deltas = step_snapshot.turn_context.emit_deltas;
     let provider_response_ingress = step_snapshot.turn_context.provider_response_ingress();
+    let workflow_lifecycle_ingress = step_snapshot.turn_context.workflow_lifecycle_ingress();
+    let wait_for_background_workflows = step_snapshot.turn_context.wait_for_background_workflows;
     let policy = step_snapshot.policy;
     let capabilities = step_snapshot.capabilities();
     let instructions = capabilities.instructions;
@@ -451,6 +455,8 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 cancel,
                 task_registry,
                 workflow_ipc,
+                workflow_lifecycle_ingress,
+                wait_for_background_workflows,
             },
             interactions: RuntimeNormalToolTurnInteractions {
                 approval_handler,
@@ -688,6 +694,8 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         cancel,
         task_registry,
         workflow_ipc,
+        workflow_lifecycle_ingress,
+        wait_for_background_workflows,
     } = runtime;
     let RuntimeNormalToolTurnInteractions {
         approval_handler,
@@ -733,6 +741,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
             background_workflows,
             workflow_ipc,
         )
+        .with_workflow_lifecycle(workflow_lifecycle_ingress, wait_for_background_workflows)
         .with_permission_overlay(sampling_state.permission_overlay_mut())
         .with_approval_handler(approval_handler)
         .with_permission_handler(permission_handler)
@@ -1474,6 +1483,8 @@ mod tests {
                 cancel: &cancel,
                 task_registry: &task_registry,
                 workflow_ipc: None,
+                workflow_lifecycle_ingress: None,
+                wait_for_background_workflows: true,
             },
             interactions: RuntimeNormalToolTurnInteractions {
                 approval_handler: None,
@@ -2815,6 +2826,8 @@ mod tests {
                 cancel: &cancel,
                 task_registry: &task_registry,
                 workflow_ipc: None,
+                workflow_lifecycle_ingress: None,
+                wait_for_background_workflows: true,
             },
             interactions: RuntimeNormalToolTurnInteractions {
                 approval_handler: None,

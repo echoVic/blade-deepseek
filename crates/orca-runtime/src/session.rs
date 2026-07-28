@@ -211,6 +211,24 @@ impl InteractiveSession {
         mcp_registry: McpRegistry,
         prepared_record_meta: Option<SessionMeta>,
     ) -> io::Result<Self> {
+        Self::new_with_prepared_history_and_runtime_id(
+            config,
+            prompt_for_title,
+            preloaded,
+            mcp_registry,
+            prepared_record_meta,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_prepared_history_and_runtime_id(
+        config: &RunConfig,
+        prompt_for_title: &str,
+        preloaded: Option<SessionTranscript>,
+        mcp_registry: McpRegistry,
+        prepared_record_meta: Option<SessionMeta>,
+        runtime_thread_id: Option<String>,
+    ) -> io::Result<Self> {
         let cwd = config
             .cwd
             .clone()
@@ -340,7 +358,16 @@ impl InteractiveSession {
             }
         };
 
-        let task_session_id = session_id.clone().unwrap_or_else(new_run_id);
+        let process_local_tasks = session_id.is_none() && runtime_thread_id.is_some();
+        let task_session_id = session_id
+            .clone()
+            .or(runtime_thread_id)
+            .unwrap_or_else(new_run_id);
+        let task_registry = if process_local_tasks {
+            TaskRegistry::new(task_session_id)
+        } else {
+            TaskRegistry::new_for_cwd(task_session_id, &cwd)
+        };
 
         Ok(Self {
             store,
@@ -355,7 +382,7 @@ impl InteractiveSession {
             mcp_registry,
             hooks,
             memory,
-            task_registry: TaskRegistry::new_for_cwd(task_session_id, &cwd),
+            task_registry,
             last_manual_compaction: None,
         })
     }

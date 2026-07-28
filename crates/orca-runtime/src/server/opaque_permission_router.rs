@@ -407,6 +407,13 @@ impl<T: Clone> JsonlOpaquePermissionRouter<T> {
         }
     }
 
+    pub(super) fn has_live_routes(&self) -> bool {
+        self.routes
+            .lock()
+            .map(|routes| !routes.is_empty())
+            .unwrap_or(true)
+    }
+
     pub(super) fn register(
         &self,
         preferred_request_id: String,

@@ -36,8 +36,7 @@ pub(in crate::server::router) fn dispatch_submit_operation<W: Write + Send + 'st
                 }
                 run_thread_submit_async(config, state, id, op, writer)
             } else {
-                let mut writer = writer.lock().map_err(lock_error)?;
-                run_submit(config, id, op, &mut *writer)
+                run_stateless_submit_async(config, state, id, op, writer)
             }
         }
         ClientOp::ThreadStart {

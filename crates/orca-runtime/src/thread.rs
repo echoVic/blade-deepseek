@@ -70,7 +70,7 @@ impl TurnProgressBaseline {
 impl RuntimeThread {
     pub fn start(config: &RunConfig, title: impl Into<String>) -> io::Result<Self> {
         let session = InteractiveSession::new_with_preloaded(config, &title.into(), None)?;
-        Ok(Self::from_session(session))
+        Ok(Self::from_session(session, None))
     }
 
     pub fn start_with_preloaded(
@@ -79,7 +79,7 @@ impl RuntimeThread {
         preloaded: Option<SessionTranscript>,
     ) -> io::Result<Self> {
         let session = InteractiveSession::new_with_preloaded(config, &title.into(), preloaded)?;
-        Ok(Self::from_session(session))
+        Ok(Self::from_session(session, None))
     }
 
     pub fn start_with_preloaded_and_mcp_registry(
@@ -94,31 +94,35 @@ impl RuntimeThread {
             preloaded,
             mcp_registry,
         )?;
-        Ok(Self::from_session(session))
+        Ok(Self::from_session(session, None))
     }
 
-    pub(crate) fn start_with_prepared_history(
+    pub(crate) fn start_with_prepared_history_and_runtime_id(
         config: &RunConfig,
         title: impl Into<String>,
         preloaded: Option<SessionTranscript>,
         mcp_registry: McpRegistry,
         prepared_record_meta: Option<crate::thread_store::SessionMeta>,
+        runtime_thread_id: Option<String>,
     ) -> io::Result<Self> {
-        let session = InteractiveSession::new_with_prepared_history(
+        let session = InteractiveSession::new_with_prepared_history_and_runtime_id(
             config,
             &title.into(),
             preloaded,
             mcp_registry,
             prepared_record_meta,
+            runtime_thread_id.clone(),
         )?;
-        Ok(Self::from_session(session))
+        Ok(Self::from_session(session, runtime_thread_id))
     }
 
-    fn from_session(session: InteractiveSession) -> Self {
-        let thread_id = session
-            .session_id()
-            .map(ToString::to_string)
-            .unwrap_or_else(new_run_id);
+    fn from_session(session: InteractiveSession, runtime_thread_id: Option<String>) -> Self {
+        let thread_id = runtime_thread_id.unwrap_or_else(|| {
+            session
+                .session_id()
+                .map(ToString::to_string)
+                .unwrap_or_else(new_run_id)
+        });
         let mut lifecycle = RuntimeSessionLifecycle::new(thread_id.clone());
         lifecycle.start_task(RuntimeTaskKind::Agent);
 

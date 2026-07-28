@@ -41,7 +41,7 @@ use crate::runtime_host::{
     HostedTurnRequest, OperationHandle, OperationOutcome, OperationTerminal, RuntimeHost,
     RuntimeHostError,
 };
-use crate::runtime_surface::RuntimeProviderResponseIngress;
+use crate::runtime_surface::{RuntimeProviderResponseIngress, RuntimeWorkflowLifecycleIngress};
 use crate::session::{InteractiveSession, InteractiveSessionRuntimeParts};
 use crate::tasks::{MainSessionTerminalUpdate, TaskRegistry};
 #[cfg(test)]
@@ -251,6 +251,7 @@ pub struct ThreadTurnRequest {
     continuation: Option<RuntimeTurnContinuation>,
     provider_suspension_control: Option<Arc<dyn RuntimeProviderSuspensionControl>>,
     provider_response_ingress: Option<Arc<dyn RuntimeProviderResponseIngress>>,
+    workflow_lifecycle_ingress: Option<Arc<dyn RuntimeWorkflowLifecycleIngress>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -636,7 +637,9 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             loop_context
         }
         .with_provider_suspension_control(request.provider_suspension_control())
-        .with_provider_response_ingress(request.provider_response_ingress());
+        .with_provider_response_ingress(request.provider_response_ingress())
+        .with_workflow_lifecycle_ingress(request.workflow_lifecycle_ingress())
+        .with_wait_for_background_workflows(request.options().wait_for_background_workflows);
         let turn_result = (|| -> io::Result<AgentLoopOutcome> {
             run_agent_loop(
                 config,
@@ -683,7 +686,15 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
                 let mut end_reason = result.reason;
                 lifecycle.finish_task(status);
                 if request.options().wait_for_background_workflows {
-                    observe_background_workflows(true, events, sink, background_workflows)?;
+                    observe_background_workflows(
+                        true,
+                        events,
+                        sink,
+                        background_workflows,
+                        parts.task_registry,
+                        cancel,
+                        request.workflow_lifecycle_ingress(),
+                    )?;
                 }
                 let status =
                     run_verifier_if_needed(status, config.verifier.as_deref(), events, sink)?;
@@ -818,6 +829,7 @@ impl ThreadTurnRequest {
             continuation: None,
             provider_suspension_control: None,
             provider_response_ingress: None,
+            workflow_lifecycle_ingress: None,
         }
     }
 
@@ -959,6 +971,14 @@ impl ThreadTurnRequest {
         self
     }
 
+    pub fn with_workflow_lifecycle_ingress(
+        mut self,
+        ingress: Arc<dyn RuntimeWorkflowLifecycleIngress>,
+    ) -> Self {
+        self.workflow_lifecycle_ingress = Some(ingress);
+        self
+    }
+
     pub fn with_continuation(mut self, continuation: RuntimeTurnContinuation) -> Self {
         self.continuation = Some(continuation);
         self.prompt_placement = ThreadTurnPromptPlacement::ExistingTurn;
@@ -998,6 +1018,10 @@ impl ThreadTurnRequest {
 
     pub fn provider_response_ingress(&self) -> Option<&dyn RuntimeProviderResponseIngress> {
         self.provider_response_ingress.as_deref()
+    }
+
+    pub fn workflow_lifecycle_ingress(&self) -> Option<&dyn RuntimeWorkflowLifecycleIngress> {
+        self.workflow_lifecycle_ingress.as_deref()
     }
 
     pub fn continuation(&self) -> Option<&RuntimeTurnContinuation> {
@@ -2614,6 +2638,8 @@ mod tests {
                 event_error: &mut event_error,
                 subagent_child_executor: execute_child_agent_loop,
                 workflow_child_executor: execute_child_agent_loop,
+                workflow_lifecycle_ingress: None,
+                wait_for_background_workflows: true,
             })
             .unwrap();
 
@@ -2683,6 +2709,8 @@ mod tests {
                     event_error: &mut event_error,
                     subagent_child_executor: execute_child_agent_loop,
                     workflow_child_executor: execute_child_agent_loop,
+                    workflow_lifecycle_ingress: None,
+                    wait_for_background_workflows: true,
                 })
                 .expect("dispatch normal call");
 

@@ -669,6 +669,11 @@ impl RuntimeTurnProviderCycleStep {
                 conversation,
             )?
         };
+        if let RuntimeProviderErrorStepOutcome::Failed(error) = &provider_error_outcome
+            && let Some(ingress) = turn_context.provider_response_ingress()
+        {
+            ingress.commit_provider_failure(&response.identity, &error.message)?;
+        }
         match RuntimeProviderErrorResultStep::new().fold(provider_error_outcome) {
             RuntimeProviderErrorResult::ContinueLoop => {
                 return Ok(RuntimeTurnProviderCycleResult::ContinueLoop);
