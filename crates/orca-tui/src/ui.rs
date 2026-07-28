@@ -7754,6 +7754,120 @@ mod tests {
     }
 
     #[test]
+    fn streaming_newline_gate_hides_partial_source_until_completion_frame() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 16))
+            .expect("test backend");
+
+        state.update(TuiEvent::MessageDelta(
+            "visible line\nhidden half".to_string(),
+        ));
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("streaming draw");
+        let streaming = format!("{:?}", terminal.backend().buffer());
+        assert!(streaming.contains("visible line"));
+        assert!(!streaming.contains("hidden half"));
+
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("completed draw");
+        let completed = format!("{:?}", terminal.backend().buffer());
+        assert!(completed.contains("visible line"));
+        assert!(completed.contains("hidden half"));
+
+        let lines = build_lines_for_messages(&state.messages, &theme, 80, 0, false);
+        assert_eq!(
+            lines
+                .iter()
+                .rev()
+                .take_while(|line| line.to_string().is_empty())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn streaming_table_holdback_reveals_the_whole_table_at_one_boundary() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 16))
+            .expect("test backend");
+
+        for delta in ["| Name | Value |\n", "|---|---|\n", "| A | 1 |\n"] {
+            state.update(TuiEvent::MessageDelta(delta.to_string()));
+            terminal
+                .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                .expect("held table draw");
+            let held = format!("{:?}", terminal.backend().buffer());
+            assert!(!held.contains("Name"));
+            assert!(!held.contains("Value"));
+            assert!(!held.contains(" A "));
+        }
+
+        state.update(TuiEvent::MessageDelta("\n".to_string()));
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("released table draw");
+        let released = format!("{:?}", terminal.backend().buffer());
+        assert!(released.contains("Name"));
+        assert!(released.contains("Value"));
+        assert!(released.contains("A"));
+
+        let mut completed = test_state();
+        completed.update(TuiEvent::MessageDelta(
+            "| Name | Value |\n|---|---|\n| B | 2 |\n".to_string(),
+        ));
+        completed.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+        terminal
+            .draw(|frame| render(frame, &mut completed, &textarea, &theme))
+            .expect("completed table draw");
+        let completed_frame = format!("{:?}", terminal.backend().buffer());
+        assert!(completed_frame.contains("Name"));
+        assert!(completed_frame.contains("Value"));
+        assert!(completed_frame.contains("B"));
+    }
+
+    #[test]
+    fn streaming_auto_follow_tracks_checkpoints_without_showing_partial_tail() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 16))
+            .expect("test backend");
+
+        for index in 0..100 {
+            state.update(TuiEvent::MessageDelta(format!("block {index:03}\n\n")));
+        }
+        state.update(TuiEvent::MessageDelta("HIDDEN_PARTIAL_TAIL".to_string()));
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("streaming checkpoints draw");
+        let streaming = format!("{:?}", terminal.backend().buffer());
+        assert!(streaming.contains("block 099"));
+        assert!(!streaming.contains("HIDDEN_PARTIAL_TAIL"));
+        assert!(state.auto_scroll);
+
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("completed checkpoints draw");
+        let completed = format!("{:?}", terminal.backend().buffer());
+        assert!(completed.contains("HIDDEN_PARTIAL_TAIL"));
+        assert!(state.auto_scroll);
+    }
+
+    #[test]
     fn completed_turn_keeps_tail_marker_visible_after_large_diff() {
         let mut state = test_state();
         state.messages.push(ChatMessage::User(
