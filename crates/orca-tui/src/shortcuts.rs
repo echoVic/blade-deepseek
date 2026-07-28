@@ -387,6 +387,65 @@ pub(crate) fn configurable_legacy_bindings() -> impl Iterator<Item = LegacyBindi
         )
 }
 
+impl ShortcutAction {
+    pub(crate) const fn configurable_id(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Global(GlobalShortcut::Cancel) => "global.cancel",
+            Self::Global(GlobalShortcut::OpenTranscriptSearch) => "global.open-transcript-search",
+            Self::Global(GlobalShortcut::ToggleShortcuts) => "global.toggle-shortcuts",
+            Self::Global(GlobalShortcut::ScrollBottom) => "global.scroll-bottom",
+            Self::Global(GlobalShortcut::ScrollTop) => "global.scroll-top",
+            Self::Global(GlobalShortcut::ClearScreen) => "global.clear-screen",
+            Self::Idle(IdleShortcut::Submit) => "idle.submit",
+            Self::Idle(IdleShortcut::Newline) => "idle.newline",
+            Self::Idle(IdleShortcut::EditLatestQueued) => "idle.edit-latest-queued",
+            Self::Idle(IdleShortcut::HistoryPrevious) => "idle.history-previous",
+            Self::Idle(IdleShortcut::HistoryNext) => "idle.history-next",
+            Self::Idle(IdleShortcut::ScrollUp) => "idle.scroll-up",
+            Self::Idle(IdleShortcut::ScrollDown) => "idle.scroll-down",
+            Self::Idle(IdleShortcut::PageUp) => "idle.page-up",
+            Self::Idle(IdleShortcut::PageDown) => "idle.page-down",
+            Self::Idle(IdleShortcut::HalfPageUp) => "idle.half-page-up",
+            Self::Idle(IdleShortcut::HalfPageDown) => "idle.half-page-down",
+            Self::Idle(IdleShortcut::Backtrack) => "idle.backtrack",
+            Self::Idle(IdleShortcut::ExpandToolOutput) => "idle.expand-tool-output",
+            Self::Running(RunningShortcut::BackgroundCurrentTurn) => {
+                "running.background-current-turn"
+            }
+            Self::Running(RunningShortcut::Interrupt) => "running.interrupt",
+            Self::Running(RunningShortcut::SubmitQueued) => "running.submit-queued",
+            Self::Running(RunningShortcut::Newline) => "running.newline",
+            Self::Running(RunningShortcut::EditLatestQueued) => "running.edit-latest-queued",
+            Self::Running(RunningShortcut::ScrollUp) => "running.scroll-up",
+            Self::Running(RunningShortcut::ScrollDown) => "running.scroll-down",
+            Self::Running(RunningShortcut::PageUp) => "running.page-up",
+            Self::Running(RunningShortcut::PageDown) => "running.page-down",
+            Self::Running(RunningShortcut::HalfPageUp) => "running.half-page-up",
+            Self::Running(RunningShortcut::HalfPageDown) => "running.half-page-down",
+            Self::Approval(ApprovalShortcut::SelectAllow) => "approval.select-allow",
+            Self::Approval(ApprovalShortcut::SelectDeny) => "approval.select-deny",
+            Self::Approval(ApprovalShortcut::ToggleSelection) => "approval.toggle-selection",
+            Self::Approval(ApprovalShortcut::Confirm) => "approval.confirm",
+            Self::Approval(ApprovalShortcut::Approve | ApprovalShortcut::Deny) => return None,
+        })
+    }
+
+    pub(crate) const fn context(self) -> ShortcutContext {
+        match self {
+            Self::Global(_) => ShortcutContext::Global,
+            Self::Idle(_) => ShortcutContext::Idle,
+            Self::Running(_) => ShortcutContext::Running,
+            Self::Approval(_) => ShortcutContext::Approval,
+        }
+    }
+}
+
+pub(crate) fn action_for_id(id: &str) -> Option<ShortcutAction> {
+    configurable_legacy_bindings()
+        .map(|binding| binding.action)
+        .find(|action| action.configurable_id() == Some(id))
+}
+
 pub fn resolve_shortcut(context: ShortcutContext, event: KeyEvent) -> Option<ShortcutAction> {
     if let Some(shortcut) = global_shortcut(event) {
         return Some(ShortcutAction::Global(shortcut));
@@ -602,6 +661,244 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
         action: "legacy direct keys",
     },
 ];
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ShortcutDescriptor {
+    pub(crate) scope: ShortcutScope,
+    pub(crate) legacy_keys: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) actions: &'static [ShortcutAction],
+}
+
+const OPEN_SEARCH: &[ShortcutAction] =
+    &[ShortcutAction::Global(GlobalShortcut::OpenTranscriptSearch)];
+const TOGGLE_SHORTCUTS: &[ShortcutAction] =
+    &[ShortcutAction::Global(GlobalShortcut::ToggleShortcuts)];
+const CANCEL: &[ShortcutAction] = &[ShortcutAction::Global(GlobalShortcut::Cancel)];
+const SCROLL_EDGES: &[ShortcutAction] = &[
+    ShortcutAction::Global(GlobalShortcut::ScrollTop),
+    ShortcutAction::Global(GlobalShortcut::ScrollBottom),
+];
+const CLEAR_SCREEN: &[ShortcutAction] = &[ShortcutAction::Global(GlobalShortcut::ClearScreen)];
+const IDLE_SUBMIT: &[ShortcutAction] = &[ShortcutAction::Idle(IdleShortcut::Submit)];
+const IDLE_NEWLINE: &[ShortcutAction] = &[ShortcutAction::Idle(IdleShortcut::Newline)];
+const IDLE_EDIT_QUEUED: &[ShortcutAction] = &[ShortcutAction::Idle(IdleShortcut::EditLatestQueued)];
+const IDLE_HISTORY: &[ShortcutAction] = &[
+    ShortcutAction::Idle(IdleShortcut::HistoryPrevious),
+    ShortcutAction::Idle(IdleShortcut::HistoryNext),
+];
+const IDLE_PAGE: &[ShortcutAction] = &[
+    ShortcutAction::Idle(IdleShortcut::PageUp),
+    ShortcutAction::Idle(IdleShortcut::PageDown),
+];
+const IDLE_HALF_PAGE: &[ShortcutAction] = &[
+    ShortcutAction::Idle(IdleShortcut::HalfPageUp),
+    ShortcutAction::Idle(IdleShortcut::HalfPageDown),
+];
+const IDLE_BACKTRACK: &[ShortcutAction] = &[ShortcutAction::Idle(IdleShortcut::Backtrack)];
+const IDLE_EXPAND: &[ShortcutAction] = &[ShortcutAction::Idle(IdleShortcut::ExpandToolOutput)];
+const RUNNING_BACKGROUND: &[ShortcutAction] = &[ShortcutAction::Running(
+    RunningShortcut::BackgroundCurrentTurn,
+)];
+const RUNNING_INTERRUPT: &[ShortcutAction] = &[ShortcutAction::Running(RunningShortcut::Interrupt)];
+const RUNNING_SUBMIT: &[ShortcutAction] = &[ShortcutAction::Running(RunningShortcut::SubmitQueued)];
+const RUNNING_NEWLINE: &[ShortcutAction] = &[ShortcutAction::Running(RunningShortcut::Newline)];
+const RUNNING_EDIT_QUEUED: &[ShortcutAction] =
+    &[ShortcutAction::Running(RunningShortcut::EditLatestQueued)];
+const RUNNING_SCROLL: &[ShortcutAction] = &[
+    ShortcutAction::Running(RunningShortcut::ScrollUp),
+    ShortcutAction::Running(RunningShortcut::ScrollDown),
+];
+const RUNNING_PAGE: &[ShortcutAction] = &[
+    ShortcutAction::Running(RunningShortcut::PageUp),
+    ShortcutAction::Running(RunningShortcut::PageDown),
+];
+const RUNNING_HALF_PAGE: &[ShortcutAction] = &[
+    ShortcutAction::Running(RunningShortcut::HalfPageUp),
+    ShortcutAction::Running(RunningShortcut::HalfPageDown),
+];
+const APPROVAL_MOVE: &[ShortcutAction] = &[
+    ShortcutAction::Approval(ApprovalShortcut::SelectAllow),
+    ShortcutAction::Approval(ApprovalShortcut::SelectDeny),
+];
+const APPROVAL_TOGGLE: &[ShortcutAction] =
+    &[ShortcutAction::Approval(ApprovalShortcut::ToggleSelection)];
+const APPROVAL_CONFIRM: &[ShortcutAction] = &[ShortcutAction::Approval(ApprovalShortcut::Confirm)];
+
+const SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
+    ShortcutDescriptor {
+        scope: ShortcutScope::Global,
+        legacy_keys: "ctrl+f",
+        label: "find in transcript",
+        actions: OPEN_SEARCH,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Global,
+        legacy_keys: "F1 / ctrl+k",
+        label: "show or hide shortcuts",
+        actions: TOGGLE_SHORTCUTS,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Global,
+        legacy_keys: "ctrl+c",
+        label: "cancel and quit",
+        actions: CANCEL,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Global,
+        legacy_keys: "ctrl+home/end",
+        label: "jump to top or bottom",
+        actions: SCROLL_EDGES,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Global,
+        legacy_keys: "ctrl+l",
+        label: "clear screen",
+        actions: CLEAR_SCREEN,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Global,
+        legacy_keys: "shift+tab",
+        label: "cycle approval mode",
+        actions: &[],
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Idle,
+        legacy_keys: "enter",
+        label: "send message",
+        actions: IDLE_SUBMIT,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Idle,
+        legacy_keys: "alt+enter / shift+enter",
+        label: "insert newline",
+        actions: IDLE_NEWLINE,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Idle,
+        legacy_keys: "alt+up",
+        label: "edit latest queued message",
+        actions: IDLE_EDIT_QUEUED,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Idle,
+        legacy_keys: "up/down / ctrl+p/ctrl+n",
+        label: "previous or next prompt",
+        actions: IDLE_HISTORY,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Idle,
+        legacy_keys: "pgup/pgdn",
+        label: "scroll one page",
+        actions: IDLE_PAGE,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Idle,
+        legacy_keys: "ctrl+u / ctrl+d",
+        label: "scroll half page",
+        actions: IDLE_HALF_PAGE,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Idle,
+        legacy_keys: "esc",
+        label: "backtrack previous prompt",
+        actions: IDLE_BACKTRACK,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Idle,
+        legacy_keys: "e",
+        label: "expand latest tool output",
+        actions: IDLE_EXPAND,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Running,
+        legacy_keys: "ctrl+b",
+        label: "background current turn",
+        actions: RUNNING_BACKGROUND,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Running,
+        legacy_keys: "esc / ctrl+g",
+        label: "interrupt current turn",
+        actions: RUNNING_INTERRUPT,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Running,
+        legacy_keys: "enter",
+        label: "queue follow-up",
+        actions: RUNNING_SUBMIT,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Running,
+        legacy_keys: "alt+enter / shift+enter",
+        label: "insert newline",
+        actions: RUNNING_NEWLINE,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Running,
+        legacy_keys: "alt+up",
+        label: "edit latest queued message",
+        actions: RUNNING_EDIT_QUEUED,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Running,
+        legacy_keys: "up/down",
+        label: "scroll one line",
+        actions: RUNNING_SCROLL,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Running,
+        legacy_keys: "pgup/pgdn",
+        label: "scroll one page",
+        actions: RUNNING_PAGE,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Running,
+        legacy_keys: "ctrl+u / ctrl+d",
+        label: "scroll half page",
+        actions: RUNNING_HALF_PAGE,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Approval,
+        legacy_keys: "up/down/j/k",
+        label: "move selection",
+        actions: APPROVAL_MOVE,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Approval,
+        legacy_keys: "tab",
+        label: "toggle selection",
+        actions: APPROVAL_TOGGLE,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Approval,
+        legacy_keys: "enter",
+        label: "confirm selected action",
+        actions: APPROVAL_CONFIRM,
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Approval,
+        legacy_keys: "1/2/3",
+        label: "allow options",
+        actions: &[],
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Approval,
+        legacy_keys: "4",
+        label: "deny",
+        actions: &[],
+    },
+    ShortcutDescriptor {
+        scope: ShortcutScope::Approval,
+        legacy_keys: "y/A/a/n",
+        label: "legacy direct keys",
+        actions: &[],
+    },
+];
+
+pub(crate) fn shortcut_descriptors() -> impl Iterator<Item = &'static ShortcutDescriptor> {
+    SHORTCUT_DESCRIPTORS.iter()
+}
 
 fn scope_has_registered_binding(scope: ShortcutScope) -> bool {
     match scope {
