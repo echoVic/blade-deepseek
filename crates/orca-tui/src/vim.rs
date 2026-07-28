@@ -1,3 +1,6 @@
+use std::time::{Duration, Instant};
+
+use orca_core::config::VimInsertEscapeSequence;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders};
 use tui_textarea::{CursorMove, Input, Key, TextArea};
@@ -9,6 +12,20 @@ use crate::vim_command::{
 };
 
 const MAX_VIM_PASTE_BYTES: usize = 1024 * 1024;
+const VIM_INSERT_ESCAPE_WINDOW: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingInsertEscape {
+    character: char,
+    deadline: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingInsertEscapeFlow {
+    NoPending,
+    Flushed,
+    Consumed,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VimRegisterKind {
@@ -103,10 +120,19 @@ pub struct VimState {
     parser: VimCommandParser,
     registers: VimRegisterBank,
     last_change: Option<RepeatableChange>,
+    insert_escape: Option<VimInsertEscapeSequence>,
+    pending_insert_escape: Option<PendingInsertEscape>,
 }
 
 impl VimState {
     pub fn new(enabled: bool) -> Self {
+        Self::with_insert_escape(enabled, None)
+    }
+
+    pub fn with_insert_escape(
+        enabled: bool,
+        insert_escape: Option<VimInsertEscapeSequence>,
+    ) -> Self {
         Self {
             enabled,
             mode: if enabled {
@@ -117,6 +143,8 @@ impl VimState {
             parser: VimCommandParser::default(),
             registers: VimRegisterBank::default(),
             last_change: None,
+            insert_escape,
+            pending_insert_escape: None,
         }
     }
 
@@ -167,6 +195,7 @@ impl VimState {
     }
 
     pub fn reset_insert(&mut self, textarea: &mut TextArea<'_>, theme: &Theme) {
+        self.flush_pending_insert_escape(textarea);
         self.cancel_pending_command();
         self.mode = if self.enabled {
             VimMode::Normal
@@ -178,12 +207,22 @@ impl VimState {
     }
 
     pub fn handle(&mut self, input: Input, textarea: &mut TextArea<'_>, theme: &Theme) -> bool {
+        self.handle_at(input, textarea, theme, Instant::now())
+    }
+
+    pub fn handle_at(
+        &mut self,
+        input: Input,
+        textarea: &mut TextArea<'_>,
+        theme: &Theme,
+        now: Instant,
+    ) -> bool {
         if !self.enabled {
             return textarea.input(input);
         }
 
         let changed = match self.mode {
-            VimMode::Insert => self.handle_insert(input, textarea),
+            VimMode::Insert => self.handle_insert_at(input, textarea, now),
             VimMode::Normal | VimMode::Visual => self.handle_command(input, textarea),
         };
         self.configure_block(textarea, theme);
@@ -194,11 +233,80 @@ impl VimState {
         self.parser.reset();
     }
 
-    fn handle_insert(&mut self, input: Input, textarea: &mut TextArea<'_>) -> bool {
+    pub(crate) fn resolve_pending_insert_escape(
+        &mut self,
+        input: &Input,
+        now: Instant,
+        textarea: &mut TextArea<'_>,
+    ) -> PendingInsertEscapeFlow {
+        let Some(pending) = self.pending_insert_escape.take() else {
+            return PendingInsertEscapeFlow::NoPending;
+        };
+        if now <= pending.deadline
+            && !input.ctrl
+            && !input.alt
+            && self
+                .insert_escape
+                .as_ref()
+                .is_some_and(|sequence| input.key == Key::Char(sequence.second()))
+        {
+            self.mode = VimMode::Normal;
+            textarea.cancel_selection();
+            return PendingInsertEscapeFlow::Consumed;
+        }
+        textarea.insert_char(pending.character);
+        PendingInsertEscapeFlow::Flushed
+    }
+
+    pub(crate) fn flush_pending_insert_escape(&mut self, textarea: &mut TextArea<'_>) -> bool {
+        let Some(pending) = self.pending_insert_escape.take() else {
+            return false;
+        };
+        textarea.insert_char(pending.character);
+        true
+    }
+
+    pub(crate) fn flush_expired_insert_escape(
+        &mut self,
+        now: Instant,
+        textarea: &mut TextArea<'_>,
+    ) -> bool {
+        if self
+            .pending_insert_escape
+            .is_some_and(|pending| now > pending.deadline)
+        {
+            return self.flush_pending_insert_escape(textarea);
+        }
+        false
+    }
+
+    fn handle_insert_at(
+        &mut self,
+        input: Input,
+        textarea: &mut TextArea<'_>,
+        now: Instant,
+    ) -> bool {
+        match self.resolve_pending_insert_escape(&input, now, textarea) {
+            PendingInsertEscapeFlow::Consumed => return true,
+            PendingInsertEscapeFlow::Flushed | PendingInsertEscapeFlow::NoPending => {}
+        }
+
         if input.key == Key::Esc {
             self.cancel_pending_command();
             self.mode = VimMode::Normal;
             textarea.cancel_selection();
+            return true;
+        }
+
+        if !input.ctrl
+            && !input.alt
+            && let Some(sequence) = self.insert_escape.as_ref()
+            && input.key == Key::Char(sequence.first())
+        {
+            self.pending_insert_escape = Some(PendingInsertEscape {
+                character: sequence.first(),
+                deadline: now + VIM_INSERT_ESCAPE_WINDOW,
+            });
             return true;
         }
         textarea.input(input)
@@ -794,6 +902,8 @@ fn move_cursor(textarea: &mut TextArea<'_>, movement: CursorMove, visual: bool) 
 mod tests {
     use super::*;
     use orca_core::config::ThemeName;
+    use orca_core::config::VimInsertEscapeSequence;
+    use std::time::{Duration, Instant};
 
     impl VimState {
         fn register_for_test(
@@ -850,6 +960,10 @@ mod tests {
         pub(crate) fn has_repeat_for_test(&self) -> bool {
             self.last_change.is_some()
         }
+
+        pub(crate) fn has_pending_insert_escape_for_test(&self) -> bool {
+            self.pending_insert_escape.is_some()
+        }
     }
 
     fn input(ch: char) -> Input {
@@ -859,6 +973,132 @@ mod tests {
             alt: false,
             shift: false,
         }
+    }
+
+    fn insert_escape_state(value: &str) -> VimState {
+        let mut state = VimState::with_insert_escape(
+            true,
+            Some(VimInsertEscapeSequence::parse(value).unwrap()),
+        );
+        state.mode = VimMode::Insert;
+        state
+    }
+
+    #[test]
+    fn vim_insert_escape_exact_pair_exits_without_text_or_history() {
+        let theme = Theme::named(ThemeName::Dark);
+        let started = Instant::now();
+        let mut state = insert_escape_state("jj");
+        let mut textarea = TextArea::from(["draft"]);
+        textarea.move_cursor(CursorMove::End);
+
+        assert!(state.handle_at(input('j'), &mut textarea, &theme, started));
+        assert_eq!(textarea.lines(), &["draft"]);
+        assert_eq!(state.mode, VimMode::Insert);
+        assert!(state.has_pending_insert_escape_for_test());
+
+        assert!(state.handle_at(
+            input('j'),
+            &mut textarea,
+            &theme,
+            started + Duration::from_millis(500),
+        ));
+        assert_eq!(textarea.lines(), &["draft"]);
+        assert_eq!(state.mode, VimMode::Normal);
+        assert!(!state.has_pending_insert_escape_for_test());
+        assert!(!textarea.undo());
+    }
+
+    #[test]
+    fn vim_insert_escape_mismatch_overlap_and_expiry_preserve_text_once() {
+        let theme = Theme::named(ThemeName::Dark);
+        let started = Instant::now();
+
+        let mut mismatch = insert_escape_state("jk");
+        let mut mismatch_area = TextArea::default();
+        mismatch.handle_at(input('j'), &mut mismatch_area, &theme, started);
+        mismatch.handle_at(
+            input('x'),
+            &mut mismatch_area,
+            &theme,
+            started + Duration::from_millis(1),
+        );
+        assert_eq!(mismatch_area.lines(), &["jx"]);
+
+        let mut overlap = insert_escape_state("jk");
+        let mut overlap_area = TextArea::default();
+        for (character, millis) in [('j', 0), ('j', 1), ('k', 2)] {
+            overlap.handle_at(
+                input(character),
+                &mut overlap_area,
+                &theme,
+                started + Duration::from_millis(millis),
+            );
+        }
+        assert_eq!(overlap_area.lines(), &["j"]);
+        assert_eq!(overlap.mode, VimMode::Normal);
+
+        let mut expired = insert_escape_state("jj");
+        let mut expired_area = TextArea::default();
+        expired.handle_at(input('j'), &mut expired_area, &theme, started);
+        assert!(
+            expired.flush_expired_insert_escape(
+                started + Duration::from_millis(501),
+                &mut expired_area,
+            )
+        );
+        assert_eq!(expired_area.lines(), &["j"]);
+        assert!(
+            !expired
+                .flush_expired_insert_escape(started + Duration::from_secs(1), &mut expired_area,)
+        );
+    }
+
+    #[test]
+    fn vim_insert_escape_disabled_modified_and_direct_esc_paths_preserve_behavior() {
+        let theme = Theme::named(ThemeName::Dark);
+        let started = Instant::now();
+
+        let mut disabled = VimState::new(true);
+        disabled.mode = VimMode::Insert;
+        let mut disabled_area = TextArea::default();
+        disabled.handle_at(input('j'), &mut disabled_area, &theme, started);
+        disabled.handle_at(input('j'), &mut disabled_area, &theme, started);
+        assert_eq!(disabled_area.lines(), &["jj"]);
+
+        let mut modified = insert_escape_state("jj");
+        let mut modified_area = TextArea::default();
+        modified.handle_at(input('j'), &mut modified_area, &theme, started);
+        modified.handle_at(
+            Input {
+                key: Key::Char('j'),
+                ctrl: false,
+                alt: true,
+                shift: false,
+            },
+            &mut modified_area,
+            &theme,
+            started + Duration::from_millis(1),
+        );
+        assert_eq!(modified_area.lines(), &["j"]);
+        assert_eq!(modified.mode, VimMode::Insert);
+
+        let mut escaped = insert_escape_state("jj");
+        let mut escaped_area = TextArea::default();
+        escaped.handle_at(input('j'), &mut escaped_area, &theme, started);
+        escaped.handle_at(
+            Input {
+                key: Key::Esc,
+                ctrl: false,
+                alt: false,
+                shift: false,
+            },
+            &mut escaped_area,
+            &theme,
+            started + Duration::from_millis(1),
+        );
+        assert_eq!(escaped_area.lines(), &["j"]);
+        assert_eq!(escaped.mode, VimMode::Normal);
     }
 
     fn handle_sequence(
