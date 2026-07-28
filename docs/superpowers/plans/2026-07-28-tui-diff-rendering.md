@@ -743,30 +743,39 @@ struct InlineSegments {
 }
 ```
 
-For each fully admitted replacement cluster:
+The structured render owns one lazily initialized inline deadline:
 
-1. collect old/new `line.content` values;
-2. reject the cluster if either block violates existing aggregate, line-count,
+```rust
+let deadline =
+    *inline_deadline.get_or_insert_with(|| Instant::now() + INLINE_DIFF_DEADLINE);
+```
+
+Every fully admitted replacement cluster receives that same deadline:
+
+1. reject immediately if `Instant::now() >= deadline`;
+2. collect old/new `line.content` values;
+3. reject the cluster if either block violates existing aggregate, line-count,
    or line-byte guardrails;
-3. create `TextDiff::from_lines` using joined text with one synthetic newline
+4. create `TextDiff::from_lines` using joined text with one synthetic newline
    per source line;
-4. capture one deadline for the entire cluster:
+5. iterate every op with the shared deadline:
 
 ```rust
-let deadline = Some(Instant::now() + INLINE_DIFF_DEADLINE);
+diff.iter_inline_changes_deadline(op, Some(deadline))
 ```
 
-5. iterate every op with that same deadline:
-
-```rust
-diff.iter_inline_changes_deadline(op, deadline)
-```
-
-6. map `ChangeTag::Delete` by `old_index` and `ChangeTag::Insert` by
+6. reject the result if `Instant::now() >= deadline`, because `similar` can
+   return a cooperative approximate result after its deadline;
+7. map `ChangeTag::Delete` by `old_index` and `ChangeTag::Insert` by
    `new_index`;
-7. convert `iter_strings_lossy()` to owned `(emphasized, String)` values;
-8. strip only the synthetic final `\n` from each mapped source line;
-9. reject the entire cluster unless reconstructed old/new text is exact.
+8. convert `iter_strings_lossy()` to owned `(emphasized, String)` values;
+9. strip only the synthetic final `\n` from each mapped source line;
+10. reject the entire cluster unless reconstructed old/new text is exact.
+
+Cluster discovery examines only the admitted entry prefix. If the prefix ends
+inside an insertion block, the partial cluster is not refined. Once the shared
+deadline expires, later hunks skip syntax-inline work and use whole-row
+styling without allocating hidden-cluster metadata.
 
 Do not apply `ChangeTag::Equal` rows as changed source entries.
 

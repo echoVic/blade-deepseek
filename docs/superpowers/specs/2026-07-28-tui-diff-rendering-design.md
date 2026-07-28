@@ -108,7 +108,7 @@ Structured source lines render with a shared old/new number width:
 The exact formatter is:
 
 ```text
-{old:>width} {new:>width} {marker} 
+"{old:>width} {new:>width} {marker} "
 ```
 
 where absent numbers render as `width` spaces and `marker` is `-`, `+`, or one
@@ -219,9 +219,12 @@ guardrail:
 - more than 10,000 source lines;
 - a source line above 4 KiB.
 
-The renderer uses the `similar` API with an explicit short deadline rather
-than its default 500 ms deadline. The deadline is 5 ms per replacement
-cluster. A timeout or unusable result falls back to whole-row styling.
+The renderer uses the `similar` API with one explicit short deadline rather
+than its default 500 ms deadline. The deadline is created lazily when the
+first visible replacement cluster is refined and is shared by every later
+hunk and cluster in that structured diff render. The aggregate inline budget
+is 5 ms. Cooperative timeout results are rejected after `similar` returns;
+an expired deadline or unusable result falls back to whole-row styling.
 
 This keeps pathological diffs bounded while preserving the existing parser's
 larger structural validation.
