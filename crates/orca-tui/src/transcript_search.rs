@@ -330,6 +330,13 @@ impl TranscriptSearchState {
         self.matches.len()
     }
 
+    pub(crate) fn clear_matches(&mut self, generation: u64) {
+        self.matches.clear();
+        self.active = None;
+        self.prepared_generation = Some(generation);
+        self.prepared_query.clone_from(&self.query);
+    }
+
     pub(crate) fn visible_matches(
         &self,
         start_row: usize,
