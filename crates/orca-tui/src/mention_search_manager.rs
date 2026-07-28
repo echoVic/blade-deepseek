@@ -10,7 +10,7 @@ use orca_runtime::mentions::{self, MentionToken};
 use orca_runtime::mentions::{MentionCandidate, MentionCatalog};
 
 use crate::surface_actions::TuiSurfaceActions;
-use crate::types::{AppState, AppStatus, TuiEvent};
+use crate::types::{AppState, AppStatus, PanelMode, TuiEvent};
 
 const WARM_IDLE: Duration = Duration::from_secs(30);
 const CATALOG_RESULT_CAPACITY: usize = 8;
@@ -58,7 +58,11 @@ pub(crate) struct MentionSearchManager {
 
 impl MentionSearchManager {
     pub(crate) fn is_enabled(state: &AppState) -> bool {
-        matches!(state.status, AppStatus::Idle | AppStatus::WaitingUserInput)
+        state.panel_mode == PanelMode::Conversation
+            && matches!(
+                state.status,
+                AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
+            )
             && state.slash_menu.is_none()
     }
 
@@ -518,7 +522,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{MentionCandidate, MentionSearchManager, TokenIdentity};
-    use crate::types::{AppState, TuiEvent};
+    use crate::types::{AppState, AppStatus, PanelMode, TuiEvent};
 
     fn state() -> AppState {
         let (action_tx, _action_rx) = mpsc::unbounded();
@@ -528,6 +532,34 @@ mod tests {
             "model".to_string(),
             "/tmp".to_string(),
         )
+    }
+
+    #[test]
+    fn mention_search_enablement_covers_only_editable_conversation_states() {
+        let mut state = state();
+        for (status, enabled) in [
+            (AppStatus::Idle, true),
+            (AppStatus::Running, true),
+            (AppStatus::WaitingUserInput, true),
+            (AppStatus::Compacting, false),
+            (AppStatus::WaitingApproval, false),
+            (AppStatus::Setup, false),
+            (AppStatus::SessionPicker, false),
+        ] {
+            state.status = status;
+            state.panel_mode = PanelMode::Conversation;
+            state.slash_menu = None;
+            assert_eq!(
+                MentionSearchManager::is_enabled(&state),
+                enabled,
+                "{status:?}"
+            );
+        }
+        state.status = AppStatus::Running;
+        for panel in [PanelMode::Workflows, PanelMode::Agents] {
+            state.panel_mode = panel;
+            assert!(!MentionSearchManager::is_enabled(&state), "{panel:?}");
+        }
     }
 
     fn snapshot(generation: SessionGeneration, query: &str, paths: &[&str]) -> SearchSnapshot {

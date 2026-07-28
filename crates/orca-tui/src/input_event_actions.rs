@@ -115,6 +115,63 @@ mod search_paste_tests {
     }
 }
 
+#[cfg(test)]
+mod running_paste_tests {
+    use crossterm::event::Event;
+    use orca_core::config::ThemeName;
+    use tui_textarea::TextArea;
+
+    use super::handle_paste_event;
+    use crate::composer_textarea::textarea_text;
+    use crate::queued_input_actions::{enqueue_composer_follow_up, restore_latest_queued_message};
+    use crate::test_support::test_run_config;
+    use crate::theme::Theme;
+    use crate::types::AppState;
+    use crate::vim::VimState;
+
+    #[test]
+    fn running_large_paste_queues_placeholder_and_restores_payload() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.enter_running();
+        let config = test_run_config();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::default();
+        let pasted = "secret payload\n".repeat(100);
+
+        assert!(handle_paste_event(
+            &Event::Paste(pasted.clone()),
+            &mut state,
+            &config,
+            &mut textarea,
+        ));
+        let placeholder = textarea_text(&textarea);
+        assert!(placeholder.starts_with("[Pasted Content "));
+
+        assert!(enqueue_composer_follow_up(
+            &mut state,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+        assert!(restore_latest_queued_message(
+            &mut state,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+        assert_eq!(textarea_text(&textarea), placeholder);
+        assert_eq!(state.pending_pastes.len(), 1);
+        assert_eq!(state.pending_pastes[0].1, pasted);
+    }
+}
+
 /// A terminal resize re-wraps every transcript line, so content positions
 /// captured under the old width no longer describe the same text. Drop the
 /// selection rather than let it highlight (and copy) unrelated rows.
@@ -257,7 +314,7 @@ pub(crate) fn handle_paste_event(
         AppStatus::Setup if state.setup_step == 1 => {
             insert_pasted_text(textarea, pasted);
         }
-        AppStatus::Idle | AppStatus::WaitingUserInput => {
+        AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput => {
             if insert_composer_paste(textarea, &mut state.pending_pastes, pasted) {
                 state.reset_history_navigation();
                 refresh_input_menus(textarea, state, config);

@@ -10,6 +10,7 @@ use orca_runtime::history::SessionTranscript;
 
 use crate::approval_dialog_actions::handle_approval_dialog_key;
 use crate::idle_key_actions::handle_idle_key;
+use crate::queued_input_actions::handle_running_key;
 use crate::running_actions::handle_running_shortcut;
 use crate::session_picker_actions::handle_session_picker_key;
 use crate::setup_actions::{SetupFlow, handle_setup_key};
@@ -116,11 +117,10 @@ where
         return Ok(StatusKeyFlow::Continue);
     }
 
-    if state.status == AppStatus::Running
-        && let Some(ShortcutAction::Running(shortcut)) =
-            resolve_shortcut(ShortcutContext::Running, *key)
-    {
-        handle_running_shortcut(shortcut, state, action_tx);
+    if state.status == AppStatus::Running {
+        handle_running_key(
+            ev, key, state, config, action_tx, textarea, vim_state, theme,
+        );
     }
 
     if state.status == AppStatus::Compacting
@@ -160,6 +160,9 @@ mod tests {
         WorkflowConfig,
     };
     use orca_core::model::ModelSelection;
+    use orca_file_search::{MatchKind, SearchMatch, SearchPhase};
+    use orca_runtime::mentions::MentionCandidate;
+    use std::path::PathBuf;
 
     fn config() -> RunConfig {
         RunConfig {
@@ -223,6 +226,283 @@ mod tests {
         state.refresh_transcript_search();
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn press_status_key(
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        state: &mut AppState,
+        config: &mut RunConfig,
+        shared: &Arc<Mutex<RunConfig>>,
+        action_tx: &mpsc::Sender<UserAction>,
+        textarea: &mut TextArea,
+        vim: &mut VimState,
+        theme: &Theme,
+    ) {
+        let key = KeyEvent::new(code, modifiers);
+        let preloaded = Arc::new(Mutex::new(None));
+        handle_status_key(
+            &Event::Key(key),
+            &key,
+            state,
+            config,
+            shared,
+            action_tx,
+            &preloaded,
+            textarea,
+            vim,
+            theme,
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn running_composer_edits_newlines_queues_and_keeps_scroll_shortcuts() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.enter_running();
+        state.total_lines = 20;
+        state.visible_height = 5;
+        state.scroll_offset = 10;
+        state.auto_scroll = false;
+        let mut config = config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::default();
+
+        press_status_key(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert_eq!(textarea.lines(), &["x".to_string()]);
+
+        press_status_key(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert_eq!(textarea.lines(), &["x".to_string(), String::new()]);
+
+        assert!(textarea.insert_str("/compact"));
+        press_status_key(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert_eq!(state.queued_user_messages.len(), 1);
+        assert_eq!(state.queued_user_messages[0].visible_text(), "x\n/compact");
+        assert!(textarea.is_empty());
+        assert_eq!(state.status, AppStatus::Running);
+        assert!(action_rx.try_recv().is_err());
+
+        press_status_key(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert_eq!(state.scroll_offset, 9);
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn running_vim_edits_and_queued_submit_uses_existing_reset_mode() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.enter_running();
+        let mut config = config();
+        config.vim_mode = true;
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(true);
+        vim.mode = crate::vim::VimMode::Insert;
+        let mut textarea = TextArea::default();
+
+        press_status_key(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert_eq!(textarea.lines(), &["x".to_string()]);
+
+        press_status_key(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert_eq!(state.queued_user_messages.len(), 1);
+        assert_eq!(vim.mode, crate::vim::VimMode::Normal);
+        assert!(textarea.is_empty());
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn running_mention_enter_selects_before_queueing() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/workspace".to_string(),
+        );
+        state.enter_running();
+        state.mention.candidates = vec![MentionCandidate::from_file_match(&SearchMatch {
+            root: PathBuf::from("/workspace"),
+            path: "item.rs".to_string(),
+            kind: MatchKind::File,
+            score: 42,
+            indices: vec![0],
+        })];
+        state.mention.phase = Some(SearchPhase::Complete);
+        let mut config = config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = crate::composer_textarea::make_textarea_with_text("@ite", &vim, &theme);
+
+        press_status_key(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert_eq!(
+            crate::composer_textarea::textarea_text(&textarea),
+            "@item.rs "
+        );
+        assert_eq!(state.mention_bindings.bindings().len(), 1);
+        assert!(state.queued_user_messages.is_empty());
+
+        press_status_key(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert_eq!(state.queued_user_messages.len(), 1);
+        assert_eq!(
+            state.queued_user_messages[0]
+                .submission_bindings()
+                .bindings()
+                .len(),
+            1
+        );
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn idle_alt_up_restores_but_waiting_input_keeps_queue_owned() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let queued = || {
+            crate::queued_input::QueuedUserMessage::from_composer(
+                "queued".to_string(),
+                Vec::new(),
+                orca_runtime::mentions::MentionBindings::default(),
+            )
+            .unwrap()
+        };
+        state.enqueue_user_message(queued()).unwrap();
+        let mut config = config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::from(["draft"]);
+
+        press_status_key(
+            KeyCode::Up,
+            KeyModifiers::ALT,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert_eq!(crate::composer_textarea::textarea_text(&textarea), "queued");
+        assert!(state.queued_user_messages.is_empty());
+
+        state.enqueue_user_message(queued()).unwrap();
+        state.set_status(AppStatus::WaitingUserInput);
+        press_status_key(
+            KeyCode::Up,
+            KeyModifiers::ALT,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert_eq!(state.queued_user_messages.len(), 1);
+        assert_eq!(crate::composer_textarea::textarea_text(&textarea), "queued");
+    }
+
     #[test]
     fn vim_slash_opens_search_in_every_conversation_status_without_composer_edit() {
         for status in [
@@ -241,7 +521,6 @@ mod tests {
             let mut config = config();
             config.vim_mode = true;
             let shared = Arc::new(Mutex::new(config.clone()));
-            let operation = TestOperationInterrupt::default();
             let preloaded = Arc::new(Mutex::new(None));
             let mut textarea = TextArea::from(["draft"]);
             let mut vim = VimState::new(true);
@@ -255,7 +534,6 @@ mod tests {
                 &mut config,
                 &shared,
                 &action_tx,
-                &operation,
                 &preloaded,
                 &mut textarea,
                 &mut vim,
@@ -267,7 +545,6 @@ mod tests {
 
             assert!(state.transcript_search.open, "{status:?}");
             assert_eq!(textarea.lines(), &["draft".to_string()]);
-            assert_eq!(operation.call_count(), 0);
         }
     }
 
@@ -287,7 +564,6 @@ mod tests {
         let mut config = config();
         config.vim_mode = true;
         let shared = Arc::new(Mutex::new(config.clone()));
-        let operation = TestOperationInterrupt::default();
         let preloaded = Arc::new(Mutex::new(None));
         let mut textarea = TextArea::from(["draft"]);
         let mut vim = VimState::new(true);
@@ -302,7 +578,6 @@ mod tests {
                 &mut config,
                 &shared,
                 &action_tx,
-                &operation,
                 &preloaded,
                 &mut textarea,
                 &mut vim,
@@ -317,7 +592,6 @@ mod tests {
                 assert_eq!(state.transcript_search.active_ordinal(), first);
             }
         }
-        assert_eq!(operation.call_count(), 0);
         assert!(action_rx.try_recv().is_err());
     }
 
@@ -333,7 +607,6 @@ mod tests {
         let mut config = config();
         config.vim_mode = true;
         let shared = Arc::new(Mutex::new(config.clone()));
-        let operation = TestOperationInterrupt::default();
         let preloaded = Arc::new(Mutex::new(None));
         let mut textarea = TextArea::default();
         let mut vim = VimState::new(true);
@@ -348,7 +621,6 @@ mod tests {
             &mut config,
             &shared,
             &action_tx,
-            &operation,
             &preloaded,
             &mut textarea,
             &mut vim,
