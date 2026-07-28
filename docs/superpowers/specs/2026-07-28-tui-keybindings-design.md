@@ -249,8 +249,10 @@ shortcut help.
 
 ## Merge and Validation
 
-Loading builds a complete immutable `Keymap` from built-ins plus replacements.
-Validation happens after merging.
+Loading builds a complete immutable `Keymap` from configurable built-ins plus
+replacements. Fixed controls, including approval direct keys, remain outside
+the `Keymap` and are validated as reserved strokes. Validation happens after
+merging.
 
 Within each effective context, a sequence can map to only one action. Global
 bindings participate in every context and keep priority over contextual
@@ -514,7 +516,9 @@ No user-visible surface may hard-code a configurable key.
 ## Compatibility
 
 With no file, generated defaults must be byte-for-byte equivalent at the
-normalized binding level to the existing static arrays.
+normalized binding level for every configurable action. Fixed approval direct
+keys are verified separately at the handler boundary. Together they preserve
+all existing key behavior.
 
 The implementation must preserve:
 
