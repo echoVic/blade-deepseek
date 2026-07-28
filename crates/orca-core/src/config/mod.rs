@@ -341,6 +341,7 @@ pub struct RunConfig {
     pub workflows: WorkflowConfig,
     pub theme: ThemeName,
     pub vim_mode: bool,
+    pub vim_insert_escape: Option<VimInsertEscapeSequence>,
     pub update_check: bool,
     pub desktop_notifications: bool,
     pub terminal_notifications: bool,
@@ -589,6 +590,11 @@ pub fn format_config_show(config: &RunConfig) -> String {
         .map(|budget| budget.to_string())
         .unwrap_or_else(|| "<unset>".to_string());
     let runtime = runtime_summary(config);
+    let vim_insert_escape = config
+        .vim_insert_escape
+        .as_ref()
+        .map(|sequence| toml::Value::String(sequence.as_str().to_string()).to_string())
+        .unwrap_or_else(|| "\"<unset>\"".to_string());
 
     format!(
         concat!(
@@ -606,6 +612,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "max_budget_usd = \"{}\"\n",
             "theme = \"{}\"\n",
             "vim_mode = {}\n",
+            "vim_insert_escape = {}\n",
             "update_check = {}\n",
             "desktop_notifications = {}\n",
             "terminal_notifications = {}\n",
@@ -664,6 +671,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
         max_budget,
         config.theme.as_str(),
         config.vim_mode,
+        vim_insert_escape,
         config.update_check,
         config.desktop_notifications,
         config.terminal_notifications,
@@ -835,6 +843,7 @@ mod tests {
             workflows: WorkflowConfig::default(),
             theme: ThemeName::Auto,
             vim_mode: true,
+            vim_insert_escape: Some(VimInsertEscapeSequence::parse("j\\").unwrap()),
             update_check: false,
             desktop_notifications: true,
             terminal_notifications: false,
@@ -855,6 +864,17 @@ mod tests {
         assert!(shown.contains("approval = \"full-auto\""));
         assert!(shown.contains("history = \"disabled\""));
         assert!(shown.contains("theme = \"auto\""));
+        let vim_insert_escape_line = shown
+            .lines()
+            .find(|line| line.starts_with("vim_insert_escape = "))
+            .expect("vim insert escape line");
+        let parsed: toml::Value = vim_insert_escape_line.parse().unwrap();
+        assert_eq!(
+            parsed
+                .get("vim_insert_escape")
+                .and_then(toml::Value::as_str),
+            Some("j\\")
+        );
         assert!(shown.contains("desktop_notifications = true"));
         assert!(shown.contains("terminal_notifications = false"));
         assert!(shown.contains("api_key = \"<redacted>\""));

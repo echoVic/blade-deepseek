@@ -6701,6 +6701,7 @@ rl.on("line", (line) => {
             workflows: WorkflowConfig::default(),
             theme: ThemeName::Dark,
             vim_mode: false,
+            vim_insert_escape: None,
             update_check: false,
             desktop_notifications: false,
             terminal_notifications: false,

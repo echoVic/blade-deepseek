@@ -872,6 +872,7 @@ fn run_exec(args: ExecArgs) -> i32 {
         workflows: file_config.workflows.resolved(),
         theme: file_config.theme,
         vim_mode: file_config.vim_mode,
+        vim_insert_escape: file_config.vim_insert_escape.clone(),
         update_check: file_config.update_check,
         desktop_notifications: file_config.desktop_notifications,
         terminal_notifications: false,
@@ -1603,6 +1604,7 @@ fn build_workflow_run_config(
         workflows: file_config.workflows.resolved(),
         theme: file_config.theme,
         vim_mode: file_config.vim_mode,
+        vim_insert_escape: file_config.vim_insert_escape.clone(),
         update_check: file_config.update_check,
         desktop_notifications: false,
         terminal_notifications: false,
@@ -1658,6 +1660,7 @@ fn build_worker_run_config(
         workflows: file_config.workflows.resolved(),
         theme: file_config.theme,
         vim_mode: file_config.vim_mode,
+        vim_insert_escape: file_config.vim_insert_escape.clone(),
         update_check: file_config.update_check,
         desktop_notifications: false,
         terminal_notifications: false,
@@ -2294,6 +2297,7 @@ fn run_placeholder(cli: Cli) -> i32 {
         workflows: file_config.workflows.resolved(),
         theme: file_config.theme,
         vim_mode: file_config.vim_mode,
+        vim_insert_escape: file_config.vim_insert_escape.clone(),
         update_check: file_config.update_check,
         desktop_notifications: file_config.desktop_notifications,
         terminal_notifications: file_config.terminal_notifications,
@@ -2566,6 +2570,7 @@ fn run_server(cli: Cli) -> i32 {
         workflows: file_config.workflows.resolved(),
         theme: file_config.theme,
         vim_mode: file_config.vim_mode,
+        vim_insert_escape: file_config.vim_insert_escape.clone(),
         update_check: file_config.update_check,
         desktop_notifications: false,
         terminal_notifications: false,
@@ -2638,6 +2643,7 @@ fn run_acp(cli: Cli) -> i32 {
         workflows: file_config.workflows.resolved(),
         theme: file_config.theme,
         vim_mode: file_config.vim_mode,
+        vim_insert_escape: file_config.vim_insert_escape.clone(),
         update_check: file_config.update_check,
         desktop_notifications: false,
         terminal_notifications: false,
@@ -3094,6 +3100,20 @@ mod tests {
         let oversized = vec![b'x'; MAX_WORKER_API_KEY_BYTES as usize + 1];
         assert!(
             resolve_worker_api_key_from_reader(None, true, io::Cursor::new(oversized)).is_err()
+        );
+    }
+
+    #[test]
+    fn production_run_configs_propagate_vim_insert_escape() {
+        let production = include_str!("cli.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("production cli source");
+        assert_eq!(
+            production
+                .matches("vim_insert_escape: file_config.vim_insert_escape.clone()")
+                .count(),
+            6
         );
     }
 }
