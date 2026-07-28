@@ -134,6 +134,10 @@ impl StreamingMarkdownAssembler {
         }
 
         if let Some(fence) = fence_open(line) {
+            if !self.current_block.is_empty() {
+                self.freeze_current_block(actions, false);
+                *current_block_changed = false;
+            }
             self.current_block.push_str(line);
             *current_block_changed = true;
             self.fence = Some(fence);
@@ -401,6 +405,23 @@ mod tests {
                     trailing_blank: false,
                 },
                 StreamingMarkdownAction::ClearTail,
+            ]
+        );
+    }
+
+    #[test]
+    fn fence_opener_freezes_preceding_paragraph_without_blank_line() {
+        let mut assembler = StreamingMarkdownAssembler::default();
+        assert_eq!(
+            assembler.push("before\n```rust\ncode\n"),
+            vec![
+                StreamingMarkdownAction::UpdateTail("before\n".to_string()),
+                StreamingMarkdownAction::FreezeTail {
+                    text: "before\n".to_string(),
+                    trailing_blank: false,
+                },
+                StreamingMarkdownAction::ClearTail,
+                StreamingMarkdownAction::UpdateTail("```rust\ncode\n".to_string()),
             ]
         );
     }
