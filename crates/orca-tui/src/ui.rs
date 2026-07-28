@@ -4319,6 +4319,35 @@ mod tests {
     }
 
     #[test]
+    fn visible_match_iterator_bounds_overlay_work_to_viewport() {
+        use crate::selection::SelectionPos;
+        use crate::transcript_search::{
+            TranscriptLineIdentity, TranscriptSearchMatch, TranscriptSearchState,
+        };
+
+        let mut search = TranscriptSearchState::default();
+        search.open_new();
+        search.replace_query("needle");
+        search.refresh_with(1, 0, |_| {
+            (0..10_001)
+                .map(|row| {
+                    TranscriptSearchMatch::new(
+                        SelectionPos { row, col: 0 },
+                        SelectionPos { row, col: 6 },
+                        TranscriptLineIdentity {
+                            message_revision: row as u64 + 1,
+                            line_index: 0,
+                        },
+                        0..6,
+                    )
+                })
+                .collect()
+        });
+
+        assert_eq!(search.visible_matches(5_000, 5_020).count(), 20);
+    }
+
+    #[test]
     fn open_search_reserves_one_row_without_squeezing_composer_or_status() {
         let area = Rect::new(0, 0, 80, 20);
         let chunks = main_layout(area, 0, 0, 2, 1, 3);

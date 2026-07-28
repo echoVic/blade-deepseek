@@ -3353,6 +3353,31 @@ mod tests {
     }
 
     #[test]
+    fn one_append_rebuilds_one_message_then_rescans_without_render_rebuilds() {
+        let mut state = state();
+        for index in 0..1_000 {
+            state.push_message(ChatMessage::System(format!("item {index} needle")));
+        }
+        prepare_transcript_cache(&mut state, 80);
+        state.open_transcript_search();
+        state.replace_transcript_search_query("needle");
+        state.refresh_transcript_search();
+        let scans = state.transcript_search.scan_count_for_test();
+
+        state.push_message(ChatMessage::System("last needle".to_string()));
+        prepare_transcript_cache(&mut state, 80);
+        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 1);
+        let render_generation = state.transcript_render_cache.content_generation();
+        state.refresh_transcript_search();
+        assert_eq!(state.transcript_search.scan_count_for_test(), scans + 1);
+        assert_eq!(
+            state.transcript_render_cache.content_generation(),
+            render_generation
+        );
+        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 1);
+    }
+
+    #[test]
     fn removal_chooses_nearest_following_match_and_open_does_not_disable_follow() {
         let mut state = state();
         for text in ["target one", "middle", "target two"] {

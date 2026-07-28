@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::{
     collections::{BTreeSet, VecDeque},
     mem,
@@ -360,6 +362,8 @@ pub(crate) struct TranscriptRenderCache {
     content_generation: u64,
     #[cfg(test)]
     last_prepare_visited: usize,
+    #[cfg(test)]
+    last_search_lines_visited: Cell<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -431,6 +435,11 @@ impl TranscriptRenderCache {
         self.last_prepare_visited
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_search_lines_visited(&self) -> usize {
+        self.last_search_lines_visited.get()
+    }
+
     pub fn clear(&mut self) {
         let next_generation = next_generation(self.content_generation);
         *self = Self {
@@ -452,6 +461,8 @@ impl TranscriptRenderCache {
         first_retained_message: usize,
         query: &SearchQuery,
     ) -> Vec<TranscriptSearchMatch> {
+        #[cfg(test)]
+        self.last_search_lines_visited.set(0);
         if query.is_empty() {
             return Vec::new();
         }
@@ -466,6 +477,9 @@ impl TranscriptRenderCache {
                 .copied()
                 .unwrap_or_default();
             for (line_index, wrapped) in cached.wrapped_lines.iter().enumerate() {
+                #[cfg(test)]
+                self.last_search_lines_visited
+                    .set(self.last_search_lines_visited.get() + 1);
                 let line_start = cached
                     .line_cumulative_heights
                     .get(line_index)
@@ -1210,7 +1224,9 @@ mod tests {
     };
     use crate::selection::{SelectionGranularity, SelectionPos, TranscriptSelection};
     use crate::theme::Theme;
-    use crate::transcript_search::{SearchQuery, TranscriptLineIdentity, TranscriptSearchMatch};
+    use crate::transcript_search::{
+        SearchQuery, TranscriptLineIdentity, TranscriptSearchMatch, TranscriptSearchState,
+    };
     use crate::types::{AppState, ChatMessage, TuiEvent};
     use crate::ui::build_lines_for_messages;
 
@@ -2159,6 +2175,41 @@ mod tests {
 
         assert_eq!(*built_indices.borrow(), vec![1]);
         assert_eq!(cache.last_prepare_visited(), 1);
+    }
+
+    #[test]
+    fn ten_thousand_messages_search_once_then_steady_scroll_and_navigation_scan_zero() {
+        let messages = (0..10_000)
+            .map(|index| ChatMessage::System(format!("message {index} needle")))
+            .collect::<Vec<_>>();
+        let revisions = (1..=10_000).collect::<Vec<u64>>();
+        let mut cache = TranscriptRenderCache::default();
+        let theme = theme();
+        cache.prepare(
+            &messages,
+            &revisions,
+            TranscriptRenderContext::new(&theme, 80, 0, false),
+            |_, message, _, _, _, _| match message {
+                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                _ => unreachable!(),
+            },
+        );
+
+        let mut search = TranscriptSearchState::default();
+        search.open_new();
+        search.replace_query("needle");
+        search.refresh_with(cache.content_generation(), 0, |query| {
+            cache.search(0, query)
+        });
+        assert_eq!(search.match_count(), 10_000);
+        assert_eq!(cache.last_search_lines_visited(), 10_000);
+
+        search.refresh_with(cache.content_generation(), 0, |_| unreachable!());
+        let _ = cache.viewport(0, 5_000, 20);
+        search.refresh_with(cache.content_generation(), 5_000, |_| unreachable!());
+        search.next();
+        search.previous();
+        assert_eq!(search.scan_count_for_test(), 1);
     }
 
     #[test]
