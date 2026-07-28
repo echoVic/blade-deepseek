@@ -429,6 +429,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 &mut textarea,
                                 &mut vim_state,
                                 &theme,
+                                &mut presentation,
                             );
                         }
                     },
@@ -452,6 +453,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         if let Some(text) = state.pending_clipboard_copy.take() {
             clipboard::copy_to_clipboard(&text);
         }
+        let _ = presentation.write_pending(terminal.backend_mut().inner_mut(), state.status);
         if let Some(draw_at) = iteration.draw_at {
             terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
             scheduler.did_draw(draw_at);
