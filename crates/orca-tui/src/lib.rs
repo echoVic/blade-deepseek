@@ -42,6 +42,7 @@ pub mod shortcuts;
 mod slash_command_actions;
 mod slash_menu_actions;
 mod status_key_actions;
+mod streaming_markdown;
 mod submitted_turn;
 mod syntax_highlight;
 mod terminal_capabilities;
