@@ -3,6 +3,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, truncate_output};
+use orca_platform::process::ProcessJob;
 
 const GIT_STATUS_TIMEOUT: Duration = Duration::from_secs(120);
 const MIN_GIT_STATUS_RETAINED_BYTES: usize = 8 * 1024;
@@ -19,9 +20,10 @@ pub fn status(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult
         MIN_GIT_STATUS_RETAINED_BYTES,
         crate::process::DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM,
     );
-    let output = command.spawn().and_then(|child| {
+    let output = ProcessJob::spawn(&mut command).and_then(|(child, process_job)| {
         crate::process::wait_for_child_output_with_timeout_or_cancel_and_limit(
             child,
+            process_job,
             GIT_STATUS_TIMEOUT,
             || false,
             retained_bytes,

@@ -3,6 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use serde::Serialize;
+#[cfg(windows)]
+use std::collections::BTreeMap;
+
+use orca_platform::process::ProcessJob;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -26,6 +32,21 @@ use crate::runtime_subagent_call::{append_worktree_outcome, validate_subagent_ou
 use crate::subagent::{self, SubagentIsolation};
 use crate::tasks::TaskRegistry;
 use crate::worktree::WorktreeGuard;
+
+#[cfg(windows)]
+const WINDOWS_RUNNER_PROTOCOL_VERSION: u32 = 1;
+
+#[cfg(windows)]
+#[derive(Debug, Serialize)]
+struct WindowsRunnerLaunchRequest {
+    version: u32,
+    program: String,
+    args: Vec<String>,
+    cwd: String,
+    env: BTreeMap<String, Option<String>>,
+    job_name: Option<String>,
+    forward_stdin: bool,
+}
 
 #[derive(Clone, Debug)]
 pub struct AsyncSubagentWorktree {
@@ -260,8 +281,10 @@ pub(crate) fn launch_async_subagent(
         child_depth: subagent_depth + 1,
         worktree: worktree.as_ref(),
     }) {
-        Ok(child) => {
-            if let Err(error) = task_registry.adopt_subagent_worker(&agent_id, child) {
+        Ok((child, process_job)) => {
+            if let Err(error) =
+                task_registry.adopt_subagent_worker_with_job(&agent_id, child, process_job)
+            {
                 let worktree = worktree_guard.and_then(|guard| guard.finish().ok());
                 let mut error = format!("failed to own async subagent worker: {error}");
                 append_worktree_outcome(&mut error, worktree.as_ref());
@@ -326,6 +349,14 @@ fn wait_for_async_subagent_adoption(
         if record.worker_pid == Some(pid) {
             return Ok(registry);
         }
+        #[cfg(windows)]
+        if record.worker_pid.is_some()
+            && ProcessJob::open_named(&crate::tasks::async_worker_job_name(agent_id))
+                .and_then(|job| job.contains_process(pid))
+                .unwrap_or(false)
+        {
+            return Ok(registry);
+        }
         if matches!(
             record.status,
             orca_core::task_types::TaskStatus::Stopped
@@ -348,7 +379,7 @@ fn wait_for_async_subagent_adoption(
 
 fn spawn_async_subagent_worker(
     context: AsyncSubagentWorkerSpawnContext<'_>,
-) -> Result<Child, String> {
+) -> Result<(Child, ProcessJob), String> {
     let AsyncSubagentWorkerSpawnContext {
         config,
         cwd,
@@ -361,56 +392,136 @@ fn spawn_async_subagent_worker(
     } = context;
     let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let request_json = serde_json::to_string(request).map_err(|error| error.to_string())?;
-    let mut command = ProcessCommand::new(current_exe);
-    prepare_async_subagent_worker_command(&mut command, agent_id);
     let api_key = config.api_key.as_deref();
-    command
-        .current_dir(cwd)
-        .stdin(if api_key.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .arg("subagent-worker")
-        .arg("--app-version")
-        .arg(&config.app_version)
-        .arg("--cwd")
-        .arg(cwd)
-        .arg("--child-cwd")
-        .arg(child_cwd)
-        .arg("--provider")
-        .arg(config.provider.as_str())
-        .arg("--session-id")
-        .arg(task_session_id)
-        .arg("--agent-id")
-        .arg(agent_id)
-        .arg("--subagent-depth")
-        .arg(child_depth.to_string())
-        .arg("--request-json")
-        .arg(request_json)
-        .env_remove("ORCA_API_KEY")
-        .env_remove("DEEPSEEK_API_KEY");
+    let mut worker_args = vec![
+        "subagent-worker".to_string(),
+        "--cwd".to_string(),
+        cwd.to_string_lossy().into_owned(),
+        "--child-cwd".to_string(),
+        child_cwd.to_string_lossy().into_owned(),
+        "--provider".to_string(),
+        config.provider.as_str().to_string(),
+        "--session-id".to_string(),
+        task_session_id.to_string(),
+        "--agent-id".to_string(),
+        agent_id.to_string(),
+        "--subagent-depth".to_string(),
+        child_depth.to_string(),
+        "--request-json".to_string(),
+        request_json,
+    ];
     if let Some(model) = config.model.as_history_value() {
-        command.arg("--model").arg(model);
+        worker_args.extend(["--model".to_string(), model.to_string()]);
     }
     if api_key.is_some() {
-        command.arg("--api-key-stdin");
+        worker_args.push("--api-key-stdin".to_string());
     }
     if let Some(base_url) = config.base_url.as_deref() {
-        command.arg("--base-url").arg(base_url);
+        worker_args.extend(["--base-url".to_string(), base_url.to_string()]);
     }
     if let Some(worktree) = worktree {
-        command
-            .arg("--worktree-repo-root")
-            .arg(&worktree.repo_root)
-            .arg("--worktree-path")
-            .arg(&worktree.path);
+        worker_args.extend([
+            "--worktree-repo-root".to_string(),
+            worktree.repo_root.to_string_lossy().into_owned(),
+            "--worktree-path".to_string(),
+            worktree.path.to_string_lossy().into_owned(),
+        ]);
     }
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
-    handoff_async_subagent_worker_api_key(&mut child, api_key)?;
-    Ok(child)
+    #[cfg(windows)]
+    {
+        return spawn_async_subagent_worker_via_runner(
+            &current_exe,
+            worker_args,
+            cwd,
+            agent_id,
+            api_key,
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = ProcessCommand::new(current_exe);
+        prepare_async_subagent_worker_command(&mut command, agent_id);
+        command
+            .current_dir(cwd)
+            .stdin(if api_key.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .args(&worker_args)
+            .env_remove("ORCA_API_KEY")
+            .env_remove("DEEPSEEK_API_KEY");
+        let (mut child, process_job) =
+            ProcessJob::spawn(&mut command).map_err(|error| error.to_string())?;
+        handoff_async_subagent_worker_api_key(&mut child, api_key)?;
+        Ok((child, process_job))
+    }
+}
+
+#[cfg(windows)]
+fn spawn_async_subagent_worker_via_runner(
+    current_exe: &Path,
+    worker_args: Vec<String>,
+    cwd: &Path,
+    agent_id: &str,
+    api_key: Option<&str>,
+) -> Result<(Child, ProcessJob), String> {
+    let executable_dir = current_exe
+        .parent()
+        .ok_or_else(|| "orca executable has no installation directory".to_string())?;
+    let runner = executable_dir.join("orca-windows-runner.exe");
+    if !runner.is_file() {
+        return Err(format!(
+            "Windows runner is missing beside the installed Orca executable: {}",
+            runner.display()
+        ));
+    }
+    let request = WindowsRunnerLaunchRequest {
+        version: WINDOWS_RUNNER_PROTOCOL_VERSION,
+        program: current_exe.to_string_lossy().into_owned(),
+        args: worker_args,
+        cwd: cwd.to_string_lossy().into_owned(),
+        env: BTreeMap::new(),
+        job_name: Some(crate::tasks::async_worker_job_name(agent_id)),
+        forward_stdin: api_key.is_some(),
+    };
+    let mut command = ProcessCommand::new(runner);
+    prepare_async_subagent_worker_command(&mut command, agent_id);
+    command
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_remove("ORCA_API_KEY")
+        .env_remove("DEEPSEEK_API_KEY");
+    let (mut child, process_job) =
+        ProcessJob::spawn_named(&mut command, &crate::tasks::async_worker_job_name(agent_id))
+            .map_err(|error| format!("failed to spawn Windows runner: {error}"))?;
+    let result = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Windows runner did not expose request stdin".to_string())
+        .and_then(|mut stdin| {
+            serde_json::to_writer(&mut stdin, &request)
+                .map_err(|error| format!("failed to encode Windows runner request: {error}"))?;
+            stdin
+                .write_all(b"\n")
+                .map_err(|error| format!("failed to terminate Windows runner request: {error}"))?;
+            if let Some(api_key) = api_key {
+                stdin.write_all(api_key.as_bytes()).map_err(|error| {
+                    format!("failed to hand off async subagent credential: {error}")
+                })?;
+            }
+            Ok(())
+        });
+    if let Err(error) = result {
+        orca_tools::process::kill_child_tree(&mut child);
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok((child, process_job))
 }
 
 fn prepare_async_subagent_worker_command(command: &mut ProcessCommand, agent_id: &str) {

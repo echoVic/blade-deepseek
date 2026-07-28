@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::str;
 use std::sync::{
     Arc,
@@ -12,6 +12,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use orca_core::task_types::TaskStatus;
+use orca_platform::process::ProcessJob;
+use orca_platform::shell::{ShellKind, ShellResolver, ShellSpec};
+use orca_platform::terminal::native_pty_supported;
+#[cfg(windows)]
+use orca_platform::terminal::{WindowsPtyChild, WindowsPtyInput, spawn_windows_pty};
+#[cfg(windows)]
+use orca_windows_sandbox::{
+    CapabilityStore, SandboxFilesystemMode, SandboxSpawnRequest, SandboxedChild, SandboxedPty,
+    SandboxedPtyInput, WindowsSandboxPlan, WindowsSandboxPolicyInput,
+};
 use uuid::Uuid;
 
 use crate::task_output::{TaskOutputRead, TaskOutputStore};
@@ -85,8 +95,8 @@ impl Default for ShellSandboxMode {
 pub fn shell_runtime_capabilities() -> ShellRuntimeCapabilities {
     ShellRuntimeCapabilities {
         platform: shell_runtime_platform(),
-        supports_pty: cfg!(unix),
-        supports_pty_resize: cfg!(unix),
+        supports_pty: native_pty_supported(),
+        supports_pty_resize: native_pty_supported(),
         fallback_terminal_mode: ShellTerminalMode::pipe(),
         command_exec_streaming_requires_process_id: true,
     }
@@ -194,7 +204,8 @@ struct ShellSession {
     task_id: String,
     command: String,
     description: String,
-    child: Child,
+    child: ShellChild,
+    process_job: ProcessJob,
     stdin: ShellInput,
     output_store: TaskOutputStore,
     stdout_handle: Option<thread::JoinHandle<()>>,
@@ -205,12 +216,35 @@ struct ShellSession {
 }
 
 struct SpawnedShellChild {
-    child: Option<Child>,
+    child: Option<ShellChild>,
 }
 
 enum ShellInput {
     Pipe(Option<ChildStdin>),
-    Pty(File),
+    #[cfg(windows)]
+    WindowsSandbox(Option<std::fs::File>),
+    #[cfg(windows)]
+    WindowsSandboxPty(SandboxedPtyInput),
+    #[cfg(unix)]
+    UnixPty(File),
+    #[cfg(windows)]
+    WindowsPty(WindowsPtyInput),
+}
+
+enum ShellChild {
+    Process(Child),
+    #[cfg(windows)]
+    WindowsSandbox(SandboxedChild),
+    #[cfg(windows)]
+    WindowsSandboxPty(SandboxedPty),
+    #[cfg(windows)]
+    WindowsPty(WindowsPtyChild),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ShellExitStatus {
+    success: bool,
+    code: Option<i32>,
 }
 
 impl RuntimeShellSessionManager {
@@ -264,8 +298,74 @@ impl RuntimeShellSessionManager {
         let description = command.description.clone();
         let task = tasks.create_shell(description.clone(), command.command.clone());
         tasks.mark_running(&task.id).map_err(io::Error::other)?;
+        let shell = ShellResolver::for_current_host()
+            .resolve_from_environment()
+            .map_err(io::Error::other)?;
+        ensure_shell_sandbox_supported(shell.kind(), command.sandbox)?;
         let uses_seatbelt = cfg!(target_os = "macos")
             && !matches!(command.sandbox, ShellSandboxMode::DangerFullAccess);
+
+        #[cfg(windows)]
+        if !matches!(command.sandbox, ShellSandboxMode::DangerFullAccess) {
+            let restricted = spawn_windows_sandbox(
+                &command,
+                &metadata_writable_directories,
+                &shell,
+                tasks.clone(),
+                &task.id,
+            );
+            let (child, process_job, stdin, stdout_reader, stderr_reader, effective_terminal) =
+                match restricted {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
+                        return Err(error);
+                    }
+                };
+            let output_store = self.output_store.clone();
+            let reader_stop = Arc::new(AtomicBool::new(false));
+            let stdout_handle = Some(spawn_output_reader(
+                stdout_reader,
+                output_store.clone(),
+                task.id.clone(),
+                ShellOutputStream::Stdout,
+                Arc::clone(&reader_stop),
+            ));
+            let stderr_handle = stderr_reader.map(|reader| {
+                spawn_output_reader(
+                    reader,
+                    output_store.clone(),
+                    task.id.clone(),
+                    ShellOutputStream::Stderr,
+                    Arc::clone(&reader_stop),
+                )
+            });
+            let id = format!("shell-{}", Uuid::new_v4());
+            self.sessions.insert(
+                id.clone(),
+                ShellSession {
+                    tasks,
+                    task_id: task.id.clone(),
+                    command: command.command.clone(),
+                    description,
+                    child,
+                    process_job,
+                    stdin,
+                    output_store,
+                    stdout_handle,
+                    stderr_handle,
+                    reader_stop,
+                    requested_terminal,
+                    effective_terminal,
+                },
+            );
+            return Ok(ShellSessionHandle {
+                id,
+                task_id: task.id,
+                requested_terminal,
+                effective_terminal,
+            });
+        }
 
         let mut process = match command.sandbox {
             ShellSandboxMode::WorkspaceWrite {
@@ -303,7 +403,7 @@ impl RuntimeShellSessionManager {
                 },
             ),
             ShellSandboxMode::DangerFullAccess => {
-                orca_tools::sandbox::plain_bash_command(&command.command, &command.cwd)
+                shell_command(&shell, &command.command, &command.cwd)
             }
         };
         process.env_remove("ORCA_API_KEY");
@@ -322,18 +422,16 @@ impl RuntimeShellSessionManager {
         }
         let stdio = configure_shell_stdio(&mut process, requested_terminal)?;
         let effective_terminal = stdio.effective_terminal();
-        let child = process.spawn().inspect_err(|error| {
-            let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
-        })?;
-        let initialized = initialize_spawned_shell(child, stdio, |pid| {
+        let initialized = spawn_configured_shell(process, stdio, |pid| {
             tasks
                 .mark_worker_spawned(&task.id, pid)
-                .map_err(io::Error::other)
+                .map_err(io::Error::other)?;
+            Ok(())
         });
-        let (child, stdin, stdout_reader, stderr_reader) = match initialized {
+        let (child, process_job, stdin, stdout_reader, stderr_reader) = match initialized {
             Ok(initialized) => initialized,
             Err(error) => {
-                let _ = tasks.fail(&task.id, format!("failed to initialize shell: {error}"));
+                let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
                 return Err(error);
             }
         };
@@ -365,6 +463,7 @@ impl RuntimeShellSessionManager {
                 description,
                 stdin,
                 child,
+                process_job,
                 output_store,
                 stdout_handle,
                 stderr_handle,
@@ -642,7 +741,7 @@ impl RuntimeShellSessionManager {
             self.output_store.remove(&output.task_id);
             return Ok(output);
         }
-        orca_tools::process::kill_child_tree(&mut session.child);
+        session.terminate_child_tree();
         let status = session.child.wait()?;
         session.join_readers();
         let output = session.output(
@@ -668,7 +767,7 @@ impl RuntimeShellSessionManager {
     fn finish_terminal_session(
         &mut self,
         id: &str,
-        status: ExitStatus,
+        status: ShellExitStatus,
         remove_completed_output: bool,
     ) -> io::Result<ShellSessionOutput> {
         let mut session = self.take_session(id)?;
@@ -722,6 +821,136 @@ impl RuntimeShellSessionManager {
     }
 }
 
+fn ensure_shell_sandbox_supported(shell: ShellKind, sandbox: ShellSandboxMode) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        if !matches!(sandbox, ShellSandboxMode::DangerFullAccess)
+            && matches!(shell, ShellKind::GitBash)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Git Bash is not an eligible Windows sandbox shell",
+            ));
+        }
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    if matches!(
+        shell,
+        ShellKind::PowerShell(_) | ShellKind::Cmd | ShellKind::GitBash
+    ) && !matches!(sandbox, ShellSandboxMode::DangerFullAccess)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows shell sandbox is not available for the requested permission mode",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_windows_sandbox(
+    command: &ShellSessionCommand,
+    metadata_writable_directories: &[PathBuf],
+    shell: &ShellSpec,
+    tasks: TaskRegistry,
+    task_id: &str,
+) -> io::Result<(
+    ShellChild,
+    ProcessJob,
+    ShellInput,
+    Box<dyn Read + Send>,
+    Option<Box<dyn Read + Send>>,
+    ShellTerminalMode,
+)> {
+    let (mode, network_access) = match command.sandbox {
+        ShellSandboxMode::WorkspaceWrite { network_access, .. } => {
+            (SandboxFilesystemMode::WorkspaceWrite, network_access)
+        }
+        ShellSandboxMode::ReadOnly {
+            network_access,
+            allow_global_read,
+        } => (
+            SandboxFilesystemMode::ReadOnly { allow_global_read },
+            network_access,
+        ),
+        ShellSandboxMode::DangerFullAccess => unreachable!("full access uses std process spawn"),
+    };
+    let mut writable_roots = command.additional_working_directories.clone();
+    writable_roots.extend_from_slice(metadata_writable_directories);
+    let plan = WindowsSandboxPlan::build(WindowsSandboxPolicyInput {
+        mode,
+        cwd: command.cwd.clone(),
+        readable_roots: command.additional_readable_directories.clone(),
+        writable_roots,
+        denied_roots: command.denied_working_directories.clone(),
+        network_access,
+    })
+    .map_err(io::Error::other)?;
+    let capability_root = orca_core::config::folder_trust::config_dir()
+        .unwrap_or_else(|| command.cwd.join(".orca"))
+        .join("windows-capabilities");
+    let capabilities = CapabilityStore::new(capability_root);
+    #[cfg(test)]
+    capabilities
+        .provision_setup(&command.cwd, orca_windows_sandbox::SETUP_HELPER_VERSION)
+        .map_err(io::Error::other)?;
+    #[cfg(not(test))]
+    capabilities
+        .verify_setup_for_workspace(&command.cwd, orca_windows_sandbox::SETUP_HELPER_VERSION)
+        .map_err(io::Error::other)?;
+    let spec = shell.command(&command.command);
+    let request = || SandboxSpawnRequest {
+        program: &spec.program,
+        args: &spec.args,
+        cwd: &command.cwd,
+        env: &command.env,
+        plan: &plan,
+        capabilities: &capabilities,
+    };
+    let terminal = resolve_terminal_support(command.terminal, native_pty_supported())?;
+    if let ShellTerminalMode::Pty { cols, rows } = terminal {
+        let mut child = SandboxedPty::spawn(request(), cols, rows).map_err(io::Error::other)?;
+        let pid = child.id();
+        tasks
+            .mark_worker_spawned(task_id, pid)
+            .map_err(io::Error::other)?;
+        let process_job = child.take_process_job()?;
+        let (input, output) = child.take_pty()?;
+        return Ok((
+            ShellChild::WindowsSandboxPty(child),
+            process_job,
+            ShellInput::WindowsSandboxPty(input),
+            output,
+            None,
+            terminal,
+        ));
+    }
+
+    let mut child = SandboxedChild::spawn(request()).map_err(io::Error::other)?;
+    let pid = child.id();
+    tasks
+        .mark_worker_spawned(task_id, pid)
+        .map_err(io::Error::other)?;
+    let process_job = child.take_process_job()?;
+    let (stdin, stdout, stderr) = child.take_stdio()?;
+    Ok((
+        ShellChild::WindowsSandbox(child),
+        process_job,
+        ShellInput::WindowsSandbox(Some(stdin)),
+        stdout,
+        Some(stderr),
+        terminal,
+    ))
+}
+
+fn shell_command(shell: &ShellSpec, script: &str, cwd: &std::path::Path) -> std::process::Command {
+    let command = shell.command(script);
+    let mut process = std::process::Command::new(command.program);
+    process.args(command.args).current_dir(cwd);
+    orca_tools::process::prepare_non_interactive_command(&mut process);
+    process
+}
 impl Drop for RuntimeShellSessionManager {
     fn drop(&mut self) {
         self.terminate_all();
@@ -730,8 +959,9 @@ impl Drop for RuntimeShellSessionManager {
 
 impl ShellSession {
     fn join_readers(&mut self) {
-        orca_tools::process::kill_child_tree(&mut self.child);
+        self.terminate_child_tree();
         let _ = self.child.wait();
+        self.stdin.close();
         self.reader_stop.store(true, Ordering::Release);
         if let Some(handle) = self.stdout_handle.take() {
             let _ = handle.join();
@@ -783,6 +1013,12 @@ impl ShellSession {
     fn output_size(&self) -> usize {
         self.output_store.size(&self.task_id)
     }
+
+    fn terminate_child_tree(&mut self) {
+        let _ = self.process_job.terminate(137);
+        #[cfg(not(windows))]
+        self.child.kill();
+    }
 }
 
 impl Drop for ShellSession {
@@ -793,19 +1029,19 @@ impl Drop for ShellSession {
 }
 
 impl SpawnedShellChild {
-    fn new(child: Child) -> Self {
+    fn new(child: ShellChild) -> Self {
         Self { child: Some(child) }
     }
 
-    fn child(&self) -> &Child {
+    fn child(&self) -> &ShellChild {
         self.child.as_ref().expect("spawned shell child")
     }
 
-    fn child_mut(&mut self) -> &mut Child {
+    fn child_mut(&mut self) -> &mut ShellChild {
         self.child.as_mut().expect("spawned shell child")
     }
 
-    fn into_child(mut self) -> Child {
+    fn into_child(mut self) -> ShellChild {
         self.child.take().expect("spawned shell child")
     }
 }
@@ -813,9 +1049,127 @@ impl SpawnedShellChild {
 impl Drop for SpawnedShellChild {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
-            orca_tools::process::kill_child_tree(child);
+            child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+impl ShellChild {
+    fn id(&self) -> io::Result<u32> {
+        match self {
+            Self::Process(child) => Ok(child.id()),
+            #[cfg(windows)]
+            Self::WindowsSandbox(child) => Ok(child.id()),
+            #[cfg(windows)]
+            Self::WindowsSandboxPty(child) => Ok(child.id()),
+            #[cfg(windows)]
+            Self::WindowsPty(child) => child.id(),
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ShellExitStatus>> {
+        match self {
+            Self::Process(child) => child.try_wait().map(|status| status.map(Into::into)),
+            #[cfg(windows)]
+            Self::WindowsSandbox(child) => child.try_wait().map(|status| {
+                status.map(|status| ShellExitStatus {
+                    success: status.success(),
+                    code: status.code(),
+                })
+            }),
+            #[cfg(windows)]
+            Self::WindowsSandboxPty(child) => child.try_wait().map(|status| {
+                status.map(|status| ShellExitStatus {
+                    success: status.success(),
+                    code: status.code(),
+                })
+            }),
+            #[cfg(windows)]
+            Self::WindowsPty(child) => child.try_wait().map(|status| {
+                status.map(|status| ShellExitStatus {
+                    success: status.success(),
+                    code: status.code(),
+                })
+            }),
+        }
+    }
+
+    fn wait(&mut self) -> io::Result<ShellExitStatus> {
+        match self {
+            Self::Process(child) => child.wait().map(Into::into),
+            #[cfg(windows)]
+            Self::WindowsSandbox(child) => child.wait().map(|status| ShellExitStatus {
+                success: status.success(),
+                code: status.code(),
+            }),
+            #[cfg(windows)]
+            Self::WindowsSandboxPty(child) => child.wait().map(|status| ShellExitStatus {
+                success: status.success(),
+                code: status.code(),
+            }),
+            #[cfg(windows)]
+            Self::WindowsPty(child) => child.wait().map(|status| ShellExitStatus {
+                success: status.success(),
+                code: status.code(),
+            }),
+        }
+    }
+
+    fn kill(&mut self) {
+        match self {
+            Self::Process(child) => orca_tools::process::kill_child_tree(child),
+            #[cfg(windows)]
+            Self::WindowsSandbox(child) => {
+                let _ = child.kill();
+            }
+            #[cfg(windows)]
+            Self::WindowsSandboxPty(child) => {
+                let _ = child.kill();
+            }
+            #[cfg(windows)]
+            Self::WindowsPty(child) => {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    fn process_mut(&mut self) -> &mut Child {
+        match self {
+            Self::Process(child) => child,
+            #[cfg(windows)]
+            Self::WindowsSandbox(_) => unreachable!("sandbox child is not a standard child"),
+            #[cfg(windows)]
+            Self::WindowsSandboxPty(_) => {
+                unreachable!("sandbox ConPTY child is not a standard child")
+            }
+            #[cfg(windows)]
+            Self::WindowsPty(_) => unreachable!("ConPTY child is not a standard process child"),
+        }
+    }
+}
+
+impl From<std::process::ExitStatus> for ShellExitStatus {
+    fn from(status: std::process::ExitStatus) -> Self {
+        Self {
+            success: status.success(),
+            code: status.code().or_else(|| {
+                #[cfg(unix)]
+                {
+                    status.signal().map(|signal| 128 + signal)
+                }
+                #[cfg(not(unix))]
+                {
+                    None
+                }
+            }),
+        }
+    }
+}
+
+impl ShellExitStatus {
+    fn success(self) -> bool {
+        self.success
     }
 }
 
@@ -827,13 +1181,37 @@ impl ShellInput {
                 io::ErrorKind::BrokenPipe,
                 format!("shell session '{id}' stdin is closed"),
             )),
-            Self::Pty(master) => master.write_all(input),
+            #[cfg(windows)]
+            Self::WindowsSandbox(Some(stdin)) => stdin.write_all(input),
+            #[cfg(windows)]
+            Self::WindowsSandbox(None) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("shell session '{id}' stdin is closed"),
+            )),
+            #[cfg(windows)]
+            Self::WindowsSandboxPty(pty) => pty.write_all(input),
+            #[cfg(unix)]
+            Self::UnixPty(master) => master.write_all(input),
+            #[cfg(windows)]
+            Self::WindowsPty(pty) => pty.write_all(input),
         }
     }
 
     fn close(&mut self) {
-        if let Self::Pipe(stdin) = self {
-            stdin.take();
+        match self {
+            Self::Pipe(stdin) => {
+                stdin.take();
+            }
+            #[cfg(windows)]
+            Self::WindowsSandbox(stdin) => {
+                stdin.take();
+            }
+            #[cfg(windows)]
+            Self::WindowsSandboxPty(pty) => pty.close(),
+            #[cfg(unix)]
+            Self::UnixPty(_) => {}
+            #[cfg(windows)]
+            Self::WindowsPty(pty) => pty.close(),
         }
     }
 
@@ -843,7 +1221,17 @@ impl ShellInput {
                 io::ErrorKind::Unsupported,
                 format!("shell session '{id}' is not a PTY"),
             )),
-            Self::Pty(master) => resize_pty(master, cols, rows),
+            #[cfg(windows)]
+            Self::WindowsSandbox(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("shell session '{id}' is not a PTY"),
+            )),
+            #[cfg(windows)]
+            Self::WindowsSandboxPty(pty) => pty.resize(cols, rows),
+            #[cfg(unix)]
+            Self::UnixPty(master) => resize_pty(master, cols, rows),
+            #[cfg(windows)]
+            Self::WindowsPty(pty) => pty.resize(cols, rows),
         }
     }
 }
@@ -856,6 +1244,11 @@ enum ShellStdio {
         cols: Option<u16>,
         rows: Option<u16>,
     },
+    #[cfg(windows)]
+    WindowsPty {
+        cols: Option<u16>,
+        rows: Option<u16>,
+    },
 }
 
 impl ShellStdio {
@@ -864,6 +1257,8 @@ impl ShellStdio {
             Self::Pipe => ShellTerminalMode::pipe(),
             #[cfg(unix)]
             Self::Pty { cols, rows, .. } => ShellTerminalMode::pty(*cols, *rows),
+            #[cfg(windows)]
+            Self::WindowsPty { cols, rows } => ShellTerminalMode::pty(*cols, *rows),
         }
     }
 }
@@ -872,7 +1267,7 @@ fn configure_shell_stdio(
     process: &mut std::process::Command,
     terminal: ShellTerminalMode,
 ) -> io::Result<ShellStdio> {
-    match resolve_terminal_support(terminal, cfg!(unix)) {
+    match resolve_terminal_support(terminal, native_pty_supported())? {
         ShellTerminalMode::Pipe => {
             process
                 .stdin(Stdio::piped())
@@ -888,6 +1283,7 @@ fn configure_shell_stdio(
     }
 }
 
+#[cfg(test)]
 fn initialize_spawned_shell(
     child: Child,
     stdio: ShellStdio,
@@ -898,19 +1294,68 @@ fn initialize_spawned_shell(
     Box<dyn Read + Send>,
     Option<Box<dyn Read + Send>>,
 )> {
-    let mut child = SpawnedShellChild::new(child);
-    register_worker(child.child().id())?;
+    let mut child = SpawnedShellChild::new(ShellChild::Process(child));
+    register_worker(child.child().id()?)?;
     let (stdin, stdout_reader, stderr_reader) = stdio.finish(child.child_mut())?;
-    Ok((child.into_child(), stdin, stdout_reader, stderr_reader))
+    let child = match child.into_child() {
+        ShellChild::Process(child) => child,
+        #[cfg(windows)]
+        ShellChild::WindowsPty(_) => unreachable!("standard spawn returned a ConPTY child"),
+    };
+    Ok((child, stdin, stdout_reader, stderr_reader))
+}
+
+fn spawn_configured_shell(
+    mut process: std::process::Command,
+    stdio: ShellStdio,
+    register_worker: impl FnOnce(u32) -> io::Result<()>,
+) -> io::Result<(
+    ShellChild,
+    ProcessJob,
+    ShellInput,
+    Box<dyn Read + Send>,
+    Option<Box<dyn Read + Send>>,
+)> {
+    #[cfg(windows)]
+    if matches!(&stdio, ShellStdio::WindowsPty { .. }) {
+        let ShellStdio::WindowsPty { cols, rows } = stdio else {
+            unreachable!("matched ConPTY stdio")
+        };
+        let spawned = spawn_windows_pty(&process, cols, rows)?;
+        let mut child = SpawnedShellChild::new(ShellChild::WindowsPty(spawned.child));
+        register_worker(child.child().id()?)?;
+        return Ok((
+            child.into_child(),
+            spawned.process_job,
+            ShellInput::WindowsPty(spawned.input),
+            spawned.reader,
+            None,
+        ));
+    }
+
+    let (child, process_job) = ProcessJob::spawn(&mut process)?;
+    let mut child = SpawnedShellChild::new(ShellChild::Process(child));
+    register_worker(child.child().id()?)?;
+    let (stdin, stdout_reader, stderr_reader) = stdio.finish(child.child_mut())?;
+    Ok((
+        child.into_child(),
+        process_job,
+        stdin,
+        stdout_reader,
+        stderr_reader,
+    ))
 }
 
 fn resolve_terminal_support(
     requested: ShellTerminalMode,
     platform_supports_pty: bool,
-) -> ShellTerminalMode {
+) -> io::Result<ShellTerminalMode> {
     match requested {
-        ShellTerminalMode::Pty { .. } if !platform_supports_pty => ShellTerminalMode::Pipe,
-        other => other,
+        ShellTerminalMode::Pty { .. } if !platform_supports_pty => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the requested PTY is unavailable on this host",
+        )),
+        other => Ok(other),
     }
 }
 
@@ -933,15 +1378,22 @@ fn configure_pty_stdio(
 
 #[cfg(not(unix))]
 fn configure_pty_stdio(
-    process: &mut std::process::Command,
-    _cols: Option<u16>,
-    _rows: Option<u16>,
+    _process: &mut std::process::Command,
+    cols: Option<u16>,
+    rows: Option<u16>,
 ) -> io::Result<ShellStdio> {
-    process
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    Ok(ShellStdio::Pipe)
+    #[cfg(windows)]
+    {
+        Ok(ShellStdio::WindowsPty { cols, rows })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (cols, rows);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native PTY support is unavailable on this platform",
+        ))
+    }
 }
 
 #[cfg(unix)]
@@ -977,18 +1429,10 @@ fn resize_pty(master: &File, cols: u16, rows: u16) -> io::Result<()> {
     }
 }
 
-#[cfg(not(unix))]
-fn resize_pty(_master: &File, _cols: u16, _rows: u16) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "PTY resize is only supported on Unix",
-    ))
-}
-
 impl ShellStdio {
     fn finish(
         self,
-        child: &mut Child,
+        child: &mut ShellChild,
     ) -> io::Result<(
         ShellInput,
         Box<dyn Read + Send>,
@@ -996,6 +1440,7 @@ impl ShellStdio {
     )> {
         match self {
             Self::Pipe => {
+                let child = child.process_mut();
                 let stdin = child.stdin.take();
                 let stdout = child
                     .stdout
@@ -1014,10 +1459,13 @@ impl ShellStdio {
             }
             #[cfg(unix)]
             Self::Pty { master, .. } => {
+                let _ = child.process_mut();
                 set_nonblocking(&master)?;
                 let reader = master.try_clone()?;
-                Ok((ShellInput::Pty(master), Box::new(reader), None))
+                Ok((ShellInput::UnixPty(master), Box::new(reader), None))
             }
+            #[cfg(windows)]
+            Self::WindowsPty { .. } => unreachable!("ConPTY is finalized during spawn"),
         }
     }
 }
@@ -1138,7 +1586,7 @@ fn set_nonblocking(reader: &impl AsRawFd) -> io::Result<()> {
 fn wait_for_process_exit(
     session: &mut ShellSession,
     timeout: Duration,
-) -> io::Result<Option<std::process::ExitStatus>> {
+) -> io::Result<Option<ShellExitStatus>> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(Instant::now);
@@ -1224,35 +1672,126 @@ fn shell_output_text_with_omitted_prefix(
     (stdout, stderr)
 }
 
-fn process_exit_code(status: ExitStatus) -> Option<i32> {
-    status.code().or_else(|| {
-        #[cfg(unix)]
-        {
-            status.signal().map(|signal| 128 + signal)
-        }
-        #[cfg(not(unix))]
-        {
-            None
-        }
-    })
+fn process_exit_code(status: ShellExitStatus) -> Option<i32> {
+    status.code
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use orca_platform::shell::{PowerShellEdition, ShellKind};
 
     #[test]
-    fn terminal_support_resolution_falls_back_to_pipe_without_pty_support() {
-        assert_eq!(
-            resolve_terminal_support(ShellTerminalMode::pty(Some(120), Some(33)), false),
-            ShellTerminalMode::pipe()
+    fn native_pty_capabilities_match_supported_hosts() {
+        let capabilities = shell_runtime_capabilities();
+        assert_eq!(capabilities.supports_pty, native_pty_supported());
+        assert_eq!(capabilities.supports_pty_resize, native_pty_supported());
+    }
+
+    #[test]
+    fn restricted_windows_shell_sessions_retain_supported_ptys() {
+        let source = include_str!("shell_session.rs");
+        let spawn_marker = format!("{}{}", "let mut child = ", "SandboxedPty::spawn");
+        let legacy_fallback = ["intentionally", "has no", "ConPTY path yet"].join(" ");
+        assert!(
+            source.contains(&spawn_marker),
+            "restricted Windows shell sessions must use the token-aware ConPTY transport"
         );
+        assert!(
+            !source.contains(&legacy_fallback),
+            "restricted Windows shell sessions must not silently downgrade supported PTYs"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_shells_accept_capability_sandbox_modes() {
+        for kind in [
+            ShellKind::PowerShell(PowerShellEdition::Core),
+            ShellKind::PowerShell(PowerShellEdition::Windows),
+            ShellKind::Cmd,
+        ] {
+            assert!(
+                ensure_shell_sandbox_supported(
+                    kind,
+                    ShellSandboxMode::WorkspaceWrite {
+                        network_access: true,
+                        exclude_tmpdir_env_var: false,
+                        exclude_slash_tmp: false,
+                    }
+                )
+                .is_ok()
+            );
+            assert!(
+                ensure_shell_sandbox_supported(
+                    kind,
+                    ShellSandboxMode::ReadOnly {
+                        network_access: true,
+                        allow_global_read: true,
+                    }
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restricted_windows_pty_session_keeps_terminal_and_resizes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tasks = TaskRegistry::new("restricted-windows-conpty".to_string());
+        let mut sessions = RuntimeShellSessionManager::new(tasks);
+        let handle = sessions
+            .spawn(ShellSessionCommand {
+                command: "ping -n 2 127.0.0.1".to_string(),
+                cwd: temp.path().to_path_buf(),
+                additional_readable_directories: Vec::new(),
+                additional_working_directories: Vec::new(),
+                denied_working_directories: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                env: BTreeMap::new(),
+                description: "restricted ConPTY".to_string(),
+                terminal: ShellTerminalMode::pty(Some(100), Some(30)),
+                sandbox: ShellSandboxMode::WorkspaceWrite {
+                    network_access: true,
+                    exclude_tmpdir_env_var: false,
+                    exclude_slash_tmp: false,
+                },
+            })
+            .expect("spawn restricted ConPTY session");
         assert_eq!(
-            resolve_terminal_support(ShellTerminalMode::pty(Some(120), Some(33)), true),
+            handle.effective_terminal,
+            ShellTerminalMode::pty(Some(100), Some(30))
+        );
+        sessions
+            .close_stdin(&handle.id)
+            .expect("close ConPTY stdin without closing the terminal");
+        sessions
+            .resize(&handle.id, 120, 40)
+            .expect("resize ConPTY after closing stdin");
+        let output = sessions
+            .wait(&handle.id, Duration::from_secs(5))
+            .expect("wait for restricted ConPTY session");
+        assert_eq!(output.status, TaskStatus::Completed);
+        assert_eq!(
+            output.effective_terminal,
+            ShellTerminalMode::pty(Some(100), Some(30))
+        );
+    }
+
+    #[test]
+    fn terminal_support_resolution_rejects_pty_without_support() {
+        let error = resolve_terminal_support(ShellTerminalMode::pty(Some(120), Some(33)), false)
+            .expect_err("unsupported PTY must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(
+            resolve_terminal_support(ShellTerminalMode::pty(Some(120), Some(33)), true)
+                .expect("supported PTY"),
             ShellTerminalMode::pty(Some(120), Some(33))
         );
         assert_eq!(
-            resolve_terminal_support(ShellTerminalMode::pipe(), false),
+            resolve_terminal_support(ShellTerminalMode::pipe(), false).expect("pipe"),
             ShellTerminalMode::pipe()
         );
     }

@@ -10,6 +10,7 @@ use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::tool_types::truncate_output;
+use orca_platform::process::ProcessJob;
 
 use super::pagination::{page_thread_items, page_thread_turns, page_vec};
 use super::projection::{
@@ -664,13 +665,14 @@ fn search_roots_with_ripgrep(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     orca_tools::process::prepare_non_interactive_command(&mut command);
-    let child = match command.spawn() {
-        Ok(child) => child,
+    let (child, process_job) = match ProcessJob::spawn(&mut command) {
+        Ok(spawned) => spawned,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
     let output = orca_tools::process::wait_for_child_stdout_lines_with_timeout(
         child,
+        process_job,
         THREAD_SEARCH_TIMEOUT,
         THREAD_SEARCH_MAX_JSON_LINE_BYTES,
         RipgrepSearchCollector::new(),

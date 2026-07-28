@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use orca_core::retained_output::{RetainedOutput, RetainedOutputSnapshot};
+use orca_platform::process::ProcessJob;
 
 const MAX_WORKFLOW_HOST_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_WORKFLOW_HOST_EVENTS: usize = 8_192;
@@ -277,7 +278,8 @@ impl WorkflowHost {
         #[cfg(unix)]
         command.process_group(0);
 
-        let mut child = WorkflowHostChild::new(command.spawn()?);
+        let (child, process_job) = ProcessJob::spawn(&mut command)?;
+        let mut child = WorkflowHostChild::new(child, process_job);
         let stdin = child
             .child_mut()?
             .stdin
@@ -529,13 +531,15 @@ impl Drop for WorkflowHostFileGuard {
 
 struct WorkflowHostChild {
     child: Option<Child>,
+    process_job: ProcessJob,
     exit_status: Option<ExitStatus>,
 }
 
 impl WorkflowHostChild {
-    fn new(child: Child) -> Self {
+    fn new(child: Child, process_job: ProcessJob) -> Self {
         Self {
             child: Some(child),
+            process_job,
             exit_status: None,
         }
     }
@@ -570,6 +574,7 @@ impl WorkflowHostChild {
         if let Some(status) = self.exit_status {
             return Ok(status);
         }
+        let _ = self.process_job.terminate(137);
         let child = self.child_mut()?;
         orca_tools::process::kill_child_tree(child);
         let status = child.wait()?;
@@ -578,6 +583,7 @@ impl WorkflowHostChild {
     }
 
     fn terminate_process_group(&mut self) {
+        let _ = self.process_job.terminate(137);
         if let Some(child) = self.child.as_mut() {
             orca_tools::process::kill_child_tree(child);
         }

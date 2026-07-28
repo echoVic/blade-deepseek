@@ -14,6 +14,8 @@ use std::os::unix::process::CommandExt;
 use serde_json::{Value, json};
 
 use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
+use orca_platform::process::ProcessJob;
+use orca_platform::shell::resolve_program;
 
 const STDIO_RESPONSE_QUEUE_CAPACITY: usize = 8;
 const MAX_STDIO_RESPONSE_LINE_BYTES: usize = 1024 * 1024;
@@ -157,11 +159,15 @@ impl Drop for StdioState {
 
 struct StdioChild {
     child: Option<Child>,
+    process_job: ProcessJob,
 }
 
 impl StdioChild {
-    fn new(child: Child) -> Self {
-        Self { child: Some(child) }
+    fn new(child: Child, process_job: ProcessJob) -> Self {
+        Self {
+            child: Some(child),
+            process_job,
+        }
     }
 
     fn child_mut(&mut self) -> &mut Child {
@@ -169,6 +175,7 @@ impl StdioChild {
     }
 
     fn terminate(&mut self) {
+        let _ = self.process_job.terminate(137);
         let Some(mut child) = self.child.take() else {
             return;
         };
@@ -190,7 +197,9 @@ impl StdioTransport {
             .as_deref()
             .ok_or_else(|| format!("MCP server '{}' is missing command", config.name))?;
 
-        let mut child_command = Command::new(command);
+        let program = resolve_program(command)
+            .map_or_else(|| command.into(), std::path::PathBuf::into_os_string);
+        let mut child_command = Command::new(program);
         child_command
             .args(&config.args)
             .envs(&config.env)
@@ -201,10 +210,9 @@ impl StdioTransport {
         {
             child_command.process_group(0);
         }
-        let child = child_command
-            .spawn()
+        let (child, process_job) = ProcessJob::spawn(&mut child_command)
             .map_err(|error| format!("failed to start MCP server '{}': {error}", config.name))?;
-        let mut child = StdioChild::new(child);
+        let mut child = StdioChild::new(child, process_job);
 
         let stdin = child
             .child_mut()

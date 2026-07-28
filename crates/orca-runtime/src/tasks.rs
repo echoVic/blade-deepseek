@@ -25,6 +25,7 @@ use orca_core::thread_identity::TurnId;
 use orca_core::thread_item_projection::ModelResponseIdentity;
 use orca_core::tool_types::ToolRequest;
 use orca_core::workflow_types::WorkflowInput;
+use orca_platform::process::ProcessJob;
 use serde::{Deserialize, Serialize};
 
 use crate::lifecycle::{
@@ -120,14 +121,20 @@ pub struct TaskRecord {
 pub struct TaskControl {
     pub cancel: CancelToken,
     pub pause: Arc<AtomicBool>,
-    worker: Arc<Mutex<Option<Child>>>,
+    worker: Arc<Mutex<Option<OwnedWorker>>>,
+}
+
+#[derive(Debug)]
+struct OwnedWorker {
+    child: Child,
+    process_job: ProcessJob,
 }
 
 enum TaskStopTarget {
     InProcess,
     Owned {
-        worker: Arc<Mutex<Option<Child>>>,
-        child: Child,
+        worker: Arc<Mutex<Option<OwnedWorker>>>,
+        owned_worker: OwnedWorker,
     },
     Recovered {
         pid: u32,
@@ -141,6 +148,10 @@ enum RecoveredWorkerState {
     Replaced,
 }
 
+#[cfg(windows)]
+pub(crate) fn async_worker_job_name(agent_id: &str) -> String {
+    format!(r"Local\Orca.AsyncWorker.{agent_id}")
+}
 #[derive(Clone, Debug)]
 struct TaskPersistence {
     root: PathBuf,
@@ -907,9 +918,35 @@ impl TaskRegistry {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn adopt_subagent_worker(&self, id: &str, child: Child) -> Result<(), String> {
         let pid = child.id();
-        let mut child = Some(child);
+        #[cfg(windows)]
+        let process_job = ProcessJob::attach_named(pid, &async_worker_job_name(id));
+        #[cfg(not(windows))]
+        let process_job = ProcessJob::attach(pid);
+        let process_job = match process_job {
+            Ok(process_job) => process_job,
+            Err(error) => {
+                let mut child = child;
+                orca_tools::process::kill_child_tree(&mut child);
+                let _ = child.wait();
+                return Err(format!(
+                    "failed to assign async subagent process job: {error}"
+                ));
+            }
+        };
+        self.adopt_subagent_worker_with_job(id, child, process_job)
+    }
+
+    pub(crate) fn adopt_subagent_worker_with_job(
+        &self,
+        id: &str,
+        child: Child,
+        process_job: ProcessJob,
+    ) -> Result<(), String> {
+        let pid = child.id();
+        let mut owned_worker = Some(OwnedWorker { child, process_job });
         let worker = self
             .with_tasks(|tasks| {
                 let worker = {
@@ -953,7 +990,7 @@ impl TaskRegistry {
                     record.completed_at_ms = previous_completed_at;
                     return Err(error);
                 }
-                *slot = child.take();
+                *slot = owned_worker.take();
                 drop(slot);
                 Ok(worker)
             })
@@ -965,9 +1002,9 @@ impl TaskRegistry {
                 Ok(())
             }
             Err(error) => {
-                if let Some(mut child) = child {
-                    terminate_worker(&mut child);
-                    let _ = child.wait();
+                if let Some(mut owned_worker) = owned_worker {
+                    terminate_worker(&mut owned_worker);
+                    let _ = owned_worker.child.wait();
                 }
                 Err(error)
             }
@@ -1314,9 +1351,12 @@ impl TaskRegistry {
                 let mut slot = worker
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some(child) = slot.take() {
+                if let Some(owned_worker) = slot.take() {
                     drop(slot);
-                    return Ok(TaskStopTarget::Owned { worker, child });
+                    return Ok(TaskStopTarget::Owned {
+                        worker,
+                        owned_worker,
+                    });
                 }
                 drop(slot);
                 if pid == 0 {
@@ -1337,24 +1377,31 @@ impl TaskRegistry {
         }
 
         if let Err(error) = self.mark_stop_requested(id) {
-            if let TaskStopTarget::Owned { worker, child } = target {
+            if let TaskStopTarget::Owned {
+                worker,
+                owned_worker,
+            } = target
+            {
                 let mut slot = worker
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                *slot = Some(child);
+                *slot = Some(owned_worker);
             }
             return Err(error);
         }
 
         match target {
             TaskStopTarget::InProcess => Ok(()),
-            TaskStopTarget::Owned { worker, mut child } => {
-                terminate_worker(&mut child);
-                if let Err(error) = child.wait() {
+            TaskStopTarget::Owned {
+                worker,
+                mut owned_worker,
+            } => {
+                terminate_worker(&mut owned_worker);
+                if let Err(error) = owned_worker.child.wait() {
                     let mut slot = worker
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    *slot = Some(child);
+                    *slot = Some(owned_worker);
                     return Err(format!("failed to reap async subagent worker: {error}"));
                 }
                 self.stop(id, "Task stopped".to_string())
@@ -1889,22 +1936,26 @@ fn new_task_control() -> TaskControl {
     }
 }
 
-fn spawn_worker_reaper(registry: TaskRegistry, task_id: String, worker: Arc<Mutex<Option<Child>>>) {
+fn spawn_worker_reaper(
+    registry: TaskRegistry,
+    task_id: String,
+    worker: Arc<Mutex<Option<OwnedWorker>>>,
+) {
     thread::spawn(move || {
         loop {
             let finished = {
                 let mut slot = worker
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let Some(child) = slot.as_mut() else {
+                let Some(owned_worker) = slot.as_mut() else {
                     return;
                 };
-                match child.try_wait() {
+                match owned_worker.child.try_wait() {
                     Ok(Some(_)) => true,
                     Ok(None) => false,
                     Err(_) => {
-                        terminate_worker(child);
-                        let _ = child.wait();
+                        terminate_worker(owned_worker);
+                        let _ = owned_worker.child.wait();
                         true
                     }
                 }
@@ -1970,8 +2021,9 @@ fn task_summary(record: &TaskRecord) -> BackgroundTaskSummary {
     }
 }
 
-fn terminate_worker(child: &mut Child) {
-    orca_tools::process::kill_child_tree(child);
+fn terminate_worker(worker: &mut OwnedWorker) {
+    let _ = worker.process_job.terminate(137);
+    orca_tools::process::kill_child_tree(&mut worker.child);
 }
 
 const SUBAGENT_WORKER_PROCESS_PREFIX: &str = "orca-subagent-worker-";
@@ -3268,6 +3320,37 @@ while :; do :; done
             signals.contains("descendant"),
             "recovered worker descendant missed process-group TERM"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn request_stop_terminates_worker_through_reopened_named_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let owner = TaskRegistry::new_persistent("session-1".to_string(), root.clone()).unwrap();
+        let task = owner.create_subagent("long-running recovered work".to_string(), None);
+        let mut command = std::process::Command::new("cmd.exe");
+        command
+            .args(["/D", "/S", "/C", "ping", "-n", "30", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let (child, process_job) =
+            ProcessJob::spawn_named(&mut command, &async_worker_job_name(&task.id))
+                .expect("spawn Windows recovered worker fixture inside named job");
+        let pid = child.id();
+        owner
+            .adopt_subagent_worker_with_job(&task.id, child, process_job)
+            .unwrap();
+
+        let recovered = TaskRegistry::new_persistent("session-2".to_string(), root).unwrap();
+        assert_eq!(recovered.get(&task.id).unwrap().worker_pid, Some(pid));
+
+        recovered.request_stop(&task.id).unwrap();
+
+        let stopped = recovered.get(&task.id).unwrap();
+        assert_eq!(stopped.status, TaskStatus::Stopped);
+        assert_eq!(stopped.worker_pid, None);
     }
 
     #[cfg(unix)]

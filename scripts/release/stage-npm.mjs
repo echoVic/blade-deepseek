@@ -39,6 +39,26 @@ const TARGETS = [
     targetTriple: "x86_64-unknown-linux-gnu",
     os: "linux",
     cpu: "x64"
+  },
+  {
+    aliasName: "@blade-ai/orca-win32-arm64",
+    versionSuffix: "win32-arm64",
+    targetTriple: "aarch64-pc-windows-msvc",
+    os: "win32",
+    cpu: "arm64",
+    binaryName: "orca.exe",
+    archiveExtension: "zip",
+    helperNames: ["orca-windows-runner.exe", "orca-windows-sandbox-setup.exe"]
+  },
+  {
+    aliasName: "@blade-ai/orca-win32-x64",
+    versionSuffix: "win32-x64",
+    targetTriple: "x86_64-pc-windows-msvc",
+    os: "win32",
+    cpu: "x64",
+    binaryName: "orca.exe",
+    archiveExtension: "zip",
+    helperNames: ["orca-windows-runner.exe", "orca-windows-sandbox-setup.exe"]
   }
 ];
 
@@ -102,30 +122,36 @@ function sha256(filePath) {
   return createHash("sha256").update(readFileSync(filePath)).digest("hex");
 }
 
-function findBinaryForTarget(artifactsDir, targetTriple) {
-  const directBinary = path.join(artifactsDir, `orca-${targetTriple}`, "orca");
-  const archive = path.join(artifactsDir, `orca-${targetTriple}.tar.gz`);
+function findBinaryForTarget(artifactsDir, target) {
+  const binaryName = target.binaryName ?? "orca";
+  const archiveExtension = target.archiveExtension ?? "tar.gz";
+  const directBinary = path.join(artifactsDir, `orca-${target.targetTriple}`, binaryName);
+  const archive = path.join(artifactsDir, `orca-${target.targetTriple}.${archiveExtension}`);
   const checksum = `${archive}.sha256`;
   for (const [filePath, label] of [
     [directBinary, "binary"],
     [archive, "archive"],
     [checksum, "checksum"],
   ]) {
-    if (!existsSync(filePath)) throw new Error(`Missing ${label} artifact for ${targetTriple}: ${filePath}`);
+    if (!existsSync(filePath)) throw new Error(`Missing ${label} artifact for ${target.targetTriple}: ${filePath}`);
   }
 
   const expectedArchiveHash = readFileSync(checksum, "utf8").trim().split(/\s+/)[0];
   const actualArchiveHash = sha256(archive);
   if (!/^[0-9a-f]{64}$/i.test(expectedArchiveHash) || expectedArchiveHash.toLowerCase() !== actualArchiveHash) {
-    throw new Error(`Checksum mismatch for ${targetTriple}: expected ${expectedArchiveHash}, got ${actualArchiveHash}`);
+    throw new Error(`Checksum mismatch for ${target.targetTriple}: expected ${expectedArchiveHash}, got ${actualArchiveHash}`);
   }
-  const tempDir = mkdtempSync(path.join(os.tmpdir(), `orca-${targetTriple}-`));
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), `orca-${target.targetTriple}-`));
   try {
-    execFileSync("tar", ["-xzf", archive, "-C", tempDir], { stdio: "inherit" });
-    const extracted = path.join(tempDir, "orca");
+    if (archiveExtension === "zip") {
+      execFileSync("unzip", ["-q", archive, "-d", tempDir], { stdio: "inherit" });
+    } else {
+      execFileSync("tar", ["-xzf", archive, "-C", tempDir], { stdio: "inherit" });
+    }
+    const extracted = path.join(tempDir, binaryName);
     if (!existsSync(extracted)) throw new Error(`Archive ${archive} did not contain orca`);
     if (sha256(extracted) !== sha256(directBinary)) {
-      throw new Error(`Package/archive binary mismatch for ${targetTriple}`);
+      throw new Error(`Package/archive binary mismatch for ${target.targetTriple}`);
     }
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
@@ -138,9 +164,23 @@ async function stagePlatformPackage(target, version, artifactsDir, stageRoot) {
   const vendorBin = path.join(packageDir, "vendor", target.targetTriple, "bin");
   mkdirSync(vendorBin, { recursive: true });
 
-  const binary = findBinaryForTarget(artifactsDir, target.targetTriple);
-  const dest = path.join(vendorBin, "orca");
+  const binary = findBinaryForTarget(artifactsDir, target);
+  const dest = path.join(vendorBin, target.binaryName ?? "orca");
   copyFileSync(binary, dest);
+  if (target.helperNames) {
+    const archive = path.join(artifactsDir, `orca-${target.targetTriple}.${target.archiveExtension}`);
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), `orca-${target.targetTriple}-bundle-`));
+    try {
+      execFileSync("unzip", ["-q", archive, "-d", tempDir], { stdio: "inherit" });
+      for (const helperName of target.helperNames) {
+        const helper = path.join(tempDir, helperName);
+        if (!existsSync(helper)) throw new Error(`Archive ${archive} did not contain ${helperName}`);
+        copyFileSync(helper, path.join(vendorBin, helperName));
+      }
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
   chmodSync(dest, 0o755);
 
   const template = readJson(path.join(repoRoot, "npm", "platform-package.json"));

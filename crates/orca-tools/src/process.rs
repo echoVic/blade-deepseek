@@ -15,8 +15,17 @@ use std::os::unix::process::CommandExt;
 use orca_core::retained_output::{
     DEFAULT_RETAINED_OUTPUT_BYTES, RetainedOutputSnapshot, read_to_retained,
 };
+use orca_platform::process::ProcessJob;
+use orca_platform::shell::ShellSpec;
 
 pub const DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM: usize = DEFAULT_RETAINED_OUTPUT_BYTES;
+
+pub fn shell_command(shell: &ShellSpec, script: &str) -> Command {
+    let command_spec = shell.command(script);
+    let mut command = Command::new(command_spec.program);
+    command.args(command_spec.args);
+    command
+}
 
 pub struct CommandOutput {
     pub stdout: Vec<u8>,
@@ -110,18 +119,21 @@ pub fn preserve_ingress_omission_notice(output: String, omitted_bytes: usize) ->
 
 pub fn wait_for_child_output_with_timeout(
     child: Child,
+    process_job: ProcessJob,
     timeout: Duration,
 ) -> io::Result<CommandOutput> {
-    wait_for_child_output_with_timeout_or_cancel(child, timeout, || false)
+    wait_for_child_output_with_timeout_or_cancel(child, process_job, timeout, || false)
 }
 
 pub fn wait_for_child_output_with_timeout_or_cancel(
     child: Child,
+    process_job: ProcessJob,
     timeout: Duration,
     should_cancel: impl Fn() -> bool,
 ) -> io::Result<CommandOutput> {
     wait_for_child_output_with_timeout_or_cancel_and_limit(
         child,
+        process_job,
         timeout,
         should_cancel,
         DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM,
@@ -130,6 +142,7 @@ pub fn wait_for_child_output_with_timeout_or_cancel(
 
 pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
     mut child: Child,
+    process_job: ProcessJob,
     timeout: Duration,
     should_cancel: impl Fn() -> bool,
     max_retained_bytes_per_stream: usize,
@@ -137,16 +150,20 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
     let child_pid = child.id();
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
-        None => return child_setup_error(&mut child, "child process has no stdout"),
+        None => {
+            return child_setup_error(&mut child, &process_job, "child process has no stdout");
+        }
     };
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
-        None => return child_setup_error(&mut child, "child process has no stderr"),
+        None => {
+            return child_setup_error(&mut child, &process_job, "child process has no stderr");
+        }
     };
 
     #[cfg(unix)]
     if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
-        kill_child_tree(&mut child);
+        terminate_child_tree(&mut child, &process_job);
         let _ = child.wait();
         return Err(error);
     }
@@ -165,6 +182,7 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
 
     let status = wait_for_child_and_readers(
         &mut child,
+        &process_job,
         child_pid,
         timeout,
         should_cancel,
@@ -194,6 +212,7 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
 
 pub fn wait_for_child_stdout_lines_with_timeout<T, F>(
     child: Child,
+    process_job: ProcessJob,
     timeout: Duration,
     max_line_bytes: usize,
     initial: T,
@@ -205,6 +224,7 @@ where
 {
     wait_for_child_stdout_lines_with_timeout_or_cancel(
         child,
+        process_job,
         timeout,
         max_line_bytes,
         DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM,
@@ -217,6 +237,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub fn wait_for_child_stdout_lines_with_timeout_or_cancel<T, F>(
     mut child: Child,
+    process_job: ProcessJob,
     timeout: Duration,
     max_line_bytes: usize,
     max_retained_stderr_bytes: usize,
@@ -231,16 +252,20 @@ where
     let child_pid = child.id();
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
-        None => return child_setup_error(&mut child, "child process has no stdout"),
+        None => {
+            return child_setup_error(&mut child, &process_job, "child process has no stdout");
+        }
     };
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
-        None => return child_setup_error(&mut child, "child process has no stderr"),
+        None => {
+            return child_setup_error(&mut child, &process_job, "child process has no stderr");
+        }
     };
 
     #[cfg(unix)]
     if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
-        kill_child_tree(&mut child);
+        terminate_child_tree(&mut child, &process_job);
         let _ = child.wait();
         return Err(error);
     }
@@ -257,6 +282,7 @@ where
         spawn_stoppable_reader(stderr, max_retained_stderr_bytes, Arc::clone(&reader_stop));
     let status = wait_for_child_and_readers(
         &mut child,
+        &process_job,
         child_pid,
         timeout,
         should_cancel,
@@ -288,6 +314,7 @@ where
 
 fn wait_for_child_and_readers(
     child: &mut Child,
+    process_job: &ProcessJob,
     child_pid: u32,
     timeout: Duration,
     should_cancel: impl Fn() -> bool,
@@ -301,7 +328,7 @@ fn wait_for_child_and_readers(
 
     loop {
         if status.is_none() {
-            status = try_observe_child_exit(child, child_pid, reader_stop)?;
+            status = try_observe_child_exit(child, process_job, child_pid, reader_stop)?;
         }
         if let Some(exit_status) = status
             && readers_finished()
@@ -310,7 +337,7 @@ fn wait_for_child_and_readers(
         }
         if should_cancel() {
             if status.is_none() {
-                status = try_observe_child_exit(child, child_pid, reader_stop)?;
+                status = try_observe_child_exit(child, process_job, child_pid, reader_stop)?;
             }
             let termination = if status.is_some() {
                 CommandTermination::Exited
@@ -318,7 +345,7 @@ fn wait_for_child_and_readers(
                 CommandTermination::Cancelled
             };
             if status.is_none() {
-                kill_child_tree(child);
+                terminate_child_tree(child, process_job);
                 status = Some(child.wait()?);
             }
             reader_stop.store(true, Ordering::Release);
@@ -326,7 +353,7 @@ fn wait_for_child_and_readers(
         }
         if Instant::now() >= deadline {
             if status.is_none() {
-                status = try_observe_child_exit(child, child_pid, reader_stop)?;
+                status = try_observe_child_exit(child, process_job, child_pid, reader_stop)?;
             }
             let termination = if status.is_some() {
                 CommandTermination::Exited
@@ -334,7 +361,7 @@ fn wait_for_child_and_readers(
                 CommandTermination::TimedOut
             };
             if status.is_none() {
-                kill_child_tree(child);
+                terminate_child_tree(child, process_job);
                 status = Some(child.wait()?);
             }
             reader_stop.store(true, Ordering::Release);
@@ -346,6 +373,7 @@ fn wait_for_child_and_readers(
 
 fn try_observe_child_exit(
     child: &mut Child,
+    process_job: &ProcessJob,
     child_pid: u32,
     reader_stop: &AtomicBool,
 ) -> io::Result<Option<ExitStatus>> {
@@ -353,13 +381,14 @@ fn try_observe_child_exit(
         Ok(Some(exit_status)) => {
             // Retire the process-group lease while the PID still identifies
             // this operation, then release readers held by escaped descendants.
+            let _ = process_job.terminate(1);
             kill_process_group_by_pid(child_pid);
             reader_stop.store(true, Ordering::Release);
             Ok(Some(exit_status))
         }
         Ok(None) => Ok(None),
         Err(error) => {
-            kill_child_tree(child);
+            terminate_child_tree(child, process_job);
             let _ = child.wait();
             reader_stop.store(true, Ordering::Release);
             Err(error)
@@ -488,6 +517,28 @@ fn finish_bounded_line<T, F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_platform::host::{Architecture, HostPlatform, OperatingSystem};
+    use orca_platform::shell::ShellResolver;
+    use std::path::PathBuf;
+
+    #[test]
+    fn shell_command_uses_the_resolved_windows_dialect() {
+        let shell = ShellResolver::new(
+            HostPlatform::new(OperatingSystem::Windows, Architecture::Aarch64),
+            |name| (name == "cmd.exe").then(|| PathBuf::from(r"C:\Windows\System32\cmd.exe")),
+        )
+        .resolve(None)
+        .expect("resolve cmd.exe");
+
+        let command = shell_command(&shell, "echo ready");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), r"C:\Windows\System32\cmd.exe");
+        assert_eq!(args, ["/D", "/S", "/C", "echo ready"]);
+    }
 
     #[test]
     fn child_output_is_bounded_at_ingress_with_exact_omission_counts() {
@@ -503,10 +554,11 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         prepare_non_interactive_command(&mut command);
-        let child = command.spawn().expect("spawn noisy child");
+        let (child, process_job) = ProcessJob::spawn(&mut command).expect("spawn noisy child");
 
         let output = wait_for_child_output_with_timeout_or_cancel_and_limit(
             child,
+            process_job,
             Duration::from_secs(5),
             || false,
             retained_bytes,
@@ -534,10 +586,11 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         prepare_non_interactive_command(&mut command);
-        let child = command.spawn().expect("spawn noisy child");
+        let (child, process_job) = ProcessJob::spawn(&mut command).expect("spawn noisy child");
 
         let output = wait_for_child_stdout_lines_with_timeout(
             child,
+            process_job,
             Duration::from_secs(5),
             retained_bytes,
             Vec::new(),
@@ -568,11 +621,12 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         prepare_non_interactive_command(&mut command);
-        let child = command.spawn().expect("spawn child");
+        let (child, process_job) = ProcessJob::spawn(&mut command).expect("spawn child");
         let started = Instant::now();
 
         let error = wait_for_child_stdout_lines_with_timeout(
             child,
+            process_job,
             Duration::from_millis(200),
             1024,
             (),
@@ -598,11 +652,13 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         prepare_non_interactive_command(&mut command);
-        let child = command.spawn().expect("spawn shell with pipe descendant");
+        let (child, process_job) =
+            ProcessJob::spawn(&mut command).expect("spawn shell with pipe descendant");
         let start = Instant::now();
 
         let output = wait_for_child_output_with_timeout_or_cancel_and_limit(
             child,
+            process_job,
             Duration::from_millis(200),
             || false,
             1024,
@@ -632,13 +688,13 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         prepare_non_interactive_command(&mut command);
-        let child = command
-            .spawn()
-            .expect("spawn shell with escaped pipe descendant");
+        let (child, process_job) =
+            ProcessJob::spawn(&mut command).expect("spawn shell with escaped pipe descendant");
         let start = Instant::now();
 
         let output = wait_for_child_output_with_timeout_or_cancel_and_limit(
             child,
+            process_job,
             Duration::from_millis(200),
             || false,
             1024,
@@ -764,10 +820,20 @@ fn join_reader(
         .map_err(|_| io::Error::other(format!("{stream} reader thread panicked")))?
 }
 
-fn child_setup_error<T>(child: &mut Child, message: &str) -> io::Result<T> {
-    kill_child_tree(child);
+fn child_setup_error<T>(
+    child: &mut Child,
+    process_job: &ProcessJob,
+    message: &str,
+) -> io::Result<T> {
+    terminate_child_tree(child, process_job);
     let _ = child.wait();
     Err(io::Error::other(message))
+}
+
+pub fn terminate_child_tree(child: &mut Child, process_job: &ProcessJob) {
+    let _ = process_job.terminate(1);
+    kill_process_group_by_pid(child.id());
+    let _ = child.kill();
 }
 
 pub fn kill_child_tree(child: &mut Child) {
@@ -819,11 +885,14 @@ mod cancellation_tests {
         ));
         prepare_non_interactive_command(&mut command);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let child = command.spawn().expect("spawn child");
+        let (child, process_job) = ProcessJob::spawn(&mut command).expect("spawn child");
         let cancellation_observed = AtomicBool::new(false);
 
-        let output =
-            wait_for_child_output_with_timeout_or_cancel(child, Duration::from_secs(5), || {
+        let output = wait_for_child_output_with_timeout_or_cancel(
+            child,
+            process_job,
+            Duration::from_secs(5),
+            || {
                 if !cancellation_observed.swap(true, Ordering::SeqCst) {
                     std::fs::write(&release, []).expect("release child");
                     let deadline = Instant::now() + Duration::from_secs(2);
@@ -834,8 +903,9 @@ mod cancellation_tests {
                     thread::sleep(Duration::from_millis(50));
                 }
                 true
-            })
-            .expect("wait for child");
+            },
+        )
+        .expect("wait for child");
 
         assert!(cancellation_observed.load(Ordering::SeqCst));
         assert!(output.status.success());

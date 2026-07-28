@@ -1,0 +1,113 @@
+name: Windows
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "crates/**"
+      - "npm/orca/**"
+      - "install.ps1"
+      - "scripts/release/**"
+      - "scripts/validate-windows-platform-boundaries.mjs"
+      - "scripts/test-validate-windows-platform-boundaries.mjs"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/windows-ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "crates/**"
+      - "npm/orca/**"
+      - "install.ps1"
+      - "scripts/release/**"
+      - "scripts/validate-windows-platform-boundaries.mjs"
+      - "scripts/test-validate-windows-platform-boundaries.mjs"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/windows-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  native-x64:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: windows-x64-${{ hashFiles('Cargo.lock') }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Validate reviewed platform boundaries
+        run: |
+          node scripts/test-validate-windows-platform-boundaries.mjs
+          node scripts/validate-windows-platform-boundaries.mjs
+      - name: Check the full workspace
+        run: cargo check --workspace --all-targets --locked
+      - name: Run workspace clippy
+        run: cargo clippy --workspace --all-targets --locked
+      - name: Run native Windows platform contracts
+        run: |
+          cargo test -p orca-platform --locked -- --nocapture
+          cargo test -p orca-windows-runner --locked -- --nocapture
+          cargo test -p orca-windows-sandbox-setup --locked -- --nocapture
+          cargo test -p orca-windows-sandbox --locked -- --nocapture
+          cargo test -p orca-tools sandbox --locked -- --nocapture
+          cargo test -p orca-runtime native_windows_shells_accept_capability_sandbox_modes --locked -- --nocapture
+          cargo test -p orca-runtime restricted_windows_pty_session_keeps_terminal_and_resizes --locked -- --nocapture
+          cargo test -p orca-runtime native_pty_capabilities_match_supported_hosts --locked -- --nocapture
+          cargo test --test session_server_contract server_mode_reports_shell_capabilities --locked -- --nocapture
+      - name: Run the full Windows test suite
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo test --workspace --all-targets --locked -- --test-threads=1
+
+  native-arm64:
+    runs-on: windows-11-arm
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: windows-arm64-${{ hashFiles('Cargo.lock') }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Validate reviewed platform boundaries
+        run: |
+          node scripts/test-validate-windows-platform-boundaries.mjs
+          node scripts/validate-windows-platform-boundaries.mjs
+      - name: Check the native ARM64 workspace
+        run: cargo check --workspace --all-targets --locked
+      - name: Build and start the native ARM64 binary
+        run: |
+          cargo build --release --locked
+          & "./target/release/orca.exe" --version
+      - name: Run native ARM64 platform smoke tests
+        run: |
+          cargo test -p orca-platform --locked -- --nocapture
+          cargo test -p orca-windows-runner --locked -- --nocapture
+          cargo test -p orca-windows-sandbox-setup --locked -- --nocapture
+          cargo test -p orca-windows-sandbox --locked -- --nocapture
+          cargo test -p orca-tools sandbox --locked -- --nocapture
+          cargo test -p orca-runtime restricted_windows_pty_session_keeps_terminal_and_resizes --locked -- --nocapture
+      - name: Run the full native ARM64 test suite
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo test --workspace --all-targets --locked -- --test-threads=1

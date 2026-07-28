@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use orca_core::tool_types::{
     ToolOutputTruncation, ToolRequest, ToolResult, truncate_output_with_policy,
 };
+use orca_platform::process::ProcessJob;
+use orca_platform::shell::{ShellKind, ShellSpec};
 
 use crate::process;
 use crate::sandbox;
@@ -59,21 +61,69 @@ pub fn execute_with_policy_roots_or_cancel(
     shell_timeout: Duration,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
+    let shell =
+        match orca_platform::shell::ShellResolver::for_current_host().resolve_from_environment() {
+            Ok(shell) => shell,
+            Err(error) => {
+                return ToolResult::failed(
+                    request,
+                    format!("failed to resolve host shell: {error}"),
+                    None,
+                );
+            }
+        };
+    execute_with_shell_spec_roots_or_cancel(
+        &shell,
+        request,
+        cwd,
+        additional_roots,
+        output_truncation,
+        shell_timeout,
+        should_cancel,
+    )
+}
+
+pub fn execute_with_shell_spec_roots_or_cancel(
+    shell: &ShellSpec,
+    request: &ToolRequest,
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
+    output_truncation: ToolOutputTruncation,
+    shell_timeout: Duration,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let Some(command) = request
         .target
         .as_deref()
         .filter(|target| !target.is_empty())
     else {
-        return ToolResult::failed(request, "bash command is required", None);
+        return ToolResult::failed(request, "shell command is required", None);
     };
 
-    let child = match sandbox::bash_command_with_additional_roots(command, cwd, additional_roots)
+    if matches!(
+        shell.kind(),
+        ShellKind::PowerShell(_) | ShellKind::Cmd | ShellKind::GitBash
+    ) {
+        return ToolResult::failed(
+            request,
+            "native Windows shell execution requires the runtime permission and sandbox path",
+            None,
+        );
+    }
+
+    let mut process_command = match shell.kind() {
+        ShellKind::Posix | ShellKind::GitBash => {
+            sandbox::bash_command_with_additional_roots(command, cwd, additional_roots)
+        }
+        ShellKind::PowerShell(_) | ShellKind::Cmd => unreachable!("guarded above"),
+    };
+
+    process_command
         .env_remove("ORCA_API_KEY")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
+        .stderr(Stdio::piped());
+    let (child, process_job) = match ProcessJob::spawn(&mut process_command) {
+        Ok(spawned) => spawned,
         Err(error) => {
             return ToolResult::failed(
                 request,
@@ -85,6 +135,7 @@ pub fn execute_with_policy_roots_or_cancel(
 
     let output = match process::wait_for_child_output_with_timeout_or_cancel(
         child,
+        process_job,
         shell_timeout,
         &should_cancel,
     ) {
@@ -264,13 +315,12 @@ pub fn execute_streaming_command_or_cancel(
     on_output: &mut dyn FnMut(&str),
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
-    let mut child = match command
+    command
         .env_remove("ORCA_API_KEY")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
+        .stderr(Stdio::piped());
+    let (mut child, process_job) = match ProcessJob::spawn(&mut command) {
+        Ok(spawned) => spawned,
         Err(error) => {
             return ToolResult::failed(
                 request,
@@ -287,7 +337,7 @@ pub fn execute_streaming_command_or_cancel(
         .map_or(Ok(()), process::set_nonblocking)
         .and_then(|()| stderr.as_ref().map_or(Ok(()), process::set_nonblocking))
     {
-        process::kill_child_tree(&mut child);
+        process::terminate_child_tree(&mut child, &process_job);
         let _ = child.wait();
         return ToolResult::failed(
             request,
@@ -336,7 +386,10 @@ pub fn execute_streaming_command_or_cancel(
             std::thread::sleep(Duration::from_millis(50));
         }
         match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
+            Ok(Some(status)) => {
+                process::terminate_child_tree(&mut child, &process_job);
+                break Ok(status);
+            }
             Ok(None) => {}
             Err(error) => {
                 return ToolResult::failed(
@@ -359,7 +412,7 @@ pub fn execute_streaming_command_or_cancel(
                 }
             }
             cancelled = true;
-            process::kill_child_tree(&mut child);
+            process::terminate_child_tree(&mut child, &process_job);
             break child
                 .wait()
                 .map_err(|error| format!("failed to wait for shell command: {error}"));
@@ -377,7 +430,7 @@ pub fn execute_streaming_command_or_cancel(
                 }
             }
             timed_out = true;
-            process::kill_child_tree(&mut child);
+            process::terminate_child_tree(&mut child, &process_job);
             break child
                 .wait()
                 .map_err(|error| format!("failed to wait for shell command: {error}"));

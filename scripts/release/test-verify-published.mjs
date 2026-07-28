@@ -10,11 +10,19 @@ const repoRoot = path.resolve(import.meta.dirname, "..", "..");
 const script = path.join(repoRoot, "scripts", "release", "verify-published.mjs");
 const tempDir = mkdtempSync(path.join(os.tmpdir(), "orca-verify-published-test-"));
 const version = "9.8.7";
-const targets = [["darwin-arm64", "aarch64-apple-darwin"], ["darwin-x64", "x86_64-apple-darwin"], ["linux-arm64", "aarch64-unknown-linux-gnu"], ["linux-x64", "x86_64-unknown-linux-gnu"]];
+const targets = [
+  ["darwin-arm64", "aarch64-apple-darwin", "orca", "tar.gz"],
+  ["darwin-x64", "x86_64-apple-darwin", "orca", "tar.gz"],
+  ["linux-arm64", "aarch64-unknown-linux-gnu", "orca", "tar.gz"],
+  ["linux-x64", "x86_64-unknown-linux-gnu", "orca", "tar.gz"],
+  ["win32-arm64", "aarch64-pc-windows-msvc", "orca.exe", "zip", ["orca-windows-runner.exe", "orca-windows-sandbox-setup.exe"]],
+  ["win32-x64", "x86_64-pc-windows-msvc", "orca.exe", "zip", ["orca-windows-runner.exe", "orca-windows-sandbox-setup.exe"]],
+];
 
 function executable(filePath, contents) { writeFileSync(filePath, contents); chmodSync(filePath, 0o755); }
 function sha(filePath, algorithm = "sha256", encoding = "hex") { return createHash(algorithm).update(readFileSync(filePath)).digest(encoding); }
 function tar(source, destination, entries = ["."]) { execFileSync("tar", ["-C", source, "-czf", destination, ...entries]); }
+function zip(source, destination, entry) { execFileSync("zip", ["-j", "-q", destination, path.join(source, entry)]); }
 
 try {
   const fixture = path.join(tempDir, "fixture");
@@ -25,20 +33,24 @@ try {
   for (const dir of [releaseDir, npmDir, metadataDir, binDir]) mkdirSync(dir, { recursive: true });
   const aliases = Object.fromEntries(targets.map(([suffix]) => [`@blade-ai/orca-${suffix}`, `npm:@blade-ai/orca@${version}-${suffix}`]));
 
-  for (const [suffix, triple] of targets) {
+  for (const [suffix, triple, binaryName, extension, helpers = []] of targets) {
     const binaryContent = `orca-binary-${triple}\n`;
     const releaseStage = path.join(tempDir, `release-${suffix}`);
     mkdirSync(releaseStage);
-    executable(path.join(releaseStage, "orca"), binaryContent);
-    const archive = path.join(releaseDir, `orca-${triple}.tar.gz`);
-    tar(releaseStage, archive, ["orca"]);
+    executable(path.join(releaseStage, binaryName), binaryContent);
+    for (const helper of helpers) executable(path.join(releaseStage, helper), `${helper}-${triple}\n`);
+    if (helpers.length > 0) writeFileSync(path.join(releaseStage, "LICENSE"), "MIT\n");
+    const archive = path.join(releaseDir, `orca-${triple}.${extension}`);
+    if (extension === "zip") execFileSync("zip", ["-j", "-q", archive, ...[binaryName, ...helpers, ...(helpers.length > 0 ? ["LICENSE"] : [])].map((entry) => path.join(releaseStage, entry))]);
+    else tar(releaseStage, archive, [binaryName]);
     writeFileSync(`${archive}.sha256`, `${sha(archive)}  ${path.basename(archive)}\n`);
 
     const packageVersion = `${version}-${suffix}`;
     const packageRoot = path.join(tempDir, `package-${suffix}`, "package");
     mkdirSync(path.join(packageRoot, "vendor", triple, "bin"), { recursive: true });
     writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ name: "@blade-ai/orca", version: packageVersion }));
-    executable(path.join(packageRoot, "vendor", triple, "bin", "orca"), binaryContent);
+    executable(path.join(packageRoot, "vendor", triple, "bin", binaryName), binaryContent);
+    for (const helper of helpers) executable(path.join(packageRoot, "vendor", triple, "bin", helper), `${helper}-${triple}\n`);
     const tarball = path.join(npmDir, `blade-ai-orca-${packageVersion}.tgz`);
     tar(path.dirname(packageRoot), tarball, ["package"]);
     copyFileSync(tarball, path.join(releaseDir, path.basename(tarball)));

@@ -471,6 +471,17 @@ fn execute_bash_with_sandbox(context: RuntimeBashSandboxContext<'_, '_>) -> Bash
     } = context;
     let mut additional_working_directories = additional_roots.to_vec();
     additional_working_directories.extend(sandbox.additional_writable_roots.clone());
+    #[cfg(windows)]
+    if !sandbox.network_policy_domains.is_empty() {
+        return BashExecutionResult {
+            output: BashShellOutput {
+                output: Err(
+                    "Windows domain-restricted network sandbox is unavailable; refusing to run without an OS-enforced network boundary".to_string(),
+                ),
+            },
+            network_block: None,
+        };
+    }
     let mut env = BTreeMap::new();
     let mut block_receiver = None;
     let _network_proxy = if sandbox.network_policy_domains.is_empty() {

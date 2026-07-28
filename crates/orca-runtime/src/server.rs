@@ -1312,6 +1312,16 @@ fn run_command_exec<W: Write>(
     {
         additional_working_directories.extend(writable_roots.iter().cloned());
     }
+    #[cfg(windows)]
+    if !effective_sandbox.network_policy_domains.is_empty() {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error(
+                "Windows domain-restricted network sandbox is unavailable; refusing to run without an OS-enforced network boundary",
+            ),
+        );
+    }
     let mut retry_block_reporter = None;
     let mut retry_block_receiver = None;
     let command_permission_request = thread_id.map(|thread_id| JsonlCommandExecPermissionRequest {

@@ -73,12 +73,28 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
+            binary: orca
+            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-latest
+            binary: orca
+            archive: tar.gz
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            binary: orca
+            archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+            binary: orca
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            binary: orca.exe
+            archive: zip
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            binary: orca.exe
+            archive: zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -92,22 +108,58 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - name: Run native Windows x64 behavior gates
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: powershell
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo test --workspace --all-targets --locked -- --test-threads=1
+      - name: Run native Windows ARM64 behavior gates
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: powershell
+        run: |
+          cargo test -p orca-platform --locked -- --nocapture
+          cargo test -p orca-windows-sandbox --locked -- --nocapture
+          cargo test -p orca-tools sandbox --locked -- --nocapture
+          cargo test -p orca-runtime native_windows_shells_accept_capability_sandbox_modes --locked -- --nocapture
+          cargo test -p orca-runtime restricted_windows_pty_session_keeps_terminal_and_resizes --locked -- --nocapture
+          cargo test -p orca-runtime native_pty_capabilities_match_supported_hosts --locked -- --nocapture
+          cargo test --test session_server_contract server_mode_reports_shell_capabilities --locked -- --nocapture
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --locked
+      - name: Smoke the native Windows release binary
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: '& "target/${{ matrix.target }}/release/orca.exe" --version'
       - name: Package
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p "dist/orca-${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release/orca" "dist/orca-${{ matrix.target }}/orca"
           tar -C "dist/orca-${{ matrix.target }}" -czf "dist/orca-${{ matrix.target }}.tar.gz" orca
           shasum -a 256 "dist/orca-${{ matrix.target }}.tar.gz" > "dist/orca-${{ matrix.target }}.tar.gz.sha256"
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $stage = "dist/orca-${{ matrix.target }}"
+          $archive = "dist/orca-${{ matrix.target }}.zip"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/orca.exe" "$stage/orca.exe"
+          Copy-Item "target/${{ matrix.target }}/release/orca-windows-runner.exe" "$stage/orca-windows-runner.exe"
+          Copy-Item "target/${{ matrix.target }}/release/orca-windows-sandbox-setup.exe" "$stage/orca-windows-sandbox-setup.exe"
+          Copy-Item "LICENSE" "$stage/LICENSE"
+          Compress-Archive -Path "$stage/*" -DestinationPath $archive -Force
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          "$hash  orca-${{ matrix.target }}.zip" | Set-Content -Encoding ascii "$archive.sha256"
       - uses: actions/upload-artifact@v5
         with:
           name: orca-${{ matrix.target }}
           path: |
-            dist/orca-${{ matrix.target }}/orca
-            dist/orca-${{ matrix.target }}.tar.gz
-            dist/orca-${{ matrix.target }}.tar.gz.sha256
+            dist/orca-${{ matrix.target }}/*
+            dist/orca-${{ matrix.target }}.${{ matrix.archive }}
+            dist/orca-${{ matrix.target }}.${{ matrix.archive }}.sha256
 
   npm-auth:
     if: github.ref_type == 'tag'
@@ -141,6 +193,7 @@ jobs:
         run: |
           mkdir -p dist/release
           find dist/artifacts -name '*.tar.gz' -exec cp {} dist/release/ \;
+          find dist/artifacts -name '*.zip' -exec cp {} dist/release/ \;
           find dist/artifacts -name '*.sha256' -exec cp {} dist/release/ \;
       - uses: softprops/action-gh-release@v2
         with:
@@ -194,6 +247,8 @@ jobs:
             "dist/npm/tarballs/blade-ai-orca-${version}-darwin-x64.tgz" \
             "dist/npm/tarballs/blade-ai-orca-${version}-linux-arm64.tgz" \
             "dist/npm/tarballs/blade-ai-orca-${version}-linux-x64.tgz" \
+            "dist/npm/tarballs/blade-ai-orca-${version}-win32-arm64.tgz" \
+            "dist/npm/tarballs/blade-ai-orca-${version}-win32-x64.tgz" \
             "dist/npm/tarballs/blade-ai-orca-${version}.tgz"
           )
           declare -A existing
@@ -275,3 +330,117 @@ jobs:
             --repo "${{ github.repository }}" \
             --package "@blade-ai/orca" \
             --bin "orca"
+
+  verify-windows:
+    if: ${{ always() && github.ref_type == 'tag' && needs.npm.result == 'success' && needs['npm-release-assets'].result == 'success' }}
+    needs: [version, npm, npm-release-assets]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+      - name: Smoke the published Windows npm package
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "orca-npm-smoke"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Set-Content -Path (Join-Path $root "package.json") -Value '{"private":true}'
+          Push-Location $root
+          npm install --ignore-scripts --save-exact "@blade-ai/orca@${{ needs.version.outputs.version }}"
+          node (Join-Path $root "node_modules/@blade-ai/orca/bin/orca.js") --version
+          Pop-Location
+      - name: Smoke the published PowerShell installer
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "orca-installer-smoke"
+          & ./install.ps1 `
+            -Repo "${{ github.repository }}" `
+            -Version "${{ needs.version.outputs.version }}" `
+            -InstallDir (Join-Path $root "bin") `
+            -NonInteractive
+      - name: Smoke the installed native Windows runner and sandbox lifecycle
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "orca-native-helper-smoke"
+          $installDir = Join-Path (Join-Path $env:RUNNER_TEMP "orca-installer-smoke") "bin"
+          $runner = Join-Path $installDir "orca-windows-runner.exe"
+          $setup = Join-Path $installDir "orca-windows-sandbox-setup.exe"
+          $workspace = Join-Path $root "workspace"
+          $stateDir = Join-Path $root "state"
+          New-Item -ItemType Directory -Force -Path $workspace | Out-Null
+          New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+
+          $runnerRequest = @{
+            version = 1
+            program = $env:ComSpec
+            args = @("/D", "/S", "/C", "echo orca-runner-release-smoke")
+            cwd = (Get-Location).Path
+            env = @{}
+            job_name = $null
+            forward_stdin = $false
+          } | ConvertTo-Json -Compress
+          $runnerResponseText = $runnerRequest | & $runner
+          if ($LASTEXITCODE -ne 0) { throw "native Windows runner exited with code $LASTEXITCODE" }
+          $runnerResponse = $runnerResponseText | ConvertFrom-Json
+          if (-not $runnerResponse.ok -or $runnerResponse.exit_code -ne 0) {
+            throw "native Windows runner smoke failed: $runnerResponseText"
+          }
+          $runnerOutput = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($runnerResponse.stdout_base64))
+          if ($runnerOutput -notmatch "orca-runner-release-smoke") {
+            throw "native Windows runner did not return captured child output"
+          }
+
+          function Invoke-SandboxSetup([string]$Operation) {
+            $request = @{
+              version = 1
+              operation = $Operation
+              state_dir = $stateDir
+              workspace = $workspace
+            } | ConvertTo-Json -Compress
+            $responseText = $request | & $setup
+            if ($LASTEXITCODE -ne 0) { throw "sandbox setup '$Operation' exited with code $($LASTEXITCODE): $responseText" }
+            $response = $responseText | ConvertFrom-Json
+            if (-not $response.ok) { throw "sandbox setup '$Operation' failed: $responseText" }
+            return $response
+          }
+
+          $provision = Invoke-SandboxSetup "provision"
+          if (-not $provision.receipt) { throw "sandbox provision did not return a receipt" }
+          $check = Invoke-SandboxSetup "check"
+          if (-not $check.receipt) { throw "sandbox check did not return a receipt" }
+          $repair = Invoke-SandboxSetup "repair"
+          if (-not $repair.receipt) { throw "sandbox repair did not return a receipt" }
+          $remove = Invoke-SandboxSetup "remove"
+          if (-not $remove.removed) { throw "sandbox remove did not revoke the workspace capability" }
+      - name: Verify the published Windows archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "orca-release-smoke"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --pattern "orca-${{ matrix.target }}.zip" --pattern "orca-${{ matrix.target }}.zip.sha256" --dir $root
+          $archive = Join-Path $root "orca-${{ matrix.target }}.zip"
+          $expected = ((Get-Content ("$archive.sha256") -Raw).Trim() -split "\s+")[0].ToLowerInvariant()
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($expected -ne $actual) { throw "Windows release checksum mismatch" }
+          Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $root "extract") -Force
+          foreach ($member in @("orca-windows-runner.exe", "orca-windows-sandbox-setup.exe", "LICENSE")) {
+            if (-not (Test-Path (Join-Path $root "extract/$member") -PathType Leaf)) {
+              throw "Windows release bundle is missing $member"
+            }
+          }
+          & (Join-Path $root "extract/orca.exe") --version

@@ -1,13 +1,14 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::tool_types::{
     ToolOutputTruncation, ToolRequest, ToolResult, truncate_output_with_policy,
 };
+use orca_platform::process::ProcessJob;
 
 use crate::process;
 
@@ -112,10 +113,22 @@ pub fn execute_external_tool_with_policy_or_cancel(
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
     let args = request.raw_arguments.as_deref().unwrap_or("{}");
-    let mut command = Command::new("sh");
+    let shell =
+        match orca_platform::shell::ShellResolver::for_current_host().resolve_from_environment() {
+            Ok(shell) => shell,
+            Err(error) => {
+                return ToolResult::failed(
+                    request,
+                    format!(
+                        "external tool '{}' could not resolve the host shell: {error}",
+                        config.name
+                    ),
+                    None,
+                );
+            }
+        };
+    let mut command = process::shell_command(&shell, &config.command);
     command
-        .arg("-c")
-        .arg(&config.command)
         .current_dir(cwd)
         .env("ORCA_TOOL_NAME", &config.name)
         .env(
@@ -132,8 +145,8 @@ pub fn execute_external_tool_with_policy_or_cancel(
     process::prepare_non_interactive_command(&mut command);
     command.stdin(Stdio::piped());
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    let (mut child, process_job) = match ProcessJob::spawn(&mut command) {
+        Ok(spawned) => spawned,
         Err(error) => {
             return ToolResult::failed(
                 request,
@@ -145,7 +158,7 @@ pub fn execute_external_tool_with_policy_or_cancel(
 
     if let Some(mut stdin) = child.stdin.take() {
         if let Err(error) = stdin.write_all(args.as_bytes()) {
-            process::kill_child_tree(&mut child);
+            process::terminate_child_tree(&mut child, &process_job);
             let exit_code = child.wait().ok().and_then(|status| status.code());
             return ToolResult::failed(
                 request,
@@ -160,6 +173,7 @@ pub fn execute_external_tool_with_policy_or_cancel(
 
     let output = match process::wait_for_child_output_with_timeout_or_cancel(
         child,
+        process_job,
         shell_timeout,
         &should_cancel,
     ) {

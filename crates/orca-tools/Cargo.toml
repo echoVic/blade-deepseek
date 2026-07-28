@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 orca-core = { path = "../orca-core" }
+orca-platform = { path = "../orca-platform" }
 orca-mcp = { path = "../orca-mcp" }
 serde = { workspace = true }
 serde_json = { workspace = true }

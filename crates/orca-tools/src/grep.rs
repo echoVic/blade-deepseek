@@ -3,6 +3,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
+use orca_platform::process::ProcessJob;
 use serde::Deserialize;
 
 const DEFAULT_GREP_HEAD_LIMIT: usize = 250;
@@ -50,9 +51,10 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
     let limit = normalized_head_limit(args.head_limit);
     let collector = GrepPageCollector::new(offset, limit, max_bytes.max(1));
     let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_LINE_BYTES);
-    let output = command.spawn().and_then(|child| {
+    let output = ProcessJob::spawn(&mut command).and_then(|(child, process_job)| {
         crate::process::wait_for_child_stdout_lines_with_timeout(
             child,
+            process_job,
             Duration::from_secs(120),
             max_line_bytes,
             collector,

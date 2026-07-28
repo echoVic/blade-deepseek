@@ -1,0 +1,396 @@
+#!/usr/bin/env node
+
+import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import {
+  parseManifestText,
+  validateCurrentInventory,
+  validateManifest,
+} from "./validate-windows-platform-boundaries.mjs";
+
+const repoRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
+const manifestPath = path.join(
+  repoRoot,
+  "docs/superpowers/specs/2026-07-28-native-windows-platform-foundation.manifest.json",
+);
+const baseline = JSON.parse(readFileSync(manifestPath, "utf8"));
+
+assert.throws(
+  () => parseManifestText('{"schema_version":'),
+  /malformed manifest JSON/,
+  "malformed manifests must fail with a stable diagnostic",
+);
+
+{
+  const candidate = structuredClone(baseline);
+  candidate.deferred_boundaries.push(candidate.deferred_boundaries[0]);
+  assert.throws(
+    () => validateManifest(candidate),
+    /duplicate boundary id/,
+    "duplicate reviewed boundary ids must fail",
+  );
+}
+
+{
+  const candidate = structuredClone(baseline);
+  candidate.operation_patterns = candidate.operation_patterns.filter(
+    ([id]) => id !== "non_unix_lock_stub",
+  );
+  assert.throws(
+    () => validateManifest(candidate),
+    /reviewed operation pattern set drift/,
+    "the manifest cannot weaken scanning by deleting an operation class",
+  );
+}
+
+{
+  const candidate = structuredClone(baseline);
+  candidate.operation_patterns[0][1] = "never-match-this-pattern";
+  assert.throws(
+    () => validateManifest(candidate),
+    /reviewed regex drift/,
+    "the manifest cannot weaken scanning by changing a reviewed regex",
+  );
+}
+
+{
+  const candidate = structuredClone(baseline);
+  candidate.deferred_boundaries[0][4] = "unowned-future-plan";
+  assert.throws(
+    () => validateManifest(candidate),
+    /unknown deferred owner/,
+    "every deferral must point at a closed implementation phase",
+  );
+}
+
+{
+  const candidate = structuredClone(baseline);
+  candidate.deferred_boundaries[0][1] = "crates/missing.rs";
+  assert.throws(
+    () => validateCurrentInventory(candidate, { repoRoot }),
+    /inventory path does not exist/,
+    "missing reviewed paths must fail",
+  );
+}
+
+{
+  const candidate = structuredClone(baseline);
+  candidate.deferred_boundaries[0][3] += 1;
+  assert.throws(
+    () => validateCurrentInventory(candidate, { repoRoot }),
+    /reviewed platform operation count drift/,
+    "stale reviewed counts must fail",
+  );
+}
+
+{
+  const relativePath = "crates/orca-runtime/src/goal_actor.rs";
+  const original = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const sourceOverrides = new Map([
+    [
+      relativePath,
+      `${original}\nfn regression() { let _ = std::process::Command::new("sh"); }\n`,
+    ],
+  ]);
+  assert.throws(
+    () => validateCurrentInventory(baseline, { repoRoot, sourceOverrides }),
+    /unreviewed direct platform operation/,
+    "source overrides must pass through the same inventory scanner",
+  );
+}
+
+validateManifest(baseline);
+validateCurrentInventory(baseline, { repoRoot });
+
+const atomicJobSpawnContracts = [
+  ["crates/orca-core/src/verification.rs", "ProcessJob::spawn(&mut child_command)"],
+  ["crates/orca-mcp/src/transport.rs", "ProcessJob::spawn(&mut child_command)"],
+  ["crates/orca-runtime/src/hooks.rs", "ProcessJob::spawn(&mut command)"],
+  ["crates/orca-runtime/src/subagent_async_worker.rs", "ProcessJob::spawn_named(&mut command"],
+  ["crates/orca-runtime/src/workflow/host.rs", "ProcessJob::spawn(&mut command)"],
+  ["crates/orca-runtime/src/shell_session.rs", "ProcessJob::spawn(&mut process)"],
+  ["crates/orca-tools/src/bash.rs", "ProcessJob::spawn(&mut process_command)"],
+  ["crates/orca-tools/src/external.rs", "ProcessJob::spawn(&mut command)"],
+  ["crates/orca-tools/src/git.rs", "ProcessJob::spawn(&mut command)"],
+  ["crates/orca-tools/src/grep.rs", "ProcessJob::spawn(&mut command)"],
+];
+for (const [relativePath, marker] of atomicJobSpawnContracts) {
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  assert.ok(
+    source.includes(marker),
+    `${relativePath} must create its Windows child inside the Job Object`,
+  );
+}
+const verificationSource = readFileSync(
+  path.join(repoRoot, "crates/orca-core/src/verification.rs"),
+  "utf8",
+);
+assert.match(
+  verificationSource,
+  /fn kill_child_tree_without_job\(child: &mut Child\) \{[\s\S]*?#\[cfg\(not\(windows\)\)\][\s\S]*?child\.kill\(\)/,
+  "verifier cleanup must not bypass Windows Job Object ownership",
+);
+
+const processSource = readFileSync(
+  path.join(repoRoot, "crates/orca-platform/src/process.rs"),
+  "utf8",
+);
+const shellResolverSource = readFileSync(
+  path.join(repoRoot, "crates/orca-platform/src/shell/resolve.rs"),
+  "utf8",
+);
+assert.ok(
+  shellResolverSource.includes("is_current_directory_executable"),
+  "Windows shell lookup must reject executables from the current directory",
+);
+assert.ok(
+  shellResolverSource.includes("resolve_program"),
+  "Windows process lookup must resolve PATHEXT launcher shims",
+);
+assert.ok(
+  readFileSync(path.join(repoRoot, "crates/orca-mcp/src/transport.rs"), "utf8").includes("resolve_program(command)"),
+  "MCP stdio launches must use the Windows PATHEXT-aware program resolver",
+);
+const toolProcessSource = readFileSync(
+  path.join(repoRoot, "crates/orca-tools/src/process.rs"),
+  "utf8",
+);
+for (const marker of [
+  "command.creation_flags(CREATE_SUSPENDED)",
+  "AssignProcessToJobObject(job.handle, process)",
+  "resume_process_threads(child.id())",
+  "spawn_named_or_inherited",
+]) {
+  assert.ok(
+    processSource.includes(marker),
+    `Windows atomic Job spawn must contain ${marker}`,
+  );
+}
+assert.ok(
+  processSource.indexOf("AssignProcessToJobObject(job.handle, process)") <
+    processSource.indexOf("resume_process_threads(child.id())"),
+  "Windows child must enter its Job Object before any thread resumes",
+);
+assert.ok(
+  !toolProcessSource.includes("let _process_job = ProcessJob::attach(child_pid)"),
+  "process waiters must receive the Job lease created at spawn time",
+);
+
+const terminalSource = readFileSync(
+  path.join(repoRoot, "crates/orca-platform/src/terminal.rs"),
+  "utf8",
+);
+assert.ok(
+  !terminalSource.includes("portable_pty"),
+  "Windows ConPTY ownership must not use a spawn-before-Job abstraction",
+);
+for (const marker of [
+  "CREATE_SUSPENDED",
+  "ProcessJob::attach_named(info.dwProcessId, name)",
+  "ResumeThread(thread.raw())",
+]) {
+  assert.ok(
+    terminalSource.includes(marker),
+    `Windows ConPTY spawn must contain ${marker}`,
+  );
+}
+assert.ok(
+  terminalSource.indexOf("ProcessJob::attach_named(info.dwProcessId, name)") <
+    terminalSource.indexOf("ResumeThread(thread.raw())"),
+  "Windows ConPTY child must enter its Job Object before its primary thread resumes",
+);
+
+const clipboardSource = readFileSync(
+  path.join(repoRoot, "crates/orca-tui/src/clipboard.rs"),
+  "utf8",
+);
+for (const marker of ["OpenClipboard", "CF_UNICODETEXT", "SetClipboardData"]) {
+  assert.ok(
+    clipboardSource.includes(marker),
+    `Windows clipboard fallback must use the Unicode clipboard API: ${marker}`,
+  );
+}
+assert.ok(
+  !clipboardSource.includes('"powershell.exe"'),
+  "Windows clipboard fallback must not spawn PowerShell",
+);
+
+const sandboxSource = readFileSync(
+  path.join(repoRoot, "crates/orca-runtime/src/shell_session.rs"),
+  "utf8",
+);
+for (const marker of ["verify_setup", "SETUP_HELPER_VERSION"]) {
+  assert.ok(
+    sandboxSource.includes(marker),
+    `Windows sandbox runtime must validate setup receipts: ${marker}`,
+  );
+}
+const setupHelperSource = readFileSync(
+  path.join(repoRoot, "crates/orca-windows-sandbox-setup/src/main.rs"),
+  "utf8",
+);
+assert.ok(
+  setupHelperSource.includes("ensure_appcontainer_profile"),
+  "Windows setup helper must provision the stable AppContainer profile",
+);
+const runnerSource = readFileSync(
+  path.join(repoRoot, "crates/orca-windows-runner/src/main.rs"),
+  "utf8",
+);
+assert.ok(
+  runnerSource.includes("native_runner_launches_absolute_windows_program"),
+  "Windows runner must include a real native execution contract",
+);
+for (const marker of ["forward_stdin", "MAX_FORWARDED_STDIN_BYTES", "spawn_named_or_inherited"]) {
+  assert.ok(
+    runnerSource.includes(marker),
+    `Windows runner must enforce its bounded stdin/job contract: ${marker}`,
+  );
+}
+const asyncWorkerSource = readFileSync(
+  path.join(repoRoot, "crates/orca-runtime/src/subagent_async_worker.rs"),
+  "utf8",
+);
+for (const marker of [
+  "spawn_async_subagent_worker_via_runner",
+  "orca-windows-runner.exe",
+  "forward_stdin",
+  "contains_process(pid)",
+]) {
+  assert.ok(
+    asyncWorkerSource.includes(marker),
+    `Windows async workers must use the runtime-owned runner boundary: ${marker}`,
+  );
+}
+assert.doesNotMatch(
+  asyncWorkerSource,
+  /WindowsRunnerLaunchRequest[\s\S]{0,180}serde\(rename_all = "camelCase"\)/,
+  "Windows runner request fields must retain the snake_case protocol names",
+);
+assert.ok(
+  setupHelperSource.includes("native_setup_provisions_and_checks_profile_receipt"),
+  "Windows setup helper must include a real native profile contract",
+);
+for (const marker of ["SetupOperation::Repair", "SetupOperation::Remove", "repair_setup", "remove_setup"]) {
+  assert.ok(
+    setupHelperSource.includes(marker),
+    `Windows setup helper must expose lifecycle operation ${marker}`,
+  );
+}
+const capabilitySource = readFileSync(
+  path.join(repoRoot, "crates/orca-windows-sandbox/src/capabilities.rs"),
+  "utf8",
+);
+for (const marker of ["Sha256", "receipt_path", "verify_setup_for_workspace"]) {
+  assert.ok(
+    capabilitySource.includes(marker),
+    `Windows setup receipts must be workspace-scoped: ${marker}`,
+  );
+}
+const runtimeBashSource = readFileSync(
+  path.join(repoRoot, "crates/orca-runtime/src/runtime_bash.rs"),
+  "utf8",
+);
+assert.ok(
+  runtimeBashSource.includes("domain-restricted network sandbox is unavailable"),
+  "Windows domain-restricted network policy must fail closed until direct bypass is enforced",
+);
+const serverSource = readFileSync(
+  path.join(repoRoot, "crates/orca-runtime/src/server.rs"),
+  "utf8",
+);
+assert.ok(
+  serverSource.includes("Windows domain-restricted network sandbox is unavailable"),
+  "Windows command/exec domain network policy must fail closed until direct bypass is enforced",
+);
+
+const workflowPath = path.join(repoRoot, ".github/workflows/windows-ci.yml");
+assert.ok(existsSync(workflowPath), "native Windows CI workflow must exist");
+const workflow = readFileSync(workflowPath, "utf8");
+const releaseWorkflowPath = path.join(repoRoot, ".github/workflows/release.yml");
+assert.ok(existsSync(releaseWorkflowPath), "release workflow must exist");
+const releaseWorkflow = readFileSync(releaseWorkflowPath, "utf8");
+const installerSource = readFileSync(path.join(repoRoot, "install.ps1"), "utf8");
+const pullRequest = workflow.match(/  pull_request:\n([\s\S]*?)\n  push:/);
+assert.ok(pullRequest, "Windows CI must validate pull requests before merge");
+const push = workflow.match(/  push:\n([\s\S]*?)\n\npermissions:/);
+assert.ok(push, "Windows CI must validate relevant main-branch pushes");
+for (const marker of [
+  "branches: [main]",
+  '"npm/orca/**"',
+  '"install.ps1"',
+  '"scripts/release/**"',
+  '".github/workflows/release.yml"',
+  '".github/workflows/windows-ci.yml"',
+]) {
+  assert.ok(
+    pullRequest[1].includes(marker),
+    `Windows pull-request trigger must contain ${marker}`,
+  );
+}
+for (const marker of [
+  '"npm/orca/**"',
+  '"install.ps1"',
+  '"scripts/release/**"',
+  '".github/workflows/release.yml"',
+]) {
+  assert.ok(
+    push[1].includes(marker),
+    `Windows push trigger must contain ${marker}`,
+  );
+}
+for (const marker of [
+  "windows-latest",
+  "windows-11-arm",
+  "aarch64-pc-windows-msvc",
+  "shell: powershell",
+  "node scripts/test-validate-windows-platform-boundaries.mjs",
+  "cargo check --workspace --all-targets --locked",
+  "cargo clippy --workspace --all-targets --locked",
+  "cargo test --workspace --all-targets --locked -- --test-threads=1",
+  "cargo build --release --locked",
+  "target/release/orca.exe",
+  "--version",
+  "restricted_windows_pty_session_keeps_terminal_and_resizes",
+  "orca-windows-runner",
+  "orca-windows-sandbox-setup",
+]) {
+  assert.ok(workflow.includes(marker), `Windows CI workflow must contain ${marker}`);
+}
+for (const marker of [
+  "orca-windows-runner.exe",
+  "orca-windows-sandbox-setup.exe",
+  'Copy-Item "LICENSE"',
+  'Compress-Archive -Path "$stage/*"',
+]) {
+  assert.ok(releaseWorkflow.includes(marker), `release workflow must package ${marker}`);
+}
+for (const marker of [
+  "orca-windows-runner.exe",
+  "orca-windows-sandbox-setup.exe",
+  '"LICENSE"',
+  "SetupSandbox",
+  "RepairSandbox",
+  "RemoveSandbox",
+  "echoVic/orca-agent",
+]) {
+  assert.ok(installerSource.includes(marker), `Windows installer must handle ${marker}`);
+}
+assert.ok(
+  installerSource.indexOf("if ($RemoveSandbox)") <
+    installerSource.indexOf("$target = Get-OrcaTarget"),
+  "Windows sandbox removal must not require a release download",
+);
+for (const marker of ['operation = "remove"', '"repair"', '"provision"']) {
+  assert.ok(
+    installerSource.includes(marker),
+    `Windows installer must dispatch setup lifecycle operation ${marker}`,
+  );
+}
+console.log("windows platform boundary validator tests passed");

@@ -7,14 +7,16 @@ import os from "node:os";
 import path from "node:path";
 
 const TARGETS = [
-  ["darwin-arm64", "aarch64-apple-darwin"],
-  ["darwin-x64", "x86_64-apple-darwin"],
-  ["linux-arm64", "aarch64-unknown-linux-gnu"],
-  ["linux-x64", "x86_64-unknown-linux-gnu"],
+  ["darwin-arm64", "aarch64-apple-darwin", "orca", "tar.gz"],
+  ["darwin-x64", "x86_64-apple-darwin", "orca", "tar.gz"],
+  ["linux-arm64", "aarch64-unknown-linux-gnu", "orca", "tar.gz"],
+  ["linux-x64", "x86_64-unknown-linux-gnu", "orca", "tar.gz"],
+  ["win32-arm64", "aarch64-pc-windows-msvc", "orca.exe", "zip", ["orca-windows-runner.exe", "orca-windows-sandbox-setup.exe"]],
+  ["win32-x64", "x86_64-pc-windows-msvc", "orca.exe", "zip", ["orca-windows-runner.exe", "orca-windows-sandbox-setup.exe"]],
 ];
 
 function parseArgs(argv) {
-  const args = { version: null, repo: "echoVic/blade-deepseek", packageName: "@blade-ai/orca", bin: "orca", retries: 12, retryDelayMs: 10000 };
+  const args = { version: null, repo: "echoVic/orca-agent", packageName: "@blade-ai/orca", bin: "orca", retries: 12, retryDelayMs: 10000 };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--version") args.version = argv[++index];
@@ -57,9 +59,10 @@ async function retry(label, args, operation) {
   throw lastError;
 }
 
-function extract(tarball, destination) {
+function extract(archive, destination, extension) {
   mkdirSync(destination, { recursive: true });
-  run("tar", ["-xzf", tarball, "-C", destination]);
+  if (extension === "zip") run("unzip", ["-q", archive, "-d", destination]);
+  else run("tar", ["-xzf", archive, "-C", destination]);
 }
 
 async function main() {
@@ -75,15 +78,15 @@ async function main() {
     if (tagSha !== mainSha) throw new Error(`Release tag target ${tagSha} does not match main ${mainSha}`);
 
     const expectedAssets = [
-      ...TARGETS.flatMap(([, triple]) => [`orca-${triple}.tar.gz`, `orca-${triple}.tar.gz.sha256`]),
+      ...TARGETS.flatMap(([, triple, , extension]) => [`orca-${triple}.${extension}`, `orca-${triple}.${extension}.sha256`]),
       ...TARGETS.map(([suffix]) => `blade-ai-orca-${version}-${suffix}.tgz`),
       `blade-ai-orca-${version}.tgz`,
     ];
     const assetNames = new Set((release.assets ?? []).map((asset) => asset.name));
     for (const name of expectedAssets) if (!assetNames.has(name)) throw new Error(`GitHub Release missing asset ${name}`);
     run("gh", ["release", "download", tag, "--repo", args.repo, "--dir", tempDir]);
-    for (const [, triple] of TARGETS) {
-      const archive = path.join(tempDir, `orca-${triple}.tar.gz`);
+    for (const [, triple, , extension] of TARGETS) {
+      const archive = path.join(tempDir, `orca-${triple}.${extension}`);
       const checksum = readFileSync(`${archive}.sha256`, "utf8").trim().split(/\s+/)[0];
       if (checksum !== digest(archive)) throw new Error(`Checksum failure for ${path.basename(archive)}`);
     }
@@ -112,14 +115,24 @@ async function main() {
       packed.set(packageVersion, tarball);
     }
 
-    for (const [suffix, triple] of TARGETS) {
+    for (const [suffix, triple, binaryName, extension, helpers = []] of TARGETS) {
       const releaseExtract = path.join(tempDir, `release-${suffix}`);
       const npmExtract = path.join(tempDir, `npm-${suffix}`);
-      extract(path.join(tempDir, `orca-${triple}.tar.gz`), releaseExtract);
-      extract(packed.get(`${version}-${suffix}`), npmExtract);
-      const releaseBinary = path.join(releaseExtract, "orca");
-      const npmBinary = path.join(npmExtract, "package", "vendor", triple, "bin", "orca");
+      extract(path.join(tempDir, `orca-${triple}.${extension}`), releaseExtract, extension);
+      extract(packed.get(`${version}-${suffix}`), npmExtract, "tar.gz");
+      const releaseBinary = path.join(releaseExtract, binaryName);
+      const npmBinary = path.join(npmExtract, "package", "vendor", triple, "bin", binaryName);
       if (!existsSync(npmBinary) || digest(releaseBinary) !== digest(npmBinary)) throw new Error(`package/archive binary mismatch for ${triple}`);
+      for (const helper of helpers) {
+        const releaseHelper = path.join(releaseExtract, helper);
+        const npmHelper = path.join(npmExtract, "package", "vendor", triple, "bin", helper);
+        if (!existsSync(releaseHelper) || !existsSync(npmHelper) || digest(releaseHelper) !== digest(npmHelper)) {
+          throw new Error(`package/archive helper mismatch for ${triple}: ${helper}`);
+        }
+      }
+      if (helpers.length > 0 && !existsSync(path.join(releaseExtract, "LICENSE"))) {
+        throw new Error(`Windows bundle for ${triple} is missing LICENSE`);
+      }
     }
 
     const installDir = path.join(tempDir, "install");

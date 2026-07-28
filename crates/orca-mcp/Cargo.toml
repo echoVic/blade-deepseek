@@ -8,6 +8,7 @@ test-utils = []
 
 [dependencies]
 orca-core = { path = "../orca-core" }
+orca-platform = { path = "../orca-platform" }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }

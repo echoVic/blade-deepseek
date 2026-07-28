@@ -1,5 +1,5 @@
 use std::fmt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use orca_core::cancel::CancelToken;
@@ -7,6 +7,7 @@ use orca_core::conversation::Conversation;
 use orca_core::hook_types::{HookConfig, HookEvent};
 use orca_core::provider_types::Usage;
 use orca_core::tool_types::{ToolRequest, ToolResult};
+use orca_platform::process::ProcessJob;
 
 #[derive(Clone, Debug, Default)]
 pub struct HookRunner {
@@ -109,10 +110,16 @@ impl HookRunner {
     ) -> Result<HookOutcome, HookRunError> {
         let mut outcome = HookOutcome::default();
         for hook in self.matching_hooks(event, context.tool_request) {
-            let mut command = Command::new("sh");
+            let shell = orca_platform::shell::ShellResolver::for_current_host()
+                .resolve_from_environment()
+                .map_err(|error| {
+                    HookRunError::Failed(format!(
+                        "hook '{}' could not resolve the host shell: {error}",
+                        hook.command
+                    ))
+                })?;
+            let mut command = orca_tools::process::shell_command(&shell, &hook.command);
             command
-                .arg("-c")
-                .arg(&hook.command)
                 .env("ORCA_HOOK_EVENT", event.as_str())
                 .env("ORCA_CWD", context.cwd)
                 .env(
@@ -180,11 +187,12 @@ impl HookRunner {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             orca_tools::process::prepare_non_interactive_command(&mut command);
-            let child = command.spawn().map_err(|error| {
+            let (child, process_job) = ProcessJob::spawn(&mut command).map_err(|error| {
                 HookRunError::Failed(format!("hook '{}' failed to start: {error}", hook.command))
             })?;
             let output = orca_tools::process::wait_for_child_output_with_timeout_or_cancel(
                 child,
+                process_job,
                 timeout,
                 &should_cancel,
             )

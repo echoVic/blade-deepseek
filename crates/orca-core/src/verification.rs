@@ -14,6 +14,9 @@ use std::os::unix::process::CommandExt;
 
 use serde::{Deserialize, Serialize};
 
+use orca_platform::process::ProcessJob;
+use orca_platform::shell::{ShellResolver, ShellSpec};
+
 use crate::retained_output::{
     DEFAULT_RETAINED_OUTPUT_BYTES, RetainedOutputSnapshot, read_to_retained,
 };
@@ -32,48 +35,43 @@ pub fn run(command: &str) -> VerificationResult {
 }
 
 fn run_with_timeout(command: &str, timeout: Duration) -> VerificationResult {
-    let mut child_command = Command::new("sh");
-    child_command
-        .arg("-c")
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        child_command.process_group(0);
-    }
-
-    let child = child_command.spawn();
-
-    match child {
-        Ok(child) => match wait_for_child_output_with_timeout(child, timeout) {
-            Ok(output) => VerificationResult {
-                command: command.to_string(),
-                success: output.status.success() && !output.timed_out,
-                exit_code: if output.timed_out {
-                    None
-                } else {
-                    output.status.code()
-                },
-                stdout: output.stdout_text().trim().to_string(),
-                stderr: if output.timed_out {
-                    let stderr = output.stderr_text().trim().to_string();
-                    if stderr.is_empty() {
-                        format!("verifier timed out after {}s", timeout.as_secs())
-                    } else {
-                        format!("verifier timed out after {}s: {stderr}", timeout.as_secs())
-                    }
-                } else {
-                    output.stderr_text().trim().to_string()
-                },
-            },
-            Err(error) => VerificationResult {
+    let shell = match ShellResolver::for_current_host().resolve_from_environment() {
+        Ok(shell) => shell,
+        Err(error) => {
+            return VerificationResult {
                 command: command.to_string(),
                 success: false,
                 exit_code: None,
                 stdout: String::new(),
-                stderr: format!("failed to run verifier: {error}"),
+                stderr: format!("failed to resolve verifier shell: {error}"),
+            };
+        }
+    };
+    let mut child_command = build_verifier_command(&shell, command);
+
+    let output = ProcessJob::spawn(&mut child_command).and_then(|(child, process_job)| {
+        wait_for_child_output_with_timeout(child, process_job, timeout)
+    });
+
+    match output {
+        Ok(output) => VerificationResult {
+            command: command.to_string(),
+            success: output.status.success() && !output.timed_out,
+            exit_code: if output.timed_out {
+                None
+            } else {
+                output.status.code()
+            },
+            stdout: output.stdout_text().trim().to_string(),
+            stderr: if output.timed_out {
+                let stderr = output.stderr_text().trim().to_string();
+                if stderr.is_empty() {
+                    format!("verifier timed out after {}s", timeout.as_secs())
+                } else {
+                    format!("verifier timed out after {}s: {stderr}", timeout.as_secs())
+                }
+            } else {
+                output.stderr_text().trim().to_string()
             },
         },
         Err(error) => VerificationResult {
@@ -84,6 +82,21 @@ fn run_with_timeout(command: &str, timeout: Duration) -> VerificationResult {
             stderr: format!("failed to run verifier: {error}"),
         },
     }
+}
+
+fn build_verifier_command(shell: &ShellSpec, script: &str) -> Command {
+    let command_spec = shell.command(script);
+    let mut command = Command::new(command_spec.program);
+    command
+        .args(command_spec.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    command
 }
 
 struct CommandOutput {
@@ -105,20 +118,25 @@ impl CommandOutput {
 
 fn wait_for_child_output_with_timeout(
     mut child: Child,
+    process_job: ProcessJob,
     timeout: Duration,
 ) -> io::Result<CommandOutput> {
     let child_pid = child.id();
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
-        None => return child_setup_error(&mut child, "child process has no stdout"),
+        None => {
+            return child_setup_error(&mut child, &process_job, "child process has no stdout");
+        }
     };
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
-        None => return child_setup_error(&mut child, "child process has no stderr"),
+        None => {
+            return child_setup_error(&mut child, &process_job, "child process has no stderr");
+        }
     };
     #[cfg(unix)]
     if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
-        kill_child_tree(&mut child);
+        terminate_child_tree(&mut child, &process_job);
         let _ = child.wait();
         return Err(error);
     }
@@ -144,12 +162,13 @@ fn wait_for_child_output_with_timeout(
                     if !stdout_handle.is_finished() || !stderr_handle.is_finished() {
                         timed_out = true;
                     }
+                    let _ = process_job.terminate(1);
                     kill_process_group_by_pid(child_pid);
                     reader_stop.store(true, Ordering::Release);
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    kill_child_tree(&mut child);
+                    terminate_child_tree(&mut child, &process_job);
                     let _ = child.wait();
                     break Err(error);
                 }
@@ -164,7 +183,7 @@ fn wait_for_child_output_with_timeout(
         if std::time::Instant::now() >= deadline {
             timed_out = true;
             if status.is_none() {
-                kill_child_tree(&mut child);
+                terminate_child_tree(&mut child, &process_job);
                 status = Some(child.wait()?);
             }
             reader_stop.store(true, Ordering::Release);
@@ -232,14 +251,24 @@ fn set_nonblocking(reader: &impl AsRawFd) -> io::Result<()> {
     Ok(())
 }
 
-fn child_setup_error<T>(child: &mut Child, message: &str) -> io::Result<T> {
-    kill_child_tree(child);
+fn child_setup_error<T>(
+    child: &mut Child,
+    process_job: &ProcessJob,
+    message: &str,
+) -> io::Result<T> {
+    terminate_child_tree(child, process_job);
     let _ = child.wait();
     Err(io::Error::other(message))
 }
 
-fn kill_child_tree(child: &mut Child) {
+fn terminate_child_tree(child: &mut Child, process_job: &ProcessJob) {
+    let _ = process_job.terminate(1);
+    kill_child_tree_without_job(child);
+}
+
+fn kill_child_tree_without_job(child: &mut Child) {
     kill_process_group_by_pid(child.id());
+    #[cfg(not(windows))]
     let _ = child.kill();
 }
 
@@ -269,7 +298,40 @@ fn kill_process_group(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_platform::host::{Architecture, HostPlatform, OperatingSystem};
+    use orca_platform::shell::ShellResolver;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn verifier_command_uses_resolved_windows_shell_dialect() {
+        let shell = ShellResolver::new(
+            HostPlatform::new(OperatingSystem::Windows, Architecture::X86_64),
+            |name| {
+                (name == "pwsh.exe")
+                    .then(|| PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"))
+            },
+        )
+        .resolve(None)
+        .expect("resolve PowerShell");
+
+        let command = build_verifier_command(&shell, "Write-Output ok");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            command.get_program(),
+            r"C:\Program Files\PowerShell\7\pwsh.exe"
+        );
+        assert_eq!(
+            &args[..4],
+            ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
+        );
+        assert!(args[4].contains("[Console]::OutputEncoding"));
+        assert!(args[4].ends_with("Write-Output ok"));
+    }
 
     #[test]
     fn verifier_command_timeout_kills_descendant_processes() {
