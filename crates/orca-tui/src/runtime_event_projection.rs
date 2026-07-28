@@ -433,7 +433,9 @@ mod tests {
                     status,
                     turn: 3,
                 }),
-            } if id == "main-session-1" && kind == "agent" && status == "running"
+            } if id == "main-session-1"
+                && kind == "agent"
+                && status == "running"
         ));
     }
 

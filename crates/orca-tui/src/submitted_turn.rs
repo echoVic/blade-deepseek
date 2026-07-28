@@ -35,6 +35,7 @@ impl SubmittedTurnPresentation {
 pub(crate) struct SubmittedTurn {
     kind: SubmittedTurnKind,
     presentation: SubmittedTurnPresentation,
+    queued_id: Option<u64>,
 }
 
 impl SubmittedTurn {
@@ -45,6 +46,7 @@ impl SubmittedTurn {
                 prompt,
             },
             presentation: SubmittedTurnPresentation::user(),
+            queued_id: None,
         }
     }
 
@@ -52,6 +54,19 @@ impl SubmittedTurn {
         Self {
             kind: SubmittedTurnKind::User { prompt, bindings },
             presentation: SubmittedTurnPresentation::user(),
+            queued_id: None,
+        }
+    }
+
+    pub(crate) fn queued_user_with_mentions(
+        id: u64,
+        prompt: String,
+        bindings: mentions::MentionBindings,
+    ) -> Self {
+        Self {
+            kind: SubmittedTurnKind::User { prompt, bindings },
+            presentation: SubmittedTurnPresentation::user(),
+            queued_id: Some(id),
         }
     }
 
@@ -60,7 +75,12 @@ impl SubmittedTurn {
         Self {
             kind: SubmittedTurnKind::WorkflowNotification(notification),
             presentation: SubmittedTurnPresentation::workflow_notification(&id),
+            queued_id: None,
         }
+    }
+
+    pub(crate) fn queued_id(&self) -> Option<u64> {
+        self.queued_id
     }
 
     pub(crate) fn prompt(&self) -> &str {

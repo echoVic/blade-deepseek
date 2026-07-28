@@ -1,5 +1,4 @@
 use crossbeam_channel as mpsc;
-use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -2147,13 +2146,16 @@ mod tests {
 
         send_submission_error(
             &event_tx,
+            None,
             Some("review @gone.txt"),
             "bound file is no longer available".to_string(),
         );
 
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(TuiEvent::SubmissionRejected { prompt, message })
+            Ok(TuiEvent::SubmissionRejected {
+                prompt, message, ..
+            })
                 if prompt == "review @gone.txt"
                     && message == "bound file is no longer available"
         ));
@@ -2210,9 +2212,59 @@ mod tests {
                 harness.recv_until(|event| matches!(event, TuiEvent::SubmissionRejected { .. }));
             assert!(matches!(
                 rejection,
-                TuiEvent::SubmissionRejected { prompt, message }
+                TuiEvent::SubmissionRejected {
+                    prompt, message, ..
+                }
                     if prompt == "review @gone.txt"
                         && message.contains("failed to resolve bound @gone.txt")
+            ));
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn queued_stale_bound_file_rejection_preserves_queued_identity() {
+        with_orca_home(|_| {
+            let root = tempdir().expect("workspace root");
+            let root_path = root
+                .path()
+                .canonicalize()
+                .expect("canonical workspace root");
+            let mut config = test_config(HistoryMode::Disabled);
+            config.cwd = Some(root_path.clone());
+            config.runtime_workspace_roots = Some(vec![root_path.clone()]);
+            let prompt = "review @gone.txt";
+            let bindings = orca_runtime::mentions::MentionBindings::from_bindings(
+                prompt,
+                vec![orca_runtime::mentions::MentionBinding {
+                    start: 7,
+                    end: prompt.len(),
+                    visible: "@gone.txt".to_string(),
+                    target: orca_runtime::mentions::MentionTarget::File {
+                        root: root_path,
+                        path: "gone.txt".to_string(),
+                        kind: orca_runtime::mentions::MentionFileKind::File,
+                    },
+                }],
+            );
+            let mut harness = HostedTuiHarness::start(config, None);
+
+            harness.send(UserAction::SubmitQueued {
+                id: 42,
+                prompt: prompt.to_string(),
+                bindings,
+            });
+
+            let rejection =
+                harness.recv_until(|event| matches!(event, TuiEvent::SubmissionRejected { .. }));
+            assert!(matches!(
+                rejection,
+                TuiEvent::SubmissionRejected {
+                    queued_id: Some(42),
+                    prompt,
+                    message,
+                } if prompt == "review @gone.txt"
+                    && message.contains("failed to resolve bound @gone.txt")
             ));
             harness.shutdown();
         });
@@ -2222,7 +2274,7 @@ mod tests {
     fn workflow_submission_error_remains_generic() {
         let (event_tx, event_rx) = mpsc::unbounded();
 
-        send_submission_error(&event_tx, None, "workflow failed".to_string());
+        send_submission_error(&event_tx, None, None, "workflow failed".to_string());
 
         assert!(matches!(
             event_rx.try_recv(),
@@ -3422,7 +3474,9 @@ mod tests {
 
             assert!(matches!(
                 event_rx.recv_timeout(Duration::from_secs(1)),
-                Ok(TuiEvent::SubmissionRejected { prompt, message })
+                Ok(TuiEvent::SubmissionRejected {
+                    prompt, message, ..
+                })
                     if prompt == "retry me"
                         && message.contains("failed to initialize conversation history")
             ));
@@ -3610,12 +3664,97 @@ mod tests {
                 cfg,
                 &controller,
                 &event_tx,
+                None,
             );
 
             assert!(result.is_err());
             assert!(matches!(
                 event_rx.recv_timeout(Duration::from_secs(1)),
                 Ok(TuiEvent::SessionCompleted { status }) if status == "failed"
+            ));
+            host.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn queued_operation_controller_install_failure_preserves_queued_identity() {
+        with_orca_home(|_| {
+            let cfg = test_config(HistoryMode::Record);
+            let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+            let runtime_thread = host
+                .start_thread(cfg.clone(), "queued install failure")
+                .unwrap();
+            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            controller.shutdown();
+            let (event_tx, event_rx) = mpsc::unbounded();
+
+            let result = run_hosted_operation(
+                &runtime_thread,
+                HostedTurnRequest::new("restore queued prompt"),
+                cfg,
+                &controller,
+                &event_tx,
+                Some(42),
+            );
+
+            assert!(result.is_err());
+            let events = event_rx.try_iter().collect::<Vec<_>>();
+            let acknowledged = events
+                .iter()
+                .any(|event| matches!(event, TuiEvent::QueuedSubmissionStarted { id: 42 }));
+            let rejected = events.iter().any(|event| {
+                matches!(
+                    event,
+                    TuiEvent::SubmissionRejected {
+                        queued_id: Some(42),
+                        prompt,
+                        message,
+                    } if prompt == "restore queued prompt"
+                        && message.contains("controller is shutting down")
+                )
+            });
+            assert_ne!(
+                acknowledged, rejected,
+                "queued identity must be acknowledged or rejected exactly once: {events:?}"
+            );
+            host.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn queued_goal_preflight_failure_preserves_queued_identity() {
+        with_orca_home(|_| {
+            let cfg = test_config(HistoryMode::Disabled);
+            let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+            let runtime_thread = host
+                .start_thread(cfg.clone(), "queued preflight failure")
+                .unwrap();
+            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let control = controller.surface_task_control();
+            let (event_tx, event_rx) = mpsc::unbounded();
+
+            run_hosted_goal_run(
+                &cfg,
+                &runtime_thread,
+                SubmittedTurn::queued_user_with_mentions(
+                    42,
+                    "restore queued prompt".to_string(),
+                    orca_runtime::mentions::MentionBindings::new("restore queued prompt"),
+                ),
+                orca_core::goal_runtime::GoalTurnOrigin::User,
+                &event_tx,
+                &control,
+                &OrdinaryTurnRunner::Typed,
+            );
+
+            assert!(matches!(
+                event_rx.recv_timeout(Duration::from_secs(1)),
+                Ok(TuiEvent::SubmissionRejected {
+                    queued_id: Some(42),
+                    prompt,
+                    message,
+                }) if prompt == "restore queued prompt"
+                    && message.contains("persistent goals require recorded history")
             ));
             host.shutdown().unwrap();
         });
@@ -5737,7 +5876,6 @@ mod tests {
         state.enter_running();
         let mut config = test_config(HistoryMode::Record);
         let shared = Arc::new(Mutex::new(config.clone()));
-        let operation = crate::test_support::TestOperationInterrupt::default();
         let preloaded = Arc::new(Mutex::new(None));
         let theme = Theme::named(ThemeName::Dark);
         let mut vim = VimState::new(false);
@@ -5752,7 +5890,6 @@ mod tests {
                 &mut config,
                 &shared,
                 &action_tx,
-                &operation,
                 &preloaded,
                 &mut textarea,
                 &mut vim,
@@ -5770,7 +5907,6 @@ mod tests {
             &mut config,
             &shared,
             &action_tx,
-            &operation,
             &preloaded,
             &mut textarea,
             &mut vim,
@@ -5803,7 +5939,6 @@ mod tests {
             &mut config,
             &shared,
             &action_tx,
-            &operation,
             &preloaded,
             &mut textarea,
             &mut vim,
@@ -5823,7 +5958,6 @@ mod tests {
             &mut config,
             &shared,
             &action_tx,
-            &operation,
             &preloaded,
             &mut textarea,
             &mut vim,
@@ -5857,7 +5991,7 @@ mod tests {
 
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "foo!"
+            Ok(UserAction::SubmitQueued { prompt, .. }) if prompt == "foo!"
         ));
         assert!(matches!(
             state.messages.last(),
@@ -5912,7 +6046,7 @@ mod tests {
             );
 
             let mut terminal_event = first_terminal;
-            for (turn, expected_count) in [(2, 2usize), (3, 3usize)] {
+            for expected_count in [2usize, 3usize] {
                 handle_runtime_event(
                     terminal_event,
                     &mut state,
@@ -5923,8 +6057,12 @@ mod tests {
                     &theme,
                     &mut presentation,
                 );
-                harness.recv_until(|event| matches!(event, TuiEvent::TurnStarted { .. }));
-                state.update(TuiEvent::TurnStarted { turn, task: None });
+                let queued_started = harness
+                    .recv_until(|event| matches!(event, TuiEvent::QueuedSubmissionStarted { .. }));
+                state.update(queued_started);
+                let turn_started =
+                    harness.recv_until(|event| matches!(event, TuiEvent::TurnStarted { .. }));
+                state.update(turn_started);
                 let delta = harness.recv_until(|event| {
                     matches!(
                         event,
@@ -6008,10 +6146,10 @@ mod tests {
         state.enter_running();
         state.open_transcript_search();
         let mut textarea = TextArea::from(["composer"]);
-        let operation = crate::test_support::TestOperationInterrupt::default();
         let mut config = test_config(HistoryMode::Record);
         let shared = Arc::new(Mutex::new(config.clone()));
         let (action_tx, action_rx) = mpsc::unbounded();
+        let mut vim = VimState::new(false);
 
         assert!(handle_paste_event(
             &Event::Paste("alpha\r\nbeta".to_string()),
@@ -6028,17 +6166,13 @@ mod tests {
             esc,
             &mut state,
             &mut config,
-            &shared,
             &action_tx,
-            &operation,
             || Ok(()),
         )
         .unwrap();
         assert!(!state.transcript_search.open);
-        assert_eq!(operation.call_count(), 0);
 
         let preloaded = Arc::new(Mutex::new(None));
-        let mut vim = VimState::new(false);
         let theme = Theme::named(ThemeName::Dark);
         handle_status_key(
             &Event::Key(esc),
@@ -6047,7 +6181,6 @@ mod tests {
             &mut config,
             &shared,
             &action_tx,
-            &operation,
             &preloaded,
             &mut textarea,
             &mut vim,
@@ -6056,7 +6189,6 @@ mod tests {
             || Ok(()),
         )
         .unwrap();
-        assert_eq!(operation.call_count(), 1);
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
     }
 
@@ -6738,11 +6870,13 @@ fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
 
 fn send_submission_error(
     event_tx: &mpsc::Sender<TuiEvent>,
+    queued_id: Option<u64>,
     rejection_prompt: Option<&str>,
     message: String,
 ) {
     if let Some(prompt) = rejection_prompt {
         let _ = event_tx.send(TuiEvent::SubmissionRejected {
+            queued_id,
             prompt: prompt.to_string(),
             message,
         });
@@ -6814,7 +6948,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
     ordinary_turn_runner: OrdinaryTurnRunner,
 ) {
     let mut thread: Option<RuntimeThreadHandle> = None;
-    let mut pending_actions = VecDeque::new();
 
     let startup_history_mode = config.lock().unwrap().history_mode.clone();
     if typed_history_startup_eligible(&startup_history_mode, &preloaded) {
@@ -6859,8 +6992,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
     loop {
         let action = if control.is_shutdown() {
             Ok(UserAction::Cancel)
-        } else if let Some(action) = pending_actions.pop_front() {
-            Ok(action)
         } else {
             action_rx.recv()
         };
@@ -6880,6 +7011,24 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
             Ok(UserAction::SubmitWithMentions { prompt, bindings }) => {
                 handle_hosted_submitted_turn(
                     SubmittedTurn::user_with_mentions(prompt, bindings),
+                    &config,
+                    &preloaded,
+                    &mut thread,
+                    &event_tx,
+                    &control,
+                    &pending_workflow_notifications,
+                    &mcp_registry,
+                    &host,
+                    &ordinary_turn_runner,
+                );
+            }
+            Ok(UserAction::SubmitQueued {
+                id,
+                prompt,
+                bindings,
+            }) => {
+                handle_hosted_submitted_turn(
+                    SubmittedTurn::queued_user_with_mentions(id, prompt, bindings),
                     &config,
                     &preloaded,
                     &mut thread,
@@ -7446,6 +7595,7 @@ fn handle_hosted_submitted_turn(
     ordinary_turn_runner: &OrdinaryTurnRunner,
 ) {
     let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
+    let queued_id = submitted_turn.queued_id();
     let cfg = config.lock().unwrap().clone();
     let thread_was_missing = thread.is_none();
     let cwd = cfg
@@ -7462,7 +7612,7 @@ fn handle_hosted_submitted_turn(
         mcp_registry,
         event_tx,
     ) {
-        send_submission_error(event_tx, rejection_prompt.as_deref(), error);
+        send_submission_error(event_tx, queued_id, rejection_prompt.as_deref(), error);
         return;
     }
     if thread_was_missing {
@@ -7478,7 +7628,7 @@ fn handle_hosted_submitted_turn(
     let prompt = match submitted_turn.prompt_for_model(&actions, &cwd, &workspace_roots) {
         Ok(prompt) => prompt,
         Err(error) => {
-            send_submission_error(event_tx, rejection_prompt.as_deref(), error);
+            send_submission_error(event_tx, queued_id, rejection_prompt.as_deref(), error);
             return;
         }
     };
@@ -7502,12 +7652,28 @@ pub(crate) fn run_hosted_operation(
     config: RunConfig,
     controller: &TuiOperationController,
     event_tx: &mpsc::Sender<TuiEvent>,
+    queued_id: Option<u64>,
 ) -> io::Result<TuiHostedOperationOutcome> {
-    if !matches!(request.operation_kind(), HostedOperationKind::GoalRun) {
-        controller.begin_surface_activation()?;
-    }
     let operation_kind = request.operation_kind().clone();
-    let observer = Arc::new(TuiHostedEventObserver::new(event_tx.clone()));
+    let rejection_prompt = queued_id.map(|_| request.prompt().to_string());
+    if !matches!(request.operation_kind(), HostedOperationKind::GoalRun) {
+        if let Err(error) = controller.begin_surface_activation() {
+            if let Some(id) = queued_id {
+                let _ = event_tx.send(TuiEvent::SubmissionRejected {
+                    queued_id: Some(id),
+                    prompt: rejection_prompt.unwrap_or_default(),
+                    message: error.to_string(),
+                });
+            } else {
+                send_hosted_operation_terminal_failure(event_tx, &operation_kind);
+            }
+            return Err(error);
+        }
+    }
+    let observer = Arc::new(TuiHostedEventObserver::new_with_queued_id(
+        event_tx.clone(),
+        queued_id,
+    ));
     let pending_interactions =
         orca_runtime::runtime_pending_interaction::RuntimePendingInteractionStore::default();
     let generation_pending_interactions = pending_interactions.clone();
@@ -7544,8 +7710,15 @@ pub(crate) fn run_hosted_operation(
     let operation = match thread.start_turn_with_config(request, io::sink(), config) {
         Ok(operation) => Arc::new(operation),
         Err(error) => {
-            controller.cancel_surface_activation();
-            send_hosted_operation_terminal_failure(event_tx, &operation_kind);
+            if let Some(id) = queued_id {
+                let _ = event_tx.send(TuiEvent::SubmissionRejected {
+                    queued_id: Some(id),
+                    prompt: rejection_prompt.unwrap_or_default(),
+                    message: error.to_string(),
+                });
+            } else {
+                send_hosted_operation_terminal_failure(event_tx, &operation_kind);
+            }
             return Err(io::Error::other(error.to_string()));
         }
     };
@@ -7554,8 +7727,19 @@ pub(crate) fn run_hosted_operation(
         let _ = operation.interrupt();
         let _ = operation.wait();
         controller.complete_hosted(operation_id);
-        let _ = observer.finish_foreground();
-        send_hosted_operation_terminal_failure(event_tx, &operation_kind);
+        if let Some(id) = queued_id
+            && !observer.queued_submission_started()
+        {
+            let _ = event_tx.send(TuiEvent::SubmissionRejected {
+                queued_id: Some(id),
+                prompt: rejection_prompt.unwrap_or_default(),
+                message: error.to_string(),
+            });
+        }
+        let terminal_published = observer.finish_foreground().unwrap_or(false);
+        if queued_id.is_none() && !terminal_published {
+            send_hosted_operation_terminal_failure(event_tx, &operation_kind);
+        }
         return Err(error);
     }
     let terminal = operation.wait();
@@ -7620,20 +7804,43 @@ fn run_hosted_goal_run(
     control: &TuiSurfaceTaskControl,
     ordinary_turn_runner: &OrdinaryTurnRunner,
 ) {
+    let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
+    let queued_id = submitted_turn.queued_id();
     let Some(session_id) = thread.session_id().map(str::to_string) else {
-        send_goal_history_error(event_tx);
+        if queued_id.is_some() {
+            send_submission_error(
+                event_tx,
+                queued_id,
+                rejection_prompt.as_deref(),
+                goal_history_error_message().to_string(),
+            );
+        } else {
+            send_goal_history_error(event_tx);
+        }
         return;
     };
     let actions = TuiSurfaceActions::new(thread.typed_surface());
     let active_goal = match actions.goal(&session_id) {
         Ok(goal) => goal.filter(|goal| goal.status.should_continue()),
         Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+            if queued_id.is_some() {
+                send_submission_error(
+                    event_tx,
+                    queued_id,
+                    rejection_prompt.as_deref(),
+                    error.to_string(),
+                );
+            } else {
+                let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+            }
             return;
         }
     };
     if let Some(goal) = active_goal.as_ref() {
         let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
+        if let Some(id) = queued_id {
+            let _ = event_tx.send(TuiEvent::QueuedSubmissionStarted { id });
+        }
         if let Err(error) =
             actions.resume_goal_and_run(submitted_turn.prompt().to_string(), control, event_tx)
         {
@@ -7642,6 +7849,9 @@ fn run_hosted_goal_run(
         return;
     }
     let _ = origin;
+    if let Some(id) = queued_id {
+        let _ = event_tx.send(TuiEvent::QueuedSubmissionStarted { id });
+    }
     let request = hosted_turn_request(&submitted_turn, false);
     let outcome = ordinary_turn_runner.run(config, thread, request, event_tx, control);
     let status = match outcome {
@@ -7683,7 +7893,7 @@ fn run_legacy_feature_turn_for_test(
     event_tx: &mpsc::Sender<TuiEvent>,
     controller: &TuiOperationController,
 ) -> io::Result<TuiHostedOperationOutcome> {
-    run_hosted_operation(thread, request, config.clone(), controller, event_tx)
+    run_hosted_operation(thread, request, config.clone(), controller, event_tx, None)
 }
 
 fn hosted_turn_request(
@@ -7765,9 +7975,11 @@ fn show_hosted_goal(
 }
 
 fn send_goal_history_error(event_tx: &mpsc::Sender<TuiEvent>) {
-    let _ = event_tx.send(TuiEvent::Error(
-        "persistent goals require recorded history; enable history before using /goal".to_string(),
-    ));
+    let _ = event_tx.send(TuiEvent::Error(goal_history_error_message().to_string()));
+}
+
+fn goal_history_error_message() -> &'static str {
+    "persistent goals require recorded history; enable history before using /goal"
 }
 
 #[allow(clippy::too_many_arguments)]

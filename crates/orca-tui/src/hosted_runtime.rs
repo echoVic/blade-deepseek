@@ -16,19 +16,26 @@ pub(crate) enum TuiHostedOperationOutcome {
 
 pub(crate) struct TuiHostedEventObserver {
     event_tx: Sender<TuiEvent>,
+    queued_id: Option<u64>,
     state: Mutex<TuiHostedEventObserverState>,
 }
 
 #[derive(Default)]
 struct TuiHostedEventObserverState {
     foreground_finished: bool,
+    queued_submission_started: bool,
     terminal_event: Option<TuiEvent>,
 }
 
 impl TuiHostedEventObserver {
     pub(crate) fn new(event_tx: Sender<TuiEvent>) -> Self {
+        Self::new_with_queued_id(event_tx, None)
+    }
+
+    pub(crate) fn new_with_queued_id(event_tx: Sender<TuiEvent>, queued_id: Option<u64>) -> Self {
         Self {
             event_tx,
+            queued_id,
             state: Mutex::new(TuiHostedEventObserverState::default()),
         }
     }
@@ -47,6 +54,13 @@ impl TuiHostedEventObserver {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    pub(crate) fn queued_submission_started(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .queued_submission_started
     }
 
     fn send(&self, event: TuiEvent) -> io::Result<()> {
@@ -72,7 +86,16 @@ impl EventObserver for TuiHostedEventObserver {
             state.terminal_event = Some(event);
             return Ok(());
         }
-        drop(state);
+        if matches!(event, TuiEvent::TurnStarted { .. })
+            && let Some(id) = self.queued_id
+            && !state.queued_submission_started
+        {
+            state.queued_submission_started = true;
+            drop(state);
+            self.send(TuiEvent::QueuedSubmissionStarted { id })?;
+        } else {
+            drop(state);
+        }
         let notice = background_task_notice_from_event(&event);
         self.send(event)?;
         if let Some(notice) = notice {
@@ -178,5 +201,43 @@ mod tests {
             event_rx.try_recv(),
             Ok(TuiEvent::SessionCompleted { status }) if status == "cancelled"
         ));
+    }
+
+    #[test]
+    fn hosted_observer_acknowledges_queued_id_only_at_runtime_turn_start() {
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let observer = TuiHostedEventObserver::new_with_queued_id(event_tx, Some(42));
+        let mut events = EventFactory::new("queued-turn-start".to_string());
+        let turn_id = orca_core::thread_identity::TurnId::new();
+
+        assert!(!observer.queued_submission_started());
+        observe_event(
+            Some(&observer),
+            events.turn_started(&turn_id, 1, Some("expanded prompt")),
+        )
+        .unwrap();
+
+        assert!(observer.queued_submission_started());
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::QueuedSubmissionStarted { id: 42 })
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::TurnStarted { turn: 1, .. })
+        ));
+
+        let next_turn_id = orca_core::thread_identity::TurnId::new();
+        observe_event(
+            Some(&observer),
+            events.turn_started(&next_turn_id, 2, Some("automatic continuation")),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::TurnStarted { turn: 2, .. })
+        ));
+        assert!(event_rx.try_recv().is_err());
     }
 }

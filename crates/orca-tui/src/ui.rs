@@ -148,6 +148,14 @@ fn main_layout(
     // LOWEST, so giving the transcript `Min(5)` made it steal rows from the `Length` chrome
     // when the transcript overflowed — the input box got squeezed off-screen and the
     // auto-scrolled tail landed behind it. `Fill(1)` makes the transcript yield instead.
+    let fixed_without_queue = goal_height
+        .saturating_add(plan_height)
+        .saturating_add(activity_height)
+        .saturating_add(search_height)
+        .saturating_add(input_height)
+        .saturating_add(1);
+    let queue_preview_height =
+        queue_preview_height.min(area.height.saturating_sub(fixed_without_queue));
     Layout::vertical([
         Constraint::Length(goal_height),
         Constraint::Fill(1),
@@ -4571,6 +4579,18 @@ mod tests {
         assert_eq!(chunks[5].height, 1);
         assert_eq!(chunks[6].height, 3);
         assert_eq!(chunks[7].height, 1);
+    }
+
+    #[test]
+    fn queue_preview_yields_before_search_composer_and_status() {
+        let area = Rect::new(0, 0, 20, 5);
+        let without_queue = main_layout(area, 0, 0, 0, 0, 1, 3);
+        let with_queue = main_layout(area, 0, 0, 0, 3, 1, 3);
+
+        assert_eq!(with_queue[4].height, 0);
+        assert_eq!(with_queue[5].height, without_queue[5].height);
+        assert_eq!(with_queue[6].height, without_queue[6].height);
+        assert_eq!(with_queue[7].height, without_queue[7].height);
     }
 
     #[test]
