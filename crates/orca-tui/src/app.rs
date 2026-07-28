@@ -4958,6 +4958,242 @@ mod tests {
     }
 
     #[test]
+    fn running_queue_preview_restore_and_terminal_dispatch_frames_are_consistent() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.enter_running();
+        let mut config = test_config(HistoryMode::Record);
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let operation = crate::test_support::TestOperationInterrupt::default();
+        let preloaded = Arc::new(Mutex::new(None));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::default();
+
+        for code in [KeyCode::Char('f'), KeyCode::Char('o'), KeyCode::Char('o')] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            handle_status_key(
+                &Event::Key(key),
+                &key,
+                &mut state,
+                &mut config,
+                &shared,
+                &action_tx,
+                &operation,
+                &preloaded,
+                &mut textarea,
+                &mut vim,
+                &theme,
+                None,
+                || Ok(()),
+            )
+            .unwrap();
+        }
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_status_key(
+            &Event::Key(enter),
+            &enter,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &operation,
+            &preloaded,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(state.queued_user_messages.len(), 1);
+        assert!(action_rx.try_recv().is_err());
+        assert!(
+            !state
+                .messages
+                .iter()
+                .any(|message| matches!(message, ChatMessage::User(text) if text == "foo"))
+        );
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| ui::render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+        assert!(format!("{:?}", terminal.backend().buffer()).contains("Queued 1"));
+
+        let restore = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        handle_status_key(
+            &Event::Key(restore),
+            &restore,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &operation,
+            &preloaded,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(state.queued_user_messages.is_empty());
+        assert_eq!(textarea_text(&textarea), "foo");
+
+        textarea.insert_char('!');
+        handle_status_key(
+            &Event::Key(enter),
+            &enter,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &operation,
+            &preloaded,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(action_rx.try_recv().is_err());
+
+        let pending = test_pending_workflow_notifications();
+        let mut presentation = TerminalPresentation::new(
+            false,
+            TerminalPresentationProfile {
+                osc9_supported: false,
+                tmux_passthrough: false,
+            },
+        );
+        handle_runtime_event(
+            TuiEvent::SessionCompleted {
+                status: "success".to_string(),
+            },
+            &mut state,
+            &action_tx,
+            &pending,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut presentation,
+        );
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "foo!"
+        ));
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::User(text)) if text == "foo!"
+        ));
+        assert!(state.queued_user_messages.is_empty());
+        terminal
+            .draw(|frame| ui::render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+        assert!(!format!("{:?}", terminal.backend().buffer()).contains("Queued 1"));
+    }
+
+    #[test]
+    fn hosted_tui_runs_app_state_queued_follow_ups_one_at_a_time_in_fifo_order() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("mock_stream_delay_ms 100".to_string()));
+            harness.recv_until(|event| matches!(event, TuiEvent::TurnStarted { .. }));
+            let first_terminal = harness.recv_until(|event| {
+                matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
+            });
+
+            let mut state = AppState::new(
+                harness.action_tx.clone(),
+                "test".to_string(),
+                "mock".to_string(),
+                "/tmp".to_string(),
+            );
+            for _ in 0..2 {
+                state
+                    .enqueue_user_message(
+                        crate::queued_input::QueuedUserMessage::from_composer(
+                            "mock_history_echo".to_string(),
+                            Vec::new(),
+                            orca_runtime::mentions::MentionBindings::default(),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            state.enter_running();
+            let pending = test_pending_workflow_notifications();
+            let theme = Theme::named(ThemeName::Dark);
+            let mut textarea = TextArea::default();
+            let mut vim = VimState::new(false);
+            let mut presentation = TerminalPresentation::new(
+                false,
+                TerminalPresentationProfile {
+                    osc9_supported: false,
+                    tmux_passthrough: false,
+                },
+            );
+
+            let mut terminal_event = first_terminal;
+            for (turn, expected_count) in [(2, 2usize), (3, 3usize)] {
+                handle_runtime_event(
+                    terminal_event,
+                    &mut state,
+                    &harness.action_tx,
+                    &pending,
+                    &mut textarea,
+                    &mut vim,
+                    &theme,
+                    &mut presentation,
+                );
+                harness.recv_until(|event| matches!(event, TuiEvent::TurnStarted { .. }));
+                state.update(TuiEvent::TurnStarted { turn, task: None });
+                let delta = harness.recv_until(|event| {
+                    matches!(
+                        event,
+                        TuiEvent::MessageDelta(text)
+                            if text.contains("Mock history users:")
+                    )
+                });
+                let TuiEvent::MessageDelta(text) = delta else {
+                    unreachable!()
+                };
+                let expected = format!(
+                    "Mock history users: {}",
+                    std::iter::once("mock_stream_delay_ms 100")
+                        .chain(std::iter::repeat_n("mock_history_echo", expected_count - 1,))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                );
+                assert_eq!(text, expected);
+                terminal_event = harness.recv_until(|event| {
+                    matches!(
+                        event,
+                        TuiEvent::SessionCompleted { status }
+                            if status == "success"
+                    )
+                });
+                if expected_count == 2 {
+                    assert_eq!(state.queued_user_messages.len(), 1);
+                    state.set_status(AppStatus::Running);
+                }
+            }
+
+            assert!(state.queued_user_messages.is_empty());
+            harness.shutdown();
+        });
+    }
+
+    #[test]
     fn search_keyboard_frames_move_active_match_without_composer_mutation() {
         let (mut state, _rx) = test_state();
         for index in 0..30 {

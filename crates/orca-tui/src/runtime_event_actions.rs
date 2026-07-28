@@ -109,7 +109,7 @@ pub(crate) fn handle_runtime_event(
         if dispatch_next_queued_user_message(state, action_tx) == QueuedDispatch::None {
             submit_pending_workflow_notification(state, action_tx, false);
         }
-    } else {
+    } else if !state.queued_follow_up_pending_or_in_flight() {
         submit_pending_workflow_notification(state, action_tx, true);
     }
     if state.auto_scroll {
@@ -204,6 +204,44 @@ mod tests {
             action_rx.try_recv(),
             Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "first"
         ));
+        assert_eq!(state.pending_workflow_notifications.len(), 1);
+    }
+
+    #[test]
+    fn idle_workflow_notification_waits_behind_held_user_follow_up() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        queue_text(&mut state, "user first");
+        state.suspend_queued_follow_up_autosend();
+        let pending = bridge::PendingWorkflowNotifications::new();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut textarea = TextArea::default();
+        let mut vim = VimState::new(false);
+        let mut presentation = test_presentation();
+
+        handle_runtime_event(
+            TuiEvent::WorkflowNotification {
+                id: "workflow-1".to_string(),
+                prompt: "internal workflow".to_string(),
+                status: "completed".to_string(),
+                summary: "done".to_string(),
+            },
+            &mut state,
+            &action_tx,
+            &pending,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut presentation,
+        );
+
+        assert!(action_rx.try_recv().is_err());
+        assert_eq!(state.queued_user_messages.len(), 1);
         assert_eq!(state.pending_workflow_notifications.len(), 1);
     }
 
