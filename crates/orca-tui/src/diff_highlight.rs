@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use crate::syntax_highlight::{
@@ -759,6 +759,21 @@ fn refined_spans(
     (text == line.content).then(|| spans.clone())
 }
 
+fn row_background(kind: DiffLineKind, theme: &Theme) -> Option<Color> {
+    match (kind, theme.color_level) {
+        (_, TerminalColorLevel::Monochrome) | (DiffLineKind::Context, _) => None,
+        (DiffLineKind::Insert, _) => Some(theme.diff_add_bg),
+        (DiffLineKind::Delete, _) => Some(theme.diff_remove_bg),
+    }
+}
+
+fn with_background(mut style: Style, background: Option<Color>) -> Style {
+    if let Some(background) = background {
+        style.bg = Some(background);
+    }
+    style
+}
+
 fn rendered_source_line(
     line: &DiffSourceLine,
     syntax_spans: Option<StyledSourceLine>,
@@ -767,19 +782,23 @@ fn rendered_source_line(
     gutter_width: usize,
 ) -> Line<'static> {
     let fallback_color = source_color(line.kind, theme);
+    let background = row_background(line.kind, theme);
     let mut spans = vec![Span::styled(
         source_gutter(line, gutter_width),
-        Style::default().fg(fallback_color),
+        with_background(Style::default().fg(fallback_color), background),
     )];
+    let content_spans = refined_spans(line, refined)
+        .or(syntax_spans)
+        .unwrap_or_else(|| {
+            vec![Span::styled(
+                line.content.clone(),
+                Style::default().fg(fallback_color),
+            )]
+        });
     spans.extend(
-        refined_spans(line, refined)
-            .or(syntax_spans)
-            .unwrap_or_else(|| {
-                vec![Span::styled(
-                    line.content.clone(),
-                    Style::default().fg(fallback_color),
-                )]
-            }),
+        content_spans
+            .into_iter()
+            .map(|span| Span::styled(span.content, with_background(span.style, background))),
     );
     Line::from(spans)
 }
@@ -1040,7 +1059,7 @@ mod tests {
 
     use orca_core::config::ThemeName;
     use orca_core::tool_types::FileChangePreview;
-    use ratatui::style::{Color, Style};
+    use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
 
     use super::{
@@ -1098,13 +1117,73 @@ mod tests {
             );
             let rendered = render_parsed_diff(&parsed, &theme, None);
 
-            assert!(
-                rendered
-                    .iter()
-                    .flat_map(|line| &line.spans)
-                    .all(|span| color_fits(level, span.style.fg))
-            );
+            assert!(rendered.iter().flat_map(|line| &line.spans).all(|span| {
+                color_fits(level, span.style.fg) && color_fits(level, span.style.bg)
+            }));
         }
+    }
+
+    #[test]
+    fn changed_rows_apply_exact_dark_backgrounds_to_gutter_and_content() {
+        let theme = dark_theme();
+        let lines = render_unified_diff(RUST_DIFF, &theme, None);
+        let deletion = find_rendered_line(&lines, "-fn old");
+        let insertion = find_rendered_line(&lines, "+fn new");
+
+        assert!(
+            deletion
+                .spans
+                .iter()
+                .all(|span| span.style.bg == Some(Color::Rgb(0x4a, 0x22, 0x1d)))
+        );
+        assert!(
+            insertion
+                .spans
+                .iter()
+                .all(|span| span.style.bg == Some(Color::Rgb(0x21, 0x3a, 0x2b)))
+        );
+    }
+
+    #[test]
+    fn diff_backgrounds_preserve_syntax_and_refined_foregrounds() {
+        let theme = dark_theme();
+        let overlay = Color::Rgb(1, 2, 3);
+        let refined = RefinedDiffStyles::from([(
+            1,
+            vec![Span::styled(
+                "fn new() { let value = \"new\"; }",
+                Style::default().fg(overlay).add_modifier(Modifier::ITALIC),
+            )],
+        )]);
+        let lines = render_unified_diff(RUST_DIFF, &theme, Some(&refined));
+        let insertion = find_rendered_line(&lines, "+fn new");
+        let refined_span = insertion
+            .spans
+            .iter()
+            .find(|span| span.style.fg == Some(overlay))
+            .expect("refined foreground");
+
+        assert_eq!(refined_span.style.bg, Some(theme.diff_add_bg));
+        assert!(refined_span.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn monochrome_changed_rows_use_markers_without_backgrounds() {
+        let theme = Theme::resolve(
+            ThemeName::Dark,
+            TerminalProfile {
+                background: TerminalBackground::Dark,
+                color_level: TerminalColorLevel::Monochrome,
+            },
+        );
+        let lines = render_unified_diff(RUST_DIFF, &theme, None);
+        let deletion = find_rendered_line(&lines, "-fn old");
+        let insertion = find_rendered_line(&lines, "+fn new");
+
+        assert!(rendered_text(deletion).contains("- "));
+        assert!(rendered_text(insertion).contains("+ "));
+        assert!(deletion.spans.iter().all(|span| span.style.bg.is_none()));
+        assert!(insertion.spans.iter().all(|span| span.style.bg.is_none()));
     }
 
     fn rendered_text(line: &Line<'_>) -> String {
@@ -1159,6 +1238,17 @@ mod tests {
         source
             .iter()
             .map(|line| highlighter.highlight_line(line).expect("highlighted line"))
+            .collect()
+    }
+
+    fn without_backgrounds(spans: &[Span<'_>]) -> StyledSourceLine {
+        spans
+            .iter()
+            .map(|span| {
+                let mut style = span.style;
+                style.bg = None;
+                Span::styled(span.content.to_string(), style)
+            })
             .collect()
     }
 
@@ -2581,10 +2671,10 @@ metadata instead of paired new header
             &theme,
         );
 
-        assert_eq!(deleted.spans[1..], old_expected[1]);
-        assert_eq!(value.spans[1..], new_expected[0]);
-        assert_eq!(print.spans[1..], new_expected[1]);
-        assert_ne!(value.spans[1..], leaked[2]);
+        assert_eq!(without_backgrounds(&deleted.spans[1..]), old_expected[1]);
+        assert_eq!(without_backgrounds(&value.spans[1..]), new_expected[0]);
+        assert_eq!(without_backgrounds(&print.spans[1..]), new_expected[1]);
+        assert_ne!(without_backgrounds(&value.spans[1..]), leaked[2]);
     }
 
     #[test]
@@ -2609,10 +2699,10 @@ metadata instead of paired new header
         let fresh_old = highlight_sequence("item.py", &["old tail\"\"\""], &theme);
         let fresh_new = highlight_sequence("item.py", &["new tail\"\"\""], &theme);
 
-        assert_eq!(deleted.spans[1..], old_expected[1]);
-        assert_eq!(inserted.spans[1..], new_expected[1]);
-        assert_ne!(deleted.spans[1..], fresh_old[0]);
-        assert_ne!(inserted.spans[1..], fresh_new[0]);
+        assert_eq!(without_backgrounds(&deleted.spans[1..]), old_expected[1]);
+        assert_eq!(without_backgrounds(&inserted.spans[1..]), new_expected[1]);
+        assert_ne!(without_backgrounds(&deleted.spans[1..]), fresh_old[0]);
+        assert_ne!(without_backgrounds(&inserted.spans[1..]), fresh_new[0]);
     }
 
     #[test]
@@ -2717,8 +2807,8 @@ metadata instead of paired new header
         let fresh = highlight_sequence("item.py", &["value = 1"], &theme);
         let leaked = highlight_sequence("item.py", &["\"\"\"open string", "value = 1"], &theme);
 
-        assert_eq!(inserted.spans[1..], fresh[0]);
-        assert_ne!(inserted.spans[1..], leaked[1]);
+        assert_eq!(without_backgrounds(&inserted.spans[1..]), fresh[0]);
+        assert_ne!(without_backgrounds(&inserted.spans[1..]), leaked[1]);
     }
 
     #[test]
@@ -3077,7 +3167,7 @@ class Item:
         assert!(refined.contains_key(&4));
         assert_ne!(warm_field.spans[1..], cold_field.spans[1..]);
         assert_eq!(refined.get(&4), Some(&direct[3]));
-        assert_eq!(warm_field.spans[1..], direct[3]);
+        assert_eq!(without_backgrounds(&warm_field.spans[1..]), direct[3]);
     }
 
     #[test]
