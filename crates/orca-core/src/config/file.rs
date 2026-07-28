@@ -46,6 +46,8 @@ pub struct FileConfig {
     pub theme: ThemeName,
     #[serde(default)]
     pub vim_mode: bool,
+    #[serde(default)]
+    pub vim_insert_escape: Option<crate::config::VimInsertEscapeSequence>,
     #[serde(default = "default_true")]
     pub update_check: bool,
     #[serde(default)]
@@ -90,6 +92,8 @@ struct RawFileConfig {
     pub theme: ThemeName,
     #[serde(default)]
     pub vim_mode: bool,
+    #[serde(default)]
+    pub vim_insert_escape: Option<crate::config::VimInsertEscapeSequence>,
     #[serde(default = "default_true")]
     pub update_check: bool,
     #[serde(default)]
@@ -118,6 +122,7 @@ impl Default for FileConfig {
             workflows: WorkflowFileConfig::default(),
             theme: ThemeName::default(),
             vim_mode: false,
+            vim_insert_escape: None,
             update_check: true,
             desktop_notifications: false,
             terminal_notifications: true,
@@ -151,6 +156,7 @@ impl From<RawFileConfig> for FileConfig {
             workflows,
             theme: raw.theme,
             vim_mode: raw.vim_mode,
+            vim_insert_escape: raw.vim_insert_escape,
             update_check: raw.update_check,
             desktop_notifications: raw.desktop_notifications,
             terminal_notifications: raw.terminal_notifications,
@@ -1105,6 +1111,45 @@ auto_memory = true
         assert!(!config.update_check);
         assert!(config.desktop_notifications);
         assert!(config.auto_memory);
+    }
+
+    #[test]
+    fn vim_insert_escape_defaults_to_none_and_parses_valid_sequence() {
+        let omitted: FileConfig = toml::from_str("").unwrap();
+        let configured: FileConfig = toml::from_str(
+            r#"
+vim_mode = true
+vim_insert_escape = "jj"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(omitted.vim_insert_escape, None);
+        assert_eq!(
+            configured
+                .vim_insert_escape
+                .as_ref()
+                .map(crate::config::VimInsertEscapeSequence::as_str),
+            Some("jj")
+        );
+    }
+
+    #[test]
+    fn vim_insert_escape_rejects_invalid_effective_value() {
+        let error = toml::from_str::<FileConfig>(r#"vim_insert_escape = "j""#).unwrap_err();
+        assert!(error.to_string().contains("exactly two"));
+    }
+
+    #[test]
+    fn invalid_layered_vim_insert_escape_uses_existing_default_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("config.toml");
+        std::fs::write(&user_path, r#"vim_insert_escape = "j""#).unwrap();
+
+        let config = load_layered_config_from_paths(&user_path, dir.path());
+
+        assert_eq!(config.vim_insert_escape, None);
+        assert_eq!(config.theme, ThemeName::Auto);
     }
 
     #[test]
