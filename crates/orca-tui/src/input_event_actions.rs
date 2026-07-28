@@ -79,6 +79,42 @@ mod focus_tests {
     }
 }
 
+#[cfg(test)]
+mod search_paste_tests {
+    use crossterm::event::Event;
+    use tui_textarea::TextArea;
+
+    use super::handle_paste_event;
+    use crate::composer_textarea::textarea_text;
+    use crate::test_support::test_run_config;
+    use crate::types::AppState;
+
+    #[test]
+    fn search_paste_updates_query_without_touching_composer() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.open_transcript_search();
+        let config = test_run_config();
+        let mut textarea = TextArea::from(["composer"]);
+
+        assert!(handle_paste_event(
+            &Event::Paste("one\r\ntwo".to_string()),
+            &mut state,
+            &config,
+            &mut textarea,
+        ));
+
+        assert_eq!(state.transcript_search.query(), "one two");
+        assert_eq!(textarea_text(&textarea), "composer");
+        assert!(state.pending_pastes.is_empty());
+    }
+}
+
 /// A terminal resize re-wraps every transcript line, so content positions
 /// captured under the old width no longer describe the same text. Drop the
 /// selection rather than let it highlight (and copy) unrelated rows.
@@ -212,6 +248,11 @@ pub(crate) fn handle_paste_event(
     let Event::Paste(pasted) = ev else {
         return false;
     };
+    if state.transcript_search.open {
+        state.transcript_search.insert_paste(pasted);
+        state.refresh_transcript_search();
+        return true;
+    }
     match state.status {
         AppStatus::Setup if state.setup_step == 1 => {
             insert_pasted_text(textarea, pasted);
