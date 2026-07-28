@@ -469,6 +469,62 @@ impl From<OutputFormatArg> for OutputFormat {
     }
 }
 
+impl From<ExecArgs> for orca_runtime::command::exec::ExecCommandRequest {
+    fn from(args: ExecArgs) -> Self {
+        Self {
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            output_format: args.output_format.into(),
+            cwd: args.cwd,
+            approval_mode: args.approval_mode,
+            model: args.model,
+            api_key: args.api_key,
+            base_url: args.base_url,
+            verifier: args.verifier,
+            max_budget: args.max_budget,
+            resume: args.resume,
+            fork: args.fork,
+            continue_latest: args.continue_latest,
+            no_history: args.no_history,
+            save_history: args.save_history,
+            provider: args.provider,
+            prompt: args.prompt,
+        }
+    }
+}
+
+impl From<HistoryArgs> for orca_runtime::command::history::HistoryCommandRequest {
+    fn from(args: HistoryArgs) -> Self {
+        use orca_runtime::command::history::HistoryCommandRequest;
+
+        match args.command {
+            HistoryCommand::List { limit, all } => HistoryCommandRequest::List { limit, all },
+            HistoryCommand::Show { session } => HistoryCommandRequest::Show { session },
+            HistoryCommand::Archive { session } => HistoryCommandRequest::Archive { session },
+            HistoryCommand::Delete { session } => HistoryCommandRequest::Delete { session },
+            HistoryCommand::Rename { session, title } => {
+                HistoryCommandRequest::Rename { session, title }
+            }
+            HistoryCommand::Search { query, all } => HistoryCommandRequest::Search { query, all },
+            HistoryCommand::Compress { session } => HistoryCommandRequest::Compress { session },
+        }
+    }
+}
+
+impl From<TrustArgs> for orca_runtime::command::trust::TrustCommandRequest {
+    fn from(args: TrustArgs) -> Self {
+        use orca_runtime::command::trust::TrustAction as RuntimeTrustAction;
+
+        Self {
+            cwd: args.cwd,
+            action: match args.action {
+                TrustAction::Show => RuntimeTrustAction::Show,
+                TrustAction::Add => RuntimeTrustAction::Add,
+                TrustAction::Remove => RuntimeTrustAction::Remove,
+            },
+        }
+    }
+}
+
 pub fn run() -> i32 {
     let cli = Cli::parse();
 
@@ -480,51 +536,12 @@ pub fn run() -> i32 {
     }
 
     match cli.command {
-        Some(Command::Exec(args)) => run_exec(args),
-        Some(Command::History(args)) => run_history(args),
+        Some(Command::Exec(args)) => orca_runtime::command::exec::run(args.into()),
+        Some(Command::History(args)) => orca_runtime::command::history::run(args.into()),
         Some(Command::Workflow(args)) => orca_runtime::workflow::command::run(args.into()),
-        Some(Command::Trust(args)) => run_trust(args),
+        Some(Command::Trust(args)) => orca_runtime::command::trust::run(args.into()),
         Some(Command::SubagentWorker(args)) => run_subagent_worker(args),
         None => run_placeholder(cli),
-    }
-}
-
-fn run_trust(args: TrustArgs) -> i32 {
-    use crate::config::folder_trust::{self, TrustLevel};
-
-    let cwd = args
-        .cwd
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    match args.action {
-        TrustAction::Show => {
-            let level = match folder_trust::trust_level(&cwd) {
-                Some(TrustLevel::Trusted) => "trusted",
-                Some(TrustLevel::Untrusted) => "untrusted",
-                None => "unknown (treated as untrusted)",
-            };
-            println!("{}: {level}", cwd.display());
-            0
-        }
-        TrustAction::Add => match folder_trust::set_trust(&cwd, TrustLevel::Trusted) {
-            Ok(()) => {
-                println!("trusted {}", cwd.display());
-                0
-            }
-            Err(error) => {
-                eprintln!("orca: failed to trust folder: {error}");
-                1
-            }
-        },
-        TrustAction::Remove => match folder_trust::set_trust(&cwd, TrustLevel::Untrusted) {
-            Ok(()) => {
-                println!("marked {} untrusted", cwd.display());
-                0
-            }
-            Err(error) => {
-                eprintln!("orca: failed to update folder trust: {error}");
-                1
-            }
-        },
     }
 }
 
@@ -575,312 +592,6 @@ fn parse_reasoning_effort_value(value: &str) -> Result<ReasoningEffort, String> 
         other => Err(format!(
             "unsupported reasoning_effort '{other}'. Use high or max"
         )),
-    }
-}
-
-fn read_stdin_text() -> Result<String, String> {
-    let mut buffer = String::new();
-    io::stdin()
-        .read_to_string(&mut buffer)
-        .map_err(|error| format!("failed to read stdin: {error}"))?;
-    Ok(buffer)
-}
-
-fn prompt_with_stdin_context(prompt: &str, stdin_text: &str) -> String {
-    let mut combined = format!("{prompt}\n\n<stdin>\n{stdin_text}");
-    if !stdin_text.ends_with('\n') {
-        combined.push('\n');
-    }
-    combined.push_str("</stdin>");
-    combined
-}
-
-fn resolve_exec_prompt_from_stdin(prompt_args: Vec<String>) -> Result<String, String> {
-    let force_stdin = prompt_args.len() == 1 && prompt_args[0] == "-";
-    let has_prompt = !prompt_args.is_empty() && !force_stdin;
-    let prompt = if has_prompt {
-        prompt_args.join(" ")
-    } else {
-        String::new()
-    };
-
-    if force_stdin || !has_prompt {
-        if io::stdin().is_terminal() {
-            return Err(
-                "No prompt provided. Either specify one as an argument or pipe the prompt into stdin."
-                    .to_string(),
-            );
-        }
-        let stdin_text = read_stdin_text()?;
-        if stdin_text.trim().is_empty() {
-            return Err("No prompt provided via stdin.".to_string());
-        }
-        return Ok(stdin_text);
-    }
-
-    if io::stdin().is_terminal() {
-        return Ok(prompt);
-    }
-
-    let stdin_text = read_stdin_text()?;
-    if stdin_text.trim().is_empty() {
-        Ok(prompt)
-    } else {
-        Ok(prompt_with_stdin_context(&prompt, &stdin_text))
-    }
-}
-
-fn run_exec(args: ExecArgs) -> i32 {
-    if args.no_history && (args.resume.is_some() || args.fork.is_some() || args.continue_latest) {
-        eprintln!("orca: --resume/--fork/--continue cannot be combined with --no-history");
-        return 1;
-    }
-    if args.no_history && args.save_history {
-        eprintln!("orca: --save-history cannot be combined with --no-history");
-        return 1;
-    }
-    let resume_like =
-        args.resume.is_some() as u8 + args.fork.is_some() as u8 + args.continue_latest as u8;
-    if resume_like > 1 {
-        eprintln!("orca: --resume, --fork, and --continue are mutually exclusive");
-        return 1;
-    }
-
-    let prompt = match resolve_exec_prompt_from_stdin(args.prompt) {
-        Ok(prompt) => prompt,
-        Err(error) => {
-            eprintln!("orca: {error}");
-            return 1;
-        }
-    };
-    let config_cwd = args
-        .cwd
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let file_config = match load_effective_file_config(
-        &config_cwd,
-        ConfigOverrides {
-            model: args.model,
-            mode: args.approval_mode,
-            api_key: args.api_key,
-            base_url: args.base_url,
-            reasoning_effort: None,
-        },
-    ) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("orca: {error}");
-            return 1;
-        }
-    };
-    let api_key = file_config.api_key;
-    let base_url = file_config.base_url;
-
-    let model = file_config.model;
-    let model = match ModelSelection::parse(model) {
-        Ok(model) => model,
-        Err(error) => {
-            eprintln!("orca: {error}");
-            return 1;
-        }
-    };
-
-    let output_format = args.output_format;
-    let fallback =
-        if args.no_history || (output_format == OutputFormatArg::Jsonl && !args.save_history) {
-            HistoryMode::Disabled
-        } else {
-            HistoryMode::Record
-        };
-    let history_mode = resolve_history_mode(args.resume, args.fork, args.continue_latest, fallback);
-
-    let config = RunConfig {
-        app_version: env!("CARGO_PKG_VERSION").to_string(),
-        prompt,
-        cwd: args.cwd,
-        output_format: output_format.into(),
-        approval_mode: file_config.mode.unwrap_or_default(),
-        provider: args.provider,
-        verifier: args.verifier,
-        model,
-        model_runtime: file_config.model_runtime,
-        reasoning_effort: file_config.reasoning_effort,
-        api_key,
-        base_url,
-        history_mode,
-        show_session_picker: false,
-        active_permission_profile: None,
-        permission_profiles: file_config.permission_profiles,
-        runtime_workspace_roots: None,
-        permission_rules: file_config.permissions,
-        additional_working_directories: Vec::new(),
-        max_budget_usd: args.max_budget,
-        mcp_servers: file_config.mcp_servers,
-        hooks: file_config.hooks,
-        external_tools: crate::tools::external::load_default_external_tools(),
-        subagents: file_config.subagents.normalized(),
-        tools: file_config.tools.normalized(),
-        workflows: file_config.workflows.resolved(),
-        theme: file_config.theme,
-        vim_mode: file_config.vim_mode,
-        update_check: file_config.update_check,
-        desktop_notifications: file_config.desktop_notifications,
-        auto_memory: file_config.auto_memory,
-    };
-
-    controller::run(config)
-}
-
-fn run_history(args: HistoryArgs) -> i32 {
-    match args.command {
-        HistoryCommand::List { limit, all } => {
-            match history::list_sessions_with_archived(limit, all) {
-                Ok(sessions) => {
-                    for session in sessions {
-                        let model = session.model.as_deref().unwrap_or("-");
-                        let state = if session.archived {
-                            "archived"
-                        } else {
-                            "active"
-                        };
-                        println!(
-                            "{}\t{}\t{}\t{}\t{}\t{}",
-                            session.session_id,
-                            session.updated_at.to_rfc3339(),
-                            state,
-                            session.provider,
-                            model,
-                            session.title
-                        );
-                    }
-                    0
-                }
-                Err(error) => {
-                    eprintln!("orca: failed to list history: {error}");
-                    1
-                }
-            }
-        }
-        HistoryCommand::Show { session } => match history::load_session(&session) {
-            Ok(transcript) => {
-                println!("Session: {}", transcript.meta.session_id);
-                println!("Title: {}", transcript.meta.title);
-                println!("Created: {}", transcript.meta.created_at.to_rfc3339());
-                println!("Provider: {}", transcript.meta.provider);
-                println!("Model: {}", transcript.meta.model.as_deref().unwrap_or("-"));
-                if let Some(parent_id) = &transcript.meta.parent_id {
-                    println!("Parent: {parent_id}");
-                }
-                println!("Forked: {}", transcript.meta.forked);
-                if !transcript.compactions.is_empty() {
-                    println!("Compactions: {}", transcript.compactions.len());
-                    for compaction in &transcript.compactions {
-                        println!(
-                            "  {} {} -> {} messages",
-                            compaction.collapsed_at.to_rfc3339(),
-                            compaction.before_messages,
-                            compaction.after_messages
-                        );
-                    }
-                }
-                if !transcript.summaries.is_empty() {
-                    println!("Summaries: {}", transcript.summaries.len());
-                    for summary in &transcript.summaries {
-                        println!(
-                            "  {} {} -> {} messages: {}",
-                            summary.summarized_at.to_rfc3339(),
-                            summary.before_messages,
-                            summary.after_messages,
-                            summary.summary.lines().next().unwrap_or_default()
-                        );
-                    }
-                }
-                if let Some(usage) = transcript.usage {
-                    println!(
-                        "Usage: input={} output={} cache={} total={}",
-                        usage.input_tokens,
-                        usage.output_tokens,
-                        usage.cache_tokens,
-                        usage.total_tokens()
-                    );
-                    println!("Estimated cost: ${:.6}", usage.estimated_cost_usd);
-                }
-                println!("CWD: {}", transcript.meta.cwd);
-                println!("Path: {}", transcript.path.display());
-                println!();
-                for message in transcript.messages {
-                    print_message(message);
-                }
-                0
-            }
-            Err(error) => {
-                eprintln!("orca: failed to show history: {error}");
-                1
-            }
-        },
-        HistoryCommand::Archive { session } => match history::archive_session(&session) {
-            Ok(path) => {
-                println!("archived {}", path.display());
-                0
-            }
-            Err(error) => {
-                eprintln!("orca: failed to archive history: {error}");
-                1
-            }
-        },
-        HistoryCommand::Delete { session } => match history::delete_session(&session) {
-            Ok(path) => {
-                println!("deleted {}", path.display());
-                0
-            }
-            Err(error) => {
-                eprintln!("orca: failed to delete history: {error}");
-                1
-            }
-        },
-        HistoryCommand::Rename { session, title } => {
-            match history::rename_session(&session, &title) {
-                Ok(path) => {
-                    println!("renamed {}", path.display());
-                    0
-                }
-                Err(error) => {
-                    eprintln!("orca: failed to rename history: {error}");
-                    1
-                }
-            }
-        }
-        HistoryCommand::Search { query, all } => match history::search_sessions(&query, all) {
-            Ok(hits) => {
-                for hit in hits {
-                    let state = if hit.archived { "archived" } else { "active" };
-                    println!(
-                        "{}\t{}\t{}\t{}:{}\t{}",
-                        hit.session_id,
-                        state,
-                        hit.title,
-                        hit.path.display(),
-                        hit.line_number,
-                        hit.line
-                    );
-                }
-                0
-            }
-            Err(error) => {
-                eprintln!("orca: failed to search history: {error}");
-                1
-            }
-        },
-        HistoryCommand::Compress { session } => match history::compress_session(&session) {
-            Ok(path) => {
-                println!("compressed {}", path.display());
-                0
-            }
-            Err(error) => {
-                eprintln!("orca: failed to compress history: {error}");
-                1
-            }
-        },
     }
 }
 
@@ -1016,41 +727,6 @@ fn resolve_worker_api_key_from_reader(
         return Err("worker credential from stdin exceeds 64 KiB".to_string());
     }
     Ok(Some(api_key))
-}
-
-fn print_message(message: crate::provider::conversation::Message) {
-    use crate::provider::conversation::Message;
-
-    match message {
-        Message::System { content, .. } => println!("[system]\n{}\n", content.trim()),
-        Message::User { content, .. } => println!("[user]\n{}\n", content.trim()),
-        Message::Assistant {
-            content,
-            reasoning_content,
-            tool_calls,
-            ..
-        } => {
-            println!("[assistant]");
-            if let Some(reasoning) = reasoning_content.filter(|text| !text.trim().is_empty()) {
-                println!("reasoning: {}", reasoning.trim());
-            }
-            if let Some(content) = content.filter(|text| !text.trim().is_empty()) {
-                println!("{}", content.trim());
-            }
-            for tool_call in tool_calls {
-                println!(
-                    "tool_call {} {} {}",
-                    tool_call.id, tool_call.function_name, tool_call.arguments
-                );
-            }
-            println!();
-        }
-        Message::Tool {
-            tool_call_id,
-            content,
-            ..
-        } => println!("[tool {tool_call_id}]\n{}\n", content.trim()),
-    }
 }
 
 fn resolve_history_mode(
