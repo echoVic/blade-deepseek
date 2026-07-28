@@ -24,6 +24,7 @@ use crate::edit_highlight_worker::DrainResults;
 use crate::edit_highlight_worker::{
     EditHighlightJob, EditHighlightOutcome, EditHighlightResult, EditHighlightRuntime,
 };
+use crate::queued_input::{QueuedComposerState, QueuedUserMessage};
 use crate::streaming_markdown::{StreamingMarkdownAction, StreamingMarkdownAssembler};
 use crate::syntax_highlight::{SyntaxTheme, highlighter_for_path};
 use crate::terminal_capabilities::{TerminalColorLevel, syntax_style_revision};
@@ -771,6 +772,10 @@ pub struct AppState {
     pub show_shortcuts: bool,
     pub input_history: Vec<String>,
     pub(crate) pending_pastes: Vec<(String, String)>,
+    pub(crate) queued_user_messages: VecDeque<QueuedUserMessage>,
+    pub(crate) queued_submission_in_flight: Option<QueuedUserMessage>,
+    pub(crate) queued_follow_up_autosend: bool,
+    pub(crate) queued_input_error: Option<String>,
     pub history_cursor: Option<usize>,
     pub draft_before_history: Option<String>,
     pub last_ctrl_c: Option<Instant>,
@@ -917,6 +922,10 @@ impl AppState {
             show_shortcuts: false,
             input_history: load_input_history(),
             pending_pastes: Vec::new(),
+            queued_user_messages: VecDeque::new(),
+            queued_submission_in_flight: None,
+            queued_follow_up_autosend: true,
+            queued_input_error: None,
             history_cursor: None,
             draft_before_history: None,
             last_ctrl_c: None,
@@ -1523,6 +1532,7 @@ impl AppState {
 
     pub(crate) fn replace_messages(&mut self, messages: impl IntoIterator<Item = ChatMessage>) {
         self.reset_assistant_stream();
+        self.reset_queued_user_messages();
         self.messages = messages.into_iter().collect();
         self.applied_diff_highlights.clear();
         self.clear_pending_edit_highlights();
@@ -1535,6 +1545,7 @@ impl AppState {
 
     pub(crate) fn clear_messages(&mut self) {
         self.reset_assistant_stream();
+        self.reset_queued_user_messages();
         self.transcript_search.reset();
         self.messages.clear();
         self.message_revisions.clear();
@@ -1971,6 +1982,90 @@ fn append_input_history(prompt: &str) {
 }
 
 impl AppState {
+    pub(crate) fn enqueue_user_message(
+        &mut self,
+        message: QueuedUserMessage,
+    ) -> Result<(), QueuedUserMessage> {
+        if self.queued_user_messages.len() >= crate::channels::USER_ACTION_CAPACITY {
+            return Err(message);
+        }
+        self.queued_user_messages.push_back(message);
+        self.queued_input_error = None;
+        Ok(())
+    }
+
+    pub(crate) fn pop_latest_queued_message(&mut self) -> Option<QueuedUserMessage> {
+        let message = self.queued_user_messages.pop_back();
+        if message.is_some() {
+            self.queued_input_error = None;
+        }
+        message
+    }
+
+    pub(crate) fn begin_next_queued_message(&mut self) -> Option<UserAction> {
+        if self.status != AppStatus::Idle
+            || !self.queued_follow_up_autosend
+            || self.queued_submission_in_flight.is_some()
+        {
+            return None;
+        }
+        let message = self.queued_user_messages.pop_front()?;
+        self.push_message(ChatMessage::User(message.visible_text().to_string()));
+        self.enter_running();
+        self.scroll_to_bottom();
+        self.queued_submission_in_flight = Some(message.clone());
+        self.queued_input_error = None;
+        Some(UserAction::SubmitWithMentions {
+            prompt: message.submission_text().to_string(),
+            bindings: message.submission_bindings().clone(),
+        })
+    }
+
+    pub(crate) fn commit_queued_submission_admission(&mut self) {
+        let Some(prompt) = self
+            .queued_submission_in_flight
+            .as_ref()
+            .map(|message| message.visible_text().to_string())
+        else {
+            return;
+        };
+        self.record_prompt(prompt);
+    }
+
+    pub(crate) fn rollback_queued_submission(&mut self) -> Option<QueuedUserMessage> {
+        let message = self.queued_submission_in_flight.take()?;
+        self.remove_after_last_user();
+        self.queued_user_messages.push_front(message.clone());
+        self.set_status(AppStatus::Idle);
+        Some(message)
+    }
+
+    pub(crate) fn take_rejected_queued_composer_state(&mut self) -> Option<QueuedComposerState> {
+        let message = self.queued_submission_in_flight.take()?;
+        self.suspend_queued_follow_up_autosend();
+        self.queued_input_error = None;
+        Some(message.into_composer_state())
+    }
+
+    pub(crate) fn suspend_queued_follow_up_autosend(&mut self) {
+        self.queued_follow_up_autosend = false;
+    }
+
+    pub(crate) fn resume_queued_follow_up_autosend(&mut self) {
+        self.queued_follow_up_autosend = true;
+    }
+
+    pub(crate) fn queued_follow_up_pending_or_in_flight(&self) -> bool {
+        !self.queued_user_messages.is_empty() || self.queued_submission_in_flight.is_some()
+    }
+
+    fn reset_queued_user_messages(&mut self) {
+        self.queued_user_messages.clear();
+        self.queued_submission_in_flight = None;
+        self.queued_follow_up_autosend = true;
+        self.queued_input_error = None;
+    }
+
     pub fn record_prompt(&mut self, prompt: String) {
         if self
             .input_history
@@ -2132,6 +2227,7 @@ impl AppState {
             TuiEvent::TurnStarted { .. } => {
                 self.recoverable_operation_id = None;
                 self.suppress_background_main_session_output = false;
+                self.queued_submission_in_flight = None;
                 self.enter_running();
             }
             TuiEvent::BackgroundTaskOutputAttached { .. } => {
@@ -3242,6 +3338,131 @@ mod tests {
                 )
             },
         );
+    }
+
+    fn queued(text: &str) -> crate::queued_input::QueuedUserMessage {
+        crate::queued_input::QueuedUserMessage::from_composer(
+            text.to_string(),
+            Vec::new(),
+            orca_runtime::mentions::MentionBindings::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn queued_follow_ups_promote_fifo_restore_lifo_and_fence_admission() {
+        let mut state = state();
+        state.enqueue_user_message(queued("first")).unwrap();
+        state.enqueue_user_message(queued("second")).unwrap();
+        state.enqueue_user_message(queued("third")).unwrap();
+        state.set_status(AppStatus::Idle);
+
+        let action = state.begin_next_queued_message().expect("first action");
+        assert!(matches!(
+            action,
+            UserAction::SubmitWithMentions { prompt, .. } if prompt == "first"
+        ));
+        assert_eq!(state.queued_user_messages.len(), 2);
+        assert!(state.queued_submission_in_flight.is_some());
+        assert!(state.begin_next_queued_message().is_none());
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::User(text)) if text == "first"
+        ));
+        assert!(!state.input_history.iter().any(|entry| entry == "first"));
+        state.commit_queued_submission_admission();
+        assert_eq!(
+            state.input_history.last().map(String::as_str),
+            Some("first")
+        );
+
+        state.update(TuiEvent::TurnStarted {
+            turn: 1,
+            task: None,
+        });
+        assert!(state.queued_submission_in_flight.is_none());
+        assert_eq!(
+            state.pop_latest_queued_message().unwrap().visible_text(),
+            "third"
+        );
+        assert_eq!(
+            state.queued_user_messages.front().unwrap().visible_text(),
+            "second"
+        );
+    }
+
+    #[test]
+    fn queued_follow_up_capacity_matches_user_action_mailbox() {
+        let mut state = state();
+        for index in 0..crate::channels::USER_ACTION_CAPACITY {
+            state
+                .enqueue_user_message(queued(&format!("queued {index}")))
+                .unwrap();
+        }
+        let rejected = state
+            .enqueue_user_message(queued("overflow"))
+            .expect_err("65th item rejected");
+        assert_eq!(rejected.visible_text(), "overflow");
+        assert_eq!(
+            state.queued_user_messages.len(),
+            crate::channels::USER_ACTION_CAPACITY
+        );
+    }
+
+    #[test]
+    fn queued_submission_rollback_and_rejection_preserve_distinct_paths() {
+        let mut state = state();
+        state.enqueue_user_message(queued("first")).unwrap();
+        state.set_status(AppStatus::Idle);
+        state.begin_next_queued_message().unwrap();
+
+        let rolled_back = state.rollback_queued_submission().unwrap();
+        assert_eq!(rolled_back.visible_text(), "first");
+        assert_eq!(
+            state.queued_user_messages.front().unwrap().visible_text(),
+            "first"
+        );
+        assert!(
+            !state
+                .messages
+                .iter()
+                .any(|message| matches!(message, ChatMessage::User(text) if text == "first"))
+        );
+        assert!(!state.input_history.iter().any(|entry| entry == "first"));
+
+        state.begin_next_queued_message().unwrap();
+        state.update(TuiEvent::SubmissionRejected {
+            prompt: "first".to_string(),
+            message: "rejected".to_string(),
+        });
+        let restored = state.take_rejected_queued_composer_state().unwrap();
+        assert_eq!(restored.visible_text, "first");
+        assert!(state.queued_submission_in_flight.is_none());
+        assert!(!state.queued_follow_up_autosend);
+        assert!(state.queued_user_messages.is_empty());
+    }
+
+    #[test]
+    fn conversation_replacement_resets_all_queued_follow_up_state() {
+        for clear in [false, true] {
+            let mut state = state();
+            state.enqueue_user_message(queued("queued")).unwrap();
+            state.queued_submission_in_flight = Some(queued("in flight"));
+            state.suspend_queued_follow_up_autosend();
+            state.queued_input_error = Some("full".to_string());
+
+            if clear {
+                state.clear_messages();
+            } else {
+                state.replace_messages([ChatMessage::System("replacement".to_string())]);
+            }
+
+            assert!(state.queued_user_messages.is_empty());
+            assert!(state.queued_submission_in_flight.is_none());
+            assert!(state.queued_follow_up_autosend);
+            assert!(state.queued_input_error.is_none());
+            assert!(!state.queued_follow_up_pending_or_in_flight());
+        }
     }
 
     #[test]
