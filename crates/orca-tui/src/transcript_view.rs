@@ -1009,7 +1009,7 @@ mod tests {
     };
     use crate::selection::{SelectionGranularity, SelectionPos, TranscriptSelection};
     use crate::theme::Theme;
-    use crate::types::ChatMessage;
+    use crate::types::{AppState, ChatMessage, TuiEvent};
     use crate::ui::build_lines_for_messages;
 
     fn theme() -> Theme {
@@ -1709,6 +1709,202 @@ mod tests {
 
         assert_eq!(*built_indices.borrow(), vec![1]);
         assert_eq!(cache.last_prepare_visited(), 1);
+    }
+
+    #[test]
+    fn thousand_streaming_blocks_rebuild_only_the_active_tail() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        for index in 0..1_000 {
+            state.update(TuiEvent::MessageDelta(format!("block {index}\n\n")));
+        }
+
+        assert_eq!(state.messages.len(), 1_000);
+        assert!(
+            state
+                .messages
+                .iter()
+                .all(|message| matches!(message, ChatMessage::AssistantChunk { .. }))
+        );
+        let frozen_revisions = state.message_revisions.clone();
+        let theme = theme();
+        let built_indices = RefCell::new(Vec::new());
+        let rebuilt_text_bytes = Cell::new(0);
+        state.transcript_render_cache.prepare(
+            &state.messages,
+            &state.message_revisions,
+            TranscriptRenderContext::new(&theme, 80, 0, false).with_syntax_theme_revision(1),
+            |index, message, theme, width, tick, force_expand| {
+                built_indices.borrow_mut().push(index);
+                if let ChatMessage::Assistant(text) | ChatMessage::AssistantChunk { text, .. } =
+                    message
+                {
+                    rebuilt_text_bytes.set(rebuilt_text_bytes.get() + text.len());
+                }
+                build_lines_for_messages(
+                    std::slice::from_ref(message),
+                    theme,
+                    width,
+                    tick,
+                    force_expand,
+                )
+            },
+        );
+        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 1_000);
+
+        built_indices.borrow_mut().clear();
+        rebuilt_text_bytes.set(0);
+        state.update(TuiEvent::MessageDelta("live tail\n".to_string()));
+        state.transcript_render_cache.prepare(
+            &state.messages,
+            &state.message_revisions,
+            TranscriptRenderContext::new(&theme, 80, 0, false).with_syntax_theme_revision(1),
+            |index, message, theme, width, tick, force_expand| {
+                built_indices.borrow_mut().push(index);
+                if let ChatMessage::Assistant(text) | ChatMessage::AssistantChunk { text, .. } =
+                    message
+                {
+                    rebuilt_text_bytes.set(rebuilt_text_bytes.get() + text.len());
+                }
+                build_lines_for_messages(
+                    std::slice::from_ref(message),
+                    theme,
+                    width,
+                    tick,
+                    force_expand,
+                )
+            },
+        );
+
+        assert_eq!(*built_indices.borrow(), vec![1_000]);
+        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 1);
+        assert_eq!(rebuilt_text_bytes.get(), "live tail\n".len());
+        assert_eq!(
+            &state.message_revisions[..1_000],
+            frozen_revisions.as_slice()
+        );
+
+        built_indices.borrow_mut().clear();
+        state.transcript_render_cache.prepare(
+            &state.messages,
+            &state.message_revisions,
+            TranscriptRenderContext::new(&theme, 80, 0, false).with_syntax_theme_revision(1),
+            |index, message, theme, width, tick, force_expand| {
+                built_indices.borrow_mut().push(index);
+                build_lines_for_messages(
+                    std::slice::from_ref(message),
+                    theme,
+                    width,
+                    tick,
+                    force_expand,
+                )
+            },
+        );
+        assert!(built_indices.borrow().is_empty());
+        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 0);
+
+        let _ = state.transcript_render_cache.viewport(0, 500, 20);
+        state.transcript_render_cache.prepare(
+            &state.messages,
+            &state.message_revisions,
+            TranscriptRenderContext::new(&theme, 80, 0, false).with_syntax_theme_revision(1),
+            |index, message, theme, width, tick, force_expand| {
+                built_indices.borrow_mut().push(index);
+                build_lines_for_messages(
+                    std::slice::from_ref(message),
+                    theme,
+                    width,
+                    tick,
+                    force_expand,
+                )
+            },
+        );
+        assert!(built_indices.borrow().is_empty());
+        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 0);
+
+        for (width, theme, syntax_revision, force_expand) in [
+            (79, theme, 1, false),
+            (
+                79,
+                Theme::named(orca_core::config::ThemeName::Light),
+                1,
+                false,
+            ),
+            (
+                79,
+                Theme::named(orca_core::config::ThemeName::Light),
+                2,
+                false,
+            ),
+            (
+                79,
+                Theme::named(orca_core::config::ThemeName::Light),
+                2,
+                true,
+            ),
+        ] {
+            built_indices.borrow_mut().clear();
+            state.transcript_render_cache.prepare(
+                &state.messages,
+                &state.message_revisions,
+                TranscriptRenderContext::new(&theme, width, 0, force_expand)
+                    .with_syntax_theme_revision(syntax_revision),
+                |index, message, theme, width, tick, force_expand| {
+                    built_indices.borrow_mut().push(index);
+                    build_lines_for_messages(
+                        std::slice::from_ref(message),
+                        theme,
+                        width,
+                        tick,
+                        force_expand,
+                    )
+                },
+            );
+            assert_eq!(built_indices.borrow().len(), 1_001);
+            assert_eq!(state.transcript_render_cache.last_prepare_visited(), 1_001);
+        }
+    }
+
+    #[test]
+    fn assistant_chunk_selection_preserves_checkpoint_spacing_and_code() {
+        let messages = vec![
+            ChatMessage::AssistantChunk {
+                text: "first paragraph\n\n".to_string(),
+                trailing_blank: true,
+            },
+            ChatMessage::AssistantChunk {
+                text: "```rust\nfn main() {}\n```\n".to_string(),
+                trailing_blank: false,
+            },
+            ChatMessage::Assistant("tail".to_string()),
+        ];
+        let revisions = vec![1, 2, 3];
+        let mut cache = TranscriptRenderCache::default();
+        let theme = theme();
+        cache.prepare(
+            &messages,
+            &revisions,
+            TranscriptRenderContext::new(&theme, 80, 0, false),
+            |_, message, theme, width, tick, force_expand| {
+                build_lines_for_messages(
+                    std::slice::from_ref(message),
+                    theme,
+                    width,
+                    tick,
+                    force_expand,
+                )
+            },
+        );
+
+        assert_eq!(
+            cache.extract_text(&selection((0, 0), (99, 99))),
+            "first paragraph\n\n  fn main() {}\ntail\n"
+        );
     }
 
     #[test]
