@@ -31,6 +31,7 @@ use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::TranscriptRenderCache;
 #[cfg(test)]
 use crate::transcript_view::TranscriptRenderContext;
+use crate::workspace_status::GitIdentity;
 
 const SUBAGENT_ACTIVITY_TAIL_LIMIT: usize = 6;
 const GOAL_NOTICE_OBJECTIVE_WIDTH: usize = 80;
@@ -736,6 +737,7 @@ pub struct AppState {
     pub reasoning_effort: orca_core::config::ReasoningEffort,
     pub approval_mode: ApprovalMode,
     pub cwd: String,
+    pub(crate) workspace_git: Option<GitIdentity>,
     #[allow(dead_code)]
     pub event_tx: mpsc::Sender<UserAction>,
     pub approval_dialog: Option<ApprovalDialog>,
@@ -889,6 +891,7 @@ impl AppState {
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             approval_mode: ApprovalMode::default(),
             cwd,
+            workspace_git: None,
             event_tx,
             approval_dialog: None,
             pending_input: None,
@@ -3598,6 +3601,7 @@ mod tests {
     fn fresh_app_state_has_default_syntax_highlight_state() {
         let state = state();
 
+        assert!(state.workspace_git.is_none());
         assert!(state.workspace_root.is_none());
         assert_eq!(
             state.syntax_theme,

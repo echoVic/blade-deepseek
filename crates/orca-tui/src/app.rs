@@ -54,6 +54,7 @@ use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
 use crate::ui;
 use crate::vim::VimState;
+use crate::workspace_status;
 
 pub fn run_tui(config: RunConfig) -> i32 {
     match run_tui_inner(config) {
@@ -115,14 +116,14 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         Vec::new()
     };
 
-    let cwd_display = shorten_home(&workspace_root.display().to_string());
-
+    let workspace_status = workspace_status::snapshot(&workspace_root);
     let mut state = AppState::new(
         action_tx.clone(),
         config.app_version.clone(),
         model_name,
-        cwd_display,
+        workspace_status.cwd,
     );
+    state.workspace_git = workspace_status.git;
     state.approval_mode = config.approval_mode;
     state.reasoning_effort = config.reasoning_effort;
     if should_show_picker && !picker_sessions.is_empty() {
@@ -739,16 +740,6 @@ fn configure_and_preload_tui_state(
     }
 }
 
-fn shorten_home(path: &str) -> String {
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = home.to_string_lossy();
-        if let Some(rest) = path.strip_prefix(home.as_ref()) {
-            return format!("~{rest}");
-        }
-    }
-    path.to_string()
-}
-
 type InlineTerminal = Terminal<CapabilityBackend<CrosstermBackend<std::io::Stdout>>>;
 
 fn clear_terminal_scrollback_with<T>(
@@ -1247,6 +1238,32 @@ mod tests {
         assert!(start < terminal);
         assert_eq!(production.matches("InputRuntime::start").count(), 1);
         assert_eq!(production.matches("Terminal::new").count(), 1);
+    }
+
+    #[test]
+    fn startup_captures_workspace_status_once_before_frame_loop() {
+        let production = include_str!("app.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production source before tests");
+        assert_eq!(
+            production
+                .matches("workspace_status::snapshot(&workspace_root)")
+                .count(),
+            1
+        );
+        let snapshot = production
+            .find("workspace_status::snapshot(&workspace_root)")
+            .expect("workspace snapshot");
+        let state = production
+            .find("AppState::new(")
+            .expect("app state construction");
+        let terminal = production
+            .find("Terminal::new")
+            .expect("frame loop terminal");
+        assert!(snapshot < state);
+        assert!(state < terminal);
+        assert!(!production[state..].contains("workspace_status::snapshot("));
     }
 
     #[test]
