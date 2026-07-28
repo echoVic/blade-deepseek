@@ -736,7 +736,6 @@ mod tests {
             let mut config = config();
             config.vim_mode = true;
             let shared = Arc::new(Mutex::new(config.clone()));
-            let operation = TestOperationInterrupt::default();
             let theme = Theme::named(ThemeName::Dark);
             let mut vim = VimState::new(true);
             vim.seed_pending_count_for_test();
@@ -751,7 +750,6 @@ mod tests {
                 &mut config,
                 &shared,
                 &action_tx,
-                &operation,
                 &mut textarea,
                 &mut vim,
                 &theme,

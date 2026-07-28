@@ -799,6 +799,7 @@ git commit \
 **Files:**
 - Modify: `crates/orca-tui/src/app.rs`
 - Modify: `crates/orca-tui/src/runtime_event_actions.rs`
+- Test: `crates/orca-tui/src/idle_key_actions.rs`
 
 - [ ] **Step 1: Write RED app routing tests**
 
