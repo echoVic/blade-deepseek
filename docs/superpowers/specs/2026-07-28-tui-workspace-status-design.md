@@ -134,17 +134,21 @@ The first command is:
 git symbolic-ref --quiet --short HEAD
 ```
 
-On success with a nonempty single-line value, the result is
+On exit code 0 with a nonempty single-line value, the result is
 `GitIdentity::Branch`.
 
-When that command exits unsuccessfully, the fallback is:
+Only exit code 1 means `HEAD` is not symbolic and permits the detached fallback:
 
 ```text
 git rev-parse --short=8 HEAD
 ```
 
-On success with a nonempty single-line value, the result is
+On exit code 0 with a nonempty single-line value, the result is
 `GitIdentity::Detached`.
+
+Any other `symbolic-ref` exit code, including fatal code 128 or termination by
+signal, stops discovery and hides Git identity. It must not fall through to
+`rev-parse`.
 
 Both commands:
 
@@ -167,6 +171,7 @@ Internally, discovery is split into:
 ```rust
 struct GitCommandResult {
     success: bool,
+    exit_code: Option<i32>,
     timed_out: bool,
     output_omitted: bool,
     stdout: String,
@@ -180,8 +185,8 @@ fn discover_git_identity(
 
 Production passes the bounded process adapter. Unit tests pass a deterministic
 closure to prove command order, timeout/spawn degradation, malformed output,
-and oversized-output rejection without replacing the real `git` binary or
-mutating process-global `PATH`.
+oversized-output rejection, and fatal-exit rejection without replacing the real
+`git` binary or mutating process-global `PATH`.
 
 The rendered labels are:
 
@@ -314,6 +319,8 @@ Use real temporary directories and real temporary Git repositories:
 - an unborn repository returns no detached identity;
 - malformed or oversized command output is rejected through the injected
   command-result closure;
+- `symbolic-ref` exit code 128 and signal termination do not invoke
+  `rev-parse`;
 - timeout and spawn failure return no Git identity.
 
 Git-dependent tests skip only when `git --version` cannot execute.

@@ -86,6 +86,7 @@ fn display_cwd(workspace: &Path, home: Option<&Path>) -> String {
 #[derive(Debug)]
 struct GitCommandResult {
     success: bool,
+    exit_code: Option<i32>,
     timed_out: bool,
     output_omitted: bool,
     stdout: String,
@@ -101,6 +102,9 @@ fn discover_git_identity(
     }
     if symbolic.success {
         return valid_single_line(&symbolic).map(GitIdentity::Branch);
+    }
+    if symbolic.exit_code != Some(1) {
+        return None;
     }
 
     let detached = run(workspace, &["rev-parse", "--short=8", "HEAD"]).ok()?;
@@ -137,6 +141,7 @@ fn run_git(workspace: &Path, args: &[&str]) -> io::Result<GitCommandResult> {
     )?;
     Ok(GitCommandResult {
         success: output.status.success(),
+        exit_code: output.status.code(),
         timed_out: output.timed_out,
         output_omitted: output.output_was_omitted(),
         stdout: output.stdout_text(),
@@ -229,6 +234,7 @@ mod tests {
             calls.push((cwd.to_path_buf(), args.join(" ")));
             Ok(GitCommandResult {
                 success: true,
+                exit_code: Some(0),
                 timed_out: false,
                 output_omitted: false,
                 stdout: "feature/footer\n".to_string(),
@@ -256,6 +262,7 @@ mod tests {
             if args[0] == "symbolic-ref" {
                 Ok(GitCommandResult {
                     success: false,
+                    exit_code: Some(1),
                     timed_out: false,
                     output_omitted: false,
                     stdout: String::new(),
@@ -263,6 +270,7 @@ mod tests {
             } else {
                 Ok(GitCommandResult {
                     success: true,
+                    exit_code: Some(0),
                     timed_out: false,
                     output_omitted: false,
                     stdout: "5bbb60aa\n".to_string(),
@@ -284,23 +292,44 @@ mod tests {
     }
 
     #[test]
+    fn discovery_does_not_treat_fatal_symbolic_ref_error_as_detached_head() {
+        let mut calls = Vec::new();
+        let identity = discover_git_identity(Path::new("/workspace"), |_, args| {
+            calls.push(args.join(" "));
+            Ok(GitCommandResult {
+                success: false,
+                exit_code: Some(128),
+                timed_out: false,
+                output_omitted: false,
+                stdout: String::new(),
+            })
+        });
+
+        assert_eq!(identity, None);
+        assert_eq!(calls, ["symbolic-ref --quiet --short HEAD"]);
+    }
+
+    #[test]
     fn discovery_rejects_errors_timeouts_omission_and_malformed_output() {
         let cases = [
             Err(io::Error::new(io::ErrorKind::NotFound, "git missing")),
             Ok(GitCommandResult {
                 success: true,
+                exit_code: Some(0),
                 timed_out: true,
                 output_omitted: false,
                 stdout: "main".to_string(),
             }),
             Ok(GitCommandResult {
                 success: true,
+                exit_code: Some(0),
                 timed_out: false,
                 output_omitted: true,
                 stdout: "main".to_string(),
             }),
             Ok(GitCommandResult {
                 success: true,
+                exit_code: Some(0),
                 timed_out: false,
                 output_omitted: false,
                 stdout: "main\ninjected".to_string(),
@@ -326,6 +355,7 @@ mod tests {
                 call += 1;
                 Ok(GitCommandResult {
                     success: call == 2,
+                    exit_code: Some(if call == 2 { 0 } else { 1 }),
                     timed_out: false,
                     output_omitted: false,
                     stdout: if call == 2 {

@@ -293,6 +293,7 @@ use std::io;
 #[derive(Debug)]
 struct GitCommandResult {
     success: bool,
+    exit_code: Option<i32>,
     timed_out: bool,
     output_omitted: bool,
     stdout: String,
@@ -316,6 +317,7 @@ fn discovery_prefers_symbolic_branch_without_requesting_head() {
         calls.push((cwd.to_path_buf(), args.join(" ")));
         Ok(GitCommandResult {
             success: true,
+            exit_code: Some(0),
             timed_out: false,
             output_omitted: false,
             stdout: "feature/footer\n".to_string(),
@@ -343,6 +345,7 @@ fn discovery_falls_back_to_detached_commit_only_after_symbolic_failure() {
         if args[0] == "symbolic-ref" {
             Ok(GitCommandResult {
                 success: false,
+                exit_code: Some(1),
                 timed_out: false,
                 output_omitted: false,
                 stdout: String::new(),
@@ -350,6 +353,7 @@ fn discovery_falls_back_to_detached_commit_only_after_symbolic_failure() {
         } else {
             Ok(GitCommandResult {
                 success: true,
+                exit_code: Some(0),
                 timed_out: false,
                 output_omitted: false,
                 stdout: "5bbb60aa\n".to_string(),
@@ -371,23 +375,44 @@ fn discovery_falls_back_to_detached_commit_only_after_symbolic_failure() {
 }
 
 #[test]
+fn discovery_does_not_treat_fatal_symbolic_ref_error_as_detached_head() {
+    let mut calls = Vec::new();
+    let identity = discover_git_identity(Path::new("/workspace"), |_, args| {
+        calls.push(args.join(" "));
+        Ok(GitCommandResult {
+            success: false,
+            exit_code: Some(128),
+            timed_out: false,
+            output_omitted: false,
+            stdout: String::new(),
+        })
+    });
+
+    assert_eq!(identity, None);
+    assert_eq!(calls, ["symbolic-ref --quiet --short HEAD"]);
+}
+
+#[test]
 fn discovery_rejects_errors_timeouts_omission_and_malformed_output() {
     let cases = [
         Err(io::Error::new(io::ErrorKind::NotFound, "git missing")),
         Ok(GitCommandResult {
             success: true,
+            exit_code: Some(0),
             timed_out: true,
             output_omitted: false,
             stdout: "main".to_string(),
         }),
         Ok(GitCommandResult {
             success: true,
+            exit_code: Some(0),
             timed_out: false,
             output_omitted: true,
             stdout: "main".to_string(),
         }),
         Ok(GitCommandResult {
             success: true,
+            exit_code: Some(0),
             timed_out: false,
             output_omitted: false,
             stdout: "main\ninjected".to_string(),
@@ -413,6 +438,7 @@ fn detached_discovery_requires_exactly_eight_hex_characters() {
             call += 1;
             Ok(GitCommandResult {
                 success: call == 2,
+                exit_code: Some(if call == 2 { 0 } else { 1 }),
                 timed_out: false,
                 output_omitted: false,
                 stdout: if call == 2 {
@@ -437,7 +463,7 @@ cargo test -p orca-tui workspace_status::tests::detached_discovery_ --lib -- --t
 ```
 
 Expected: branch and detached tests FAIL because discovery always returns
-`None`.
+`None`; negative rejection tests may already pass against the empty stub.
 
 - [ ] **Step 7: Implement deterministic discovery and bounded production runner**
 
@@ -484,6 +510,9 @@ fn discover_git_identity(
     if symbolic.success {
         return valid_single_line(&symbolic).map(GitIdentity::Branch);
     }
+    if symbolic.exit_code != Some(1) {
+        return None;
+    }
 
     let detached = run(workspace, &["rev-parse", "--short=8", "HEAD"]).ok()?;
     let commit = valid_single_line(&detached)?;
@@ -512,6 +541,7 @@ fn run_git(workspace: &Path, args: &[&str]) -> io::Result<GitCommandResult> {
     )?;
     Ok(GitCommandResult {
         success: output.status.success(),
+        exit_code: output.status.code(),
         timed_out: output.timed_out,
         output_omitted: output.output_was_omitted(),
         stdout: output.stdout_text(),
