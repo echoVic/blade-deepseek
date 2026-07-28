@@ -13,6 +13,7 @@ mod child_agent_response_folding;
 #[cfg(test)]
 mod child_agent_tests;
 mod child_agent_types;
+pub mod command;
 pub mod compaction;
 pub use compaction::{
     TuiAgentProviderErrorAction, TuiAgentTurnCompactionInput, TuiAgentTurnCompactionOutcome,

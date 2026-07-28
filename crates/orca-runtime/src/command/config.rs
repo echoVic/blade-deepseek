@@ -1,0 +1,168 @@
+use std::path::PathBuf;
+
+use orca_core::config::file::{ConfigOverrides, FileConfig, load_effective_config};
+use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
+use orca_core::model::ModelSelection;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DesktopNotifications {
+    #[default]
+    FromConfig,
+    Disabled,
+}
+
+#[derive(Clone, Debug)]
+pub struct RunConfigRequest {
+    pub app_version: String,
+    pub config_cwd: PathBuf,
+    pub runtime_cwd: Option<PathBuf>,
+    pub prompt: String,
+    pub output_format: OutputFormat,
+    pub provider: ProviderKind,
+    pub verifier: Option<String>,
+    pub history_mode: HistoryMode,
+    pub show_session_picker: bool,
+    pub max_budget_usd: Option<f64>,
+    pub overrides: ConfigOverrides,
+    pub desktop_notifications: DesktopNotifications,
+}
+
+impl RunConfigRequest {
+    pub fn new(app_version: impl Into<String>, config_cwd: PathBuf) -> Self {
+        Self {
+            app_version: app_version.into(),
+            config_cwd,
+            runtime_cwd: None,
+            prompt: String::new(),
+            output_format: OutputFormat::Text,
+            provider: ProviderKind::DeepSeek,
+            verifier: None,
+            history_mode: HistoryMode::Record,
+            show_session_picker: false,
+            max_budget_usd: None,
+            overrides: ConfigOverrides::default(),
+            desktop_notifications: DesktopNotifications::FromConfig,
+        }
+    }
+}
+
+pub fn build_run_config(request: RunConfigRequest) -> Result<RunConfig, String> {
+    let file = load_effective_config(&request.config_cwd, request.overrides.clone())?;
+    assemble_run_config(request, file)
+}
+
+pub fn assemble_run_config(
+    request: RunConfigRequest,
+    file: FileConfig,
+) -> Result<RunConfig, String> {
+    let model = ModelSelection::parse(file.model.clone())?;
+    let desktop_notifications = match request.desktop_notifications {
+        DesktopNotifications::FromConfig => file.desktop_notifications,
+        DesktopNotifications::Disabled => false,
+    };
+
+    Ok(RunConfig {
+        app_version: request.app_version,
+        prompt: request.prompt,
+        cwd: request.runtime_cwd,
+        output_format: request.output_format,
+        approval_mode: file.mode.unwrap_or_default(),
+        provider: request.provider,
+        verifier: request.verifier,
+        model,
+        model_runtime: file.model_runtime,
+        reasoning_effort: file.reasoning_effort,
+        api_key: file.api_key,
+        base_url: file.base_url,
+        history_mode: request.history_mode,
+        show_session_picker: request.show_session_picker,
+        active_permission_profile: None,
+        permission_profiles: file.permission_profiles,
+        runtime_workspace_roots: None,
+        permission_rules: file.permissions,
+        additional_working_directories: Vec::new(),
+        max_budget_usd: request.max_budget_usd,
+        mcp_servers: file.mcp_servers,
+        hooks: file.hooks,
+        external_tools: orca_tools::external::load_default_external_tools(),
+        subagents: file.subagents.normalized(),
+        tools: file.tools.normalized(),
+        workflows: file.workflows.resolved(),
+        theme: file.theme,
+        vim_mode: file.vim_mode,
+        update_check: file.update_check,
+        desktop_notifications,
+        auto_memory: file.auto_memory,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use orca_core::approval_types::ApprovalMode;
+    use orca_core::config::file::{ConfigOverrides, FileConfig};
+    use orca_core::config::{HistoryMode, OutputFormat, ProviderKind};
+
+    use super::*;
+
+    #[test]
+    fn assembles_shared_run_config_without_losing_launch_fields() {
+        let file = FileConfig {
+            mode: Some(ApprovalMode::Plan),
+            update_check: false,
+            desktop_notifications: true,
+            auto_memory: true,
+            ..FileConfig::default()
+        };
+        let request = RunConfigRequest {
+            app_version: "9.8.7".to_string(),
+            config_cwd: PathBuf::from("/config-root"),
+            runtime_cwd: Some(PathBuf::from("/runtime-root")),
+            prompt: "inspect".to_string(),
+            output_format: OutputFormat::Jsonl,
+            provider: ProviderKind::Mock,
+            verifier: Some("cargo test".to_string()),
+            history_mode: HistoryMode::Resume("latest".to_string()),
+            show_session_picker: true,
+            max_budget_usd: Some(2.5),
+            overrides: ConfigOverrides::default(),
+            desktop_notifications: DesktopNotifications::FromConfig,
+        };
+
+        let config = assemble_run_config(request, file).unwrap();
+
+        assert_eq!(config.app_version, "9.8.7");
+        assert_eq!(config.cwd, Some(PathBuf::from("/runtime-root")));
+        assert_eq!(config.prompt, "inspect");
+        assert_eq!(config.output_format, OutputFormat::Jsonl);
+        assert_eq!(config.approval_mode, ApprovalMode::Plan);
+        assert_eq!(config.provider, ProviderKind::Mock);
+        assert_eq!(config.verifier.as_deref(), Some("cargo test"));
+        assert!(matches!(
+            config.history_mode,
+            HistoryMode::Resume(ref selector) if selector == "latest"
+        ));
+        assert!(config.show_session_picker);
+        assert_eq!(config.max_budget_usd, Some(2.5));
+        assert!(!config.update_check);
+        assert!(config.desktop_notifications);
+        assert!(config.auto_memory);
+    }
+
+    #[test]
+    fn launch_can_disable_desktop_notifications_without_changing_file_config() {
+        let file = FileConfig {
+            desktop_notifications: true,
+            ..FileConfig::default()
+        };
+        let request = RunConfigRequest {
+            desktop_notifications: DesktopNotifications::Disabled,
+            ..RunConfigRequest::new("0.2.55", PathBuf::from("/workspace"))
+        };
+
+        let config = assemble_run_config(request, file).unwrap();
+
+        assert!(!config.desktop_notifications);
+    }
+}
