@@ -65,6 +65,7 @@ impl KeyBinding {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GlobalShortcut {
     Cancel,
+    OpenTranscriptSearch,
     ToggleShortcuts,
     ScrollBottom,
     ScrollTop,
@@ -113,6 +114,10 @@ const GLOBAL_BINDINGS: &[(GlobalShortcut, KeyBinding)] = &[
     (
         GlobalShortcut::Cancel,
         KeyBinding::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ),
+    (
+        GlobalShortcut::OpenTranscriptSearch,
+        KeyBinding::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
     ),
     (
         GlobalShortcut::ToggleShortcuts,
@@ -361,6 +366,11 @@ pub fn shortcut_lines(scopes: &[ShortcutScope]) -> Vec<Line<'static>> {
 pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     ShortcutHint {
         scope: ShortcutScope::Global,
+        keys: "ctrl+f",
+        action: "find in transcript",
+    },
+    ShortcutHint {
+        scope: ShortcutScope::Global,
         keys: "F1 / ctrl+k",
         action: "show or hide shortcuts",
     },
@@ -601,6 +611,23 @@ mod tests {
             running_shortcut(key(KeyCode::Char('b'), KeyModifiers::CONTROL)),
             Some(RunningShortcut::BackgroundCurrentTurn)
         );
+    }
+
+    #[test]
+    fn global_ctrl_f_opens_transcript_search() {
+        assert_eq!(
+            global_shortcut(key(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+            Some(GlobalShortcut::OpenTranscriptSearch)
+        );
+    }
+
+    #[test]
+    fn search_shortcut_hint_is_backed_by_a_binding() {
+        assert!(shortcut_hints().any(|hint| {
+            hint.scope == ShortcutScope::Global
+                && hint.keys == "ctrl+f"
+                && hint.has_registered_binding
+        }));
     }
 
     #[test]

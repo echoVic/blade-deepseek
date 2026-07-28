@@ -43,6 +43,9 @@ where
             state.push_message(ChatMessage::System("Press Ctrl+C again to quit.".into()));
             state.scroll_to_bottom();
         }
+        GlobalShortcut::OpenTranscriptSearch => {
+            state.open_transcript_search();
+        }
         GlobalShortcut::ToggleShortcuts => {
             state.toggle_shortcuts();
         }
