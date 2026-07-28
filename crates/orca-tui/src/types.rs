@@ -790,6 +790,7 @@ pub struct AppState {
     /// Composer (input box) outer rect from the last render, `None` while
     /// the composer is hidden.
     pub input_area: Option<ratatui::layout::Rect>,
+    pub(crate) search_area: Option<ratatui::layout::Rect>,
     workspace_root: Option<PathBuf>,
     pub(crate) syntax_theme: SyntaxTheme,
     pub(crate) syntax_color_level: TerminalColorLevel,
@@ -915,6 +916,7 @@ impl AppState {
             jump_to_bottom_area: None,
             frame_area: None,
             input_area: None,
+            search_area: None,
             workspace_root: None,
             syntax_theme: SyntaxTheme::OneHalfDark,
             syntax_color_level: TerminalColorLevel::TrueColor,

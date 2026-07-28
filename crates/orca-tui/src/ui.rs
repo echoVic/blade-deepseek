@@ -33,6 +33,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     state.jump_to_bottom_area = None;
     state.frame_area = Some(frame.area());
     state.input_area = None;
+    state.search_area = None;
     if state.status == AppStatus::Setup {
         render_setup(frame, state, textarea, theme);
         return;
@@ -42,7 +43,9 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         return;
     }
 
-    let show_composer_hardware_cursor = main_composer_hardware_cursor_visible(state);
+    let search_height = u16::from(search_visible(state));
+    let show_composer_hardware_cursor =
+        main_composer_hardware_cursor_visible(state) && search_height == 0;
     let composer_layout = composer_visible(state)
         .then(|| composer_visual_layout(frame.area().width, textarea, theme));
     let input_height = composer_layout
@@ -68,6 +71,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         goal_height,
         plan_height,
         activity_height,
+        search_height,
         input_height,
     );
 
@@ -87,11 +91,15 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     if activity_height > 0 {
         render_activity(frame, chunks[3], state, theme);
     }
+    if search_height > 0 {
+        state.search_area = Some(chunks[4]);
+        render_search_bar(frame, chunks[4], state, theme);
+    }
     if composer_visible(state) {
-        state.input_area = Some(chunks[4]);
+        state.input_area = Some(chunks[5]);
         render_input(
             frame,
-            chunks[4],
+            chunks[5],
             textarea,
             composer_layout.as_ref().expect("visible composer layout"),
             state,
@@ -99,14 +107,15 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
             show_composer_hardware_cursor,
         );
     }
-    render_status(frame, chunks[5], state, theme);
+    render_status(frame, chunks[6], state, theme);
 
-    if state.slash_menu.is_some() {
-        render_slash_menu(frame, chunks[4], state, theme);
+    if !state.transcript_search.open && state.slash_menu.is_some() {
+        render_slash_menu(frame, chunks[5], state, theme);
     }
 
-    if state.mention.phase.is_some() && state.slash_menu.is_none() {
-        render_mention_candidates(frame, chunks[4], state, theme);
+    if !state.transcript_search.open && state.mention.phase.is_some() && state.slash_menu.is_none()
+    {
+        render_mention_candidates(frame, chunks[5], state, theme);
     }
 
     if state.status == AppStatus::WaitingApproval {
@@ -123,6 +132,7 @@ fn main_layout(
     goal_height: u16,
     plan_height: u16,
     activity_height: u16,
+    search_height: u16,
     input_height: u16,
 ) -> std::rc::Rc<[Rect]> {
     // The fixed chrome (goal banner, plan, activity line, input box, status line) MUST keep
@@ -136,6 +146,7 @@ fn main_layout(
         Constraint::Fill(1),
         Constraint::Length(plan_height),
         Constraint::Length(activity_height),
+        Constraint::Length(search_height),
         Constraint::Length(input_height),
         Constraint::Length(1),
     ])
@@ -171,6 +182,15 @@ fn composer_visible(state: &AppState) -> bool {
 
 fn main_composer_hardware_cursor_visible(state: &AppState) -> bool {
     composer_visible(state) && !state.show_shortcuts
+}
+
+fn search_visible(state: &AppState) -> bool {
+    state.transcript_search.open
+        && state.panel_mode == PanelMode::Conversation
+        && matches!(
+            state.status,
+            AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
+        )
 }
 
 fn render_goal_banner(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -477,6 +497,9 @@ pub(crate) fn render_live_messages(
     state.transcript_area = Some(area);
 
     if state.messages.is_empty() {
+        state
+            .transcript_search
+            .clear_matches(state.transcript_render_cache.content_generation());
         // The welcome screen renders through its own cache so its text is
         // selectable and copyable exactly like transcript content.
         let lines = build_welcome_lines(state, theme);
@@ -523,18 +546,25 @@ pub(crate) fn render_live_messages(
     let messages = &state.messages;
     let revisions = &state.message_revisions;
     let highlights = &state.applied_diff_highlights;
-    let cache = &mut state.transcript_render_cache;
-    cache.prepare(
-        messages,
-        revisions,
-        TranscriptRenderContext::new(theme, width, state.tick, false),
-        |index, message, theme, width, tick, force_expand| {
-            let refined =
-                AppState::refined_diff_styles_for_message(revisions, highlights, index, message);
-            build_lines_for_message(message, theme, width, tick, force_expand, refined)
-        },
-    );
-    let viewport = cache.viewport(live_start, requested_scroll, visible_height);
+    {
+        let cache = &mut state.transcript_render_cache;
+        cache.prepare(
+            messages,
+            revisions,
+            TranscriptRenderContext::new(theme, width, state.tick, false),
+            |index, message, theme, width, tick, force_expand| {
+                let refined = AppState::refined_diff_styles_for_message(
+                    revisions, highlights, index, message,
+                );
+                build_lines_for_message(message, theme, width, tick, force_expand, refined)
+            },
+        );
+    }
+    state.refresh_transcript_search();
+    let viewport =
+        state
+            .transcript_render_cache
+            .viewport(live_start, requested_scroll, visible_height);
     state.total_lines = viewport.total_height;
     state.visible_height = visible_height;
     state.scroll_offset = viewport.scroll_offset;
@@ -1896,6 +1926,63 @@ fn render_input(
         state.copy_notice_at(std::time::Instant::now()),
         theme,
         show_hardware_cursor,
+    );
+}
+
+fn render_search_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    if area.is_empty() {
+        return;
+    }
+    let count = format!(
+        " {}/{} ",
+        state.transcript_search.active_ordinal().unwrap_or(0),
+        state.transcript_search.match_count()
+    );
+    let count_width = UnicodeWidthStr::width(count.as_str()).min(area.width as usize) as u16;
+    let prefix = if area.width.saturating_sub(count_width) >= 7 {
+        " Find: "
+    } else {
+        "F:"
+    };
+    let prefix_width = UnicodeWidthStr::width(prefix).min(area.width as usize) as u16;
+    let query_width = area.width.saturating_sub(prefix_width + count_width);
+
+    if prefix_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(prefix, Style::default().fg(theme.muted))),
+            Rect::new(area.x, area.y, prefix_width, 1),
+        );
+    }
+    if count_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(count, Style::default().fg(theme.muted))),
+            Rect::new(area.right() - count_width, area.y, count_width, 1),
+        );
+    }
+    if query_width == 0 {
+        return;
+    }
+
+    let mut textarea = TextArea::from([state.transcript_search.query()]);
+    textarea.set_cursor_line_style(Style::default());
+    textarea.set_cursor_style(
+        Style::default()
+            .fg(theme.border)
+            .add_modifier(Modifier::REVERSED),
+    );
+    let cursor_column = state.transcript_search.query()[..state.transcript_search.cursor()]
+        .chars()
+        .count()
+        .min(u16::MAX as usize) as u16;
+    textarea.move_cursor(tui_textarea::CursorMove::Jump(0, cursor_column));
+    render_textarea_surface(
+        frame,
+        Rect::new(area.x + prefix_width, area.y, query_width, 1),
+        &textarea,
+        None,
+        None,
+        theme,
+        !state.show_shortcuts && state.status != AppStatus::WaitingApproval,
     );
 }
 
@@ -4229,6 +4316,130 @@ mod tests {
                 .iter()
                 .any(|span| { span.style.bg == theme.selection_style().bg })
         );
+    }
+
+    #[test]
+    fn open_search_reserves_one_row_without_squeezing_composer_or_status() {
+        let area = Rect::new(0, 0, 80, 20);
+        let chunks = main_layout(area, 0, 0, 2, 1, 3);
+        assert_eq!(chunks[4].height, 1);
+        assert_eq!(chunks[5].height, 3);
+        assert_eq!(chunks[6].height, 1);
+        assert_eq!(chunks[4].bottom(), chunks[5].y);
+    }
+
+    #[test]
+    fn compact_search_layout_preserves_fixed_chrome_before_transcript() {
+        let chunks = main_layout(Rect::new(0, 0, 20, 6), 0, 0, 0, 1, 3);
+        assert_eq!(chunks[1].height, 1);
+        assert_eq!(chunks[4].height, 1);
+        assert_eq!(chunks[5].height, 3);
+        assert_eq!(chunks[6].height, 1);
+    }
+
+    #[test]
+    fn search_frame_shows_query_count_and_hardware_cursor() {
+        let mut state = test_state();
+        state.push_message(ChatMessage::Assistant("alpha beta alpha".to_string()));
+        state.open_transcript_search();
+        state.replace_transcript_search_query("alpha");
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(50, 12))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Find:"));
+        assert!(rendered.contains("alpha"));
+        assert!(rendered.contains("1/2"));
+        let cursor = terminal.get_cursor_position().expect("hardware cursor");
+        assert!(state.search_area.expect("search area").contains(cursor));
+    }
+
+    #[test]
+    fn search_frame_status_matrix_and_zero_counts_are_stable() {
+        for status in [
+            AppStatus::Idle,
+            AppStatus::Running,
+            AppStatus::WaitingUserInput,
+        ] {
+            let mut state = test_state();
+            state.set_status(status);
+            state.push_message(ChatMessage::System("alpha".to_string()));
+            state.open_transcript_search();
+            let theme = Theme::named(orca_core::config::ThemeName::Dark);
+            let textarea = TextArea::default();
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(24, 8))
+                .expect("test backend");
+
+            terminal
+                .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                .expect("empty query draw");
+            let empty = format!("{:?}", terminal.backend().buffer());
+            assert!(empty.contains("0/0"), "{status:?}: {empty}");
+
+            state.replace_transcript_search_query("missing");
+            terminal
+                .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                .expect("missing query draw");
+            let missing = format!("{:?}", terminal.backend().buffer());
+            assert!(missing.contains("0/0"), "{status:?}: {missing}");
+            assert!(state.search_area.is_some());
+        }
+    }
+
+    #[test]
+    fn narrow_search_frame_keeps_count_and_cursor_segment_without_composer_cursor() {
+        let mut state = test_state();
+        state.push_message(ChatMessage::System(
+            "long-query-tail long-query-tail".to_string(),
+        ));
+        state.open_transcript_search();
+        state.replace_transcript_search_query("prefix-long-query-tail");
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::from(["COMPOSER_CURSOR_SENTINEL"]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(18, 8))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("narrow draw");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("0/0"));
+        assert!(rendered.contains("tail"));
+        let cursor = terminal.get_cursor_position().expect("search cursor");
+        assert!(state.search_area.unwrap().contains(cursor));
+        assert!(!state.input_area.unwrap().contains(cursor));
+    }
+
+    #[test]
+    fn shortcuts_and_approval_hide_search_hardware_cursor() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut shortcuts = test_state();
+        shortcuts.open_transcript_search();
+        shortcuts.show_shortcuts = true;
+        let (backend, events) = RecordingBackend::new(50, 12);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &mut shortcuts, &textarea, &theme))
+            .expect("shortcuts draw");
+        assert_eq!(take_cursor_events(&events), [CursorEvent::Hide]);
+
+        let mut approval = test_state();
+        approval.open_transcript_search();
+        approval.set_status(AppStatus::WaitingApproval);
+        let (backend, events) = RecordingBackend::new(50, 12);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &mut approval, &textarea, &theme))
+            .expect("approval draw");
+        assert_eq!(take_cursor_events(&events), [CursorEvent::Hide]);
     }
 
     #[test]
