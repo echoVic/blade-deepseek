@@ -31,6 +31,8 @@ pub struct Theme {
     pub diff_remove_emphasis_bg: Color,
     /// Background for the mouse text selection in the transcript.
     pub selection_bg: Color,
+    pub search_match_bg: Color,
+    pub search_match_active_bg: Color,
     pub(crate) syntax_theme: SyntaxTheme,
     pub(crate) color_level: TerminalColorLevel,
     pub(crate) syntax_theme_revision: u64,
@@ -75,6 +77,8 @@ impl Theme {
                 diff_remove_emphasis_bg: Color::Rgb(0x71, 0x35, 0x2a),
                 // Muted brand blue: keeps every foreground legible.
                 selection_bg: Color::Rgb(46, 62, 132),
+                search_match_bg: Color::Rgb(78, 67, 31),
+                search_match_active_bg: Color::Rgb(77, 107, 254),
                 syntax_theme,
                 color_level: TerminalColorLevel::TrueColor,
                 syntax_theme_revision: syntax_theme.revision(),
@@ -100,6 +104,8 @@ impl Theme {
                 diff_add_emphasis_bg: Color::Rgb(0x86, 0xef, 0xac),
                 diff_remove_emphasis_bg: Color::Rgb(0xfc, 0xa5, 0xa5),
                 selection_bg: Color::Rgb(198, 210, 250),
+                search_match_bg: Color::Rgb(255, 235, 153),
+                search_match_active_bg: Color::Rgb(166, 188, 255),
                 syntax_theme,
                 color_level: TerminalColorLevel::TrueColor,
                 syntax_theme_revision: syntax_theme.revision(),
@@ -126,6 +132,8 @@ impl Theme {
                 diff_remove_emphasis_bg: Color::Rgb(0x71, 0x3c, 0x35),
                 // base02, Solarized's canonical selection background.
                 selection_bg: Color::Rgb(7, 54, 66),
+                search_match_bg: Color::Rgb(88, 73, 0),
+                search_match_active_bg: Color::Rgb(38, 139, 210),
                 syntax_theme,
                 color_level: TerminalColorLevel::TrueColor,
                 syntax_theme_revision: syntax_theme.revision(),
@@ -152,6 +160,8 @@ impl Theme {
                 diff_remove_emphasis_bg: Color::Rgb(0x70, 0x45, 0x55),
                 // surface2 from the Mocha palette.
                 selection_bg: Color::Rgb(88, 91, 112),
+                search_match_bg: Color::Rgb(88, 91, 112),
+                search_match_active_bg: Color::Rgb(137, 180, 250),
                 syntax_theme,
                 color_level: TerminalColorLevel::TrueColor,
                 syntax_theme_revision: syntax_theme.revision(),
@@ -193,6 +203,8 @@ impl Theme {
         theme.diff_add_emphasis_bg = adapt(theme.diff_add_emphasis_bg);
         theme.diff_remove_emphasis_bg = adapt(theme.diff_remove_emphasis_bg);
         theme.selection_bg = adapt(theme.selection_bg);
+        theme.search_match_bg = adapt(theme.search_match_bg);
+        theme.search_match_active_bg = adapt(theme.search_match_active_bg);
         theme.color_level = profile.color_level;
         theme.syntax_theme_revision =
             syntax_style_revision(theme.syntax_theme, profile.color_level);
@@ -206,6 +218,24 @@ impl Theme {
             _ => Style::default().bg(self.selection_bg),
         }
     }
+
+    pub(crate) fn search_match_style(self) -> Style {
+        match self.color_level {
+            TerminalColorLevel::Monochrome => Style::default().add_modifier(Modifier::UNDERLINED),
+            _ => Style::default().bg(self.search_match_bg),
+        }
+    }
+
+    pub(crate) fn search_match_active_style(self) -> Style {
+        match self.color_level {
+            TerminalColorLevel::Monochrome => {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            }
+            _ => Style::default()
+                .bg(self.search_match_active_bg)
+                .add_modifier(Modifier::BOLD),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -217,7 +247,7 @@ mod tests {
     use crate::syntax_highlight::SyntaxTheme;
     use crate::terminal_capabilities::{TerminalBackground, TerminalColorLevel, TerminalProfile};
 
-    fn theme_colors(theme: Theme) -> [Color; 20] {
+    fn theme_colors(theme: Theme) -> [Color; 22] {
         [
             theme.border,
             theme.text,
@@ -239,6 +269,8 @@ mod tests {
             theme.diff_add_emphasis_bg,
             theme.diff_remove_emphasis_bg,
             theme.selection_bg,
+            theme.search_match_bg,
+            theme.search_match_active_bg,
         ]
     }
 
@@ -295,6 +327,8 @@ mod tests {
                     Color::Rgb(0x31, 0x5c, 0x40),
                     Color::Rgb(0x71, 0x35, 0x2a),
                     Color::Rgb(46, 62, 132),
+                    Color::Rgb(78, 67, 31),
+                    Color::Rgb(77, 107, 254),
                 ],
             ),
             (
@@ -320,6 +354,8 @@ mod tests {
                     Color::Rgb(0x86, 0xef, 0xac),
                     Color::Rgb(0xfc, 0xa5, 0xa5),
                     Color::Rgb(198, 210, 250),
+                    Color::Rgb(255, 235, 153),
+                    Color::Rgb(166, 188, 255),
                 ],
             ),
             (
@@ -345,6 +381,8 @@ mod tests {
                     Color::Rgb(0x24, 0x5b, 0x52),
                     Color::Rgb(0x71, 0x3c, 0x35),
                     Color::Rgb(7, 54, 66),
+                    Color::Rgb(88, 73, 0),
+                    Color::Rgb(38, 139, 210),
                 ],
             ),
             (
@@ -370,6 +408,8 @@ mod tests {
                     Color::Rgb(0x3d, 0x65, 0x4d),
                     Color::Rgb(0x70, 0x45, 0x55),
                     Color::Rgb(88, 91, 112),
+                    Color::Rgb(88, 91, 112),
+                    Color::Rgb(137, 180, 250),
                 ],
             ),
         ];
@@ -496,6 +536,49 @@ mod tests {
             monochrome.selection_style(),
             Style::default().add_modifier(Modifier::REVERSED)
         );
+    }
+
+    #[test]
+    fn search_styles_are_distinct_and_capability_safe() {
+        for name in [
+            ThemeName::Dark,
+            ThemeName::Light,
+            ThemeName::Solarized,
+            ThemeName::Catppuccin,
+        ] {
+            for level in [
+                TerminalColorLevel::TrueColor,
+                TerminalColorLevel::Ansi256,
+                TerminalColorLevel::Ansi16,
+                TerminalColorLevel::Monochrome,
+            ] {
+                let theme = Theme::resolve(
+                    name,
+                    TerminalProfile {
+                        background: TerminalBackground::Unknown,
+                        color_level: level,
+                    },
+                );
+                assert_ne!(
+                    theme.search_match_style(),
+                    theme.search_match_active_style()
+                );
+                if level == TerminalColorLevel::Monochrome {
+                    assert!(
+                        theme
+                            .search_match_style()
+                            .add_modifier
+                            .contains(Modifier::UNDERLINED)
+                    );
+                    assert!(
+                        theme
+                            .search_match_active_style()
+                            .add_modifier
+                            .contains(Modifier::REVERSED)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
