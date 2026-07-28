@@ -242,7 +242,8 @@ impl VimState {
         let Some(pending) = self.pending_insert_escape.take() else {
             return PendingInsertEscapeFlow::NoPending;
         };
-        if now <= pending.deadline
+        if self.mode == VimMode::Insert
+            && now <= pending.deadline
             && !input.ctrl
             && !input.alt
             && self
@@ -1099,6 +1100,27 @@ mod tests {
         );
         assert_eq!(escaped_area.lines(), &["j"]);
         assert_eq!(escaped.mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn vim_insert_escape_cannot_complete_after_leaving_insert_mode() {
+        let theme = Theme::named(ThemeName::Dark);
+        let started = Instant::now();
+        let mut state = insert_escape_state("jj");
+        let mut textarea = TextArea::default();
+        state.handle_at(input('j'), &mut textarea, &theme, started);
+        state.mode = VimMode::Normal;
+
+        assert_eq!(
+            state.resolve_pending_insert_escape(
+                &input('j'),
+                started + Duration::from_millis(1),
+                &mut textarea,
+            ),
+            PendingInsertEscapeFlow::Flushed
+        );
+        assert_eq!(textarea.lines(), &["j"]);
+        assert_eq!(state.mode, VimMode::Normal);
     }
 
     fn handle_sequence(
