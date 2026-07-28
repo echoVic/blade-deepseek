@@ -13,6 +13,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::selection::{SelectionPos, TranscriptSelection, slice_row_by_columns};
 use crate::terminal_capabilities::TerminalColorLevel;
 use crate::theme::Theme;
+use crate::transcript_search::{SearchQuery, TranscriptLineIdentity, TranscriptSearchMatch};
 use crate::types::ChatMessage;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -278,6 +279,11 @@ struct CachedMessage {
     visual_height: usize,
 }
 
+struct SearchableLogicalLine {
+    text: String,
+    boundaries: Vec<(usize, SelectionPos)>,
+}
+
 impl CachedMessage {
     fn matches(
         &self,
@@ -351,6 +357,7 @@ pub(crate) struct TranscriptRenderCache {
     prepared_syntax_theme_revision: Option<u64>,
     prepared_force_expand: Option<bool>,
     prepared_spinner_phase: Option<u8>,
+    content_generation: u64,
     #[cfg(test)]
     last_prepare_visited: usize,
 }
@@ -425,7 +432,114 @@ impl TranscriptRenderCache {
     }
 
     pub fn clear(&mut self) {
-        *self = Self::default();
+        let next_generation = next_generation(self.content_generation);
+        *self = Self {
+            content_generation: next_generation,
+            ..Self::default()
+        };
+    }
+
+    pub(crate) fn content_generation(&self) -> u64 {
+        self.content_generation
+    }
+
+    fn bump_content_generation(&mut self) {
+        self.content_generation = next_generation(self.content_generation);
+    }
+
+    pub(crate) fn search(
+        &self,
+        first_retained_message: usize,
+        query: &SearchQuery,
+    ) -> Vec<TranscriptSearchMatch> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let mut matches = Vec::new();
+        for message_index in first_retained_message.min(self.entries.len())..self.entries.len() {
+            let Some(cached) = self.entries[message_index].as_ref() else {
+                continue;
+            };
+            let message_start = self
+                .cumulative_heights
+                .get(message_index)
+                .copied()
+                .unwrap_or_default();
+            for (line_index, wrapped) in cached.wrapped_lines.iter().enumerate() {
+                let line_start = cached
+                    .line_cumulative_heights
+                    .get(line_index)
+                    .copied()
+                    .unwrap_or_default();
+                let searchable = searchable_logical_line(
+                    wrapped,
+                    message_start.saturating_add(line_start),
+                    line_index == 0 && cached.spinner_phase.is_some(),
+                );
+                for byte_range in query.find_ranges(&searchable.text) {
+                    let Ok(start_index) = searchable
+                        .boundaries
+                        .binary_search_by_key(&byte_range.start, |(byte, _)| *byte)
+                    else {
+                        continue;
+                    };
+                    let Ok(end_index) = searchable
+                        .boundaries
+                        .binary_search_by_key(&byte_range.end, |(byte, _)| *byte)
+                    else {
+                        continue;
+                    };
+                    matches.push(TranscriptSearchMatch::new(
+                        searchable.boundaries[start_index].1,
+                        searchable.boundaries[end_index].1,
+                        TranscriptLineIdentity {
+                            message_revision: cached.revision,
+                            line_index,
+                        },
+                        byte_range,
+                    ));
+                }
+            }
+        }
+        matches
+    }
+
+    pub(crate) fn reveal_offset(
+        &self,
+        first_retained_message: usize,
+        current_offset: usize,
+        visible_height: usize,
+        found: &TranscriptSearchMatch,
+    ) -> usize {
+        let live_start = first_retained_message.min(self.entries.len());
+        let base_height = self
+            .cumulative_heights
+            .get(live_start)
+            .copied()
+            .unwrap_or_default();
+        let absolute_total = self.cumulative_heights.last().copied().unwrap_or_default();
+        let total_height = absolute_total.saturating_sub(base_height);
+        let max_scroll = total_height.saturating_sub(visible_height);
+        let current = current_offset.min(max_scroll);
+        if visible_height == 0 {
+            return current;
+        }
+
+        let visible_start = base_height.saturating_add(current);
+        let visible_end = visible_start.saturating_add(visible_height);
+        let match_start = found.start.row;
+        let match_end = found.last_covered_row();
+        let target = if match_start < visible_start {
+            match_start.saturating_sub(base_height)
+        } else if match_end >= visible_end {
+            match_end
+                .saturating_add(1)
+                .saturating_sub(visible_height)
+                .saturating_sub(base_height)
+        } else {
+            current
+        };
+        target.min(max_scroll)
     }
 
     pub fn reconcile_len(&mut self, len: usize) {
@@ -452,13 +566,18 @@ impl TranscriptRenderCache {
     }
 
     pub fn truncate(&mut self, len: usize) {
+        let changed = len < self.entries.len();
         self.entries.truncate(len);
         self.dirty_indices.retain(|index| *index < len);
         self.spinner_indices.retain(|index| *index < len);
         self.rebuild_cumulative_heights();
+        if changed {
+            self.bump_content_generation();
+        }
     }
 
     pub fn retain(&mut self, keep: &[bool]) {
+        let original_len = self.entries.len();
         let old_entries = mem::take(&mut self.entries);
         let old_dirty = mem::take(&mut self.dirty_indices);
         let old_spinners = mem::take(&mut self.spinner_indices);
@@ -478,6 +597,9 @@ impl TranscriptRenderCache {
             self.entries.push(entry);
         }
         self.rebuild_cumulative_heights();
+        if self.entries.len() != original_len {
+            self.bump_content_generation();
+        }
     }
 
     pub fn invalidate(&mut self, index: usize) {
@@ -524,6 +646,7 @@ impl TranscriptRenderCache {
         }
         let dirty_indices = mem::take(&mut self.dirty_indices);
         let mut first_height_change: Option<usize> = None;
+        let mut rebuilt_any = false;
         #[cfg(test)]
         {
             self.last_prepare_visited = 0;
@@ -566,6 +689,7 @@ impl TranscriptRenderCache {
             }
 
             let lines = build_message(index, message, theme, width, tick, force_expand);
+            rebuilt_any = true;
             let ratatui_width = width.min(u16::MAX as usize) as u16;
             let wrapped_lines = lines
                 .iter()
@@ -616,6 +740,9 @@ impl TranscriptRenderCache {
         }
         if let Some(index) = first_height_change {
             self.rebuild_cumulative_heights_from(index);
+        }
+        if rebuilt_any {
+            self.bump_content_generation();
         }
     }
 
@@ -992,6 +1119,80 @@ fn message_spinner_phase(message: &ChatMessage, tick: u64) -> Option<u8> {
     }
 }
 
+fn next_generation(current: u64) -> u64 {
+    current.wrapping_add(1).max(1)
+}
+
+fn searchable_logical_line(
+    wrapped: &CompactWrappedLine,
+    absolute_first_row: usize,
+    exclude_spinner: bool,
+) -> SearchableLogicalLine {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut text = String::new();
+    let mut boundaries = Vec::new();
+    for row_within in 0..wrapped.row_count() {
+        let row_start = wrapped.row_boundaries[row_within];
+        let row_end = wrapped.row_boundaries[row_within + 1];
+        let row = &wrapped.text[row_start..row_end];
+        let absolute_row = absolute_first_row.saturating_add(row_within);
+        let mut col = 0usize;
+        for (character_index, character) in row.chars().enumerate() {
+            let spinner = exclude_spinner
+                && row_within == 0
+                && character_index == 2
+                && SPINNER_FRAMES
+                    .iter()
+                    .any(|frame| frame.starts_with(character));
+            if spinner {
+                col = col.saturating_add(character.width().unwrap_or(0));
+                continue;
+            }
+            boundaries.push((
+                text.len(),
+                SelectionPos {
+                    row: absolute_row,
+                    col,
+                },
+            ));
+            text.push(character);
+            col = col.saturating_add(character.width().unwrap_or(0));
+        }
+        if let Some(gap) = wrapped.wrap_gaps.get(row_within) {
+            let next_row = absolute_row.saturating_add(1);
+            let mut gap_col = 0usize;
+            for character in gap.chars() {
+                boundaries.push((
+                    text.len(),
+                    SelectionPos {
+                        row: next_row,
+                        col: gap_col,
+                    },
+                ));
+                text.push(character);
+                gap_col = gap_col.saturating_add(character.width().unwrap_or(0));
+            }
+        }
+    }
+    let end = if let Some(last_row) = wrapped.row_count().checked_sub(1) {
+        let row_start = wrapped.row_boundaries[last_row];
+        let row_end = wrapped.row_boundaries[last_row + 1];
+        let row = &wrapped.text[row_start..row_end];
+        SelectionPos {
+            row: absolute_first_row.saturating_add(last_row),
+            col: UnicodeWidthStr::width(row),
+        }
+    } else {
+        SelectionPos {
+            row: absolute_first_row,
+            col: 0,
+        }
+    };
+    boundaries.push((text.len(), end));
+    SearchableLogicalLine { text, boundaries }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
@@ -1009,6 +1210,7 @@ mod tests {
     };
     use crate::selection::{SelectionGranularity, SelectionPos, TranscriptSelection};
     use crate::theme::Theme;
+    use crate::transcript_search::{SearchQuery, TranscriptLineIdentity, TranscriptSearchMatch};
     use crate::types::{AppState, ChatMessage, TuiEvent};
     use crate::ui::build_lines_for_messages;
 
@@ -1354,6 +1556,254 @@ mod tests {
                 )
             },
         );
+    }
+
+    fn prepare_exact(
+        cache: &mut TranscriptRenderCache,
+        messages: &[ChatMessage],
+        revisions: &[u64],
+        width: usize,
+        tick: u64,
+    ) {
+        let theme = theme();
+        cache.prepare(
+            messages,
+            revisions,
+            TranscriptRenderContext::new(&theme, width, tick, false),
+            |_, message, theme, width, tick, force_expand| {
+                build_lines_for_messages(
+                    std::slice::from_ref(message),
+                    theme,
+                    width,
+                    tick,
+                    force_expand,
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn content_generation_changes_only_when_searchable_cache_content_changes() {
+        let messages = vec![ChatMessage::Assistant("alpha".to_string())];
+        let mut revisions = vec![1];
+        let mut cache = TranscriptRenderCache::default();
+        assert_eq!(cache.content_generation(), 0);
+
+        prepare_exact(&mut cache, &messages, &revisions, 40, 0);
+        let built = cache.content_generation();
+        assert_ne!(built, 0);
+
+        prepare_exact(&mut cache, &messages, &revisions, 40, 0);
+        let _ = cache.viewport(0, 0, 10);
+        assert_eq!(cache.content_generation(), built);
+
+        revisions[0] += 1;
+        cache.invalidate(0);
+        prepare_exact(&mut cache, &messages, &revisions, 40, 0);
+        assert_ne!(cache.content_generation(), built);
+    }
+
+    #[test]
+    fn spinner_only_patch_does_not_change_search_generation() {
+        let messages = vec![ChatMessage::ToolCall {
+            id: "running".to_string(),
+            name: "read".to_string(),
+            target: None,
+            status: "running".to_string(),
+            output: None,
+            diff: None,
+            kind: None,
+            expanded: false,
+        }];
+        let revisions = vec![1];
+        let mut cache = TranscriptRenderCache::default();
+        prepare_exact(&mut cache, &messages, &revisions, 40, 0);
+        let generation = cache.content_generation();
+
+        prepare_exact(&mut cache, &messages, &revisions, 40, 2);
+
+        assert_eq!(cache.content_generation(), generation);
+    }
+
+    #[test]
+    fn structural_cache_mutations_bump_generation_only_when_effective() {
+        let messages = vec![
+            ChatMessage::System("one".to_string()),
+            ChatMessage::System("two".to_string()),
+        ];
+        let revisions = vec![1, 2];
+        let mut cache = TranscriptRenderCache::default();
+        prepare_exact(&mut cache, &messages, &revisions, 40, 0);
+
+        let initial = cache.content_generation();
+        cache.retain(&[true, true]);
+        assert_eq!(cache.content_generation(), initial);
+
+        cache.retain(&[false, true]);
+        let retained = cache.content_generation();
+        assert_ne!(retained, initial);
+
+        cache.truncate(0);
+        let truncated = cache.content_generation();
+        assert_ne!(truncated, retained);
+
+        cache.clear();
+        assert_ne!(cache.content_generation(), truncated);
+    }
+
+    fn prepared_search_cache(
+        lines_per_message: &[Vec<Line<'static>>],
+        width: usize,
+    ) -> TranscriptRenderCache {
+        let messages = (0..lines_per_message.len())
+            .map(|index| ChatMessage::System(index.to_string()))
+            .collect::<Vec<_>>();
+        let revisions = (1..=messages.len() as u64).collect::<Vec<_>>();
+        let mut cache = TranscriptRenderCache::default();
+        let theme = theme();
+        cache.prepare(
+            &messages,
+            &revisions,
+            TranscriptRenderContext::new(&theme, width, 0, false),
+            |_, message, _, _, _, _| {
+                let ChatMessage::System(index) = message else {
+                    unreachable!();
+                };
+                lines_per_message[index.parse::<usize>().unwrap()].clone()
+            },
+        );
+        cache
+    }
+
+    #[test]
+    fn search_maps_span_and_soft_wrap_matches_to_absolute_rows() {
+        let messages = vec![ChatMessage::System("fixture".to_string())];
+        let revisions = vec![7];
+        let mut cache = TranscriptRenderCache::default();
+        let theme = theme();
+        cache.prepare(
+            &messages,
+            &revisions,
+            TranscriptRenderContext::new(&theme, 6, 0, false),
+            |_, _, _, _, _, _| {
+                vec![Line::from(vec![
+                    Span::styled("alpha ", Style::default().fg(Color::Red)),
+                    Span::styled("beta", Style::default().fg(Color::Blue)),
+                ])]
+            },
+        );
+
+        let matches = cache.search(0, &SearchQuery::new("alpha beta"));
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].start, SelectionPos { row: 0, col: 0 });
+        assert_eq!(matches[0].end, SelectionPos { row: 1, col: 4 });
+        assert_eq!(matches[0].line_identity.message_revision, 7);
+    }
+
+    #[test]
+    fn search_does_not_cross_hard_lines_or_message_boundaries() {
+        let cache = prepared_search_cache(
+            &[
+                vec![Line::from("alpha"), Line::from("beta")],
+                vec![Line::from("gamma")],
+            ],
+            80,
+        );
+        assert!(cache.search(0, &SearchQuery::new("alpha beta")).is_empty());
+        assert!(cache.search(0, &SearchQuery::new("beta gamma")).is_empty());
+    }
+
+    #[test]
+    fn search_maps_cjk_combining_and_emoji_to_display_columns() {
+        let cache = prepared_search_cache(&[vec![Line::from("A中e\u{301}👍🏽Z")]], 80);
+        let cjk = cache.search(0, &SearchQuery::new("中"));
+        assert_eq!((cjk[0].start.col, cjk[0].end.col), (1, 3));
+        let combining = cache.search(0, &SearchQuery::new("e\u{301}"));
+        assert_eq!((combining[0].start.col, combining[0].end.col), (3, 4));
+        let emoji = cache.search(0, &SearchQuery::new("👍🏽"));
+        assert!(emoji[0].end.col > emoji[0].start.col);
+    }
+
+    #[test]
+    fn search_skips_unprepared_and_flushed_entries_and_keeps_repeated_matches() {
+        let mut unprepared = TranscriptRenderCache::default();
+        unprepared.reconcile_len(1);
+        assert!(unprepared.search(0, &SearchQuery::new("x")).is_empty());
+
+        let repeated = prepared_search_cache(&[vec![Line::from("x x x")]], 80);
+        assert_eq!(repeated.search(0, &SearchQuery::new("x")).len(), 3);
+
+        let flushed = prepared_search_cache(
+            &[
+                vec![Line::from("old target")],
+                vec![Line::from("live target")],
+            ],
+            80,
+        );
+        let found = flushed.search(1, &SearchQuery::new("target"));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].line_identity.message_revision, 2);
+    }
+
+    #[test]
+    fn search_coordinates_remain_usize_above_u16_max() {
+        let lines = (0..70_000)
+            .map(|index| Line::from(format!("line {index}")))
+            .collect::<Vec<_>>();
+        let cache = prepared_search_cache(&[lines], 80);
+        let found = cache.search(0, &SearchQuery::new("line 69999"));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].start.row, 69_999);
+    }
+
+    #[test]
+    fn search_excludes_spinner_glyph_but_keeps_stable_tool_text() {
+        let messages = vec![ChatMessage::ToolCall {
+            id: "running".to_string(),
+            name: "read".to_string(),
+            target: Some("src/lib.rs".to_string()),
+            status: "running".to_string(),
+            output: None,
+            diff: None,
+            kind: None,
+            expanded: false,
+        }];
+        let revisions = vec![1];
+        let mut cache = TranscriptRenderCache::default();
+        prepare_exact(&mut cache, &messages, &revisions, 80, 0);
+
+        assert!(
+            cache
+                .search(0, &SearchQuery::new(SPINNER_FRAMES[0]))
+                .is_empty()
+        );
+        assert_eq!(cache.search(0, &SearchQuery::new("read")).len(), 1);
+        assert_eq!(cache.search(0, &SearchQuery::new("running")).len(), 1);
+    }
+
+    #[test]
+    fn reveal_offset_keeps_visible_match_and_uses_nearest_edge() {
+        let cache = prepared_search_cache(
+            &(0..30)
+                .map(|index| vec![Line::from(format!("line {index}"))])
+                .collect::<Vec<_>>(),
+            80,
+        );
+        let found = |row, revision| {
+            TranscriptSearchMatch::new(
+                SelectionPos { row, col: 0 },
+                SelectionPos { row, col: 4 },
+                TranscriptLineIdentity {
+                    message_revision: revision,
+                    line_index: 0,
+                },
+                0..4,
+            )
+        };
+
+        assert_eq!(cache.reveal_offset(0, 10, 5, &found(12, 13)), 10);
+        assert_eq!(cache.reveal_offset(0, 10, 5, &found(3, 4)), 3);
+        assert_eq!(cache.reveal_offset(0, 10, 5, &found(20, 21)), 16);
     }
 
     #[test]
