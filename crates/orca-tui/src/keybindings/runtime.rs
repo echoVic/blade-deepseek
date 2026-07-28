@@ -8,6 +8,7 @@ use crate::types::PanelMode;
 use crate::vim::VimMode;
 
 use super::config::{KeyStroke, Keymap};
+use super::reload::FileObservation;
 
 const CHORD_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -68,6 +69,14 @@ pub(crate) enum ShortcutResolution {
     Action(ShortcutInvocation),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReloadOutcome {
+    Unchanged,
+    Applied,
+    RestoredDefaults,
+    Rejected(String),
+}
+
 #[derive(Clone, Debug)]
 struct PendingChord {
     owner: InputOwnerFingerprint,
@@ -79,6 +88,8 @@ pub(crate) struct KeymapRuntime {
     keymap: Arc<Keymap>,
     generation: u64,
     pending: Option<PendingChord>,
+    last_observation: Option<FileObservation>,
+    active_bytes: Option<Vec<u8>>,
 }
 
 impl KeymapRuntime {
@@ -87,6 +98,8 @@ impl KeymapRuntime {
             keymap,
             generation: 0,
             pending: None,
+            last_observation: None,
+            active_bytes: None,
         }
     }
 
@@ -182,6 +195,46 @@ impl KeymapRuntime {
     pub(crate) const fn generation(&self) -> u64 {
         self.generation
     }
+
+    pub(crate) fn apply_observation(&mut self, observation: FileObservation) -> ReloadOutcome {
+        if self.last_observation.as_ref() == Some(&observation) {
+            return ReloadOutcome::Unchanged;
+        }
+        self.last_observation = Some(observation.clone());
+        match observation {
+            FileObservation::Missing => {
+                if self.active_bytes.is_none() {
+                    return ReloadOutcome::Unchanged;
+                }
+                self.active_bytes = None;
+                self.install(Keymap::built_in());
+                ReloadOutcome::RestoredDefaults
+            }
+            FileObservation::Rejected(error) => {
+                ReloadOutcome::Rejected(format!("keybindings reload rejected: {error}"))
+            }
+            FileObservation::Bytes(bytes) => {
+                if self.active_bytes.as_ref() == Some(&bytes) {
+                    return ReloadOutcome::Unchanged;
+                }
+                match super::config::parse_keymap(&bytes) {
+                    Ok(keymap) => {
+                        self.active_bytes = Some(bytes);
+                        self.install(keymap);
+                        ReloadOutcome::Applied
+                    }
+                    Err(error) => ReloadOutcome::Rejected(format!(
+                        "keybindings reload rejected: {}",
+                        stable_parse_error(&error.to_string())
+                    )),
+                }
+            }
+        }
+    }
+}
+
+fn stable_parse_error(error: &str) -> &str {
+    error.split(" at line ").next().unwrap_or(error)
 }
 
 #[cfg(test)]
