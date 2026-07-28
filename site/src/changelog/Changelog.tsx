@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.56":
+        "The CLI binary is now limited to argument parsing and library forwarding: configuration, launch, update, history, trust, workflow, protocol and worker ownership live in orca-runtime and orca-tui. Stateless JSONL submissions now own their complete turn lifecycle without requiring a persisted thread, including exact EOF cancellation and settlement. macOS Seatbelt execution now uses the absolute system binary, parameterized path rules, protected metadata write roots and fail-closed enforcement, while trust and command-output failures propagate instead of being reported as success.",
       "v0.2.55":
         "ACP and the JSONL server now complete the runtime-owned typed-surface convergence begun in v0.2.54. ACP session admission, prompt binding, replay, terminal flush, cancellation, capability settlement and bounded transport supervision are owned by the runtime. JSONL thread, control, permission, user-input and MCP routes now use one surface adapter with durable request identity, EOF settlement and restart recovery. Release gates exercise TUI, ACP and server paths against the real binary, while publication verifies exact archives, npm tarballs, checksums, registry integrity, package aliases, binary identity and clean installation.",
       "v0.2.54":
@@ -554,6 +556,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.56":
+        "CLI 二进制现在只负责参数解析和转发：配置、启动、更新、历史、信任、workflow、协议与 worker 生命周期都下沉到 orca-runtime 和 orca-tui。无状态 JSONL submit 不再依赖已持久化 thread，由 runtime 完整拥有 turn，并在 EOF 时精确取消和结算。macOS Seatbelt 改用系统绝对路径、参数化路径规则、受保护 metadata 写入根目录与 fail-closed 强制；信任和命令输出失败也会向上返回，不再误报成功。",
       "v0.2.55":
         "ACP 与 JSONL server 已完成 v0.2.54 开始的 runtime-owned typed surface 收敛。ACP 的 session 准入、prompt 绑定、replay、terminal flush、取消、capability settlement 与有界 transport supervision 现在统一由 runtime 拥有；JSONL 的 thread、control、permission、user-input 和 MCP 路由则收敛到同一个 surface adapter，并保留 durable request identity、EOF settlement 与重启恢复。发布门禁会用真实二进制覆盖 TUI、ACP 和 server，同时校验 release archive、npm tarball、checksum、registry integrity、package alias、binary identity 与干净安装的一致性。",
       "v0.2.54":

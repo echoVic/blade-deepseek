@@ -3,8 +3,20 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-07-25
-Current baseline: v0.2.52 separates Goal continuation admission from
+Last updated: 2026-07-29
+Current baseline: v0.2.56 keeps the executable as a thin parser and forwarding
+layer while `orca-runtime` and `orca-tui` own configuration, launch, update,
+history, trust, workflow, protocol, and worker behavior. Stateless JSONL
+submissions now complete through the runtime without requiring a persisted
+thread, including EOF cancellation and terminal settlement.
+
+The macOS command boundary now invokes `/usr/bin/sandbox-exec` directly, builds
+Seatbelt profiles from parameterized paths, permits only explicit protected
+metadata write roots, and fails closed when enforcement is unavailable. Shell
+sessions, workflow commands, and direct command execution share that sandbox
+contract; trust and output-publication failures propagate to their callers.
+
+Earlier v0.2.52 separates Goal continuation admission from
 cross-turn progress detection. A turn now ends as advanced, resumably
 interrupted, or blocked. Reaching the inner-turn limit preserves a typed
 `MaxInnerTurns` reason and continues with a structured handoff; cost-budget
