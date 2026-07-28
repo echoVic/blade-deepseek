@@ -18,10 +18,7 @@ fn root_cli_is_only_argument_parsing_conversion_and_forwarding() {
         "check_latest_for_prompt",
         "#[cfg(test)]",
     ] {
-        assert!(
-            !cli.contains(forbidden),
-            "root CLI still owns {forbidden}"
-        );
+        assert!(!cli.contains(forbidden), "root CLI still owns {forbidden}");
     }
     for facade in [
         "orca_runtime::command::exec",
