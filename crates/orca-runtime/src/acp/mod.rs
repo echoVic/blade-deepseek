@@ -13,21 +13,7 @@ pub use agent::OrcaAcpAgent;
 
 use orca_core::config::RunConfig;
 
-use crate::runtime_host::RuntimeHost;
 use crate::surface::RuntimeSurfaceHostHandle;
-
-pub fn run(config: RunConfig) -> i32 {
-    let host = match RuntimeHost::start() {
-        Ok(host) => host,
-        Err(error) => {
-            eprintln!("orca: failed to start runtime host: {error}");
-            return 1;
-        }
-    };
-    let exit_code = run_with_surface_host(host.surface_handle(), config);
-    drop(host);
-    exit_code
-}
 
 /// Runs the ACP adapter on stdio using a caller-owned runtime surface host.
 pub fn run_with_surface_host(surface_host: RuntimeSurfaceHostHandle, config: RunConfig) -> i32 {

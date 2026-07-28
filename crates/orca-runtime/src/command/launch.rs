@@ -132,8 +132,21 @@ pub fn run_protocol(request: ProtocolLaunchRequest) -> i32 {
         ProtocolMode::Server => {
             crate::server::run(crate::server::ServerConfig { run_config: config })
         }
-        ProtocolMode::Acp => crate::acp::run(config),
+        ProtocolMode::Acp => run_acp(config),
     }
+}
+
+fn run_acp(config: RunConfig) -> i32 {
+    let host = match crate::runtime_host::RuntimeHost::start() {
+        Ok(host) => host,
+        Err(error) => {
+            eprintln!("orca: failed to start runtime host: {error}");
+            return 1;
+        }
+    };
+    let exit_code = crate::acp::run_with_surface_host(host.surface_handle(), config);
+    drop(host);
+    exit_code
 }
 
 pub fn run_subagent_worker(request: SubagentWorkerLaunchRequest) -> i32 {
