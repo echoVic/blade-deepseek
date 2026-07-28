@@ -235,12 +235,14 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         let animation_active = state.status == AppStatus::Running
             || state.copy_notice.is_some()
             || state.drag_edge_scroll.is_some()
-            || edit_highlight_animation_active(&state);
+            || edit_highlight_animation_active(&state)
+            || presentation.animation_active(state.status);
         if state.copy_notice.is_some() && state.copy_notice_at(now).is_none() {
             state.copy_notice = None;
         }
         if animation_active && scheduler.animation_due(now) {
             state.advance_tick();
+            presentation.advance_tick();
             state.apply_drag_edge_scroll();
             scheduler.did_animate(now);
         }
@@ -266,6 +268,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                     match input_control_rx.recv() {
                         Ok(InputControl::Resumed) => {
                             resume_terminal_render(&mut terminal, &mut scheduler)?;
+                            presentation.invalidate_title();
                             break;
                         }
                         Ok(InputControl::Suspend { acknowledge }) => {
@@ -468,6 +471,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         }
     }
 
+    let _ = presentation.write_reset_title(terminal.backend_mut().inner_mut());
     drop(terminal);
     terminal_input.finish()?;
     mention_search.shutdown();
@@ -949,6 +953,40 @@ mod tests {
         .expect_err("clear failure should stop resume");
         assert_eq!(error.to_string(), "clear failed");
         assert!(!dirty.get());
+    }
+
+    #[test]
+    fn terminal_presentation_animation_resume_and_exit_are_wired_in_order() {
+        let production = include_str!("app.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production source before tests");
+
+        assert!(production.contains("presentation.animation_active(state.status)"));
+        assert!(production.contains("presentation.advance_tick()"));
+
+        let resumed = production
+            .find("Ok(InputControl::Resumed)")
+            .expect("resume branch");
+        let clear = production[resumed..]
+            .find("resume_terminal_render")
+            .map(|offset| resumed + offset)
+            .expect("ratatui clear after resume");
+        let invalidate = production[resumed..]
+            .find("presentation.invalidate_title")
+            .map(|offset| resumed + offset)
+            .expect("title invalidation after resume");
+        assert!(clear < invalidate);
+
+        let reset = production
+            .rfind("presentation.write_reset_title")
+            .expect("orderly title reset");
+        let drop_terminal = production.rfind("drop(terminal)").expect("ratatui drop");
+        let finish_qwertty = production
+            .rfind("terminal_input.finish")
+            .expect("qwertty finish");
+        assert!(reset < drop_terminal);
+        assert!(drop_terminal < finish_qwertty);
     }
 
     #[test]
