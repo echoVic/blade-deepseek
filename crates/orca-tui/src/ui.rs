@@ -4033,9 +4033,21 @@ mod tests {
     }
 
     fn line_containing<'a>(lines: &'a [Line<'static>], needle: &str) -> &'a Line<'static> {
+        let (marker, source) = needle
+            .strip_prefix('+')
+            .map(|source| (Some('+'), source))
+            .or_else(|| needle.strip_prefix('-').map(|source| (Some('-'), source)))
+            .unwrap_or((None, needle));
         lines
             .iter()
-            .find(|line| line.to_string().contains(needle))
+            .find(|line| {
+                line.to_string().contains(source)
+                    && marker.is_none_or(|marker| {
+                        line.spans
+                            .first()
+                            .is_some_and(|span| span.content.ends_with(&format!("{marker} ")))
+                    })
+            })
             .unwrap_or_else(|| panic!("rendered line containing {needle:?}"))
     }
 
@@ -4067,9 +4079,9 @@ mod tests {
         let warm_insert = line_containing(&warm, "+value = 2");
         let warm_context = line_containing(&warm, "print(value)");
 
-        assert_eq!(warm_insert.spans[0].content.as_ref(), "    +");
+        assert_eq!(warm_insert.spans[0].content.as_ref(), "  1 + ");
         assert_eq!(warm_insert.spans[1].style.fg, Some(Color::Magenta));
-        assert_eq!(warm_context.spans[0].content.as_ref(), "     ");
+        assert_eq!(warm_context.spans[0].content.as_ref(), "2 2   ");
         assert_eq!(warm_context.spans[1].style.fg, Some(Color::Cyan));
         assert_eq!(cold_delete.spans, warm_delete.spans);
     }
