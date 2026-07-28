@@ -26,6 +26,7 @@ use crate::edit_highlight_worker::{
 use crate::streaming_markdown::{StreamingMarkdownAction, StreamingMarkdownAssembler};
 use crate::syntax_highlight::{SyntaxTheme, highlighter_for_path};
 use crate::terminal_capabilities::{TerminalColorLevel, syntax_style_revision};
+use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::TranscriptRenderCache;
 #[cfg(test)]
 use crate::transcript_view::TranscriptRenderContext;
@@ -702,6 +703,7 @@ pub struct AppState {
     pub(crate) message_revisions: Vec<u64>,
     next_message_revision: u64,
     pub(crate) transcript_render_cache: TranscriptRenderCache,
+    pub(crate) transcript_search: TranscriptSearchState,
     /// Separate cache for the welcome screen (no messages yet), so its text
     /// is selectable/copyable through the same machinery as the transcript.
     pub(crate) welcome_render_cache: TranscriptRenderCache,
@@ -856,6 +858,7 @@ impl AppState {
             message_revisions: Vec::new(),
             next_message_revision: 1,
             transcript_render_cache: TranscriptRenderCache::default(),
+            transcript_search: TranscriptSearchState::default(),
             welcome_render_cache: TranscriptRenderCache::default(),
             finalized_count: 0,
             flushed_count: 0,
@@ -1494,6 +1497,7 @@ impl AppState {
 
     pub(crate) fn clear_messages(&mut self) {
         self.reset_assistant_stream();
+        self.transcript_search.reset();
         self.messages.clear();
         self.message_revisions.clear();
         self.transcript_render_cache.clear();
@@ -1672,6 +1676,64 @@ impl AppState {
 
     pub fn scroll_to_top(&mut self) {
         self.scroll_offset = 0;
+        self.auto_scroll = false;
+    }
+
+    pub(crate) fn open_transcript_search(&mut self) {
+        if self.panel_mode == PanelMode::Conversation
+            && matches!(
+                self.status,
+                AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
+            )
+        {
+            self.transcript_search.open_new();
+        }
+    }
+
+    pub(crate) fn close_transcript_search(&mut self) {
+        self.transcript_search.close();
+    }
+
+    pub(crate) fn replace_transcript_search_query(&mut self, query: &str) {
+        self.transcript_search.replace_query(query);
+    }
+
+    pub(crate) fn refresh_transcript_search(&mut self) {
+        let generation = self.transcript_render_cache.content_generation();
+        let viewport_base = self.viewport_base_row;
+        let live_start = self.flushed_count.min(self.messages.len());
+        let cache = &self.transcript_render_cache;
+        self.transcript_search
+            .refresh_with(generation, viewport_base, |query| {
+                cache.search(live_start, query)
+            });
+    }
+
+    pub(crate) fn search_next(&mut self) {
+        self.refresh_transcript_search();
+        let Some(found) = self.transcript_search.next().cloned() else {
+            return;
+        };
+        self.scroll_offset = self.transcript_render_cache.reveal_offset(
+            self.flushed_count,
+            self.scroll_offset,
+            self.visible_height,
+            &found,
+        );
+        self.auto_scroll = false;
+    }
+
+    pub(crate) fn search_previous(&mut self) {
+        self.refresh_transcript_search();
+        let Some(found) = self.transcript_search.previous().cloned() else {
+            return;
+        };
+        self.scroll_offset = self.transcript_render_cache.reveal_offset(
+            self.flushed_count,
+            self.scroll_offset,
+            self.visible_height,
+            &found,
+        );
         self.auto_scroll = false;
     }
 
@@ -2369,6 +2431,7 @@ impl AppState {
                 target,
                 preview,
             } => {
+                self.close_transcript_search();
                 self.set_status(AppStatus::WaitingApproval);
                 let options = ApprovalDialog::options_for(&tool, target.as_deref());
                 self.approval_dialog = Some(ApprovalDialog {
@@ -2390,6 +2453,7 @@ impl AppState {
                 preview,
                 permission_kind,
             } => {
+                self.close_transcript_search();
                 self.set_status(AppStatus::WaitingApproval);
                 let options = ApprovalDialog::options_for(&tool, target.as_deref());
                 self.approval_dialog = Some(ApprovalDialog {
@@ -3039,6 +3103,184 @@ mod tests {
             "mock".to_string(),
             "/tmp".to_string(),
         )
+    }
+
+    fn prepare_transcript_cache(state: &mut AppState, width: usize) {
+        let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
+        let messages = &state.messages;
+        let revisions = &state.message_revisions;
+        state.transcript_render_cache.prepare(
+            messages,
+            revisions,
+            TranscriptRenderContext::new(&theme, width, 0, false),
+            |_, message, theme, width, tick, force_expand| {
+                crate::ui::build_lines_for_messages(
+                    std::slice::from_ref(message),
+                    theme,
+                    width,
+                    tick,
+                    force_expand,
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn opening_search_preserves_scroll_and_refresh_selects_viewport_match() {
+        let mut state = state();
+        state.push_message(ChatMessage::Assistant(
+            "first hit\nsecond\nthird hit".to_string(),
+        ));
+        prepare_transcript_cache(&mut state, 20);
+        state.scroll_offset = 1;
+        state.viewport_base_row = 1;
+        state.open_transcript_search();
+        state.replace_transcript_search_query("hit");
+        state.refresh_transcript_search();
+
+        assert!(state.transcript_search.open);
+        assert_eq!(state.scroll_offset, 1);
+        assert_eq!(
+            state
+                .transcript_search
+                .active_match()
+                .map(|found| found.start.row),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn explicit_search_jump_disables_follow_and_reveals_match() {
+        let mut state = state();
+        for index in 0..30 {
+            state.push_message(ChatMessage::System(format!("line {index} target")));
+        }
+        prepare_transcript_cache(&mut state, 80);
+        state.visible_height = 5;
+        state.scroll_offset = 20;
+        state.auto_scroll = true;
+        state.open_transcript_search();
+        state.replace_transcript_search_query("target");
+        state.refresh_transcript_search();
+
+        state.search_next();
+
+        assert!(!state.auto_scroll);
+        let active = state.transcript_search.active_match().unwrap();
+        assert!(active.start.row >= state.scroll_offset);
+        assert!(active.start.row < state.scroll_offset + state.visible_height);
+    }
+
+    #[test]
+    fn clear_resets_search_but_truncate_reconciles_lazily() {
+        let mut state = state();
+        state.open_transcript_search();
+        state.replace_transcript_search_query("x");
+        state.push_message(ChatMessage::System("x".to_string()));
+        prepare_transcript_cache(&mut state, 40);
+        state.refresh_transcript_search();
+        assert_eq!(state.transcript_search.match_count(), 1);
+
+        state.truncate_messages(0);
+        state.refresh_transcript_search();
+        assert_eq!(state.transcript_search.match_count(), 0);
+        assert_eq!(state.transcript_search.query(), "x");
+
+        state.clear_messages();
+        assert!(!state.transcript_search.open);
+        assert_eq!(state.transcript_search.query(), "");
+    }
+
+    #[test]
+    fn append_and_retain_preserve_active_revision_identity() {
+        let mut state = state();
+        state.push_message(ChatMessage::System("remove".to_string()));
+        state.push_message(ChatMessage::System("target".to_string()));
+        prepare_transcript_cache(&mut state, 40);
+        state.open_transcript_search();
+        state.replace_transcript_search_query("target");
+        state.refresh_transcript_search();
+        let identity = state
+            .transcript_search
+            .active_match()
+            .unwrap()
+            .line_identity;
+
+        state.push_message(ChatMessage::System("later target".to_string()));
+        prepare_transcript_cache(&mut state, 40);
+        state.refresh_transcript_search();
+        assert_eq!(
+            state
+                .transcript_search
+                .active_match()
+                .unwrap()
+                .line_identity,
+            identity
+        );
+
+        state.retain_messages(
+            |message| !matches!(message, ChatMessage::System(text) if text == "remove"),
+        );
+        prepare_transcript_cache(&mut state, 40);
+        state.refresh_transcript_search();
+        assert_eq!(
+            state
+                .transcript_search
+                .active_match()
+                .unwrap()
+                .line_identity,
+            identity
+        );
+    }
+
+    #[test]
+    fn removal_chooses_nearest_following_match_and_open_does_not_disable_follow() {
+        let mut state = state();
+        for text in ["target one", "middle", "target two"] {
+            state.push_message(ChatMessage::System(text.to_string()));
+        }
+        prepare_transcript_cache(&mut state, 40);
+        state.auto_scroll = true;
+        state.open_transcript_search();
+        assert!(state.auto_scroll);
+        state.replace_transcript_search_query("target");
+        state.refresh_transcript_search();
+        let first_revision = state
+            .transcript_search
+            .active_match()
+            .unwrap()
+            .line_identity;
+
+        state.retain_messages(
+            |message| !matches!(message, ChatMessage::System(text) if text == "target one"),
+        );
+        prepare_transcript_cache(&mut state, 40);
+        state.refresh_transcript_search();
+        assert_ne!(
+            state
+                .transcript_search
+                .active_match()
+                .unwrap()
+                .line_identity,
+            first_revision
+        );
+        assert_eq!(state.transcript_search.match_count(), 1);
+    }
+
+    #[test]
+    fn approval_closes_search_but_preserves_query() {
+        let mut state = state();
+        state.open_transcript_search();
+        state.replace_transcript_search_query("target");
+        state.update(TuiEvent::ApprovalNeeded {
+            key: interaction_key(TuiInteractionKind::Approval, "approval"),
+            tool: "bash".to_string(),
+            target: None,
+            preview: None,
+        });
+
+        assert!(!state.transcript_search.open);
+        assert_eq!(state.transcript_search.query(), "target");
     }
 
     #[test]
