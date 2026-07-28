@@ -40,7 +40,7 @@ Each character must:
 
 - not be whitespace;
 - not be a control character;
-- be representable by a normal unmodified `Key::Char` input.
+- be representable by a normal `Key::Char` input without Ctrl or Alt.
 
 The two characters may be equal (`"jj"`) or distinct (`"jk"`). Invalid values
 are rejected by effective-config deserialization with an actionable warning
@@ -122,8 +122,8 @@ clear.
 
 ### First character
 
-For an unmodified Insert-mode `Key::Char` equal to the configured first
-character:
+For an Insert-mode `Key::Char` equal to the configured first character and
+without Ctrl or Alt:
 
 1. do not mutate `TextArea`;
 2. store the character and `now + 500ms` deadline;
@@ -133,8 +133,8 @@ The held character creates no textarea undo entry.
 
 ### Exact match
 
-When the next unmodified Insert-mode character equals the configured second
-character:
+When the next Insert-mode character equals the configured second character,
+has no Ctrl or Alt, and is handled at `now <= deadline`:
 
 1. clear `pending_insert_escape`;
 2. switch to Normal mode;
@@ -168,16 +168,17 @@ j j    => exits Insert mode with no inserted text
 ```
 
 Each press is evaluated with the current `Instant` when its event is handled.
-Before processing the current key, `VimState` flushes an already-expired held
-prefix. Events drained in one intake batch retain their order; a second
-character completes the mapping only if its handler runs no later than the
-stored deadline. The loop-level expiry check and the per-key check share the
-same inclusive deadline rule, so batching cannot create two interpretations.
+Before processing the current key, `VimState` flushes a prefix only when
+`now > deadline`. Events drained in one intake batch retain their order; a
+second character completes the mapping when `now <= deadline`. The loop-level
+expiry check and the per-key check share this exact rule, so batching cannot
+create two interpretations.
 
-Modified characters (`Ctrl`, `Alt`, or other non-text modifiers), Tab,
-Backspace, Delete, Enter, arrows, function keys, and physical Esc cannot
-complete the sequence. They first flush the held character, then preserve
-their existing behavior. In the integrated TUI, Idle Esc remains the
+Ctrl/Alt-modified characters, Tab, Backspace, Delete, Enter, arrows, function
+keys, and physical Esc cannot complete the sequence. Shift is not independently
+rejected because the input adapter already reflects shifted text in the
+`Key::Char` scalar. Non-completing input first flushes the held character, then
+preserves existing behavior. In the integrated TUI, Idle Esc remains the
 higher-priority Backtrack shortcut and Running Esc remains Interrupt after the
 held character is flushed. At the `VimState` unit boundary, an Esc that reaches
 Insert handling still performs the existing Insert-to-Normal transition.
@@ -195,11 +196,11 @@ iteration it calls:
 vim_state.flush_expired_insert_escape(now, textarea)
 ```
 
-If the 500ms deadline has elapsed, the method inserts the held character once,
-clears the pending state, and returns `true`. The caller resets history
-navigation, refreshes slash/mention input state, and marks the scheduler dirty.
-No thread, channel, alarm, additional event type, or blocking sleep is added.
-The visible insertion may occur up to one frame interval after the deadline.
+If `now > deadline`, the method inserts the held character once, clears the
+pending state, and returns `true`. The caller resets history navigation,
+refreshes slash/mention input state, and marks the scheduler dirty. No thread,
+channel, alarm, additional event type, or blocking sleep is added. The visible
+insertion may occur up to one frame interval after the deadline.
 
 ## Input Ownership Boundaries
 
