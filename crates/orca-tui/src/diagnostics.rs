@@ -107,30 +107,37 @@ impl DiagnosticSnapshot {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn terminal_program(&self) -> &str {
         &self.terminal_program
     }
 
+    #[cfg(test)]
     pub(crate) fn terminal_version(&self) -> Option<&str> {
         self.terminal_version.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn multiplexers(&self) -> &[String] {
         &self.multiplexers
     }
 
+    #[cfg(test)]
     pub(crate) const fn keybindings_location(&self) -> KeybindingsLocation {
         self.keybindings_location
     }
 
+    #[cfg(test)]
     pub(crate) const fn color_level(&self) -> TerminalColorLevel {
         self.color_level
     }
 
+    #[cfg(test)]
     pub(crate) const fn requested_theme(&self) -> ThemeName {
         self.requested_theme
     }
 
+    #[cfg(test)]
     pub(crate) const fn resolved_theme(&self) -> ThemeName {
         self.resolved_theme
     }
