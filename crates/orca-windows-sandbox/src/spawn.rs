@@ -1025,13 +1025,55 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn windows_argument_quoting_preserves_backslashes() {
+    fn windows_argument_quoting_matches_create_process_contract() {
         assert_eq!(quote_windows_arg("plain"), "plain");
+        assert_eq!(quote_windows_arg(""), "\"\"");
+        assert_eq!(quote_windows_arg("two words"), "\"two words\"");
+        assert_eq!(quote_windows_arg("single'quote"), "single'quote");
+        assert_eq!(quote_windows_arg("&|<>^%!"), "&|<>^%!");
+        assert_eq!(
+            quote_windows_arg("line one\nline two"),
+            "\"line one\nline two\""
+        );
+        assert_eq!(quote_windows_arg(r"路径\文件.txt"), r"路径\文件.txt");
         assert_eq!(
             quote_windows_arg(r"C:\Program Files\orca"),
             r#""C:\Program Files\orca""#
         );
         assert_eq!(quote_windows_arg("a\"b"), "\"a\\\"b\"");
+        assert_eq!(
+            quote_windows_arg("C:\\Program Files\\Orca\\"),
+            "\"C:\\Program Files\\Orca\\\\\""
+        );
+    }
+
+    #[test]
+    fn native_command_line_keeps_each_argument_independent() {
+        let encoded = command_line(
+            Path::new(r"C:\Program Files\Node\node.exe"),
+            &[
+                OsString::from("-e"),
+                OsString::from("process.stdout.write(JSON.stringify(process.argv.slice(1)))"),
+                OsString::from(""),
+                OsString::from("two words"),
+                OsString::from("single'quote"),
+                OsString::from("double\"quote"),
+                OsString::from("&|<>^%!"),
+                OsString::from("line one\nline two"),
+                OsString::from(r"路径\文件.txt"),
+            ],
+        );
+        let decoded = String::from_utf16(
+            encoded
+                .strip_suffix(&[0])
+                .expect("nul-terminated command line"),
+        )
+        .expect("UTF-16 command line");
+
+        assert_eq!(
+            decoded,
+            "\"C:\\Program Files\\Node\\node.exe\" -e \"process.stdout.write(JSON.stringify(process.argv.slice(1)))\" \"\" \"two words\" single'quote \"double\\\"quote\" &|<>^%! \"line one\nline two\" 路径\\文件.txt"
+        );
     }
 
     #[test]
@@ -1186,6 +1228,66 @@ mod tests {
         let error = error_reader.join().expect("join stderr reader");
         assert!(status.success(), "stdout={output:?}, stderr={error:?}");
         assert!(output.contains("restricted-powershell-ok"), "{output:?}");
+    }
+
+    #[test]
+    fn appcontainer_powershell_7_initializes_with_full_language() {
+        let Some(program) = std::env::var_os("ProgramFiles")
+            .map(PathBuf::from)
+            .map(|root| root.join("PowerShell").join("7").join("pwsh.exe"))
+            .filter(|path| path.is_file())
+        else {
+            eprintln!("skipping AppContainer PowerShell 7 contract: pwsh.exe is not installed");
+            return;
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plan = WindowsSandboxPlan::build(WindowsSandboxPolicyInput {
+            mode: SandboxFilesystemMode::WorkspaceWrite,
+            cwd: temp.path().to_path_buf(),
+            readable_roots: Vec::new(),
+            writable_roots: Vec::new(),
+            denied_roots: Vec::new(),
+            network_access: false,
+        })
+        .expect("sandbox plan");
+        let capabilities = CapabilityStore::new(temp.path().join("capabilities"));
+        let args = vec![
+            OsString::from("-NoLogo"),
+            OsString::from("-NoProfile"),
+            OsString::from("-NonInteractive"),
+            OsString::from("-Command"),
+            OsString::from(
+                "Write-Output $ExecutionContext.SessionState.LanguageMode; Set-Content -NoNewline -LiteralPath appcontainer-pwsh.txt -Value appcontainer-powershell-ok; Get-Content -Raw -LiteralPath appcontainer-pwsh.txt",
+            ),
+        ];
+        let mut child = SandboxedChild::spawn(SandboxSpawnRequest {
+            program: &program,
+            args: &args,
+            cwd: temp.path(),
+            env: &BTreeMap::new(),
+            plan: &plan,
+            capabilities: &capabilities,
+        })
+        .expect("AppContainer PowerShell 7 child");
+        let (stdin, stdout, stderr) = child.take_stdio().expect("stdio");
+        drop(stdin);
+        let output_reader = text_reader(stdout, "stdout");
+        let error_reader = text_reader(stderr, "stderr");
+        let status = wait_for_pipe_child(&mut child, "AppContainer PowerShell 7 child");
+        let output = output_reader.join().expect("join stdout reader");
+        let error = error_reader.join().expect("join stderr reader");
+
+        assert!(status.success(), "stdout={output:?}, stderr={error:?}");
+        assert!(output.contains("FullLanguage"), "stdout={output:?}");
+        assert!(
+            output.contains("appcontainer-powershell-ok"),
+            "stdout={output:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("appcontainer-pwsh.txt"))
+                .expect("read AppContainer PowerShell output"),
+            "appcontainer-powershell-ok"
+        );
     }
 
     #[test]

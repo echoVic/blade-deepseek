@@ -37,6 +37,12 @@ irm https://orcaagent.dev/install.ps1 | iex
 npm 包支持 macOS、Linux 和 Windows 的 ARM64 与 x64 平台。也可以从
 [GitHub Releases](https://github.com/echoVic/orca-agent/releases/latest) 下载预编译文件。
 
+Windows 上会优先使用 PowerShell 7；即使它不在 `PATH` 中，Orca 也会检查标准
+安装目录。未安装 PowerShell 7 时，受限会话回退到 `cmd.exe`。Windows
+PowerShell 5.1 仅适用于不需要 AppContainer 隔离的显式配置。协议中的命令数组
+会作为原生 Windows argv 直接启动，不再经过 shell 二次解析；旧字符串命令仍按
+已解析的 shell 方言执行。
+
 ## 使用
 
 ```bash

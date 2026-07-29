@@ -38,6 +38,13 @@ From a project directory, provision its restricted sandbox capability with:
 The npm package supports macOS, Linux, and Windows on ARM64 and x64. Prebuilt
 archives are also available from [GitHub Releases](https://github.com/echoVic/orca-agent/releases/latest).
 
+On Windows, Orca prefers PowerShell 7 and detects its standard installation
+path even when it is absent from `PATH`. Restricted sessions fall back to
+`cmd.exe` when PowerShell 7 is unavailable. Windows PowerShell 5.1 remains an
+explicit option only for modes that do not require AppContainer isolation.
+Protocol command arrays are launched as native Windows argv without shell
+re-parsing; legacy string commands use the resolved shell dialect.
+
 ## Use
 
 ```bash

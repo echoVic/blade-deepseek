@@ -71,20 +71,24 @@ where
     }
 
     fn resolve_windows_default(&self) -> Result<ShellSpec, PlatformError> {
+        // Windows PowerShell 5.1 enters ConstrainedLanguage inside Orca's
+        // AppContainer sandbox, which cannot satisfy the general shell
+        // contract. Prefer cmd.exe as the built-in restricted-mode fallback;
+        // callers can still select powershell.exe explicitly for full access.
         for (candidate, kind) in [
             ("pwsh.exe", ShellKind::PowerShell(PowerShellEdition::Core)),
+            ("cmd.exe", ShellKind::Cmd),
             (
                 "powershell.exe",
                 ShellKind::PowerShell(PowerShellEdition::Windows),
             ),
-            ("cmd.exe", ShellKind::Cmd),
         ] {
             if let Some(executable) = (self.probe)(candidate) {
                 return Ok(ShellSpec::new(executable, kind));
             }
         }
         Err(PlatformError::ExecutableNotFound {
-            executable: "pwsh.exe, powershell.exe, or cmd.exe".to_string(),
+            executable: "pwsh.exe, cmd.exe, or powershell.exe".to_string(),
         })
     }
 
@@ -125,7 +129,7 @@ fn find_executable(candidate: &str) -> Option<PathBuf> {
         return absolute_existing_path(candidate_path);
     }
     let current_directory = env::current_dir().ok();
-    env::var_os("PATH")
+    let from_path = env::var_os("PATH")
         .into_iter()
         .flat_map(|value| env::split_paths(&value).collect::<Vec<_>>())
         .find_map(|directory| {
@@ -137,7 +141,76 @@ fn find_executable(candidate: &str) -> Option<PathBuf> {
                 return None;
             }
             absolute_existing_path(&candidate_path)
-        })
+        });
+    from_path.or_else(|| find_standard_windows_executable(candidate, current_directory.as_deref()))
+}
+
+#[cfg(windows)]
+fn find_standard_windows_executable(candidate: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    let program_files = env::var_os("ProgramFiles").map(PathBuf::from);
+    let system_root = env::var_os("SystemRoot").map(PathBuf::from);
+    let comspec = env::var_os("COMSPEC").map(PathBuf::from);
+    standard_windows_executable_candidates(
+        candidate,
+        program_files.as_deref(),
+        system_root.as_deref(),
+        comspec.as_deref(),
+    )
+    .into_iter()
+    .find_map(|candidate_path| {
+        if cwd.is_some_and(|cwd| is_current_directory_executable(&candidate_path, cwd)) {
+            return None;
+        }
+        absolute_existing_path(&candidate_path)
+    })
+}
+
+#[cfg(not(windows))]
+fn find_standard_windows_executable(_candidate: &str, _cwd: Option<&Path>) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(windows)]
+fn standard_windows_executable_candidates(
+    candidate: &str,
+    program_files: Option<&Path>,
+    system_root: Option<&Path>,
+    comspec: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    match candidate.to_ascii_lowercase().as_str() {
+        "pwsh" | "pwsh.exe" => {
+            if let Some(program_files) = program_files {
+                candidates.push(program_files.join("PowerShell").join("7").join("pwsh.exe"));
+            }
+            candidates.push(PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"));
+        }
+        "powershell" | "powershell.exe" => {
+            if let Some(system_root) = system_root {
+                candidates.push(
+                    system_root
+                        .join("System32")
+                        .join("WindowsPowerShell")
+                        .join("v1.0")
+                        .join("powershell.exe"),
+                );
+            }
+            candidates.push(PathBuf::from(
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            ));
+        }
+        "cmd" | "cmd.exe" => {
+            if let Some(comspec) = comspec {
+                candidates.push(comspec.to_path_buf());
+            }
+            if let Some(system_root) = system_root {
+                candidates.push(system_root.join("System32").join("cmd.exe"));
+            }
+            candidates.push(PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+        }
+        _ => {}
+    }
+    candidates
 }
 
 /// Resolve a bare child-process name on Windows, including `.cmd`/`.bat`
@@ -161,7 +234,7 @@ pub fn resolve_program(program: &str) -> Option<PathBuf> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 fn plan_program(
     program: &str,
     is_windows: bool,
@@ -208,7 +281,9 @@ fn absolute_existing_path(path: &Path) -> Option<PathBuf> {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use super::{is_current_directory_executable, plan_program};
+    use super::{
+        is_current_directory_executable, plan_program, standard_windows_executable_candidates,
+    };
     use std::path::Path;
 
     #[test]
@@ -240,6 +315,41 @@ mod windows_tests {
                 panic!("absolute launcher paths must not be resolved")
             }),
             None,
+        );
+    }
+
+    #[test]
+    fn native_shell_fallbacks_use_standard_windows_install_roots() {
+        let program_files = Path::new(r"D:\Program Files");
+        let system_root = Path::new(r"D:\Windows");
+        let comspec = Path::new(r"D:\Windows\System32\cmd.exe");
+
+        assert_eq!(
+            standard_windows_executable_candidates(
+                "pwsh.exe",
+                Some(program_files),
+                Some(system_root),
+                Some(comspec),
+            )[0],
+            Path::new(r"D:\Program Files\PowerShell\7\pwsh.exe")
+        );
+        assert_eq!(
+            standard_windows_executable_candidates(
+                "powershell.exe",
+                Some(program_files),
+                Some(system_root),
+                Some(comspec),
+            )[0],
+            Path::new(r"D:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+        );
+        assert_eq!(
+            standard_windows_executable_candidates(
+                "cmd.exe",
+                Some(program_files),
+                Some(system_root),
+                Some(comspec),
+            )[0],
+            comspec
         );
     }
 }

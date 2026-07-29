@@ -7,9 +7,12 @@ Last updated: 2026-07-29
 Current baseline: v0.3.0 adds native Windows x64 and ARM64 support across the
 CLI, TUI, shell sessions, sandboxing, update flow, persistence, npm packages,
 release archives, and CI. Shell resolution preserves PowerShell 7, Windows
-PowerShell, cmd.exe, and explicit Git Bash dialects; ConPTY owns interactive
-terminal I/O and resize; Job Objects own process-tree cleanup; AltGr and
-clipboard input follow Windows behavior.
+PowerShell, cmd.exe, and explicit Git Bash dialects. PowerShell 7 is discovered
+from both `PATH` and its standard installation directory; restricted sessions
+fall back to cmd.exe rather than running Windows PowerShell 5.1 in AppContainer
+ConstrainedLanguage. ConPTY owns interactive terminal I/O and resize; Job
+Objects own process-tree cleanup; AltGr and clipboard input follow Windows
+behavior.
 
 The Windows sandbox uses restricted tokens or AppContainer according to the
 requested filesystem and network policy. The PowerShell installer verifies the

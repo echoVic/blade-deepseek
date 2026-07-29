@@ -77,6 +77,8 @@ jobs:
           cargo test -p orca-runtime native_pty_capabilities_match_supported_hosts --locked -- --nocapture
           cargo test --test session_server_contract server_mode_reports_shell_capabilities --locked -- --nocapture
           cargo test --test session_server_contract server_mode_command_exec_returns_buffered_output --locked -- --nocapture
+          cargo test --test session_server_contract server_mode_command_exec_preserves_native_windows_argv --locked -- --nocapture
+          cargo test --test session_server_contract server_mode_command_exec_preserves_legacy_script_command --locked -- --nocapture
           cargo test -p orca-provider prompt_names_powershell_7_as_the_active_shell_dialect --locked -- --nocapture
           cargo test -p orca-tui altgr_char_is_normalized_to_text_input_on_windows_only --locked -- --nocapture
           cargo test -p orca-runtime windows_standalone_update_uses_downloaded_powershell_installer --locked -- --nocapture
@@ -131,6 +133,8 @@ jobs:
           cargo test -p orca-tools sandbox --locked -- --nocapture
           cargo test -p orca-runtime restricted_windows_pty_session_keeps_terminal_and_resizes --locked -- --nocapture
           cargo test --test session_server_contract server_mode_command_exec_returns_buffered_output --locked -- --nocapture
+          cargo test --test session_server_contract server_mode_command_exec_preserves_native_windows_argv --locked -- --nocapture
+          cargo test --test session_server_contract server_mode_command_exec_preserves_legacy_script_command --locked -- --nocapture
           cargo test -p orca-provider prompt_names_powershell_7_as_the_active_shell_dialect --locked -- --nocapture
           cargo test -p orca-tui altgr_char_is_normalized_to_text_input_on_windows_only --locked -- --nocapture
           cargo test -p orca-runtime windows_standalone_update_uses_downloaded_powershell_installer --locked -- --nocapture

@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use orca_core::task_types::TaskStatus;
 use orca_platform::process::ProcessJob;
+#[cfg(windows)]
+use orca_platform::shell::PowerShellEdition;
 use orca_platform::shell::{ShellKind, ShellResolver, ShellSpec};
 use orca_platform::terminal::native_pty_supported;
 #[cfg(windows)]
@@ -842,6 +844,14 @@ impl RuntimeShellSessionManager {
 fn ensure_shell_sandbox_supported(shell: ShellKind, sandbox: ShellSandboxMode) -> io::Result<()> {
     #[cfg(windows)]
     {
+        if matches!(shell, ShellKind::PowerShell(PowerShellEdition::Windows))
+            && windows_sandbox_uses_appcontainer(sandbox)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows PowerShell 5.1 runs in ConstrainedLanguage inside the AppContainer sandbox and cannot satisfy Orca's shell contract; install PowerShell 7 (pwsh.exe) or use cmd.exe",
+            ));
+        }
         if !matches!(sandbox, ShellSandboxMode::DangerFullAccess)
             && matches!(shell, ShellKind::GitBash)
         {
@@ -864,6 +874,18 @@ fn ensure_shell_sandbox_supported(shell: ShellKind, sandbox: ShellSandboxMode) -
         ));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_sandbox_uses_appcontainer(sandbox: ShellSandboxMode) -> bool {
+    match sandbox {
+        ShellSandboxMode::WorkspaceWrite { network_access, .. } => !network_access,
+        ShellSandboxMode::ReadOnly {
+            network_access,
+            allow_global_read,
+        } => !network_access || !allow_global_read,
+        ShellSandboxMode::DangerFullAccess => false,
+    }
 }
 
 #[cfg(windows)]
@@ -1867,6 +1889,33 @@ mod tests {
                 .is_ok()
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_5_rejects_appcontainer_sandbox_modes() {
+        let shell = ShellKind::PowerShell(PowerShellEdition::Windows);
+        for sandbox in [
+            ShellSandboxMode::WorkspaceWrite {
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            ShellSandboxMode::ReadOnly {
+                network_access: false,
+                allow_global_read: false,
+            },
+        ] {
+            let error = ensure_shell_sandbox_supported(shell, sandbox).expect_err(
+                "Windows PowerShell 5.1 cannot satisfy the AppContainer shell contract",
+            );
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(error.to_string().contains("ConstrainedLanguage"));
+        }
+        assert!(
+            ensure_shell_sandbox_supported(shell, ShellSandboxMode::DangerFullAccess).is_ok(),
+            "an explicit Windows PowerShell 5.1 override remains valid without AppContainer"
+        );
     }
 
     #[cfg(windows)]

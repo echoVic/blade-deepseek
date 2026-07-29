@@ -13,7 +13,7 @@ fn linux() -> HostPlatform {
 }
 
 #[test]
-fn windows_prefers_pwsh_then_windows_powershell_then_cmd() {
+fn windows_prefers_pwsh_over_native_fallbacks() {
     let available = BTreeMap::from([
         (
             "pwsh.exe".to_string(),
@@ -37,7 +37,7 @@ fn windows_prefers_pwsh_then_windows_powershell_then_cmd() {
 }
 
 #[test]
-fn windows_falls_back_to_windows_powershell_then_cmd() {
+fn windows_falls_back_to_cmd_before_windows_powershell() {
     let windows_powershell =
         PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
     let cmd = PathBuf::from(r"C:\Windows\System32\cmd.exe");
@@ -47,18 +47,20 @@ fn windows_falls_back_to_windows_powershell_then_cmd() {
     ]);
     let shell = ShellResolver::new(windows(), |name| available.get(name).cloned())
         .resolve(None)
-        .expect("resolve Windows PowerShell");
+        .expect("resolve cmd fallback");
+    assert_eq!(shell.kind(), ShellKind::Cmd);
+    assert_eq!(shell.executable(), cmd);
+
+    let shell = ShellResolver::new(windows(), |name| {
+        (name == "powershell.exe").then(|| windows_powershell.clone())
+    })
+    .resolve(None)
+    .expect("resolve final Windows PowerShell fallback");
     assert_eq!(
         shell.kind(),
         ShellKind::PowerShell(PowerShellEdition::Windows)
     );
     assert_eq!(shell.executable(), windows_powershell);
-
-    let shell = ShellResolver::new(windows(), |name| (name == "cmd.exe").then(|| cmd.clone()))
-        .resolve(None)
-        .expect("resolve cmd fallback");
-    assert_eq!(shell.kind(), ShellKind::Cmd);
-    assert_eq!(shell.tool_name(), "cmd");
 }
 
 #[test]
@@ -157,9 +159,27 @@ fn unix_default_does_not_implicitly_switch_away_from_sh() {
 #[cfg(windows)]
 #[test]
 fn installed_native_windows_shells_emit_the_expected_encoding() {
+    use std::path::Path;
     use std::process::Command;
 
     let resolver = ShellResolver::for_current_host();
+    let standard_pwsh = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .map(|root| root.join("PowerShell").join("7").join("pwsh.exe"));
+    if standard_pwsh.as_deref().is_some_and(Path::is_file) {
+        let shell = resolver
+            .resolve(None)
+            .expect("resolve the installed PowerShell 7 default");
+        assert_eq!(
+            shell.kind(),
+            ShellKind::PowerShell(PowerShellEdition::Core),
+            "an installed standard-path pwsh.exe must win even when PATH omits it"
+        );
+        assert_eq!(
+            std::fs::canonicalize(shell.executable()).expect("canonical resolved pwsh.exe"),
+            std::fs::canonicalize(standard_pwsh.unwrap()).expect("canonical standard pwsh.exe")
+        );
+    }
     let mut tested_powershell_editions = 0;
     for candidate in ["pwsh.exe", "powershell.exe"] {
         let Ok(shell) = resolver.resolve(Some(candidate)) else {

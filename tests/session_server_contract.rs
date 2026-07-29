@@ -164,7 +164,7 @@ fn platform_command(unix: &str, windows: &str) -> Vec<String> {
     {
         let _ = unix;
         vec![
-            "powershell.exe".to_string(),
+            "pwsh.exe".to_string(),
             "-NoLogo".to_string(),
             "-NoProfile".to_string(),
             "-NonInteractive".to_string(),
@@ -176,6 +176,23 @@ fn platform_command(unix: &str, windows: &str) -> Vec<String> {
     {
         let _ = windows;
         vec!["sh".to_string(), "-lc".to_string(), unix.to_string()]
+    }
+}
+
+fn platform_fixture_command(unix: &str, windows_node: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let _ = unix;
+        vec![
+            "node".to_string(),
+            "-e".to_string(),
+            windows_node.to_string(),
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = windows_node;
+        platform_command(unix, "")
     }
 }
 
@@ -3087,9 +3104,9 @@ fn server_mode_command_exec_returns_buffered_output() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": platform_command(
+                "command": platform_fixture_command(
                     "printf 'legacy-out'; printf 'legacy-err' >&2",
-                    "[Console]::Out.Write('legacy-out'); [Console]::Error.Write('legacy-err')"
+                    "process.stdout.write('legacy-out'); process.stderr.write('legacy-err')"
                 ),
                 "tty": false,
                 "streamStdin": false,
@@ -3110,7 +3127,7 @@ fn server_mode_command_exec_returns_buffered_output() {
         .iter()
         .find(|event| event["id"] == "cmd" && event["event"] == "command_exec_completed")
         .expect("command_exec_completed event");
-    assert_eq!(completed["exitCode"], 0);
+    assert_eq!(completed["exitCode"], 0, "{completed:?}");
     assert_eq!(completed["stdout"], "legacy-out");
     assert_eq!(completed["stderr"], "legacy-err");
 }
@@ -3258,9 +3275,9 @@ fn server_mode_command_exec_honors_cwd_and_env_overrides() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": platform_command(
+                "command": platform_fixture_command(
                     "printf '%s|%s|%s|%s' \"$PWD\" \"$ORCA_COMMAND_EXEC_BASE\" \"$ORCA_COMMAND_EXEC_EXTRA\" \"${ORCA_COMMAND_EXEC_REMOVE-unset}\"",
-                    "[Console]::Out.Write(\"$($PWD.Path)|$env:ORCA_COMMAND_EXEC_BASE|$env:ORCA_COMMAND_EXEC_EXTRA|$(if ([string]::IsNullOrEmpty($env:ORCA_COMMAND_EXEC_REMOVE)) { 'unset' } else { $env:ORCA_COMMAND_EXEC_REMOVE })\")"
+                    "const removed = process.env.ORCA_COMMAND_EXEC_REMOVE || 'unset'; process.stdout.write([process.cwd(), process.env.ORCA_COMMAND_EXEC_BASE, process.env.ORCA_COMMAND_EXEC_EXTRA, removed].join('|'))"
                 ),
                 "cwd": command_dir,
                 "env": {
@@ -5207,9 +5224,9 @@ fn server_mode_command_exec_respects_buffered_output_cap() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": platform_command(
+                "command": platform_fixture_command(
                     "printf 'abcdef'; printf 'uvwxyz' >&2",
-                    "[Console]::Out.Write('abcdef'); [Console]::Error.Write('uvwxyz')"
+                    "process.stdout.write('abcdef'); process.stderr.write('uvwxyz')"
                 ),
                 "outputBytesCap": 5
             }
@@ -5257,9 +5274,9 @@ fn server_mode_command_exec_caps_buffered_output_by_bytes() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": platform_command(
+                "command": platform_fixture_command(
                     "printf 'ééé'; printf 'ééé' >&2",
-                    "$encoding = [Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = $encoding; [Console]::Out.Write('ééé'); [Console]::Error.Write('ééé')"
+                    "process.stdout.write('ééé'); process.stderr.write('ééé')"
                 ),
                 "outputBytesCap": 5
             }
@@ -5772,7 +5789,7 @@ fn server_mode_command_exec_write_requires_input_or_close() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": platform_command("cat", "$null = [Console]::In.ReadToEnd()"),
+                "command": platform_fixture_command("cat", "process.stdin.resume()"),
                 "processId": "write-empty-1",
                 "streamStdin": true
             }
@@ -5842,7 +5859,7 @@ fn server_mode_command_exec_resize_rejects_zero_dimensions() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": platform_command("cat", "$null = [Console]::In.ReadToEnd()"),
+                "command": platform_fixture_command("cat", "process.stdin.resume()"),
                 "processId": "resize-zero-1",
                 "tty": true,
                 "size": {"rows": 24, "cols": 80}
@@ -5913,9 +5930,9 @@ fn server_mode_command_exec_streams_output_and_accepts_write() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": platform_command(
+                "command": platform_fixture_command(
                     "printf 'out-start\n'; printf 'err-start\n' >&2; IFS= read line; printf 'out:%s\n' \"$line\"; printf 'err:%s\n' \"$line\" >&2",
-                    "[Console]::Out.Write(\"out-start`n\"); [Console]::Error.Write(\"err-start`n\"); $line = [Console]::In.ReadLine(); [Console]::Out.Write(\"out:$line`n\"); [Console]::Error.Write(\"err:$line`n\")"
+                    "process.stdout.write('out-start\\n'); process.stderr.write('err-start\\n'); process.stdin.setEncoding('utf8'); let input = ''; process.stdin.on('data', chunk => input += chunk); process.stdin.on('end', () => { const line = input.replace(/\\r?\\n$/, ''); process.stdout.write(`out:${line}\\n`); process.stderr.write(`err:${line}\\n`); })"
                 ),
                 "processId": "pipe-1",
                 "streamStdin": true,
