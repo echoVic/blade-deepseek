@@ -992,6 +992,51 @@ mod tests {
     }
 
     #[test]
+    fn restricted_powershell_child_initializes_and_runs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plan = WindowsSandboxPlan::build(WindowsSandboxPolicyInput {
+            mode: SandboxFilesystemMode::WorkspaceWrite,
+            cwd: temp.path().to_path_buf(),
+            readable_roots: Vec::new(),
+            writable_roots: Vec::new(),
+            denied_roots: Vec::new(),
+            network_access: true,
+        })
+        .expect("sandbox plan");
+        let capabilities = CapabilityStore::new(temp.path().join("capabilities"));
+        let program = std::env::var_os("ProgramFiles")
+            .map(PathBuf::from)
+            .map(|root| root.join("PowerShell").join("7").join("pwsh.exe"))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(powershell_program);
+        let args = vec![
+            OsString::from("-NoLogo"),
+            OsString::from("-NoProfile"),
+            OsString::from("-NonInteractive"),
+            OsString::from("-Command"),
+            OsString::from("Write-Output restricted-powershell-ok"),
+        ];
+        let mut child = SandboxedChild::spawn(SandboxSpawnRequest {
+            program: &program,
+            args: &args,
+            cwd: temp.path(),
+            env: &BTreeMap::new(),
+            plan: &plan,
+            capabilities: &capabilities,
+        })
+        .expect("restricted PowerShell child");
+        let (stdin, stdout, stderr) = child.take_stdio().expect("stdio");
+        drop(stdin);
+        let output_reader = text_reader(stdout, "stdout");
+        let error_reader = text_reader(stderr, "stderr");
+        let status = wait_for_pipe_child(&mut child, "restricted PowerShell child");
+        let output = output_reader.join().expect("join stdout reader");
+        let error = error_reader.join().expect("join stderr reader");
+        assert!(status.success(), "stdout={output:?}, stderr={error:?}");
+        assert!(output.contains("restricted-powershell-ok"), "{output:?}");
+    }
+
+    #[test]
     fn appcontainer_pipe_child_runs_without_network_capability() {
         run_pipe_child(false, false);
     }

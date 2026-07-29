@@ -16,11 +16,12 @@ use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
-    ACL, AdjustTokenPrivileges, CreateRestrictedToken, CreateWellKnownSid,
-    DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, FreeSid, LUA_TOKEN, LookupPrivilegeValueW,
-    SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-    TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenDefaultDacl, WRITE_RESTRICTED,
+    ACL, AdjustTokenPrivileges, CopySid, CreateRestrictedToken, CreateWellKnownSid,
+    DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, FreeSid, GetLengthSid, GetTokenInformation,
+    LUA_TOKEN, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES,
+    SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    TokenDefaultDacl, TokenGroups, WRITE_RESTRICTED,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -35,6 +36,7 @@ const WIN_WORLD_SID: i32 = 1;
 const CONTAINER_INHERIT_ACE: u32 = 0x02;
 const OBJECT_INHERIT_ACE: u32 = 0x01;
 const TOKEN_DEFAULT_DACL_CLASS: TOKEN_INFORMATION_CLASS = TokenDefaultDacl;
+const SE_GROUP_LOGON_ID: u32 = 0xc000_0000;
 
 pub struct PreparedSecurity {
     token: OwnedHandle,
@@ -330,6 +332,7 @@ fn ensure_acl_entry(
 
 fn create_restricted_token(sids: &[*mut c_void]) -> Result<OwnedHandle, WindowsSandboxError> {
     let base = open_current_token()?;
+    let mut logon_sid = logon_sid(base.raw())?;
     let mut entries = sids
         .iter()
         .map(|sid| SID_AND_ATTRIBUTES {
@@ -340,6 +343,10 @@ fn create_restricted_token(sids: &[*mut c_void]) -> Result<OwnedHandle, WindowsS
     let mut world = world_sid()?;
     entries.push(SID_AND_ATTRIBUTES {
         Sid: world.as_mut_ptr() as *mut c_void,
+        Attributes: 0,
+    });
+    entries.push(SID_AND_ATTRIBUTES {
+        Sid: logon_sid.as_mut_ptr() as *mut c_void,
         Attributes: 0,
     });
 
@@ -364,9 +371,60 @@ fn create_restricted_token(sids: &[*mut c_void]) -> Result<OwnedHandle, WindowsS
     let restricted = OwnedHandle::new(token);
     let mut default_sids = sids.to_vec();
     default_sids.push(world.as_mut_ptr() as *mut c_void);
+    default_sids.push(logon_sid.as_mut_ptr() as *mut c_void);
     set_default_dacl(restricted.raw(), &default_sids)?;
     enable_change_notify(restricted.raw())?;
     Ok(restricted)
+}
+
+fn logon_sid(token: HANDLE) -> Result<Vec<u8>, WindowsSandboxError> {
+    let mut size = 0u32;
+    unsafe {
+        GetTokenInformation(token, TokenGroups, std::ptr::null_mut(), 0, &mut size);
+    }
+    if size == 0 {
+        return Err(win32("GetTokenInformation(TokenGroups)", unsafe {
+            GetLastError()
+        }));
+    }
+    let mut groups = vec![0u8; size as usize];
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenGroups,
+            groups.as_mut_ptr().cast(),
+            size,
+            &mut size,
+        )
+    };
+    if ok == 0 {
+        return Err(win32("GetTokenInformation(TokenGroups)", unsafe {
+            GetLastError()
+        }));
+    }
+
+    let count = unsafe { std::ptr::read_unaligned(groups.as_ptr().cast::<u32>()) } as usize;
+    let after_count = unsafe { groups.as_ptr().add(std::mem::size_of::<u32>()) } as usize;
+    let alignment = std::mem::align_of::<SID_AND_ATTRIBUTES>();
+    let entries = ((after_count + alignment - 1) & !(alignment - 1)) as *const SID_AND_ATTRIBUTES;
+    for index in 0..count {
+        let entry = unsafe { std::ptr::read_unaligned(entries.add(index)) };
+        if entry.Attributes & SE_GROUP_LOGON_ID != SE_GROUP_LOGON_ID {
+            continue;
+        }
+        let sid_size = unsafe { GetLengthSid(entry.Sid) };
+        if sid_size == 0 {
+            return Err(win32("GetLengthSid(logon SID)", unsafe { GetLastError() }));
+        }
+        let mut sid = vec![0u8; sid_size as usize];
+        if unsafe { CopySid(sid_size, sid.as_mut_ptr().cast(), entry.Sid) } == 0 {
+            return Err(win32("CopySid(logon SID)", unsafe { GetLastError() }));
+        }
+        return Ok(sid);
+    }
+    Err(WindowsSandboxError::InvalidPolicy(
+        "current Windows token does not expose a logon SID".to_string(),
+    ))
 }
 
 fn open_current_token() -> Result<OwnedHandle, WindowsSandboxError> {
