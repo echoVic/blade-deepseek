@@ -55,7 +55,7 @@ pub fn parse_with_cwd(input: &str, cwd: &Path) -> Option<SlashCommand> {
     let rest = trimmed.strip_prefix('/')?;
     let mut parts = rest.split_whitespace();
     let command = parts.next()?;
-    if builtin_command_names().contains(command) {
+    if has_builtin_name(input) {
         return None;
     }
     let args = parts.collect::<Vec<_>>().join(" ");
@@ -84,6 +84,14 @@ pub fn parse_with_cwd(input: &str, cwd: &Path) -> Option<SlashCommand> {
     }
 
     None
+}
+
+pub(crate) fn has_builtin_name(input: &str) -> bool {
+    input
+        .trim()
+        .strip_prefix('/')
+        .and_then(|rest| rest.split_whitespace().next())
+        .is_some_and(|command| builtin_command_names().contains(command))
 }
 
 fn parse_static(input: &str) -> Option<SlashCommand> {
@@ -506,6 +514,13 @@ mod tests {
             "/Doctor",
         ] {
             assert_eq!(parse(input), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn malformed_doctor_commands_still_reserve_the_builtin_name() {
+        for input in ["/doctor extra", "/doctor fps true"] {
+            assert!(has_builtin_name(input), "{input}");
         }
     }
 

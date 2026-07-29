@@ -22,14 +22,18 @@ pub(crate) fn handle_slash_command(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
 ) -> Option<SlashOutcome> {
-    let command = commands::parse(text).or_else(|| {
-        let cwd = config
-            .cwd
-            .as_deref()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        commands::parse_with_cwd(text, &cwd)
-    })?;
+    let command = if let Some(command) = commands::parse(text) {
+        command
+    } else if commands::has_builtin_name(text) {
+        return None;
+    } else {
+        let configured_cwd = config.cwd.as_deref().map(std::path::Path::to_path_buf);
+        parse_command_with_cwd(text, || {
+            configured_cwd
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+        })?
+    };
     match command {
         SlashCommand::Model(Some(model)) => match commands::validate_model(&model) {
             Ok(()) => {
@@ -292,6 +296,16 @@ pub(crate) fn handle_slash_command(
     Some(SlashOutcome::Continue)
 }
 
+fn parse_command_with_cwd(
+    text: &str,
+    cwd: impl FnOnce() -> std::path::PathBuf,
+) -> Option<SlashCommand> {
+    if commands::has_builtin_name(text) {
+        return None;
+    }
+    commands::parse_with_cwd(text, &cwd())
+}
+
 pub(crate) fn parse_approval_mode(mode: &str) -> Option<ApprovalMode> {
     match mode {
         "suggest" => Some(ApprovalMode::Suggest),
@@ -423,5 +437,17 @@ mod tests {
             .find("std::env::current_dir()")
             .expect("dynamic aliases may still need cwd discovery");
         assert!(parse_builtin < current_dir);
+    }
+
+    #[test]
+    fn malformed_builtin_commands_do_not_invoke_cwd_resolver() {
+        let mut resolver_called = false;
+        let command = parse_command_with_cwd("/doctor extra", || {
+            resolver_called = true;
+            std::path::PathBuf::from("/tmp")
+        });
+
+        assert_eq!(command, None);
+        assert!(!resolver_called);
     }
 }
