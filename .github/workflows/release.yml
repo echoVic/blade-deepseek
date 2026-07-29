@@ -110,10 +110,12 @@ jobs:
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
       - name: Run native Windows x64 behavior gates
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: powershell
+        shell: pwsh
         env:
           RUST_BACKTRACE: "1"
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo test -p orca-provider prompt_names_powershell_7_as_the_active_shell_dialect --locked -- --nocapture
           cargo test -p orca-tui altgr_char_is_normalized_to_text_input_on_windows_only --locked -- --nocapture
           cargo test -p orca-runtime windows_standalone_update_uses_downloaded_powershell_installer --locked -- --nocapture
@@ -124,8 +126,10 @@ jobs:
           cargo test --workspace --all-targets --locked -- --test-threads=1
       - name: Run native Windows ARM64 behavior gates
         if: matrix.target == 'aarch64-pc-windows-msvc'
-        shell: powershell
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo test -p orca-platform --locked -- --nocapture
           cargo test -p orca-windows-sandbox --locked -- --nocapture
           cargo test -p orca-tools sandbox --locked -- --nocapture
