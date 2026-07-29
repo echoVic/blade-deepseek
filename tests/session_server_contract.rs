@@ -6054,12 +6054,12 @@ fn server_mode_reports_shell_capabilities() {
     assert_eq!(caps["fallbackTerminalMode"], "pipe");
     assert_eq!(caps["commandExecStreamingRequiresProcessId"], true);
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         assert_eq!(caps["supportsPty"], true);
         assert_eq!(caps["supportsPtyResize"], true);
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         assert_eq!(caps["supportsPty"], false);
         assert_eq!(caps["supportsPtyResize"], false);
