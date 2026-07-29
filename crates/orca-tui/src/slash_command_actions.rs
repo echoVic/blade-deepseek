@@ -22,12 +22,14 @@ pub(crate) fn handle_slash_command(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
 ) -> Option<SlashOutcome> {
-    let cwd = config
-        .cwd
-        .as_deref()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let command = commands::parse_with_cwd(text, &cwd)?;
+    let command = commands::parse(text).or_else(|| {
+        let cwd = config
+            .cwd
+            .as_deref()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        commands::parse_with_cwd(text, &cwd)
+    })?;
     match command {
         SlashCommand::Model(Some(model)) => match commands::validate_model(&model) {
             Ok(()) => {
@@ -242,6 +244,11 @@ pub(crate) fn handle_slash_command(
         },
         SlashCommand::Trust(trust_command) => {
             use orca_core::config::folder_trust::{self, TrustLevel};
+            let cwd = config
+                .cwd
+                .as_deref()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             match trust_command {
                 TrustSlashCommand::Show => {
                     if folder_trust::is_trusted(&cwd) {
@@ -401,5 +408,20 @@ mod tests {
             state.messages.last(),
             Some(ChatMessage::System(report)) if report.starts_with("Orca diagnostics\n")
         ));
+    }
+
+    #[test]
+    fn built_in_slash_commands_are_parsed_before_cwd_discovery() {
+        let source = include_str!("slash_command_actions.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production slash command source");
+        let parse_builtin = source
+            .find("commands::parse(text)")
+            .expect("built-in parser must run first");
+        let current_dir = source
+            .find("std::env::current_dir()")
+            .expect("dynamic aliases may still need cwd discovery");
+        assert!(parse_builtin < current_dir);
     }
 }

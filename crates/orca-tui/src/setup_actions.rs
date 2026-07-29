@@ -52,6 +52,7 @@ pub(crate) fn handle_setup_key(
                     if let Ok(mut cfg) = shared_config.lock() {
                         cfg.api_key = Some(key_input);
                     }
+                    state.auth_configured = true;
                     state.setup_step = 2;
                 }
             }

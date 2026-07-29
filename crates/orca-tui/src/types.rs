@@ -737,6 +737,7 @@ pub struct AppState {
     pub(crate) fps_hud_enabled: bool,
     pub(crate) vim_mode: Option<VimMode>,
     pub(crate) keybindings_diagnostic: KeybindingsDiagnostic,
+    pub(crate) auth_configured: bool,
     pub running_started_at: Option<Instant>,
     pub scroll_offset: usize,
     pub auto_scroll: bool,
@@ -897,6 +898,7 @@ impl AppState {
             fps_hud_enabled: false,
             vim_mode: None,
             keybindings_diagnostic: KeybindingsDiagnostic::default(),
+            auth_configured: false,
             running_started_at: None,
             scroll_offset: 0,
             auto_scroll: true,
@@ -981,7 +983,7 @@ impl AppState {
                 vim_mode: self.vim_mode,
                 fps_hud_enabled: self.fps_hud_enabled,
                 keybindings: self.keybindings_diagnostic,
-                auth_configured: !matches!(self.status, AppStatus::Setup),
+                auth_configured: self.auth_configured,
             },
             self.frame_metrics.snapshot(now),
         )
@@ -8195,5 +8197,28 @@ class Item:
         assert!(!state.fps_hud_enabled);
         assert_eq!(state.vim_mode, None);
         assert_eq!(state.frame_metrics.snapshot(Instant::now()).total_draws, 0,);
+    }
+
+    #[test]
+    fn doctor_auth_projection_is_independent_of_ui_status() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+
+        state.status = AppStatus::Setup;
+        state.auth_configured = true;
+        assert!(
+            state
+                .doctor_report(Instant::now())
+                .contains("auth=configured")
+        );
+
+        state.status = AppStatus::Idle;
+        state.auth_configured = false;
+        assert!(state.doctor_report(Instant::now()).contains("auth=missing"));
     }
 }

@@ -264,6 +264,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     state.workspace_git = workspace_status.git;
     state.approval_mode = config.approval_mode;
     state.reasoning_effort = config.reasoning_effort;
+    state.auth_configured = config.api_key.is_some();
     if should_show_picker && !picker_sessions.is_empty() {
         state.status = AppStatus::SessionPicker;
         state.session_picker_sessions = picker_sessions;
@@ -1161,6 +1162,20 @@ mod tests {
         assert!(source.contains(".restored_built_ins("));
         assert!(source.contains(".rejected("));
         assert!(source.contains("keybindings_location()"));
+    }
+
+    #[test]
+    fn doctor_auth_projection_is_initialized_and_updated_from_config_facts() {
+        let app = include_str!("app.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production app source");
+        let setup = include_str!("setup_actions.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production setup source");
+        assert!(app.contains("state.auth_configured = config.api_key.is_some();"));
+        assert!(setup.contains("state.auth_configured = true;"));
     }
 
     #[test]
