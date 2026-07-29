@@ -1072,7 +1072,7 @@ mod tests {
 
         assert_eq!(
             decoded,
-            "\"C:\\Program Files\\Node\\node.exe\" -e \"process.stdout.write(JSON.stringify(process.argv.slice(1)))\" \"\" \"two words\" single'quote \"double\\\"quote\" &|<>^%! \"line one\nline two\" 路径\\文件.txt"
+            "\"C:\\Program Files\\Node\\node.exe\" -e process.stdout.write(JSON.stringify(process.argv.slice(1))) \"\" \"two words\" single'quote \"double\\\"quote\" &|<>^%! \"line one\nline two\" 路径\\文件.txt"
         );
     }
 
@@ -1251,14 +1251,16 @@ mod tests {
         })
         .expect("sandbox plan");
         let capabilities = CapabilityStore::new(temp.path().join("capabilities"));
+        let output_path = temp.path().join("appcontainer-pwsh.txt");
+        let output_path_literal = output_path.to_string_lossy().replace('\'', "''");
         let args = vec![
             OsString::from("-NoLogo"),
             OsString::from("-NoProfile"),
             OsString::from("-NonInteractive"),
             OsString::from("-Command"),
-            OsString::from(
-                "Write-Output $ExecutionContext.SessionState.LanguageMode; Set-Content -NoNewline -LiteralPath appcontainer-pwsh.txt -Value appcontainer-powershell-ok; Get-Content -Raw -LiteralPath appcontainer-pwsh.txt",
-            ),
+            OsString::from(format!(
+                "Write-Output $ExecutionContext.SessionState.LanguageMode; Set-Content -NoNewline -LiteralPath '{output_path_literal}' -Value appcontainer-powershell-ok; Get-Content -Raw -LiteralPath '{output_path_literal}'"
+            )),
         ];
         let mut child = SandboxedChild::spawn(SandboxSpawnRequest {
             program: &program,
@@ -1284,8 +1286,7 @@ mod tests {
             "stdout={output:?}"
         );
         assert_eq!(
-            std::fs::read_to_string(temp.path().join("appcontainer-pwsh.txt"))
-                .expect("read AppContainer PowerShell output"),
+            std::fs::read_to_string(output_path).expect("read AppContainer PowerShell output"),
             "appcontainer-powershell-ok"
         );
     }
