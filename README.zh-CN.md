@@ -57,6 +57,79 @@ orca --mode=acp                           # 连接 ACP 客户端
 或 `orca exec --help` 查看完整命令。用户配置位于 `~/.orca/config.toml`；
 受信任的项目还可以提供 `.orca/config.toml`、`AGENTS.md`、规则、Skills 和工作流。
 
+### 自定义快捷键
+
+TUI 从 `~/.orca/keybindings.json` 加载个人快捷键；设置 `ORCA_HOME` 后，路径为
+`$ORCA_HOME/keybindings.json`。Orca 不读取项目内的快捷键文件，避免打开仓库时
+被项目改变终端控制方式。
+
+```json
+{
+  "version": 1,
+  "bindings": {
+    "global.open-transcript-search": ["ctrl+f", "ctrl+x ctrl+f"],
+    "idle.submit": ["ctrl+s"],
+    "running.interrupt": ["esc", "ctrl+g"],
+    "approval.confirm": ["enter"]
+  }
+}
+```
+
+文件中出现的 action 会替换其内置绑定；未出现的 action 保留默认值，空数组会禁用
+该 action。一个序列包含一到四个以空格分隔的按键，例如
+`ctrl+x ctrl+f`。Chord 的固定超时时间为 1 second。可用 context 为
+`global`、`idle`、`running` 和 `approval`。
+
+可配置的 action ID：
+
+```text
+global.cancel
+global.open-transcript-search
+global.toggle-shortcuts
+global.scroll-bottom
+global.scroll-top
+global.clear-screen
+
+idle.submit
+idle.newline
+idle.edit-latest-queued
+idle.history-previous
+idle.history-next
+idle.scroll-up
+idle.scroll-down
+idle.page-up
+idle.page-down
+idle.half-page-up
+idle.half-page-down
+idle.backtrack
+idle.expand-tool-output
+
+running.background-current-turn
+running.interrupt
+running.submit-queued
+running.newline
+running.edit-latest-queued
+running.scroll-up
+running.scroll-down
+running.page-up
+running.page-down
+running.half-page-up
+running.half-page-down
+
+approval.select-allow
+approval.select-deny
+approval.toggle-selection
+approval.confirm
+```
+
+`global.cancel` 必须保留至少一个可立即触发的单键绑定。自定义 Global 绑定只能使用
+功能键或带修饰键的字符键，避免覆盖 Esc、Enter、方向键、Tab 等固定模态控制。
+审批直接键 `1/2/3/4/y/a/A/n/d` 固定且保留。
+
+TUI 每 500 ms 检查一次文件，并在不阻塞输入和渲染的前提下 live reload。
+有效修改会原子替换完整 keymap；无效修改只提示一次，并继续使用
+last-known-good keymap。删除文件会恢复全部内置绑定。
+
 更多文档：
 
 - [持久 Goal 模式](docs/goal-mode.md)

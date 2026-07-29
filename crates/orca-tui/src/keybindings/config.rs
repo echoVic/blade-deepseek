@@ -831,4 +831,34 @@ mod tests {
             Some("ctrl+x ctrl+p / alt+p / ctrl+x ctrl+n"),
         );
     }
+
+    #[test]
+    fn readmes_document_keybindings_path_schema_and_reload() {
+        for (name, readme) in [
+            ("README.md", include_str!("../../../../README.md")),
+            (
+                "README.zh-CN.md",
+                include_str!("../../../../README.zh-CN.md"),
+            ),
+        ] {
+            for required in [
+                "~/.orca/keybindings.json",
+                "ORCA_HOME",
+                "\"version\": 1",
+                "\"bindings\"",
+                "global.cancel",
+                "idle.submit",
+                "running.interrupt",
+                "approval.confirm",
+                "1 second",
+                "live reload",
+                "last-known-good",
+            ] {
+                assert!(
+                    readme.contains(required),
+                    "{name} must document {required:?}",
+                );
+            }
+        }
+    }
 }

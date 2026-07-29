@@ -64,6 +64,83 @@ then defaults. Run `orca --help` or `orca exec --help` for the full command
 surface. User configuration lives at `~/.orca/config.toml`; trusted projects
 can also provide `.orca/config.toml`, `AGENTS.md`, rules, skills, and workflows.
 
+### Custom keybindings
+
+The TUI loads personal keybindings from `~/.orca/keybindings.json`, or from
+`$ORCA_HOME/keybindings.json` when `ORCA_HOME` is set. There is deliberately no
+project-local keybindings file, so opening a repository cannot change your
+terminal controls.
+
+```json
+{
+  "version": 1,
+  "bindings": {
+    "global.open-transcript-search": ["ctrl+f", "ctrl+x ctrl+f"],
+    "idle.submit": ["ctrl+s"],
+    "running.interrupt": ["esc", "ctrl+g"],
+    "approval.confirm": ["enter"]
+  }
+}
+```
+
+Each listed action replaces its built-in bindings; omitted actions keep their
+defaults, and an empty array disables an action. A sequence contains one to
+four space-separated strokes, such as `ctrl+x ctrl+f`. Chords have a fixed
+1 second timeout. Binding contexts are `global`, `idle`, `running`, and
+`approval`.
+
+Available action IDs:
+
+```text
+global.cancel
+global.open-transcript-search
+global.toggle-shortcuts
+global.scroll-bottom
+global.scroll-top
+global.clear-screen
+
+idle.submit
+idle.newline
+idle.edit-latest-queued
+idle.history-previous
+idle.history-next
+idle.scroll-up
+idle.scroll-down
+idle.page-up
+idle.page-down
+idle.half-page-up
+idle.half-page-down
+idle.backtrack
+idle.expand-tool-output
+
+running.background-current-turn
+running.interrupt
+running.submit-queued
+running.newline
+running.edit-latest-queued
+running.scroll-up
+running.scroll-down
+running.page-up
+running.page-down
+running.half-page-up
+running.half-page-down
+
+approval.select-allow
+approval.select-deny
+approval.toggle-selection
+approval.confirm
+```
+
+`global.cancel` must keep an immediate single-stroke binding. Configurable
+global bindings use function keys or modified character keys, which prevents
+them from shadowing fixed modal controls. Approval direct keys
+`1/2/3/4/y/a/A/n/d` are fixed and reserved.
+
+The TUI checks the file every 500 ms and performs a live reload without
+blocking input or rendering. A valid edit swaps the complete keymap atomically.
+An invalid edit reports one notice and keeps the last-known-good keymap.
+Deleting the file restores all built-in bindings.
+
 More detail:
 
 - [Persistent Goal Mode](docs/goal-mode.md)
