@@ -3117,6 +3117,55 @@ fn server_mode_command_exec_returns_buffered_output() {
 }
 
 #[test]
+fn server_mode_command_exec_preserves_legacy_script_command() {
+    let workspace = tempdir().expect("workspace");
+    let mut child = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+
+    {
+        let stdin = child.stdin_mut();
+        let request = json!({
+            "id": "cmd",
+            "method": "command/exec",
+            "params": {
+                "command": platform_shell_script(
+                    "printf legacy-script",
+                    "Write-Host -NoNewline legacy-script"
+                )
+            }
+        });
+        writeln!(stdin, "{request}").expect("write legacy command/exec");
+        stdin.flush().expect("flush legacy command/exec");
+    }
+
+    child.close_stdin();
+    let output = child.wait_with_output().expect("wait for server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let events = parse_jsonl(&output.stdout);
+    let completed = events
+        .iter()
+        .find(|event| event["id"] == "cmd" && event["event"] == "command_exec_completed")
+        .expect("command_exec_completed event");
+    assert_eq!(completed["exitCode"], 0);
+    assert_eq!(completed["stdout"], "legacy-script");
+    assert_eq!(completed["stderr"], "");
+}
+
+#[test]
 fn server_mode_command_exec_honors_cwd_and_env_overrides() {
     let workspace = tempdir().expect("workspace");
     let command_dir = workspace.path().join("command-dir");

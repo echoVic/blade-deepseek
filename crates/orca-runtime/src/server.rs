@@ -1217,7 +1217,11 @@ fn run_command_exec<W: Write>(
             ),
         );
     }
-    let command_text = protocol::shell_join(command);
+    let command_text = if command_is_argv {
+        protocol::shell_join(command)
+    } else {
+        command[0].clone()
+    };
     let cwd = cwd.cloned().unwrap_or(server_cwd(&config.run_config)?);
     let (
         mut additional_working_directories,
