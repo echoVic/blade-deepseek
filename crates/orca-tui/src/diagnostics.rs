@@ -312,10 +312,11 @@ pub(crate) fn format_doctor_report(
     runtime: DiagnosticRuntimeView,
     metrics: FpsHudSnapshot,
 ) -> String {
-    let terminal = snapshot.terminal_version.as_ref().map_or_else(
-        || snapshot.terminal_program.clone(),
-        |version| format!("{} {version}", snapshot.terminal_program),
-    );
+    let terminal = match snapshot.terminal_version.as_ref() {
+        Some(version) => format!("{} {version}", snapshot.terminal_program),
+        None if snapshot.terminal_program == "unknown" => "unknown".to_string(),
+        None => format!("{} unknown", snapshot.terminal_program),
+    };
     let multiplexers = if snapshot.multiplexers.is_empty() {
         "none".to_string()
     } else {
@@ -902,6 +903,33 @@ mod tests {
                 assert!(report.len() <= 4096);
             }
         }
+    }
+
+    #[test]
+    fn doctor_report_labels_missing_version_without_duplicating_unknown_terminal() {
+        let mut known_without_version = known_snapshot();
+        known_without_version.terminal_version = None;
+        let runtime = DiagnosticRuntimeView {
+            viewport: None,
+            status: AppStatus::Idle,
+            panel: PanelMode::Conversation,
+            vim_mode: None,
+            fps_hud_enabled: false,
+            keybindings: KeybindingsDiagnostic::default(),
+            auth_configured: true,
+        };
+
+        let known =
+            format_doctor_report(&known_without_version, runtime, FpsHudSnapshot::default());
+        let unknown = format_doctor_report(
+            &DiagnosticSnapshot::default(),
+            runtime,
+            FpsHudSnapshot::default(),
+        );
+
+        assert!(known.contains("terminal: Ghostty unknown"));
+        assert!(unknown.contains("terminal: unknown\n"));
+        assert!(!unknown.contains("terminal: unknown unknown"));
     }
 
     #[test]
