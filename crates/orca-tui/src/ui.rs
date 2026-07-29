@@ -2123,6 +2123,24 @@ fn render_textarea_surface(
     show_hardware_cursor: bool,
 ) -> Option<HardwareCursorProjection> {
     let inner = render_textarea_block_and_notice(frame, area, textarea, notice, theme);
+    render_textarea_content(
+        frame,
+        inner,
+        textarea,
+        precomputed_layout,
+        theme,
+        show_hardware_cursor,
+    )
+}
+
+fn render_textarea_content(
+    frame: &mut Frame,
+    inner: Rect,
+    textarea: &TextArea,
+    precomputed_layout: Option<&TextareaVisualLayout>,
+    theme: &Theme,
+    show_hardware_cursor: bool,
+) -> Option<HardwareCursorProjection> {
     if inner.is_empty() {
         return None;
     }
@@ -3623,46 +3641,54 @@ fn render_setup(
     textarea: &TextArea,
     theme: &Theme,
 ) -> Option<HardwareCursorProjection> {
-    let area = frame.area();
+    let step = state.onboarding.step();
+    let shell = onboarding_shell_geometry(frame.area());
+    frame.render_widget(Clear, shell.panel);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(" Setup ")
+            .border_style(Style::default().fg(theme.border)),
+        shell.panel,
+    );
+    let error = (step == OnboardingStep::Review)
+        .then(|| state.onboarding.error_label())
+        .flatten();
+    render_onboarding_shell_text(frame, shell, step, error, theme);
 
-    match state.onboarding.step() {
+    match step {
         OnboardingStep::Welcome => {
-            render_setup_message(frame, area, theme, "Welcome", "Press Enter to continue");
-            None
-        }
-        OnboardingStep::Provider => {
-            render_setup_rows(
+            render_onboarding_text(
                 frame,
-                area,
+                shell.content,
                 theme,
-                "Provider",
-                state.onboarding.option_rows(),
+                &[
+                    "A DeepSeek-native coding agent",
+                    "Configure local defaults for this device.",
+                ],
             );
             None
         }
-        OnboardingStep::ApiKey => render_setup_api_key(frame, area, textarea, theme),
-        OnboardingStep::Model => {
-            render_setup_rows(frame, area, theme, "Model", state.onboarding.option_rows());
+        OnboardingStep::Provider | OnboardingStep::Model | OnboardingStep::Theme => {
+            render_onboarding_options(frame, shell.content, theme, &state.onboarding.option_rows());
             None
         }
-        OnboardingStep::Theme => {
-            render_setup_rows(frame, area, theme, "Theme", state.onboarding.option_rows());
-            None
-        }
+        OnboardingStep::ApiKey => render_onboarding_api_key(frame, shell.content, textarea, theme),
         OnboardingStep::Review => {
-            let mut rows = state.onboarding.review_rows();
-            if let Some(error) = state.onboarding.error_label() {
-                rows.push(error.to_string());
-            }
-            render_setup_text_rows(frame, area, theme, "Review", rows);
+            render_onboarding_owned_rows(
+                frame,
+                shell.content,
+                theme,
+                state.onboarding.review_rows(),
+            );
             None
         }
         OnboardingStep::Complete => {
-            render_setup_text_rows(
+            render_onboarding_owned_rows(
                 frame,
-                area,
+                shell.content,
                 theme,
-                "Complete",
                 state.onboarding.completion_rows(),
             );
             None
@@ -3670,92 +3696,223 @@ fn render_setup(
     }
 }
 
-fn setup_popup_area(area: Rect, row_count: usize) -> Rect {
-    let width = 60u16.min(area.width.saturating_sub(2));
-    let desired_height = (row_count as u16).saturating_add(2);
-    let height = desired_height.min(area.height.saturating_sub(2));
-    centered_rect(area, width, height)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OnboardingShellGeometry {
+    panel: Rect,
+    header: Rect,
+    instruction: Rect,
+    content: Rect,
+    error: Rect,
+    footer: Rect,
 }
 
-fn setup_block<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(format!(" {title} "))
-        .border_style(Style::default().fg(theme.border))
+fn onboarding_panel_area(frame: Rect) -> Rect {
+    centered_rect(
+        frame,
+        68.min(frame.width.saturating_sub(2)),
+        18.min(frame.height.saturating_sub(2)),
+    )
 }
 
-fn render_setup_message(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, message: &str) {
-    let popup = setup_popup_area(area, 1);
-    frame.render_widget(
-        Paragraph::new(Line::styled(message, Style::default().fg(theme.text)))
-            .block(setup_block(title, theme)),
-        popup,
+fn onboarding_shell_geometry(frame: Rect) -> OnboardingShellGeometry {
+    let panel = onboarding_panel_area(frame);
+    let inner = Rect::new(
+        panel.x.saturating_add(1),
+        panel.y.saturating_add(1),
+        panel.width.saturating_sub(2),
+        panel.height.saturating_sub(2),
     );
+    let constraints = match inner.height {
+        0 => [
+            Constraint::Length(0),
+            Constraint::Length(0),
+            Constraint::Length(0),
+            Constraint::Length(0),
+            Constraint::Length(0),
+        ],
+        1 => [
+            Constraint::Length(0),
+            Constraint::Length(0),
+            Constraint::Length(1),
+            Constraint::Length(0),
+            Constraint::Length(0),
+        ],
+        2 => [
+            Constraint::Length(0),
+            Constraint::Length(0),
+            Constraint::Min(1),
+            Constraint::Length(0),
+            Constraint::Length(1),
+        ],
+        3 | 4 => [
+            Constraint::Length(1),
+            Constraint::Length(0),
+            Constraint::Min(1),
+            Constraint::Length(0),
+            Constraint::Length(1),
+        ],
+        _ => [
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ],
+    };
+    let rows = Layout::vertical(constraints).split(inner);
+    OnboardingShellGeometry {
+        panel,
+        header: rows[0],
+        instruction: rows[1],
+        content: rows[2],
+        error: rows[3],
+        footer: rows[4],
+    }
 }
 
-fn render_setup_rows(
+fn onboarding_selected_style(theme: &Theme) -> Style {
+    let style = match theme.color_level {
+        crate::terminal_capabilities::TerminalColorLevel::Monochrome => {
+            Style::default().add_modifier(Modifier::REVERSED)
+        }
+        _ => Style::default()
+            .fg(theme.text)
+            .bg(theme.selection_bg)
+            .add_modifier(Modifier::BOLD),
+    };
+    theme.color_level.adapt_style(style)
+}
+
+fn render_onboarding_shell_text(
     frame: &mut Frame,
-    area: Rect,
+    shell: OnboardingShellGeometry,
+    step: OnboardingStep,
+    error: Option<&str>,
     theme: &Theme,
-    title: &str,
-    rows: Vec<OnboardingOptionRow>,
 ) {
+    if !shell.header.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!("{}/7 · {}", step.ordinal(), step.title()),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            )),
+            shell.header,
+        );
+    }
+    if !shell.instruction.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                step.instruction(),
+                Style::default().fg(theme.muted),
+            )),
+            shell.instruction,
+        );
+    }
+    if let Some(error) = error
+        && !shell.error.is_empty()
+    {
+        frame.render_widget(
+            Paragraph::new(Line::styled(error, Style::default().fg(theme.error))),
+            shell.error,
+        );
+    }
+    if !shell.footer.is_empty() {
+        let footer = if step == OnboardingStep::Complete {
+            "Enter start · Esc exit"
+        } else {
+            "↑/↓ or j/k · Enter · Esc"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(footer, Style::default().fg(theme.muted))),
+            shell.footer,
+        );
+    }
+}
+
+fn render_onboarding_text(frame: &mut Frame, area: Rect, theme: &Theme, rows: &[&str]) {
+    if area.is_empty() {
+        return;
+    }
     let lines = rows
         .iter()
-        .map(|row| {
-            let marker = if row.selected { "› " } else { "  " };
-            let color = if row.selected { theme.user } else { theme.text };
-            Line::from(vec![
-                Span::styled(marker, Style::default().fg(color)),
-                Span::styled(row.label, Style::default().fg(color)),
-                Span::styled(
-                    format!(" — {}", row.description),
-                    Style::default().fg(theme.muted),
-                ),
-            ])
-        })
+        .take(area.height as usize)
+        .map(|row| Line::styled(*row, Style::default().fg(theme.text)))
         .collect::<Vec<_>>();
-    let popup = setup_popup_area(area, lines.len());
-    frame.render_widget(
-        Paragraph::new(lines).block(setup_block(title, theme)),
-        popup,
-    );
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_setup_text_rows(
+fn render_onboarding_options(
     frame: &mut Frame,
     area: Rect,
     theme: &Theme,
-    title: &str,
-    rows: Vec<String>,
+    rows: &[OnboardingOptionRow],
 ) {
+    if area.is_empty() || rows.is_empty() {
+        return;
+    }
+    let visible = area.height as usize;
+    let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(rows.len().saturating_sub(visible));
     let lines = rows
-        .into_iter()
-        .map(|row| Line::styled(row, Style::default().fg(theme.text)))
+        .iter()
+        .skip(start)
+        .take(visible)
+        .map(|row| {
+            let row_style = if row.selected {
+                onboarding_selected_style(theme)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            let marker = if row.selected { "› " } else { "  " };
+            let label_width = UnicodeWidthStr::width(marker) + UnicodeWidthStr::width(row.label);
+            let show_description = area.width as usize > label_width.saturating_add(3);
+            let mut spans = vec![
+                Span::styled(marker, row_style),
+                Span::styled(row.label, row_style),
+            ];
+            if show_description {
+                spans.push(Span::styled(
+                    format!(" — {}", row.description),
+                    if row.selected {
+                        row_style
+                    } else {
+                        Style::default().fg(theme.muted)
+                    },
+                ));
+            }
+            Line::from(spans)
+        })
         .collect::<Vec<_>>();
-    let popup = setup_popup_area(area, lines.len());
-    frame.render_widget(
-        Paragraph::new(lines).block(setup_block(title, theme)),
-        popup,
-    );
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_setup_api_key(
+fn render_onboarding_owned_rows(frame: &mut Frame, area: Rect, theme: &Theme, rows: Vec<String>) {
+    if area.is_empty() {
+        return;
+    }
+    let lines = rows
+        .into_iter()
+        .take(area.height as usize)
+        .map(|row| Line::styled(row, Style::default().fg(theme.text)))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_onboarding_api_key(
     frame: &mut Frame,
     area: Rect,
     textarea: &TextArea,
     theme: &Theme,
 ) -> Option<HardwareCursorProjection> {
-    let popup = setup_popup_area(area, 3);
-    let inner = Rect::new(
-        popup.x.saturating_add(1),
-        popup.y.saturating_add(1),
-        popup.width.saturating_sub(2),
-        popup.height.saturating_sub(2),
-    );
-    frame.render_widget(setup_block("API Key", theme), popup);
-    render_textarea_surface(frame, inner, textarea, None, None, theme, true)
+    let input_area = Rect::new(area.x, area.y, area.width, area.height.min(3));
+    if input_area.height >= 3 {
+        render_textarea_surface(frame, input_area, textarea, None, None, theme, true)
+    } else {
+        render_textarea_content(frame, input_area, textarea, None, theme, true)
+    }
 }
 
 struct PendingCodeBlock {
@@ -4306,6 +4463,7 @@ mod tests {
     use crate::types::{SlashMenu, SlashMenuItem, TuiEvent, TuiInteractionKey, TuiInteractionKind};
     use chrono::Utc;
     use crossbeam_channel as mpsc;
+    use orca_core::config::file::UserConfigSaveError;
     use orca_core::config::{AdditionalWorkingDirectory, ThemeName};
     use orca_core::goal_types::{ThreadGoal, ThreadGoalStatus};
     use orca_core::plan_types::{PlanItem, PlanStatus};
@@ -4423,6 +4581,44 @@ mod tests {
         assert_eq!(baseline.input_area, disabled.input_area);
         assert_eq!(baseline.search_area, disabled.search_area);
         assert_eq!(baseline.jump_to_bottom_area, disabled.jump_to_bottom_area);
+    }
+
+    #[test]
+    fn non_setup_frames_ignore_onboarding_state_byte_for_byte() {
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+        let mut baseline = test_state();
+        let mut changed = test_state();
+        changed.onboarding.set_step_for_test(OnboardingStep::Theme);
+        assert_eq!(changed.onboarding.move_next(), Some(ThemeName::Dark));
+        assert_eq!(changed.onboarding.move_next(), Some(ThemeName::Light));
+        changed
+            .onboarding
+            .set_api_key("sk-never-render".to_string());
+        changed
+            .onboarding
+            .set_step_for_test(OnboardingStep::Complete);
+        changed.onboarding.set_outcomes_for_test(
+            crate::onboarding::SaveOutcome::Failed(UserConfigSaveError::WriteFailed),
+            crate::onboarding::SaveOutcome::Failed(UserConfigSaveError::ReplaceFailed),
+        );
+        let mut baseline_terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut changed_terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+
+        baseline_terminal
+            .draw(|frame| render(frame, &mut baseline, &textarea, &theme))
+            .unwrap();
+        changed_terminal
+            .draw(|frame| render(frame, &mut changed, &textarea, &theme))
+            .unwrap();
+
+        assert_eq!(
+            baseline_terminal.backend().buffer(),
+            changed_terminal.backend().buffer(),
+        );
     }
 
     #[test]
@@ -4565,6 +4761,67 @@ mod tests {
 
     fn take_cursor_events(events: &Arc<Mutex<Vec<CursorEvent>>>) -> Vec<CursorEvent> {
         std::mem::take(&mut *events.lock().unwrap())
+    }
+
+    fn render_setup_test_frame(
+        state: &mut AppState,
+        theme: &Theme,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
+        let textarea = crate::composer_textarea::make_setup_textarea(theme);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render(frame, state, &textarea, theme))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    fn non_blank_bounds(buffer: &ratatui::buffer::Buffer) -> Rect {
+        let area = buffer.area;
+        let mut min_x = u16::MAX;
+        let mut min_y = u16::MAX;
+        let mut max_x = 0;
+        let mut max_y = 0;
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                if !buffer[(x, y)].symbol().trim().is_empty() {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        assert_ne!(min_x, u16::MAX, "setup frame must render content");
+        Rect::new(
+            min_x,
+            min_y,
+            max_x.saturating_sub(min_x).saturating_add(1),
+            max_y.saturating_sub(min_y).saturating_add(1),
+        )
+    }
+
+    fn find_text_cell(buffer: &ratatui::buffer::Buffer, needle: &str) -> Position {
+        for y in buffer.area.y..buffer.area.bottom() {
+            let row = (buffer.area.x..buffer.area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            if let Some(byte_offset) = row.find(needle) {
+                let x_offset = UnicodeWidthStr::width(&row[..byte_offset]) as u16;
+                return Position::new(buffer.area.x.saturating_add(x_offset), y);
+            }
+        }
+        panic!("{needle:?} not found in setup frame");
     }
 
     fn foregrounds(line: &Line<'static>) -> HashSet<Color> {
@@ -8309,7 +8566,7 @@ mod tests {
             .draw(|frame| render(frame, &mut state, &textarea, &theme))
             .unwrap();
 
-        let cursor = Position::new(12, 9);
+        let cursor = Position::new(8, 5);
         terminal.backend_mut().assert_cursor_position(cursor);
         let buffer = terminal.backend().buffer();
         let rendered = buffer
@@ -8328,113 +8585,437 @@ mod tests {
     }
 
     #[test]
-    fn setup_cursor_events_match_the_active_onboarding_step() {
-        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+    fn compact_setup_api_key_keeps_mask_and_hardware_cursor_visible() {
+        let mut state = test_state();
+        state.status = AppStatus::Setup;
+        state.onboarding.set_step_for_test(OnboardingStep::ApiKey);
+        let theme = Theme::named(ThemeName::Dark);
+        let mut textarea = crate::composer_textarea::make_setup_textarea(&theme);
+        textarea.insert_str("密钥abc");
+        let (backend, events) = RecordingBackend::new(20, 6);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+
+        let buffer = terminal.backend().inner.buffer();
+        let rendered = buffer_text(buffer);
+        assert!(rendered.contains("*****"), "{rendered:?}");
+        for secret in ["密钥abc", "密钥", "密", "钥", "abc"] {
+            assert!(!rendered.contains(secret), "{secret:?}: {rendered:?}");
+        }
+        let cursor_events = take_cursor_events(&events);
+        assert!(
+            cursor_events.contains(&CursorEvent::Show),
+            "{cursor_events:?}"
+        );
+        let cursor = cursor_events
+            .iter()
+            .find_map(|event| match event {
+                CursorEvent::Move(position) => Some(*position),
+                CursorEvent::Show | CursorEvent::Hide => None,
+            })
+            .expect("compact API-key frame must move the hardware cursor");
+        assert!(
+            buffer.area.contains(cursor),
+            "{cursor:?} outside {:?}",
+            buffer.area
+        );
+    }
+
+    #[test]
+    fn compact_setup_api_key_extreme_frames_never_panic_or_move_out_of_bounds() {
+        let theme = Theme::named(ThemeName::Dark);
         let mut textarea = crate::composer_textarea::make_setup_textarea(&theme);
         textarea.insert_str("密钥abc");
 
-        for step in crate::onboarding::OnboardingStep::ALL {
+        for (width, height) in [(20, 5), (3, 3), (1, 1), (0, 0)] {
             let mut state = test_state();
             state.status = AppStatus::Setup;
-            state.onboarding.set_step_for_test(step);
-            let (backend, events) = RecordingBackend::new(70, 20);
+            state.onboarding.set_step_for_test(OnboardingStep::ApiKey);
+            let (backend, events) = RecordingBackend::new(width, height);
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
 
             terminal
                 .draw(|frame| render(frame, &mut state, &textarea, &theme))
                 .unwrap();
 
-            let cursor_events = take_cursor_events(&events);
-            let moves = cursor_events
-                .iter()
-                .filter(|event| matches!(event, CursorEvent::Move(_)))
-                .copied()
-                .collect::<Vec<_>>();
-            if step == crate::onboarding::OnboardingStep::ApiKey {
-                assert_eq!(
-                    cursor_events
-                        .iter()
-                        .filter(|event| **event == CursorEvent::Show)
-                        .count(),
-                    1,
-                    "{cursor_events:?}"
-                );
-                assert_eq!(
-                    cursor_events
-                        .iter()
-                        .filter(|event| **event == CursorEvent::Hide)
-                        .count(),
-                    0,
-                    "{cursor_events:?}"
-                );
-                assert_eq!(
-                    moves,
-                    [CursorEvent::Move(Position::new(12, 9))],
-                    "{cursor_events:?}"
-                );
-                let rendered = terminal
-                    .backend()
-                    .inner
-                    .buffer()
-                    .content()
-                    .iter()
-                    .map(|cell| cell.symbol())
-                    .collect::<String>();
-                assert!(!rendered.contains("密钥abc"));
-                assert!(!rendered.contains("密钥"));
-                assert!(!rendered.contains('密'));
-                assert!(!rendered.contains('钥'));
-                assert!(!rendered.contains("abc"));
-                assert!(rendered.contains("*****"));
-            } else {
-                assert_eq!(
-                    cursor_events
-                        .iter()
-                        .filter(|event| **event == CursorEvent::Hide)
-                        .count(),
-                    1,
-                    "{cursor_events:?}"
-                );
-                assert_eq!(
-                    cursor_events
-                        .iter()
-                        .filter(|event| **event == CursorEvent::Show)
-                        .count(),
-                    0,
-                    "{cursor_events:?}"
-                );
-                assert!(moves.is_empty(), "{cursor_events:?}");
+            let area = terminal.backend().inner.buffer().area;
+            for event in take_cursor_events(&events) {
+                if let CursorEvent::Move(position) = event {
+                    assert!(area.contains(position), "{width}x{height}: {position:?}");
+                }
             }
         }
     }
 
     #[test]
-    fn typed_setup_renderer_handles_every_step_at_tiny_geometry_without_secret() {
+    fn only_api_key_step_moves_hardware_cursor() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut textarea = crate::composer_textarea::make_setup_textarea(&theme);
+        textarea.insert_str("密钥abc");
+
+        for (width, height) in [(70, 20), (20, 6)] {
+            for step in crate::onboarding::OnboardingStep::ALL {
+                let mut state = test_state();
+                state.status = AppStatus::Setup;
+                state.onboarding.set_step_for_test(step);
+                let (backend, events) = RecordingBackend::new(width, height);
+                let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+                terminal
+                    .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                    .unwrap();
+
+                let cursor_events = take_cursor_events(&events);
+                let moves = cursor_events
+                    .iter()
+                    .filter_map(|event| match event {
+                        CursorEvent::Move(position) => Some(*position),
+                        CursorEvent::Show | CursorEvent::Hide => None,
+                    })
+                    .collect::<Vec<_>>();
+                if step == OnboardingStep::ApiKey {
+                    assert_eq!(
+                        cursor_events
+                            .iter()
+                            .filter(|event| **event == CursorEvent::Show)
+                            .count(),
+                        1,
+                        "{width}x{height}: {cursor_events:?}"
+                    );
+                    assert_eq!(
+                        cursor_events
+                            .iter()
+                            .filter(|event| **event == CursorEvent::Hide)
+                            .count(),
+                        0,
+                        "{width}x{height}: {cursor_events:?}"
+                    );
+                    assert_eq!(moves.len(), 1, "{width}x{height}: {cursor_events:?}");
+                    assert!(
+                        terminal.backend().inner.buffer().area.contains(moves[0]),
+                        "{width}x{height}: {:?}",
+                        moves[0]
+                    );
+                    let rendered = buffer_text(terminal.backend().inner.buffer());
+                    for secret in ["密钥abc", "密钥", "密", "钥", "abc"] {
+                        assert!(!rendered.contains(secret), "{width}x{height}: {secret:?}");
+                    }
+                    assert!(rendered.contains("*****"), "{width}x{height}");
+                } else {
+                    assert_eq!(
+                        cursor_events
+                            .iter()
+                            .filter(|event| **event == CursorEvent::Hide)
+                            .count(),
+                        1,
+                        "{width}x{height}: {cursor_events:?}"
+                    );
+                    assert_eq!(
+                        cursor_events
+                            .iter()
+                            .filter(|event| **event == CursorEvent::Show)
+                            .count(),
+                        0,
+                        "{width}x{height}: {cursor_events:?}"
+                    );
+                    assert!(moves.is_empty(), "{width}x{height}: {cursor_events:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_onboarding_step_renders_in_normal_and_compact_frames() {
+        let theme = Theme::named(ThemeName::Dark);
+        for step in OnboardingStep::ALL {
+            for (width, height) in [(80, 24), (40, 12), (20, 6)] {
+                let mut state = test_state();
+                state.status = AppStatus::Setup;
+                state.onboarding.set_step_for_test(step);
+                if step == OnboardingStep::ApiKey {
+                    state.onboarding.set_api_key("draft".to_string());
+                }
+
+                let frame = render_setup_test_frame(&mut state, &theme, width, height);
+                assert_eq!(state.frame_area, Some(Rect::new(0, 0, width, height)));
+                let rendered = buffer_text(&frame);
+                assert!(rendered.contains("Setup"), "{step:?} at {width}x{height}");
+                if width == 80 {
+                    assert!(
+                        rendered.contains(&format!("{}/7", step.ordinal())),
+                        "{step:?}: {rendered:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn onboarding_panel_is_centered_and_bounded_at_supported_frame_sizes() {
+        let theme = Theme::named(ThemeName::Dark);
+        for (width, height, expected) in [
+            (80, 24, Rect::new(6, 3, 68, 18)),
+            (40, 12, Rect::new(1, 1, 38, 10)),
+            (20, 6, Rect::new(1, 1, 18, 4)),
+        ] {
+            let mut state = test_state();
+            state.status = AppStatus::Setup;
+            let frame = render_setup_test_frame(&mut state, &theme, width, height);
+            assert_eq!(non_blank_bounds(&frame), expected, "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn onboarding_shell_renders_exact_headers_content_errors_and_footers() {
+        let theme = Theme::named(ThemeName::Dark);
+        let cases: &[(OnboardingStep, &[&str])] = &[
+            (
+                OnboardingStep::Welcome,
+                &[
+                    "1/7 · Welcome",
+                    "A DeepSeek-native coding agent",
+                    "Configure local defaults for this device.",
+                ],
+            ),
+            (
+                OnboardingStep::Provider,
+                &["2/7 · Provider", "DeepSeek", "Production provider"],
+            ),
+            (
+                OnboardingStep::Model,
+                &[
+                    "4/7 · Model",
+                    "auto",
+                    "Recommended",
+                    "deepseek-v4-flash",
+                    "deepseek-v4-pro",
+                ],
+            ),
+            (
+                OnboardingStep::Theme,
+                &[
+                    "5/7 · Theme",
+                    "auto",
+                    "dark",
+                    "light",
+                    "solarized",
+                    "catppuccin",
+                ],
+            ),
+        ];
+        for &(step, expected_rows) in cases {
+            let mut state = test_state();
+            state.status = AppStatus::Setup;
+            state.onboarding.set_step_for_test(step);
+            let rendered = buffer_text(&render_setup_test_frame(&mut state, &theme, 80, 24));
+            for expected in expected_rows {
+                assert!(
+                    rendered.contains(expected),
+                    "{step:?} missing {expected:?}: {rendered:?}"
+                );
+            }
+            assert!(rendered.contains("↑/↓ or j/k · Enter · Esc"), "{step:?}");
+        }
+
+        let mut api_key = test_state();
+        api_key.status = AppStatus::Setup;
+        api_key.onboarding.set_step_for_test(OnboardingStep::ApiKey);
+        let api_key_rendered = buffer_text(&render_setup_test_frame(&mut api_key, &theme, 80, 24));
+        assert!(api_key_rendered.contains("3/7 · API Key"));
+        assert!(api_key_rendered.contains("↑/↓ or j/k · Enter · Esc"));
+
+        let mut review = test_state();
+        review.status = AppStatus::Setup;
+        review.onboarding.set_step_for_test(OnboardingStep::Theme);
+        assert_eq!(review.onboarding.move_next(), Some(ThemeName::Dark));
+        review.onboarding.set_step_for_test(OnboardingStep::Review);
+        review.onboarding.set_api_key("sk-hidden".to_string());
+        review
+            .onboarding
+            .set_error(crate::onboarding::OnboardingError::SharedConfigUnavailable);
+        let review_rendered = buffer_text(&render_setup_test_frame(&mut review, &theme, 80, 24));
+        for expected in [
+            "6/7 · Review",
+            "Provider: DeepSeek",
+            "Model: auto",
+            "Theme: dark",
+            "API key: configured",
+            "shared configuration unavailable",
+            "↑/↓ or j/k · Enter · Esc",
+        ] {
+            assert!(review_rendered.contains(expected), "missing {expected:?}");
+        }
+
+        let mut complete = test_state();
+        complete.status = AppStatus::Setup;
+        complete
+            .onboarding
+            .set_step_for_test(OnboardingStep::Complete);
+        complete.onboarding.set_outcomes_for_test(
+            crate::onboarding::SaveOutcome::Saved,
+            crate::onboarding::SaveOutcome::Failed(UserConfigSaveError::ReplaceFailed),
+        );
+        let complete_rendered =
+            buffer_text(&render_setup_test_frame(&mut complete, &theme, 80, 24));
+        for expected in [
+            "7/7 · Complete",
+            "API key: saved",
+            "Preferences: current session only — could not replace config",
+            "Enter start · Esc exit",
+        ] {
+            assert!(complete_rendered.contains(expected), "missing {expected:?}");
+        }
+    }
+
+    #[test]
+    fn compact_option_list_keeps_selected_label_and_navigation_visible() {
+        let theme = Theme::named(ThemeName::Dark);
+        let mut state = test_state();
+        state.status = AppStatus::Setup;
+        state.onboarding.set_step_for_test(OnboardingStep::Theme);
+        assert_eq!(
+            state.onboarding.move_previous(),
+            Some(ThemeName::Catppuccin)
+        );
+
+        let rendered = buffer_text(&render_setup_test_frame(&mut state, &theme, 20, 6));
+        assert!(rendered.contains("catppuccin"), "{rendered:?}");
+        assert!(
+            rendered.contains('↑') || rendered.contains('↓'),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn onboarding_option_selection_is_capability_safe_for_every_color_level() {
+        use crate::terminal_capabilities::{
+            TerminalBackground, TerminalColorLevel, TerminalProfile,
+        };
+
+        for color_level in [
+            TerminalColorLevel::TrueColor,
+            TerminalColorLevel::Ansi256,
+            TerminalColorLevel::Ansi16,
+            TerminalColorLevel::Monochrome,
+        ] {
+            let theme = Theme::resolve(
+                ThemeName::Dark,
+                TerminalProfile {
+                    background: TerminalBackground::Dark,
+                    color_level,
+                },
+            );
+            let mut state = test_state();
+            state.status = AppStatus::Setup;
+            state.onboarding.set_step_for_test(OnboardingStep::Model);
+            let frame = render_setup_test_frame(&mut state, &theme, 80, 24);
+            let selected = find_text_cell(&frame, "auto");
+            let style = frame[selected].style();
+            assert_eq!(color_level.adapt_style(style), style, "{color_level:?}");
+            match color_level {
+                TerminalColorLevel::Monochrome => {
+                    assert!(style.add_modifier.contains(Modifier::REVERSED));
+                }
+                _ => {
+                    assert_eq!(style.fg, Some(theme.text));
+                    assert_eq!(style.bg, Some(theme.selection_bg));
+                    assert!(style.add_modifier.contains(Modifier::BOLD));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn theme_preview_changes_the_setup_frame_and_keeps_selected_label_legible() {
+        use crate::terminal_capabilities::{
+            TerminalBackground, TerminalColorLevel, TerminalProfile,
+        };
+
+        let profile = TerminalProfile {
+            background: TerminalBackground::Dark,
+            color_level: TerminalColorLevel::TrueColor,
+        };
+        let mut dark_state = test_state();
+        dark_state.status = AppStatus::Setup;
+        dark_state
+            .onboarding
+            .set_step_for_test(OnboardingStep::Theme);
+        assert_eq!(dark_state.onboarding.move_next(), Some(ThemeName::Dark));
+        let mut light_state = test_state();
+        light_state.status = AppStatus::Setup;
+        light_state
+            .onboarding
+            .set_step_for_test(OnboardingStep::Theme);
+        assert_eq!(light_state.onboarding.move_next(), Some(ThemeName::Dark));
+        assert_eq!(light_state.onboarding.move_next(), Some(ThemeName::Light));
+        assert_eq!(dark_state.onboarding.selected_theme(), ThemeName::Dark);
+        assert_eq!(light_state.onboarding.selected_theme(), ThemeName::Light);
+        let dark = Theme::resolve(dark_state.onboarding.selected_theme(), profile);
+        let light = Theme::resolve(light_state.onboarding.selected_theme(), profile);
+
+        let dark_frame = render_setup_test_frame(&mut dark_state, &dark, 80, 24);
+        let light_frame = render_setup_test_frame(&mut light_state, &light, 80, 24);
+        let dark_position = find_text_cell(&dark_frame, "dark");
+        let light_position = find_text_cell(&light_frame, "light");
+        assert_ne!(dark_frame, light_frame);
+        for (frame, position) in [(&dark_frame, dark_position), (&light_frame, light_position)] {
+            let style = frame[position].style();
+            assert!(style.fg.is_some());
+            assert!(style.bg.is_some());
+            assert_ne!(style.fg, style.bg);
+        }
+    }
+
+    #[test]
+    fn review_and_complete_never_render_secret_or_absolute_paths() {
+        let theme = Theme::named(ThemeName::Dark);
+        for step in [OnboardingStep::Review, OnboardingStep::Complete] {
+            let mut state = test_state();
+            state.status = AppStatus::Setup;
+            state.onboarding.set_step_for_test(step);
+            state
+                .onboarding
+                .set_api_key("sk-visible-secret".to_string());
+            state.onboarding.set_outcomes_for_test(
+                crate::onboarding::SaveOutcome::Failed(UserConfigSaveError::WriteFailed),
+                crate::onboarding::SaveOutcome::Failed(UserConfigSaveError::ReplaceFailed),
+            );
+            let rendered = buffer_text(&render_setup_test_frame(&mut state, &theme, 80, 24));
+            assert!(!rendered.contains("sk-visible-secret"));
+            assert!(!rendered.contains("/Users/"));
+            assert!(!rendered.contains("C:\\Users\\"));
+        }
+    }
+
+    #[test]
+    fn every_onboarding_step_masks_secrets_and_omits_expanded_paths() {
+        let theme = Theme::named(ThemeName::Dark);
         let mut textarea = crate::composer_textarea::make_setup_textarea(&theme);
         textarea.insert_str("sk-render-secret");
 
-        for step in crate::onboarding::OnboardingStep::ALL {
+        for step in OnboardingStep::ALL {
             let mut state = test_state();
             state.status = AppStatus::Setup;
             state.onboarding.set_step_for_test(step);
             state.onboarding.set_api_key("sk-draft-secret".to_string());
             let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 6)).unwrap();
-
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
             terminal
                 .draw(|frame| render(frame, &mut state, &textarea, &theme))
                 .unwrap();
 
-            let rendered = terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>();
-            assert!(!rendered.contains("sk-render-secret"), "{step:?}");
-            assert!(!rendered.contains("sk-draft-secret"), "{step:?}");
+            let rendered = buffer_text(terminal.backend().buffer());
+            for forbidden in [
+                "sk-render-secret",
+                "sk-draft-secret",
+                "/Users/",
+                "C:\\Users\\",
+            ] {
+                assert!(!rendered.contains(forbidden), "{step:?}: {forbidden:?}");
+            }
         }
     }
 

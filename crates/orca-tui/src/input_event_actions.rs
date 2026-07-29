@@ -158,6 +158,7 @@ mod setup_paste_tests {
                 },
                 "{step:?}",
             );
+            assert_eq!(state.onboarding.api_key(), None, "{step:?}");
         }
     }
 }

@@ -47,6 +47,30 @@ impl OnboardingStep {
             Self::Complete => 7,
         }
     }
+
+    pub(crate) const fn title(self) -> &'static str {
+        match self {
+            Self::Welcome => "Welcome",
+            Self::Provider => "Provider",
+            Self::ApiKey => "API Key",
+            Self::Model => "Model",
+            Self::Theme => "Theme",
+            Self::Review => "Review",
+            Self::Complete => "Complete",
+        }
+    }
+
+    pub(crate) const fn instruction(self) -> &'static str {
+        match self {
+            Self::Welcome => "Set up local defaults for this device.",
+            Self::Provider => "Choose the production provider.",
+            Self::ApiKey => "Enter your DeepSeek API key.",
+            Self::Model => "Choose the default model.",
+            Self::Theme => "Choose a theme to preview.",
+            Self::Review => "Confirm these local defaults.",
+            Self::Complete => "Setup is complete.",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -509,6 +533,17 @@ mod tests {
         assert_eq!(
             OnboardingStep::ALL.map(OnboardingStep::ordinal),
             [1, 2, 3, 4, 5, 6, 7],
+        );
+        assert_eq!(
+            OnboardingStep::ALL.map(OnboardingStep::title),
+            [
+                "Welcome", "Provider", "API Key", "Model", "Theme", "Review", "Complete",
+            ],
+        );
+        assert!(
+            OnboardingStep::ALL
+                .iter()
+                .all(|step| !step.instruction().is_empty())
         );
     }
 
