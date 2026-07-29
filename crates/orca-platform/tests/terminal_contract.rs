@@ -19,7 +19,6 @@ mod windows {
         let mut process = spawn_windows_pty(&command, Some(100), Some(30)).unwrap();
         let (output_bytes, reader) = output_reader(process.reader);
         process.input.resize(120, 40).unwrap();
-        process.input.close();
         let status = wait_for_exit(&mut process.child, "native ConPTY command");
         wait_for_output_quiet(&output_bytes, "native ConPTY command");
         process.input.close_terminal();
@@ -45,8 +44,8 @@ mod windows {
 
         let mut process = spawn_windows_pty_named(&command, Some(100), Some(30), &job_name)
             .expect("spawn ConPTY child atomically inside named Job Object");
-        process.input.close();
         let status = wait_for_exit(&mut process.child, "ConPTY membership helper");
+        process.input.close_terminal();
 
         assert!(
             status.success(),
@@ -82,7 +81,7 @@ mod windows {
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("{label} did not exit after ConPTY input reached EOF");
+                panic!("{label} did not exit before the native ConPTY deadline");
             }
             std::thread::sleep(Duration::from_millis(20));
         }
