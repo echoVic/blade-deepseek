@@ -4372,6 +4372,10 @@ mod tests {
                 .width,
             UnicodeWidthStr::width(unicode) as u16,
         );
+        assert_eq!(
+            fps_hud_area(Rect::new(u16::MAX - 4, 7, 10, 2), 6, None),
+            None,
+        );
     }
 
     #[test]
@@ -4431,6 +4435,21 @@ mod tests {
         assert_eq!(baseline.input_area, disabled.input_area);
         assert_eq!(baseline.search_area, disabled.search_area);
         assert_eq!(baseline.jump_to_bottom_area, disabled.jump_to_bottom_area);
+    }
+
+    #[test]
+    fn disabled_hud_returns_before_snapshot_or_rendering() {
+        let source = include_str!("ui.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production ui source");
+        let hud = source.find("fn render_fps_hud(").unwrap();
+        let finish = source[hud..].find("\nfn finish_frame(").unwrap();
+        let body = &source[hud..hud + finish];
+        let disabled = body.find("if !state.fps_hud_enabled").unwrap();
+        let snapshot = body.find("frame_metrics.snapshot(").unwrap();
+        let render = body.find("frame.render_widget(").unwrap();
+        assert!(disabled < snapshot && snapshot < render);
     }
 
     #[test]
