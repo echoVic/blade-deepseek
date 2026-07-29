@@ -32,6 +32,7 @@ mod key_event_actions;
 mod keybindings;
 mod mention_menu_actions;
 mod mention_search_manager;
+mod onboarding;
 mod operation_controller;
 mod queued_input;
 mod queued_input_actions;

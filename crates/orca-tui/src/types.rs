@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::OperationId;
+use orca_core::config::{ProviderKind, RunConfig, ThemeName};
 use orca_core::cost_types::UsageTotals;
 use orca_core::goal_types::ThreadGoal;
 use orca_core::plan_types::PlanItem;
@@ -27,6 +28,7 @@ use crate::edit_highlight_worker::DrainResults;
 use crate::edit_highlight_worker::{
     EditHighlightJob, EditHighlightOutcome, EditHighlightResult, EditHighlightRuntime,
 };
+use crate::onboarding::OnboardingState;
 use crate::queued_input::{QueuedComposerState, QueuedUserMessage};
 use crate::streaming_markdown::{StreamingMarkdownAction, StreamingMarkdownAssembler};
 use crate::syntax_highlight::{SyntaxTheme, highlighter_for_path};
@@ -757,6 +759,8 @@ pub struct AppState {
     /// session. Checked when a new approval arrives so the dialog is skipped.
     pub approval_allowlist: std::collections::HashSet<String>,
     pub setup_step: u8,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) onboarding: OnboardingState,
     pub show_shortcuts: bool,
     pub(crate) keymap: std::sync::Arc<crate::keybindings::Keymap>,
     pub input_history: Vec<String>,
@@ -915,6 +919,11 @@ impl AppState {
             pending_input: None,
             approval_allowlist: std::collections::HashSet::new(),
             setup_step: 0,
+            onboarding: OnboardingState::new(
+                ProviderKind::DeepSeek,
+                orca_core::model::AUTO_MODEL,
+                ThemeName::Auto,
+            ),
             show_shortcuts: false,
             keymap: crate::keybindings::Keymap::built_in(),
             input_history: load_input_history(),
@@ -971,6 +980,12 @@ impl AppState {
             composer_mouse_selecting: false,
             unseen_messages: 0,
         }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn initialize_onboarding(&mut self, config: &RunConfig) {
+        self.onboarding =
+            OnboardingState::new(config.provider, config.model.display_name(), config.theme);
     }
 
     pub(crate) fn doctor_report(&self, now: Instant) -> String {
@@ -3288,6 +3303,53 @@ mod tests {
             "mock".to_string(),
             "/tmp".to_string(),
         )
+    }
+
+    #[test]
+    fn app_state_onboarding_defaults_and_initializes_from_effective_config() {
+        let mut state = state();
+        assert_eq!(state.setup_step, 0);
+        assert_eq!(
+            state.onboarding.step(),
+            crate::onboarding::OnboardingStep::Welcome,
+        );
+        assert_eq!(
+            state.onboarding.draft_provider(),
+            orca_core::config::ProviderKind::DeepSeek,
+        );
+        assert_eq!(state.onboarding.draft_model(), orca_core::model::AUTO_MODEL,);
+        assert_eq!(
+            state.onboarding.selected_theme(),
+            orca_core::config::ThemeName::Auto,
+        );
+
+        let mut config = crate::test_support::test_run_config();
+        config.provider = orca_core::config::ProviderKind::DeepSeekFixture;
+        config.model = orca_core::model::ModelSelection::from_unchecked(Some(
+            orca_core::model::FLASH_MODEL.to_string(),
+        ));
+        config.theme = orca_core::config::ThemeName::Catppuccin;
+
+        state.initialize_onboarding(&config);
+
+        assert_eq!(
+            state.onboarding.draft_provider(),
+            orca_core::config::ProviderKind::DeepSeek,
+        );
+        assert_eq!(
+            state.onboarding.draft_model(),
+            orca_core::model::FLASH_MODEL,
+        );
+        assert_eq!(
+            state.onboarding.selected_theme(),
+            orca_core::config::ThemeName::Catppuccin,
+        );
+        assert_eq!(
+            config.provider,
+            orca_core::config::ProviderKind::DeepSeekFixture,
+        );
+        assert_eq!(config.model.display_name(), orca_core::model::FLASH_MODEL);
+        assert_eq!(config.theme, orca_core::config::ThemeName::Catppuccin);
     }
 
     fn prepare_transcript_cache(state: &mut AppState, width: usize) {
