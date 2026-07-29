@@ -34,6 +34,7 @@ use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{
     make_setup_textarea, make_textarea, textarea_cursor_byte_index, textarea_text,
 };
+use crate::diagnostics::KeybindingsDiagnostic;
 use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
 use crate::hosted_runtime::{TuiHostedEventObserver, TuiHostedOperationOutcome};
 use crate::input_event_actions::{
@@ -47,7 +48,7 @@ use crate::key_event_actions::{DynamicKeyEventFlow, handle_key_event_preflight_d
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::keybindings::{
     InputOwnerFingerprint, KeymapReloader, KeymapRuntime, ModalOwner, ReloadOutcome,
-    ShortcutInvocation,
+    ShortcutInvocation, keybindings_location,
 };
 use crate::mention_search_manager::MentionSearchManager;
 use crate::operation_controller::{TuiOperationController, TuiTurnControl};
@@ -251,6 +252,10 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         workspace_status.cwd,
     );
     let mut keymap_runtime = KeymapRuntime::new(Arc::clone(&state.keymap));
+    let keybindings_location = keybindings_location();
+    state.keybindings_diagnostic = KeybindingsDiagnostic::built_ins(keymap_runtime.generation());
+    state.diagnostics =
+        std::mem::take(&mut state.diagnostics).with_keybindings_location(keybindings_location);
     let mut keymap_reloader = crate::keybindings::keybindings_path()
         .map(|path| KeymapReloader::start(path, Instant::now()));
     if let Some(reloader) = &mut keymap_reloader {
@@ -409,11 +414,24 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                     if let Some(observation) = reloader.try_recv() {
                         match keymap_runtime.apply_observation(observation) {
                             ReloadOutcome::Unchanged => {}
-                            ReloadOutcome::Applied | ReloadOutcome::RestoredDefaults => {
+                            ReloadOutcome::Applied => {
+                                state
+                                    .keybindings_diagnostic
+                                    .applied_custom(keymap_runtime.generation());
+                                state.keymap = keymap_runtime.keymap();
+                                scheduler.mark_dirty();
+                            }
+                            ReloadOutcome::RestoredDefaults => {
+                                state
+                                    .keybindings_diagnostic
+                                    .restored_built_ins(keymap_runtime.generation());
                                 state.keymap = keymap_runtime.keymap();
                                 scheduler.mark_dirty();
                             }
                             ReloadOutcome::Rejected(message) => {
+                                state
+                                    .keybindings_diagnostic
+                                    .rejected(keymap_runtime.generation());
                                 state.push_message(ChatMessage::System(message));
                                 scheduler.mark_dirty();
                             }
@@ -1131,6 +1149,19 @@ mod tests {
     use crate::types::{ApprovalOption, PendingTuiInput, SlashMenu, SlashMenuItem, SubMenu};
     use crate::types::{TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
     use crate::workflow_notifications::drain_pending_workflow_notifications;
+
+    #[test]
+    fn doctor_keybindings_projection_is_wired_to_reload_outcomes() {
+        let source = include_str!("app.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production app source");
+        assert!(source.contains("KeybindingsDiagnostic::built_ins("));
+        assert!(source.contains(".applied_custom("));
+        assert!(source.contains(".restored_built_ins("));
+        assert!(source.contains(".rejected("));
+        assert!(source.contains("keybindings_location()"));
+    }
 
     #[test]
     fn keybinding_owner_tracks_status_modal_panel_and_vim_mode() {

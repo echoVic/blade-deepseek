@@ -6,7 +6,9 @@ use orca_core::config::RunConfig;
 use orca_core::model::ModelSelection;
 use orca_runtime::history;
 
-use crate::commands::{self, GoalSlashCommand, SlashCommand, TrustSlashCommand};
+use crate::commands::{
+    self, DoctorSlashCommand, GoalSlashCommand, SlashCommand, TrustSlashCommand,
+};
 use crate::types::{AppState, ChatMessage, UserAction};
 
 pub(crate) enum SlashOutcome {
@@ -60,6 +62,21 @@ pub(crate) fn handle_slash_command(
                 config,
             )));
         }
+        SlashCommand::Doctor(command) => match command {
+            DoctorSlashCommand::Report => {
+                state.push_message(ChatMessage::System(
+                    state.doctor_report(std::time::Instant::now()),
+                ));
+            }
+            DoctorSlashCommand::ToggleFps => {
+                let enabled = state.toggle_fps_hud();
+                state.push_message(ChatMessage::System(fps_hud_message(enabled).to_string()));
+            }
+            DoctorSlashCommand::SetFps(enabled) => {
+                state.set_fps_hud(enabled);
+                state.push_message(ChatMessage::System(fps_hud_message(enabled).to_string()));
+            }
+        },
         SlashCommand::Mode(Some(mode)) => match parse_approval_mode(&mode) {
             Some(approval_mode) => {
                 config.approval_mode = approval_mode;
@@ -275,5 +292,114 @@ pub(crate) fn parse_approval_mode(mode: &str) -> Option<ApprovalMode> {
         "full-auto" => Some(ApprovalMode::FullAuto),
         "plan" => Some(ApprovalMode::Plan),
         _ => None,
+    }
+}
+
+fn fps_hud_message(enabled: bool) -> &'static str {
+    if enabled {
+        "FPS HUD enabled."
+    } else {
+        "FPS HUD disabled."
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::Theme;
+    use crate::types::{AppStatus, PanelMode};
+    use crate::vim::{VimMode, VimState};
+    use orca_core::config::ThemeName;
+
+    fn diagnostic_state() -> (
+        AppState,
+        mpsc::Receiver<UserAction>,
+        RunConfig,
+        Arc<Mutex<RunConfig>>,
+        mpsc::Sender<UserAction>,
+    ) {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let config = crate::test_support::test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        (state, action_rx, config, shared, action_tx)
+    }
+
+    #[test]
+    fn doctor_report_pushes_one_message_and_preserves_session_state() {
+        let (mut state, _rx, mut config, shared, action_tx) = diagnostic_state();
+        state.status = AppStatus::Running;
+        state.panel_mode = PanelMode::Agents;
+        state.vim_mode = Some(VimMode::Visual);
+        let before = (state.status, state.panel_mode, state.vim_mode);
+
+        assert!(
+            handle_slash_command("/doctor", &mut config, &shared, &mut state, &action_tx,)
+                .is_some()
+        );
+
+        assert_eq!((state.status, state.panel_mode, state.vim_mode), before);
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::System(report)) if report.starts_with("Orca diagnostics\n")
+        ));
+    }
+
+    #[test]
+    fn doctor_fps_toggle_and_explicit_forms_are_session_only_and_idempotent() {
+        let (mut state, _rx, mut config, shared, action_tx) = diagnostic_state();
+        let before = orca_core::config::format_config_show(&config);
+
+        for (command, expected, message) in [
+            ("/doctor fps", true, "FPS HUD enabled."),
+            ("/doctor fps on", true, "FPS HUD enabled."),
+            ("/doctor fps off", false, "FPS HUD disabled."),
+            ("/doctor fps off", false, "FPS HUD disabled."),
+        ] {
+            handle_slash_command(command, &mut config, &shared, &mut state, &action_tx)
+                .expect("recognized doctor command");
+            assert_eq!(state.fps_hud_enabled, expected);
+            assert!(matches!(
+                state.messages.last(),
+                Some(ChatMessage::System(text)) if text == message
+            ));
+            assert_eq!(orca_core::config::format_config_show(&config), before);
+            assert_eq!(
+                orca_core::config::format_config_show(&shared.lock().unwrap()),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn submitted_doctor_command_is_cleared_by_existing_submit_contract() {
+        use crate::composer_textarea::{make_textarea_with_text, textarea_text};
+        use crate::idle_submit_actions::handle_idle_submit;
+
+        let (mut state, _rx, mut config, shared, action_tx) = diagnostic_state();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("/doctor", &vim, &theme);
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+        ));
+
+        assert_eq!(textarea_text(&textarea), "");
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::System(report)) if report.starts_with("Orca diagnostics\n")
+        ));
     }
 }

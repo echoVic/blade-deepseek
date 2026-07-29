@@ -17,6 +17,10 @@ use orca_runtime::mentions::{MentionBindings, MentionCandidate};
 use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 
+use crate::diagnostics::{
+    DiagnosticRuntimeView, DiagnosticSnapshot, FrameMetrics, KeybindingsDiagnostic,
+    format_doctor_report,
+};
 use crate::display_text::truncate_to_display_width;
 #[cfg(test)]
 use crate::edit_highlight_worker::DrainResults;
@@ -31,6 +35,7 @@ use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::TranscriptRenderCache;
 #[cfg(test)]
 use crate::transcript_view::TranscriptRenderContext;
+use crate::vim::VimMode;
 use crate::workspace_status::GitIdentity;
 
 const SUBAGENT_ACTIVITY_TAIL_LIMIT: usize = 6;
@@ -727,6 +732,11 @@ pub struct AppState {
     /// behavior and tests that exercise finalized/live suffix boundaries.
     pub flushed_count: usize,
     pub status: AppStatus,
+    pub(crate) diagnostics: DiagnosticSnapshot,
+    pub(crate) frame_metrics: FrameMetrics,
+    pub(crate) fps_hud_enabled: bool,
+    pub(crate) vim_mode: Option<VimMode>,
+    pub(crate) keybindings_diagnostic: KeybindingsDiagnostic,
     pub running_started_at: Option<Instant>,
     pub scroll_offset: usize,
     pub auto_scroll: bool,
@@ -882,6 +892,11 @@ impl AppState {
             finalized_count: 0,
             flushed_count: 0,
             status: AppStatus::Idle,
+            diagnostics: DiagnosticSnapshot::default(),
+            frame_metrics: FrameMetrics::default(),
+            fps_hud_enabled: false,
+            vim_mode: None,
+            keybindings_diagnostic: KeybindingsDiagnostic::default(),
             running_started_at: None,
             scroll_offset: 0,
             auto_scroll: true,
@@ -954,6 +969,31 @@ impl AppState {
             composer_mouse_selecting: false,
             unseen_messages: 0,
         }
+    }
+
+    pub(crate) fn doctor_report(&self, now: Instant) -> String {
+        format_doctor_report(
+            &self.diagnostics,
+            DiagnosticRuntimeView {
+                viewport: self.frame_area.map(|area| (area.width, area.height)),
+                status: self.status,
+                panel: self.panel_mode,
+                vim_mode: self.vim_mode,
+                fps_hud_enabled: self.fps_hud_enabled,
+                keybindings: self.keybindings_diagnostic,
+                auth_configured: !matches!(self.status, AppStatus::Setup),
+            },
+            self.frame_metrics.snapshot(now),
+        )
+    }
+
+    pub(crate) fn set_fps_hud(&mut self, enabled: bool) {
+        self.fps_hud_enabled = enabled;
+    }
+
+    pub(crate) fn toggle_fps_hud(&mut self) -> bool {
+        self.fps_hud_enabled = !self.fps_hud_enabled;
+        self.fps_hud_enabled
     }
 
     pub(crate) fn configure_syntax_highlighting(
@@ -8140,5 +8180,20 @@ class Item:
         assert_eq!(state.pending_edit_highlight_count(), 0);
         assert_eq!(state.successful_edit_highlight_submit_count(), 0);
         assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn app_state_diagnostics_defaults_are_inert() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let state = AppState::new(
+            action_tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+
+        assert!(!state.fps_hud_enabled);
+        assert_eq!(state.vim_mode, None);
+        assert_eq!(state.frame_metrics.snapshot(Instant::now()).total_draws, 0,);
     }
 }

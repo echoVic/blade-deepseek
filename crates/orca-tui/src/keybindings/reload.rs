@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel as mpsc;
 
+use crate::diagnostics::KeybindingsLocation;
+
 pub(crate) const MAX_KEYBINDINGS_BYTES: usize = 64 * 1024;
 const RELOAD_INTERVAL: Duration = Duration::from_millis(500);
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
@@ -21,10 +23,33 @@ pub(crate) enum FileObservation {
 type LoaderFn = Arc<dyn Fn(&Path) -> FileObservation + Send + Sync + 'static>;
 
 pub(crate) fn keybindings_path() -> Option<PathBuf> {
-    std::env::var_os(ORCA_HOME_ENV)
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
+    keybindings_directory_from_sources(std::env::var_os(ORCA_HOME_ENV), dirs::home_dir())
+        .map(|(directory, _)| directory)
         .map(|directory| directory.join("keybindings.json"))
+}
+
+pub(crate) fn keybindings_location() -> KeybindingsLocation {
+    keybindings_location_from_sources(std::env::var_os(ORCA_HOME_ENV), dirs::home_dir())
+}
+
+fn keybindings_location_from_sources(
+    orca_home: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> KeybindingsLocation {
+    keybindings_directory_from_sources(orca_home, home)
+        .map(|(_, location)| location)
+        .unwrap_or(KeybindingsLocation::Unavailable)
+}
+
+fn keybindings_directory_from_sources(
+    orca_home: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<(PathBuf, KeybindingsLocation)> {
+    orca_home
+        .map(|directory| (PathBuf::from(directory), KeybindingsLocation::OrcaHome))
+        .or_else(|| {
+            home.map(|directory| (directory.join(".orca"), KeybindingsLocation::DefaultHome))
+        })
 }
 
 pub(crate) fn load_observation(path: &Path) -> FileObservation {
@@ -170,6 +195,7 @@ mod tests {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    use crate::diagnostics::KeybindingsLocation;
     use crate::keybindings::runtime::{
         InputOwnerFingerprint, KeymapRuntime, ModalOwner, ReloadOutcome, ShortcutResolution,
     };
@@ -177,7 +203,8 @@ mod tests {
     use crate::types::PanelMode;
 
     use super::{
-        FileObservation, KeymapReloader, MAX_KEYBINDINGS_BYTES, keybindings_path, load_observation,
+        FileObservation, KeymapReloader, MAX_KEYBINDINGS_BYTES, keybindings_location_from_sources,
+        keybindings_path, load_observation,
     };
 
     fn idle_owner() -> InputOwnerFingerprint {
@@ -203,6 +230,22 @@ mod tests {
             home.path().join("keybindings.json"),
         );
         unsafe { std::env::remove_var("ORCA_HOME") };
+    }
+
+    #[test]
+    fn keybindings_location_distinguishes_orca_home_default_home_and_unavailable() {
+        assert_eq!(
+            keybindings_location_from_sources(Some("custom".into()), Some("home".into())),
+            KeybindingsLocation::OrcaHome,
+        );
+        assert_eq!(
+            keybindings_location_from_sources(None, Some("home".into())),
+            KeybindingsLocation::DefaultHome,
+        );
+        assert_eq!(
+            keybindings_location_from_sources(None, None),
+            KeybindingsLocation::Unavailable,
+        );
     }
 
     #[test]

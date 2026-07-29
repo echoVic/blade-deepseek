@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use orca_core::config::ThemeName;
@@ -121,6 +122,35 @@ impl DiagnosticSnapshot {
     pub(crate) const fn keybindings_location(&self) -> KeybindingsLocation {
         self.keybindings_location
     }
+
+    pub(crate) fn with_keybindings_location(mut self, location: KeybindingsLocation) -> Self {
+        self.keybindings_location = location;
+        self
+    }
+}
+
+impl Default for DiagnosticSnapshot {
+    fn default() -> Self {
+        Self {
+            app_version: "unknown".to_string(),
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+            terminal_program: "unknown".to_string(),
+            terminal_version: None,
+            multiplexers: Vec::new(),
+            color_level: TerminalColorLevel::Monochrome,
+            background: TerminalBackground::Unknown,
+            requested_theme: ThemeName::Auto,
+            resolved_theme: ThemeName::Dark,
+            osc9_supported: false,
+            tmux_passthrough: false,
+            focus_events_requested: false,
+            terminal_notifications: false,
+            desktop_notifications: false,
+            vim_enabled: false,
+            keybindings_location: KeybindingsLocation::Unavailable,
+        }
+    }
 }
 
 fn multiplexer_label(multiplexer: &qwertty::Multiplexer) -> &'static str {
@@ -160,6 +190,222 @@ pub(crate) struct FpsHudSnapshot {
     pub(crate) total_draws: u64,
     pub(crate) input_events: u64,
     pub(crate) runtime_events: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KeybindingsActive {
+    BuiltIns,
+    Custom,
+}
+
+impl KeybindingsActive {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::BuiltIns => "built-ins",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KeybindingsReload {
+    Ok,
+    Rejected,
+    Restored,
+}
+
+impl KeybindingsReload {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Rejected => "rejected",
+            Self::Restored => "restored",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KeybindingsDiagnostic {
+    pub(crate) active: KeybindingsActive,
+    pub(crate) generation: u64,
+    pub(crate) reload: KeybindingsReload,
+}
+
+impl Default for KeybindingsDiagnostic {
+    fn default() -> Self {
+        Self {
+            active: KeybindingsActive::BuiltIns,
+            generation: 0,
+            reload: KeybindingsReload::Ok,
+        }
+    }
+}
+
+impl KeybindingsDiagnostic {
+    pub(crate) const fn built_ins(generation: u64) -> Self {
+        Self {
+            active: KeybindingsActive::BuiltIns,
+            generation,
+            reload: KeybindingsReload::Ok,
+        }
+    }
+
+    pub(crate) fn applied_custom(&mut self, generation: u64) {
+        self.active = KeybindingsActive::Custom;
+        self.generation = generation;
+        self.reload = KeybindingsReload::Ok;
+    }
+
+    pub(crate) fn restored_built_ins(&mut self, generation: u64) {
+        self.active = KeybindingsActive::BuiltIns;
+        self.generation = generation;
+        self.reload = KeybindingsReload::Restored;
+    }
+
+    pub(crate) fn rejected(&mut self, generation: u64) {
+        self.generation = generation;
+        self.reload = KeybindingsReload::Rejected;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DiagnosticRuntimeView {
+    pub(crate) viewport: Option<(u16, u16)>,
+    pub(crate) status: crate::types::AppStatus,
+    pub(crate) panel: crate::types::PanelMode,
+    pub(crate) vim_mode: Option<crate::vim::VimMode>,
+    pub(crate) fps_hud_enabled: bool,
+    pub(crate) keybindings: KeybindingsDiagnostic,
+    pub(crate) auth_configured: bool,
+}
+
+pub(crate) fn format_doctor_report(
+    snapshot: &DiagnosticSnapshot,
+    runtime: DiagnosticRuntimeView,
+    metrics: FpsHudSnapshot,
+) -> String {
+    let terminal = snapshot.terminal_version.as_ref().map_or_else(
+        || snapshot.terminal_program.clone(),
+        |version| format!("{} {version}", snapshot.terminal_program),
+    );
+    let multiplexers = if snapshot.multiplexers.is_empty() {
+        "none".to_string()
+    } else {
+        snapshot.multiplexers.join(", ")
+    };
+    let viewport = runtime
+        .viewport
+        .map(|(width, height)| format!("{width}x{height} cells"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let mut report = String::with_capacity(1024);
+    let _ = writeln!(report, "Orca diagnostics");
+    let _ = writeln!(report, "version: {}", snapshot.app_version);
+    let _ = writeln!(report, "platform: {}/{}", snapshot.os, snapshot.arch);
+    let _ = writeln!(report, "terminal: {terminal}");
+    let _ = writeln!(report, "multiplexers: {multiplexers}");
+    let _ = writeln!(report, "viewport: {viewport}");
+    let _ = writeln!(report, "color: {}", snapshot.color_level.as_str());
+    let _ = writeln!(report, "background: {}", snapshot.background.as_str());
+    let _ = writeln!(
+        report,
+        "theme: {} -> {}",
+        snapshot.requested_theme.as_str(),
+        snapshot.resolved_theme.as_str()
+    );
+    let _ = writeln!(
+        report,
+        "notifications: terminal={} focus-events={} osc9={} tmux-passthrough={} desktop={}",
+        on_off(snapshot.terminal_notifications),
+        on_off(snapshot.focus_events_requested),
+        yes_no(snapshot.osc9_supported),
+        yes_no(snapshot.tmux_passthrough),
+        on_off(snapshot.desktop_notifications),
+    );
+    let _ = writeln!(
+        report,
+        "input: qwertty mouse=button paste=bracketed kitty-keyboard=push-succeeded"
+    );
+    let _ = writeln!(
+        report,
+        "session: status={} panel={} vim={} auth={}",
+        app_status_label(runtime.status),
+        panel_label(runtime.panel),
+        vim_mode_label(runtime.vim_mode),
+        if runtime.auth_configured {
+            "configured"
+        } else {
+            "missing"
+        },
+    );
+    let _ = writeln!(
+        report,
+        "keybindings: {} generation={} location={} reload={}",
+        runtime.keybindings.active.as_str(),
+        runtime.keybindings.generation,
+        snapshot.keybindings_location.as_str(),
+        runtime.keybindings.reload.as_str(),
+    );
+    let _ = writeln!(report, "fps-hud: {}", on_off(runtime.fps_hud_enabled));
+    let _ = write!(
+        report,
+        "frames: fps={:.1} render-ms={:.1} p95-ms={:.1} draws={} input-events={} runtime-events={}",
+        metrics.fps,
+        metrics.render_ms,
+        metrics.p95_ms,
+        metrics.total_draws,
+        metrics.input_events,
+        metrics.runtime_events,
+    );
+    truncate_utf8_bytes(report, 4096)
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value { "on" } else { "off" }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn app_status_label(status: crate::types::AppStatus) -> &'static str {
+    match status {
+        crate::types::AppStatus::Setup => "setup",
+        crate::types::AppStatus::SessionPicker => "session-picker",
+        crate::types::AppStatus::Idle => "idle",
+        crate::types::AppStatus::Running => "running",
+        crate::types::AppStatus::Compacting => "compacting",
+        crate::types::AppStatus::WaitingApproval => "waiting-approval",
+        crate::types::AppStatus::WaitingUserInput => "waiting-user-input",
+    }
+}
+
+fn panel_label(panel: crate::types::PanelMode) -> &'static str {
+    match panel {
+        crate::types::PanelMode::Conversation => "conversation",
+        crate::types::PanelMode::Workflows => "workflows",
+        crate::types::PanelMode::Agents => "agents",
+    }
+}
+
+fn vim_mode_label(mode: Option<crate::vim::VimMode>) -> &'static str {
+    match mode {
+        None => "off",
+        Some(crate::vim::VimMode::Insert) => "insert",
+        Some(crate::vim::VimMode::Normal) => "normal",
+        Some(crate::vim::VimMode::Visual) => "visual",
+    }
+}
+
+fn truncate_utf8_bytes(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary = boundary.saturating_sub(1);
+    }
+    value.truncate(boundary);
+    value
 }
 
 #[derive(Clone, Debug, Default)]
@@ -292,8 +538,40 @@ mod tests {
 
     use crate::terminal_capabilities::{TerminalBackground, TerminalColorLevel, TerminalProfile};
     use crate::terminal_presentation::TerminalPresentationProfile;
+    use crate::types::{AppStatus, PanelMode};
+    use crate::vim::VimMode;
 
-    use super::{DiagnosticSnapshot, KeybindingsLocation, SnapshotInput, bounded_diagnostic_text};
+    use super::{
+        DiagnosticRuntimeView, DiagnosticSnapshot, FpsHudSnapshot, KeybindingsActive,
+        KeybindingsDiagnostic, KeybindingsLocation, KeybindingsReload, SnapshotInput,
+        bounded_diagnostic_text, format_doctor_report,
+    };
+
+    fn known_snapshot() -> DiagnosticSnapshot {
+        let identity = qwertty::caps::identity_from_env(None, |key| match key {
+            "TERM_PROGRAM" => Some("ghostty".to_string()),
+            "TERM_PROGRAM_VERSION" => Some("1.2.0".to_string()),
+            "TMUX" => Some("tmux-session".to_string()),
+            "ZELLIJ" => Some("0".to_string()),
+            _ => None,
+        });
+        DiagnosticSnapshot::new(SnapshotInput {
+            app_version: "0.2.50",
+            terminal_identity: &identity,
+            terminal_profile: TerminalProfile {
+                background: TerminalBackground::Dark,
+                color_level: TerminalColorLevel::TrueColor,
+            },
+            presentation_profile: TerminalPresentationProfile::from_identity(&identity),
+            requested_theme: ThemeName::Auto,
+            resolved_theme: ThemeName::Dark,
+            terminal_notifications: true,
+            desktop_notifications: false,
+            focus_events_requested: true,
+            vim_mode: true,
+            keybindings_location: KeybindingsLocation::DefaultHome,
+        })
+    }
 
     #[test]
     fn diagnostic_enum_labels_are_stable() {
@@ -462,5 +740,175 @@ mod tests {
         let after = metrics.snapshot(now + Duration::from_secs(3));
         assert_eq!((after.fps, after.render_ms, after.p95_ms), (0.0, 0.0, 0.0),);
         assert_eq!(after.total_draws, u64::MAX);
+    }
+
+    #[test]
+    fn doctor_report_has_fixed_safe_line_order_and_bounded_size() {
+        let report = format_doctor_report(
+            &known_snapshot(),
+            DiagnosticRuntimeView {
+                viewport: Some((120, 40)),
+                status: AppStatus::Idle,
+                panel: PanelMode::Conversation,
+                vim_mode: Some(VimMode::Normal),
+                fps_hud_enabled: false,
+                keybindings: KeybindingsDiagnostic {
+                    active: KeybindingsActive::Custom,
+                    generation: 2,
+                    reload: KeybindingsReload::Ok,
+                },
+                auth_configured: true,
+            },
+            FpsHudSnapshot {
+                fps: 59.8,
+                render_ms: 2.3,
+                p95_ms: 4.1,
+                total_draws: 123,
+                input_events: 45,
+                runtime_events: 67,
+            },
+        );
+
+        let expected_platform = format!(
+            "platform: {}/{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        let lines = report.lines().collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            [
+                "Orca diagnostics",
+                "version: 0.2.50",
+                expected_platform.as_str(),
+                "terminal: Ghostty 1.2.0",
+                "multiplexers: tmux, zellij",
+                "viewport: 120x40 cells",
+                "color: truecolor",
+                "background: dark",
+                "theme: auto -> dark",
+                "notifications: terminal=on focus-events=on osc9=yes tmux-passthrough=yes desktop=off",
+                "input: qwertty mouse=button paste=bracketed kitty-keyboard=push-succeeded",
+                "session: status=idle panel=conversation vim=normal auth=configured",
+                "keybindings: custom generation=2 location=default-home reload=ok",
+                "fps-hud: off",
+                "frames: fps=59.8 render-ms=2.3 p95-ms=4.1 draws=123 input-events=45 runtime-events=67",
+            ],
+        );
+        assert!(report.len() <= 4096);
+        assert!(!report.contains('\u{1b}'));
+        for forbidden in ["DEEPSEEK_API_KEY", "sk-", "/Users/", "C:\\Users\\"] {
+            assert!(!report.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn doctor_report_unknown_and_projection_matrix_is_explicit() {
+        for (vim_mode, expected_vim) in [
+            (None, "off"),
+            (Some(VimMode::Insert), "insert"),
+            (Some(VimMode::Normal), "normal"),
+            (Some(VimMode::Visual), "visual"),
+        ] {
+            for (active, reload, expected) in [
+                (
+                    KeybindingsActive::BuiltIns,
+                    KeybindingsReload::Ok,
+                    "built-ins",
+                ),
+                (KeybindingsActive::Custom, KeybindingsReload::Ok, "custom"),
+                (
+                    KeybindingsActive::Custom,
+                    KeybindingsReload::Rejected,
+                    "reload=rejected",
+                ),
+                (
+                    KeybindingsActive::BuiltIns,
+                    KeybindingsReload::Restored,
+                    "reload=restored",
+                ),
+            ] {
+                let report = format_doctor_report(
+                    &DiagnosticSnapshot::default(),
+                    DiagnosticRuntimeView {
+                        viewport: None,
+                        status: AppStatus::Idle,
+                        panel: PanelMode::Conversation,
+                        vim_mode,
+                        fps_hud_enabled: false,
+                        keybindings: KeybindingsDiagnostic {
+                            active,
+                            generation: 0,
+                            reload,
+                        },
+                        auth_configured: false,
+                    },
+                    FpsHudSnapshot::default(),
+                );
+                assert!(report.contains("terminal: unknown"));
+                assert!(report.contains("viewport: unknown"));
+                assert!(report.contains(&format!("vim={expected_vim}")));
+                assert!(report.contains(expected));
+                assert!(report.len() <= 4096);
+            }
+        }
+    }
+
+    #[test]
+    fn keybindings_diagnostic_projects_reload_outcomes_without_losing_active_state() {
+        let mut diagnostic = KeybindingsDiagnostic::built_ins(0);
+        assert_eq!(
+            diagnostic,
+            KeybindingsDiagnostic {
+                active: KeybindingsActive::BuiltIns,
+                generation: 0,
+                reload: KeybindingsReload::Ok,
+            },
+        );
+
+        diagnostic.applied_custom(1);
+        assert_eq!(
+            diagnostic,
+            KeybindingsDiagnostic {
+                active: KeybindingsActive::Custom,
+                generation: 1,
+                reload: KeybindingsReload::Ok,
+            },
+        );
+
+        diagnostic.rejected(1);
+        assert_eq!(diagnostic.active, KeybindingsActive::Custom);
+        assert_eq!(diagnostic.generation, 1);
+        assert_eq!(diagnostic.reload, KeybindingsReload::Rejected);
+
+        diagnostic.restored_built_ins(2);
+        assert_eq!(
+            diagnostic,
+            KeybindingsDiagnostic {
+                active: KeybindingsActive::BuiltIns,
+                generation: 2,
+                reload: KeybindingsReload::Restored,
+            },
+        );
+    }
+
+    #[test]
+    fn doctor_formatter_source_has_no_runtime_io_or_probe_calls() {
+        let source = include_str!("diagnostics.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production diagnostics source");
+        for forbidden in [
+            "std::fs",
+            "std::process",
+            "Command::new",
+            "std::env::var",
+            "std::env::var_os",
+            "probe_capabilities",
+            "probe_background",
+            "identity_from_env",
+        ] {
+            assert!(!source.contains(forbidden), "{forbidden}");
+        }
     }
 }

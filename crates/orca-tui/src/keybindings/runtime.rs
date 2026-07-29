@@ -322,7 +322,6 @@ impl KeymapRuntime {
         self.pending = None;
     }
 
-    #[cfg(test)]
     pub(crate) const fn generation(&self) -> u64 {
         self.generation
     }

@@ -4,6 +4,7 @@ pub enum SlashCommand {
     Compact,
     Cost,
     ConfigShow,
+    Doctor(DoctorSlashCommand),
     History,
     Mode(Option<String>),
     Plan(Option<String>),
@@ -32,6 +33,13 @@ pub enum GoalSlashCommand {
     Clear,
     Pause,
     Resume,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DoctorSlashCommand {
+    Report,
+    ToggleFps,
+    SetFps(bool),
 }
 
 pub fn parse(input: &str) -> Option<SlashCommand> {
@@ -90,6 +98,16 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
         "compact" => Some(SlashCommand::Compact),
         "cost" => Some(SlashCommand::Cost),
         "config" if parts.next() == Some("show") => Some(SlashCommand::ConfigShow),
+        "doctor" => {
+            let args = parts.collect::<Vec<_>>();
+            match args.as_slice() {
+                [] => Some(SlashCommand::Doctor(DoctorSlashCommand::Report)),
+                ["fps"] => Some(SlashCommand::Doctor(DoctorSlashCommand::ToggleFps)),
+                ["fps", "on"] => Some(SlashCommand::Doctor(DoctorSlashCommand::SetFps(true))),
+                ["fps", "off"] => Some(SlashCommand::Doctor(DoctorSlashCommand::SetFps(false))),
+                _ => None,
+            }
+        }
         "history" => Some(SlashCommand::History),
         "mode" => Some(SlashCommand::Mode(
             parts.next().map(|mode| mode.to_string()),
@@ -135,6 +153,10 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/compact", "Compress conversation context"),
         ("/cost", "Show session cost"),
         ("/config show", "Show merged config"),
+        (
+            "/doctor",
+            "Show terminal diagnostics and control the FPS HUD",
+        ),
         ("/mode", "Switch approval mode"),
         ("/plan", "Toggle plan mode"),
         ("/goal", "Manage a persistent goal"),
@@ -452,6 +474,51 @@ mod tests {
     #[test]
     fn parses_config_show_command() {
         assert_eq!(parse("/config show"), Some(SlashCommand::ConfigShow));
+    }
+
+    #[test]
+    fn parses_doctor_commands_exactly() {
+        assert_eq!(
+            parse("/doctor"),
+            Some(SlashCommand::Doctor(DoctorSlashCommand::Report))
+        );
+        assert_eq!(
+            parse("/doctor fps"),
+            Some(SlashCommand::Doctor(DoctorSlashCommand::ToggleFps))
+        );
+        assert_eq!(
+            parse("/doctor fps on"),
+            Some(SlashCommand::Doctor(DoctorSlashCommand::SetFps(true)))
+        );
+        assert_eq!(
+            parse("/doctor fps off"),
+            Some(SlashCommand::Doctor(DoctorSlashCommand::SetFps(false)))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_doctor_commands() {
+        for input in [
+            "/doctor on",
+            "/doctor fps true",
+            "/doctor fps off extra",
+            "/doctor extra",
+            "/Doctor",
+        ] {
+            assert_eq!(parse(input), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn doctor_is_one_builtin_menu_row_and_cannot_be_shadowed() {
+        assert_eq!(
+            all_commands()
+                .iter()
+                .filter(|(name, _)| *name == "/doctor")
+                .count(),
+            1,
+        );
+        assert!(builtin_command_names().contains("doctor"));
     }
 
     #[test]
