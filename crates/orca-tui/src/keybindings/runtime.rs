@@ -98,6 +98,7 @@ pub(crate) struct KeymapRuntime {
     pending: Option<PendingChord>,
     last_observation: Option<FileObservation>,
     active_bytes: Option<Vec<u8>>,
+    last_reload_rejected: bool,
 }
 
 impl KeymapRuntime {
@@ -108,6 +109,7 @@ impl KeymapRuntime {
             pending: None,
             last_observation: None,
             active_bytes: None,
+            last_reload_rejected: false,
         }
     }
 
@@ -327,7 +329,7 @@ impl KeymapRuntime {
     }
 
     pub(crate) fn last_observation_rejected(&self) -> bool {
-        matches!(self.last_observation, Some(FileObservation::Rejected(_)))
+        self.last_reload_rejected
     }
 
     pub(crate) fn keymap(&self) -> Arc<Keymap> {
@@ -341,6 +343,7 @@ impl KeymapRuntime {
         self.last_observation = Some(observation.clone());
         match observation {
             FileObservation::Missing => {
+                self.last_reload_rejected = false;
                 if self.active_bytes.is_none() {
                     return ReloadOutcome::Unchanged;
                 }
@@ -349,22 +352,28 @@ impl KeymapRuntime {
                 ReloadOutcome::RestoredDefaults
             }
             FileObservation::Rejected(error) => {
+                self.last_reload_rejected = true;
                 ReloadOutcome::Rejected(format!("keybindings reload rejected: {error}"))
             }
             FileObservation::Bytes(bytes) => {
                 if self.active_bytes.as_ref() == Some(&bytes) {
+                    self.last_reload_rejected = false;
                     return ReloadOutcome::Unchanged;
                 }
                 match super::config::parse_keymap(&bytes) {
                     Ok(keymap) => {
+                        self.last_reload_rejected = false;
                         self.active_bytes = Some(bytes);
                         self.install(keymap);
                         ReloadOutcome::Applied
                     }
-                    Err(error) => ReloadOutcome::Rejected(format!(
-                        "keybindings reload rejected: {}",
-                        stable_parse_error(&error.to_string())
-                    )),
+                    Err(error) => {
+                        self.last_reload_rejected = true;
+                        ReloadOutcome::Rejected(format!(
+                            "keybindings reload rejected: {}",
+                            stable_parse_error(&error.to_string())
+                        ))
+                    }
                 }
             }
         }
@@ -604,6 +613,27 @@ mod tests {
         ));
         assert!(matches!(
             runtime.apply_observation(rejected),
+            ReloadOutcome::Unchanged,
+        ));
+        assert!(runtime.last_observation_rejected());
+
+        assert_eq!(
+            runtime.apply_observation(FileObservation::Missing),
+            ReloadOutcome::Unchanged,
+        );
+        assert!(!runtime.last_observation_rejected());
+    }
+
+    #[test]
+    fn repeated_invalid_json_remains_rejected_until_an_accepted_observation() {
+        let mut runtime = KeymapRuntime::new(crate::keybindings::config::Keymap::built_in());
+        let invalid = FileObservation::Bytes(br#"{"idle.submit":"bad"}"#.to_vec());
+        assert!(matches!(
+            runtime.apply_observation(invalid.clone()),
+            ReloadOutcome::Rejected(_),
+        ));
+        assert!(matches!(
+            runtime.apply_observation(invalid),
             ReloadOutcome::Unchanged,
         ));
         assert!(runtime.last_observation_rejected());
