@@ -18,6 +18,7 @@ mod windows {
         process.input.resize(120, 40).unwrap();
         process.input.close();
         let status = wait_for_exit(&mut process.child, "native ConPTY command");
+        process.input.close_terminal();
 
         let mut output = String::new();
         process.reader.read_to_string(&mut output).unwrap();

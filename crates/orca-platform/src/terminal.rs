@@ -118,6 +118,11 @@ mod windows {
             self.writer.take();
         }
 
+        pub fn close_terminal(&mut self) {
+            self.writer.take();
+            self.console.take();
+        }
+
         pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
             self.console
                 .as_ref()

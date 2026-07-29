@@ -975,6 +975,7 @@ impl ShellSession {
 
     fn stop_and_join_readers(&mut self) {
         self.stdin.close();
+        self.stdin.close_terminal();
         self.reader_stop.store(true, Ordering::Release);
         if let Some(handle) = self.stdout_handle.take() {
             let _ = handle.join();
@@ -1264,6 +1265,16 @@ impl ShellInput {
             Self::UnixPty(_) => {}
             #[cfg(windows)]
             Self::WindowsPty(pty) => pty.close(),
+        }
+    }
+
+    fn close_terminal(&mut self) {
+        match self {
+            #[cfg(windows)]
+            Self::WindowsSandboxPty(pty) => pty.close_terminal(),
+            #[cfg(windows)]
+            Self::WindowsPty(pty) => pty.close_terminal(),
+            _ => {}
         }
     }
 

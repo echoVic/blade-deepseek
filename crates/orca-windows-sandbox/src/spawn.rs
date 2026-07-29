@@ -228,6 +228,11 @@ impl SandboxedPtyInput {
             .resize(cols, rows)
     }
 
+    pub fn close_terminal(&mut self) {
+        self.writer.take();
+        self.console.take();
+    }
+
     pub fn close(&mut self) {
         self.writer.take();
     }
@@ -937,6 +942,7 @@ mod tests {
         input.close();
         input.resize(120, 40).expect("resize after closing stdin");
         let status = child.wait().expect("wait");
+        input.close_terminal();
         let mut text = String::new();
         output.read_to_string(&mut text).expect("pty output");
         assert!(status.success(), "{text}");
@@ -992,6 +998,7 @@ mod tests {
         input.close();
         input.resize(120, 40).expect("resize after closing stdin");
         let status = child.wait().expect("wait");
+        input.close_terminal();
         let mut text = String::new();
         output.read_to_string(&mut text).expect("pty output");
         assert!(status.success(), "{text}");
