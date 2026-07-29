@@ -1,5 +1,8 @@
 use std::ffi::{OsStr, OsString};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
+#[cfg(not(windows))]
+use std::io::{BufRead, BufReader};
+#[cfg(not(windows))]
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -83,6 +86,14 @@ impl OrcaCommand {
         self
     }
 
+    fn sandbox_workspace(&mut self, folder: &Path) -> &mut Self {
+        trust_test_folder(folder, &self.trust_config_dir);
+        if !self.trusted_folders.iter().any(|trusted| trusted == folder) {
+            self.trusted_folders.push(folder.to_path_buf());
+        }
+        self
+    }
+
     fn spawn(&mut self) -> std::io::Result<ServerTestClient> {
         #[cfg(windows)]
         {
@@ -133,6 +144,80 @@ fn trust_test_folder(folder: &Path, home: &Path) {
         orca_core::config::folder_trust::TrustLevel::Trusted,
     )
     .expect("trust server contract workspaces");
+}
+
+fn platform_shell_script<'a>(unix: &'a str, windows: &'a str) -> &'a str {
+    #[cfg(windows)]
+    {
+        let _ = unix;
+        windows
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = windows;
+        unix
+    }
+}
+
+fn platform_command(unix: &str, windows: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let _ = unix;
+        vec![
+            "powershell.exe".to_string(),
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            windows.to_string(),
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = windows;
+        vec!["sh".to_string(), "-lc".to_string(), unix.to_string()]
+    }
+}
+
+fn platform_command_with_args(unix: &str, windows: &str, unix_args: &[&str]) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let _ = unix_args;
+        platform_command(unix, windows)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = platform_command(unix, windows);
+        command.push("sh".to_string());
+        command.extend(unix_args.iter().map(|arg| (*arg).to_string()));
+        command
+    }
+}
+
+fn powershell_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
+}
+
+fn unix_shell_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn platform_write_file_command(path: &Path, content: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!(
+            "Set-Content -NoNewline -LiteralPath {} -Value '{}'",
+            powershell_path(path),
+            content.replace('\'', "''")
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        format!(
+            "printf '%s' '{}' > {}",
+            content.replace('\'', "'\\''"),
+            unix_shell_path(path)
+        )
+    }
 }
 
 #[test]
@@ -1909,13 +1994,20 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait_and_accepts_next_turn() {
     let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
     {
+        let command = platform_shell_script(
+            "touch bash-invocation-started; sleep 5; printf after",
+            "New-Item -ItemType File -Force -Path 'bash-invocation-started' | Out-Null; Start-Sleep -Seconds 5; [Console]::Out.Write('after')",
+        );
+        let request = json!({
+            "id": "turn-bash",
+            "method": "turn/start",
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": format!("bash {command}")}]
+            }
+        });
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"turn-bash","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"bash touch bash-invocation-started; sleep 5; printf after"}}]}}}}"#,
-            thread_id
-        )
-        .expect("write bash turn");
+        writeln!(stdin, "{request}").expect("write bash turn");
         stdin.flush().expect("flush bash turn");
     }
     let turn_started = child.expect_event("turn-bash", "turn_started");
@@ -2856,11 +2948,16 @@ fn server_mode_controls_runtime_shell_session() {
         .expect("spawn orca server");
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"read line; printf 'server:%s\\n' \"$line\"","description":"interactive server shell"}}}}"#
-        )
-        .expect("write shell/start");
+        let command = platform_shell_script(
+            r#"read line; printf 'server:%s\n' "$line""#,
+            "$line = [Console]::In.ReadLine(); [Console]::Out.Write(\"server:$line`n\")",
+        );
+        let request = json!({
+            "id": "shell-start",
+            "method": "shell/start",
+            "params": {"command": command, "description": "interactive server shell"}
+        });
+        writeln!(stdin, "{request}").expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
 
@@ -2871,7 +2968,10 @@ fn server_mode_controls_runtime_shell_session() {
     assert_eq!(started["effectiveTerminalMode"], "pipe");
     assert_eq!(
         started["command"],
-        r#"read line; printf 'server:%s\n' "$line""#
+        platform_shell_script(
+            r#"read line; printf 'server:%s\n' "$line""#,
+            "$line = [Console]::In.ReadLine(); [Console]::Out.Write(\"server:$line`n\")"
+        )
     );
     assert!(started["taskId"].as_str().is_some_and(|id| !id.is_empty()));
 
@@ -2978,11 +3078,20 @@ fn server_mode_command_exec_returns_buffered_output() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'legacy-out'; printf 'legacy-err' >&2"],"tty":false,"streamStdin":false,"streamStdoutStderr":false}}}}"#
-        )
-        .expect("write command/exec");
+        let request = json!({
+            "id": "cmd",
+            "method": "command/exec",
+            "params": {
+                "command": platform_command(
+                    "printf 'legacy-out'; printf 'legacy-err' >&2",
+                    "[Console]::Out.Write('legacy-out'); [Console]::Error.Write('legacy-err')"
+                ),
+                "tty": false,
+                "streamStdin": false,
+                "streamStdoutStderr": false
+            }
+        });
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
 
@@ -3019,6 +3128,7 @@ fn server_mode_command_exec_honors_cwd_and_env_overrides() {
         ])
         .env("ORCA_COMMAND_EXEC_BASE", "server")
         .env("ORCA_COMMAND_EXEC_REMOVE", "server")
+        .sandbox_workspace(&command_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3031,11 +3141,10 @@ fn server_mode_command_exec_honors_cwd_and_env_overrides() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": [
-                    "sh",
-                    "-lc",
-                    "printf '%s|%s|%s|%s' \"$PWD\" \"$ORCA_COMMAND_EXEC_BASE\" \"$ORCA_COMMAND_EXEC_EXTRA\" \"${ORCA_COMMAND_EXEC_REMOVE-unset}\""
-                ],
+                "command": platform_command(
+                    "printf '%s|%s|%s|%s' \"$PWD\" \"$ORCA_COMMAND_EXEC_BASE\" \"$ORCA_COMMAND_EXEC_EXTRA\" \"${ORCA_COMMAND_EXEC_REMOVE-unset}\"",
+                    "[Console]::Out.Write(\"$($PWD.Path)|$env:ORCA_COMMAND_EXEC_BASE|$env:ORCA_COMMAND_EXEC_EXTRA|$(if ([string]::IsNullOrEmpty($env:ORCA_COMMAND_EXEC_REMOVE)) { 'unset' } else { $env:ORCA_COMMAND_EXEC_REMOVE })\")"
+                ),
                 "cwd": command_dir,
                 "env": {
                     "ORCA_COMMAND_EXEC_BASE": "request",
@@ -4977,11 +5086,18 @@ fn server_mode_command_exec_respects_buffered_output_cap() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'abcdef'; printf 'uvwxyz' >&2"],"outputBytesCap":5}}}}"#
-        )
-        .expect("write command/exec");
+        let request = json!({
+            "id": "cmd",
+            "method": "command/exec",
+            "params": {
+                "command": platform_command(
+                    "printf 'abcdef'; printf 'uvwxyz' >&2",
+                    "[Console]::Out.Write('abcdef'); [Console]::Error.Write('uvwxyz')"
+                ),
+                "outputBytesCap": 5
+            }
+        });
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
 
@@ -5020,11 +5136,18 @@ fn server_mode_command_exec_caps_buffered_output_by_bytes() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'ééé'; printf 'ééé' >&2"],"outputBytesCap":5}}}}"#
-        )
-        .expect("write command/exec");
+        let request = json!({
+            "id": "cmd",
+            "method": "command/exec",
+            "params": {
+                "command": platform_command(
+                    "printf 'ééé'; printf 'ééé' >&2",
+                    "$encoding = [Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = $encoding; [Console]::Out.Write('ééé'); [Console]::Error.Write('ééé')"
+                ),
+                "outputBytesCap": 5
+            }
+        });
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
 
@@ -5090,6 +5213,11 @@ fn server_mode_command_exec_with_process_id_can_be_terminated() {
     let release_marker = workspace.path().join("command-release");
     let started_marker_arg = started_marker.to_str().expect("marker path");
     let release_marker_arg = release_marker.to_str().expect("release marker path");
+    let windows_command = format!(
+        "[Console]::Out.Write('started'); New-Item -ItemType File -Force -Path {} | Out-Null; while (!(Test-Path {})) {{ Start-Sleep -Milliseconds 50 }}; [Console]::Out.Write('done')",
+        powershell_path(&started_marker),
+        powershell_path(&release_marker)
+    );
     let mut child = orca_command()
         .args([
             "--mode",
@@ -5111,14 +5239,11 @@ fn server_mode_command_exec_with_process_id_can_be_terminated() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": [
-                    "sh",
-                    "-lc",
+                "command": platform_command_with_args(
                     "printf started; : > \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done; printf done",
-                    "sh",
-                    started_marker_arg,
-                    release_marker_arg
-                ],
+                    &windows_command,
+                    &[started_marker_arg, release_marker_arg]
+                ),
                 "processId": "sleep-1",
                 "tty": false,
                 "streamStdin": false,
@@ -5173,6 +5298,12 @@ fn server_mode_command_exec_stops_active_processes_when_input_closes() {
     let started_marker_arg = started_marker.to_str().expect("started marker path");
     let release_marker_arg = release_marker.to_str().expect("release marker path");
     let leaked_marker_arg = leaked_marker.to_str().expect("marker path");
+    let windows_command = format!(
+        "[Console]::Out.Write('started'); New-Item -ItemType File -Force -Path {} | Out-Null; while (!(Test-Path {})) {{ Start-Sleep -Milliseconds 50 }}; Set-Content -NoNewline -Path {} -Value 'leaked'",
+        powershell_path(&started_marker),
+        powershell_path(&release_marker),
+        powershell_path(&leaked_marker)
+    );
     let mut child = orca_command()
         .args([
             "--mode",
@@ -5194,15 +5325,11 @@ fn server_mode_command_exec_stops_active_processes_when_input_closes() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": [
-                    "sh",
-                    "-lc",
+                "command": platform_command_with_args(
                     "printf started; : > \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done; printf leaked > \"$3\"",
-                    "sh",
-                    started_marker_arg,
-                    release_marker_arg,
-                    leaked_marker_arg
-                ],
+                    &windows_command,
+                    &[started_marker_arg, release_marker_arg, leaked_marker_arg]
+                ),
                 "processId": "eof-cleanup-1",
                 "streamStdoutStderr": true
             }
@@ -5314,11 +5441,15 @@ fn server_mode_command_exec_rejects_duplicate_active_process_id() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd-1","method":"command/exec","params":{{"command":["sh","-lc","sleep 30"],"processId":"dup-1"}}}}"#
-        )
-        .expect("write first command/exec");
+        let request = json!({
+            "id": "cmd-1",
+            "method": "command/exec",
+            "params": {
+                "command": platform_command("sleep 30", "Start-Sleep -Seconds 30"),
+                "processId": "dup-1"
+            }
+        });
+        writeln!(stdin, "{request}").expect("write first command/exec");
         stdin.flush().expect("flush first command/exec");
     }
     let started = child.expect_event("cmd-1", "command_exec_started");
@@ -5376,6 +5507,18 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
     let started_marker_arg = started_marker.to_str().expect("marker path");
     let release_marker_arg = release_marker.to_str().expect("release marker path");
     let completed_marker_arg = completed_marker.to_str().expect("completed marker path");
+    let command = "printf listed; touch $1; while test ! -e $2; do sleep 0.05; done; touch $3";
+    let windows_command = format!(
+        "[Console]::Out.Write('listed'); New-Item -ItemType File -Force -Path {} | Out-Null; while (!(Test-Path {})) {{ Start-Sleep -Milliseconds 50 }}; New-Item -ItemType File -Force -Path {} | Out-Null",
+        powershell_path(&started_marker),
+        powershell_path(&release_marker),
+        powershell_path(&completed_marker)
+    );
+    let command_args = platform_command_with_args(
+        command,
+        &windows_command,
+        &[started_marker_arg, release_marker_arg, completed_marker_arg],
+    );
     let mut child = orca_command()
         .args([
             "--mode",
@@ -5391,22 +5534,13 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
         .spawn()
         .expect("spawn orca server");
 
-    let command = "printf listed; touch $1; while test ! -e $2; do sleep 0.05; done; touch $3";
     {
         let stdin = child.stdin_mut();
         let request = serde_json::json!({
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": [
-                    "sh",
-                    "-lc",
-                    command,
-                    "sh",
-                    started_marker_arg,
-                    release_marker_arg,
-                    completed_marker_arg
-                ],
+                "command": command_args,
                 "processId": "listed-1",
                 "cwd": workspace.path().to_str().unwrap(),
                 "streamStdoutStderr": true,
@@ -5458,18 +5592,7 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
     assert_eq!(process["outputBytesCap"], 32);
     assert_eq!(process["stdoutBytes"], 6);
     assert_eq!(process["stderrBytes"], 0);
-    assert_eq!(
-        process["command"],
-        serde_json::json!([
-            "sh",
-            "-lc",
-            command,
-            "sh",
-            started_marker_arg,
-            release_marker_arg,
-            completed_marker_arg
-        ])
-    );
+    assert_eq!(process["command"], serde_json::json!(command_args));
 
     std::fs::write(&release_marker, "release").expect("write release marker");
     wait_for_path(&completed_marker);
@@ -5528,11 +5651,16 @@ fn server_mode_command_exec_write_requires_input_or_close() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","cat"],"processId":"write-empty-1","streamStdin":true}}}}"#
-        )
-        .expect("write command/exec");
+        let request = json!({
+            "id": "cmd",
+            "method": "command/exec",
+            "params": {
+                "command": platform_command("cat", "$null = [Console]::In.ReadToEnd()"),
+                "processId": "write-empty-1",
+                "streamStdin": true
+            }
+        });
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
     let started = child.expect_event("cmd", "command_exec_started");
@@ -5593,11 +5721,17 @@ fn server_mode_command_exec_resize_rejects_zero_dimensions() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","cat"],"processId":"resize-zero-1","tty":true,"size":{{"rows":24,"cols":80}}}}}}"#
-        )
-        .expect("write command/exec");
+        let request = json!({
+            "id": "cmd",
+            "method": "command/exec",
+            "params": {
+                "command": platform_command("cat", "$null = [Console]::In.ReadToEnd()"),
+                "processId": "resize-zero-1",
+                "tty": true,
+                "size": {"rows": 24, "cols": 80}
+            }
+        });
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
     let started = child.expect_event("cmd", "command_exec_started");
@@ -5658,11 +5792,20 @@ fn server_mode_command_exec_streams_output_and_accepts_write() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'out-start\n'; printf 'err-start\n' >&2; IFS= read line; printf 'out:%s\n' \"$line\"; printf 'err:%s\n' \"$line\" >&2"],"processId":"pipe-1","streamStdin":true,"streamStdoutStderr":true}}}}"#
-        )
-        .expect("write command/exec");
+        let request = json!({
+            "id": "cmd",
+            "method": "command/exec",
+            "params": {
+                "command": platform_command(
+                    "printf 'out-start\n'; printf 'err-start\n' >&2; IFS= read line; printf 'out:%s\n' \"$line\"; printf 'err:%s\n' \"$line\" >&2",
+                    "[Console]::Out.Write(\"out-start`n\"); [Console]::Error.Write(\"err-start`n\"); $line = [Console]::In.ReadLine(); [Console]::Out.Write(\"out:$line`n\"); [Console]::Error.Write(\"err:$line`n\")"
+                ),
+                "processId": "pipe-1",
+                "streamStdin": true,
+                "streamStdoutStderr": true
+            }
+        });
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
     let started = child.expect_event("cmd", "command_exec_started");
@@ -5708,6 +5851,10 @@ fn server_mode_command_exec_read_drains_streaming_output() {
     let workspace = tempdir().expect("workspace");
     let release_marker = workspace.path().join("command-release");
     let release_marker_arg = release_marker.to_str().expect("release marker path");
+    let windows_command = format!(
+        "while (!(Test-Path {})) {{ Start-Sleep -Milliseconds 50 }}; [Console]::Out.Write('read-out'); [Console]::Error.Write('read-err'); Start-Sleep -Seconds 30",
+        powershell_path(&release_marker)
+    );
     let mut child = orca_command()
         .args([
             "--mode",
@@ -5729,13 +5876,11 @@ fn server_mode_command_exec_read_drains_streaming_output() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": [
-                    "sh",
-                    "-lc",
+                "command": platform_command_with_args(
                     "while [ ! -e \"$1\" ]; do sleep 0.05; done; printf 'read-out'; printf 'read-err' >&2; sleep 30",
-                    "sh",
-                    release_marker_arg
-                ],
+                    &windows_command,
+                    &[release_marker_arg]
+                ),
                 "processId": "read-1",
                 "streamStdoutStderr": true
             }
@@ -5802,6 +5947,10 @@ fn server_mode_command_exec_read_caps_streaming_output() {
     let workspace = tempdir().expect("workspace");
     let release_marker = workspace.path().join("command-cap-release");
     let release_marker_arg = release_marker.to_str().expect("release marker path");
+    let windows_command = format!(
+        "while (!(Test-Path {})) {{ Start-Sleep -Milliseconds 50 }}; [Console]::Out.Write('abcdef'); Start-Sleep -Seconds 30",
+        powershell_path(&release_marker)
+    );
     let mut child = orca_command()
         .args([
             "--mode",
@@ -5823,13 +5972,11 @@ fn server_mode_command_exec_read_caps_streaming_output() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": [
-                    "sh",
-                    "-lc",
+                "command": platform_command_with_args(
                     "while [ ! -e \"$1\" ]; do sleep 0.05; done; printf 'abcdef'; sleep 30",
-                    "sh",
-                    release_marker_arg
-                ],
+                    &windows_command,
+                    &[release_marker_arg]
+                ),
                 "processId": "read-cap-1",
                 "streamStdoutStderr": true
             }
@@ -5908,6 +6055,10 @@ fn server_mode_command_exec_streaming_respects_output_cap() {
     let workspace = tempdir().expect("workspace");
     let started_marker = workspace.path().join("stream-cap-started");
     let started_marker_arg = started_marker.to_str().expect("started marker path");
+    let windows_command = format!(
+        "[Console]::Out.Write('abcdefghij'); New-Item -ItemType File -Force -Path {} | Out-Null; Start-Sleep -Seconds 30",
+        powershell_path(&started_marker)
+    );
     let mut child = orca_command()
         .args([
             "--mode",
@@ -5929,13 +6080,11 @@ fn server_mode_command_exec_streaming_respects_output_cap() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": [
-                    "sh",
-                    "-lc",
+                "command": platform_command_with_args(
                     "printf 'abcdefghij'; : > \"$1\"; sleep 30",
-                    "sh",
-                    started_marker_arg
-                ],
+                    &windows_command,
+                    &[started_marker_arg]
+                ),
                 "processId": "stream-cap-1",
                 "streamStdoutStderr": true,
                 "outputBytesCap": 5
@@ -5997,6 +6146,10 @@ fn server_mode_command_exec_caps_streaming_output_by_bytes() {
     let workspace = tempdir().expect("workspace");
     let started_marker = workspace.path().join("stream-byte-cap-started");
     let started_marker_arg = started_marker.to_str().expect("started marker path");
+    let windows_command = format!(
+        "$encoding = [Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = $encoding; [Console]::Out.Write('ééé'); New-Item -ItemType File -Force -Path {} | Out-Null; Start-Sleep -Seconds 30",
+        powershell_path(&started_marker)
+    );
     let mut child = orca_command()
         .args([
             "--mode",
@@ -6018,13 +6171,11 @@ fn server_mode_command_exec_caps_streaming_output_by_bytes() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": [
-                    "sh",
-                    "-lc",
+                "command": platform_command_with_args(
                     "printf 'ééé'; : > \"$1\"; sleep 30",
-                    "sh",
-                    started_marker_arg
-                ],
+                    &windows_command,
+                    &[started_marker_arg]
+                ),
                 "processId": "stream-byte-cap-1",
                 "streamStdoutStderr": true,
                 "outputBytesCap": 5
@@ -6233,11 +6384,16 @@ fn server_mode_kills_runtime_shell_session() {
         .expect("spawn orca server");
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"printf started; sleep 30; printf done","description":"killable server shell"}}}}"#
-        )
-        .expect("write shell/start");
+        let command = platform_shell_script(
+            "printf started; sleep 30; printf done",
+            "[Console]::Out.Write('started'); Start-Sleep -Seconds 30; [Console]::Out.Write('done')",
+        );
+        let request = json!({
+            "id": "shell-start",
+            "method": "shell/start",
+            "params": {"command": command, "description": "killable server shell"}
+        });
+        writeln!(stdin, "{request}").expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
     let started = child.expect_event("shell-start", "shell_started");
@@ -6306,12 +6462,20 @@ fn server_mode_task_stop_reaps_runtime_shell_session() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"shell-start","method":"shell/start","params":{{"threadId":"{}","command":"printf started; sleep 30; printf done","description":"task-stoppable server shell"}}}}"#,
-            thread_id
-        )
-        .expect("write shell/start");
+        let command = platform_shell_script(
+            "printf started; sleep 30; printf done",
+            "[Console]::Out.Write('started'); Start-Sleep -Seconds 30; [Console]::Out.Write('done')",
+        );
+        let request = json!({
+            "id": "shell-start",
+            "method": "shell/start",
+            "params": {
+                "threadId": thread_id,
+                "command": command,
+                "description": "task-stoppable server shell"
+            }
+        });
+        writeln!(stdin, "{request}").expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
     let started = child.expect_event("shell-start", "shell_started");
@@ -6393,11 +6557,16 @@ fn server_mode_reads_runtime_shell_session_incrementally() {
         .expect("spawn orca server");
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"printf ready; sleep 30; printf done","description":"incremental server shell"}}}}"#
-        )
-        .expect("write shell/start");
+        let command = platform_shell_script(
+            "printf ready; sleep 30; printf done",
+            "[Console]::Out.Write('ready'); Start-Sleep -Seconds 30; [Console]::Out.Write('done')",
+        );
+        let request = json!({
+            "id": "shell-start",
+            "method": "shell/start",
+            "params": {"command": command, "description": "incremental server shell"}
+        });
+        writeln!(stdin, "{request}").expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
     let started = child.expect_event("shell-start", "shell_started");
@@ -6496,11 +6665,16 @@ fn server_mode_shell_read_honors_output_byte_cap() {
         .expect("spawn orca server");
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"printf ready-long-output; sleep 30","description":"capped server shell"}}}}"#
-        )
-        .expect("write shell/start");
+        let command = platform_shell_script(
+            "printf ready-long-output; sleep 30",
+            "[Console]::Out.Write('ready-long-output'); Start-Sleep -Seconds 30",
+        );
+        let request = json!({
+            "id": "shell-start",
+            "method": "shell/start",
+            "params": {"command": command, "description": "capped server shell"}
+        });
+        writeln!(stdin, "{request}").expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
     let started = child.expect_event("shell-start", "shell_started");
@@ -6559,6 +6733,10 @@ fn server_mode_shell_read_honors_output_byte_cap() {
 #[test]
 fn server_mode_lists_runtime_shell_sessions() {
     let workspace = tempdir().expect("workspace");
+    let command = platform_shell_script(
+        "printf ready; sleep 30",
+        "[Console]::Out.Write('ready'); Start-Sleep -Seconds 30",
+    );
     let mut child = orca_command()
         .args([
             "--mode",
@@ -6575,11 +6753,12 @@ fn server_mode_lists_runtime_shell_sessions() {
         .expect("spawn orca server");
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"printf ready; sleep 30","description":"listed server shell"}}}}"#
-        )
-        .expect("write shell/start");
+        let request = json!({
+            "id": "shell-start",
+            "method": "shell/start",
+            "params": {"command": command, "description": "listed server shell"}
+        });
+        writeln!(stdin, "{request}").expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
     let started = child.expect_event("shell-start", "shell_started");
@@ -6600,7 +6779,7 @@ fn server_mode_lists_runtime_shell_sessions() {
     let shell = &listed["shells"][0];
     assert_eq!(shell["shellId"], shell_id);
     assert_eq!(shell["taskId"], task_id);
-    assert_eq!(shell["command"], "printf ready; sleep 30");
+    assert_eq!(shell["command"], command);
     assert_eq!(shell["status"], "running");
     assert_eq!(shell["requestedTerminalMode"], "pipe");
     assert_eq!(shell["effectiveTerminalMode"], "pipe");
@@ -6641,11 +6820,13 @@ fn server_mode_updates_runtime_shell_session_description() {
         .expect("spawn orca server");
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"sleep 30","description":"old shell label"}}}}"#
-        )
-        .expect("write shell/start");
+        let command = platform_shell_script("sleep 30", "Start-Sleep -Seconds 30");
+        let request = json!({
+            "id": "shell-start",
+            "method": "shell/start",
+            "params": {"command": command, "description": "old shell label"}
+        });
+        writeln!(stdin, "{request}").expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
     let started = child.expect_event("shell-start", "shell_started");
@@ -6937,11 +7118,13 @@ fn server_mode_rejects_resize_for_pipe_shell_session() {
         .expect("spawn orca server");
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"sleep 30","description":"pipe shell","pty":false}}}}"#
-        )
-        .expect("write shell/start");
+        let command = platform_shell_script("sleep 30", "Start-Sleep -Seconds 30");
+        let request = json!({
+            "id": "shell-start",
+            "method": "shell/start",
+            "params": {"command": command, "description": "pipe shell", "pty": false}
+        });
+        writeln!(stdin, "{request}").expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
     let started = child.expect_event("shell-start", "shell_started");
@@ -8154,10 +8337,10 @@ fn server_mode_request_permissions_waits_for_permission_response() {
 
     {
         let stdin = child.stdin_mut();
+        let command = platform_write_file_command(&output_file, "granted");
         let prompt = format!(
-            "request_permissions_then_bash {} :: printf granted > {}",
+            "request_permissions_then_bash {} :: {command}",
             extra.display(),
-            output_file.display()
         );
         let request = json!({
             "id": "turn",
@@ -8249,7 +8432,11 @@ fn server_mode_input_eof_cancels_pending_permission_request() {
 
     {
         let stdin = child.stdin_mut();
-        let prompt = format!("request_permissions_then_bash {} :: true", extra.display());
+        let command = platform_shell_script("true", "$null");
+        let prompt = format!(
+            "request_permissions_then_bash {} :: {command}",
+            extra.display()
+        );
         let request = json!({
             "id": "turn",
             "method": "turn/start",
@@ -8357,10 +8544,10 @@ fn server_mode_request_permissions_propagates_strict_auto_review() {
 
     {
         let stdin = child.stdin_mut();
+        let command = platform_write_file_command(&output_file, "granted");
         let prompt = format!(
-            "request_permissions_then_bash {} :: printf granted > {}",
+            "request_permissions_then_bash {} :: {command}",
             extra.display(),
-            output_file.display()
         );
         let request = json!({
             "id": "turn",
@@ -8465,10 +8652,10 @@ fn server_mode_request_permissions_strict_auto_review_prompts_subsequent_command
 
     {
         let stdin = child.stdin_mut();
+        let command = platform_write_file_command(&output_file, "blocked");
         let prompt = format!(
-            "request_permissions_then_bash {} :: printf blocked > {}",
+            "request_permissions_then_bash {} :: {command}",
             extra.display(),
-            output_file.display()
         );
         let request = json!({
             "id": "turn",
@@ -8713,10 +8900,10 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
 
     {
         let stdin = child.stdin_mut();
+        let command = platform_write_file_command(&first_output, "first");
         let prompt = format!(
-            "request_permissions_then_bash {} :: printf first > {}",
+            "request_permissions_then_bash {} :: {command}",
             extra.display(),
-            first_output.display()
         );
         let request = json!({
             "id": "turn-1",
@@ -8752,14 +8939,17 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
 
     {
         let stdin = child.stdin_mut();
-        let command = format!("printf ok > {}", second_output.display());
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd-2","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
-            thread_id,
-            serde_json::to_string(&command).expect("json command"),
-        )
-        .expect("write second command/exec");
+        let unix_command = format!("printf ok > {}", unix_shell_path(&second_output));
+        let windows_command = platform_write_file_command(&second_output, "ok");
+        let request = json!({
+            "id": "cmd-2",
+            "method": "command/exec",
+            "params": {
+                "threadId": thread_id,
+                "command": platform_command(&unix_command, &windows_command)
+            }
+        });
+        writeln!(stdin, "{request}").expect("write second command/exec");
         stdin.flush().expect("flush second command/exec");
     }
     let _second_completed = child.expect_event("cmd-2", "command_exec_completed");
@@ -8843,10 +9033,10 @@ fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
 
     {
         let stdin = child.stdin_mut();
+        let command = platform_write_file_command(&first_output, "first");
         let prompt = format!(
-            "request_permissions_then_bash {} :: printf first > {}",
+            "request_permissions_then_bash {} :: {command}",
             extra.display(),
-            first_output.display()
         );
         let request = json!({
             "id": "turn-1",
@@ -8892,14 +9082,17 @@ fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
 
     {
         let stdin = child.stdin_mut();
-        let command = format!("printf ok > {}", second_output.display());
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd-2","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
-            thread_id,
-            serde_json::to_string(&command).expect("json command"),
-        )
-        .expect("write second command/exec");
+        let unix_command = format!("printf ok > {}", unix_shell_path(&second_output));
+        let windows_command = platform_write_file_command(&second_output, "ok");
+        let request = json!({
+            "id": "cmd-2",
+            "method": "command/exec",
+            "params": {
+                "threadId": thread_id,
+                "command": platform_command(&unix_command, &windows_command)
+            }
+        });
+        writeln!(stdin, "{request}").expect("write second command/exec");
         stdin.flush().expect("flush second command/exec");
     }
     let _second_completed = child.expect_event("cmd-2", "command_exec_completed");
@@ -8975,10 +9168,10 @@ fn server_mode_request_permissions_session_scope_accepts_workspace_roots_entries
 
     {
         let stdin = child.stdin_mut();
+        let command = platform_write_file_command(&first_output, "first");
         let prompt = format!(
-            "request_permissions_then_bash {} :: printf first > {}",
+            "request_permissions_then_bash {} :: {command}",
             docs.display(),
-            first_output.display()
         );
         let request = json!({
             "id": "turn-1",
@@ -9012,14 +9205,17 @@ fn server_mode_request_permissions_session_scope_accepts_workspace_roots_entries
 
     {
         let stdin = child.stdin_mut();
-        let command = format!("printf ok > {}", second_output.display());
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd-2","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
-            thread_id,
-            serde_json::to_string(&command).expect("json command"),
-        )
-        .expect("write second command/exec");
+        let unix_command = format!("printf ok > {}", unix_shell_path(&second_output));
+        let windows_command = platform_write_file_command(&second_output, "ok");
+        let request = json!({
+            "id": "cmd-2",
+            "method": "command/exec",
+            "params": {
+                "threadId": thread_id,
+                "command": platform_command(&unix_command, &windows_command)
+            }
+        });
+        writeln!(stdin, "{request}").expect("write second command/exec");
         stdin.flush().expect("flush second command/exec");
     }
     let _second_completed = child.expect_event("cmd-2", "command_exec_completed");
@@ -9099,10 +9295,10 @@ fn server_mode_turn_start_rebinds_runtime_workspace_roots_for_permission_grants(
 
     {
         let stdin = child.stdin_mut();
+        let command = platform_write_file_command(&first_output, "first");
         let prompt = format!(
-            "request_permissions_then_bash {} :: printf first > {}",
+            "request_permissions_then_bash {} :: {command}",
             docs.display(),
-            first_output.display()
         );
         let request = json!({
             "id": "turn-1",
@@ -9139,14 +9335,17 @@ fn server_mode_turn_start_rebinds_runtime_workspace_roots_for_permission_grants(
 
     {
         let stdin = child.stdin_mut();
-        let command = format!("printf ok > {}", second_output.display());
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd-2","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
-            thread_id,
-            serde_json::to_string(&command).expect("json command"),
-        )
-        .expect("write second command/exec");
+        let unix_command = format!("printf ok > {}", unix_shell_path(&second_output));
+        let windows_command = platform_write_file_command(&second_output, "ok");
+        let request = json!({
+            "id": "cmd-2",
+            "method": "command/exec",
+            "params": {
+                "threadId": thread_id,
+                "command": platform_command(&unix_command, &windows_command)
+            }
+        });
+        writeln!(stdin, "{request}").expect("write second command/exec");
         stdin.flush().expect("flush second command/exec");
     }
     let _second_completed = child.expect_event("cmd-2", "command_exec_completed");
@@ -9573,6 +9772,7 @@ fn assert_command_exec_error(params: &str, expected_message: &str) {
     );
 }
 
+#[cfg(unix)]
 fn read_shell_read_result(client: &mut ServerTestClient, id: &str) -> Value {
     loop {
         let event = client.expect_next_for_id(id);
