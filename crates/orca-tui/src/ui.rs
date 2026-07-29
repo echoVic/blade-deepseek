@@ -113,17 +113,16 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     }
     if composer_visible(state) {
         state.input_area = Some(chunks[6]);
-        hardware_cursor = hardware_cursor.or_else(|| {
-            render_input(
-                frame,
-                chunks[6],
-                textarea,
-                composer_layout.as_ref().expect("visible composer layout"),
-                state,
-                theme,
-                show_composer_hardware_cursor,
-            )
-        });
+        let composer_cursor = render_input(
+            frame,
+            chunks[6],
+            textarea,
+            composer_layout.as_ref().expect("visible composer layout"),
+            state,
+            theme,
+            show_composer_hardware_cursor,
+        );
+        hardware_cursor = hardware_cursor.or(composer_cursor);
     }
     render_status(frame, chunks[7], state, theme);
 
@@ -5024,6 +5023,7 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("0/0"));
         assert!(rendered.contains("tail"));
+        assert!(rendered.contains("COMPOSER"));
         let cursor = terminal.get_cursor_position().expect("search cursor");
         assert!(state.search_area.unwrap().contains(cursor));
         assert!(!state.input_area.unwrap().contains(cursor));
