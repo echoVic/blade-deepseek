@@ -19,7 +19,8 @@ import {
 
 const npmCommand = "npm install -g @blade-ai/orca";
 const curlCommand = "curl -fsSL https://orcaagent.dev/install.sh | sh";
-const powershellCommand = "irm https://orcaagent.dev/install.ps1 | iex";
+const powershellCommand =
+  "& ([scriptblock]::Create((irm https://orcaagent.dev/install.ps1))) -SetupSandbox";
 
 const canonicalUrl = `${canonicalOrigin}/`;
 
@@ -1125,7 +1126,7 @@ function App() {
               <span className="l">{t.hero.meta.tools}</span>
             </div>
             <div>
-              <span className="k">4</span>
+              <span className="k">6</span>
               <span className="l">{t.hero.meta.platforms}</span>
             </div>
           </div>
@@ -1314,7 +1315,7 @@ function App() {
           </div>
           <div>
             <div className="num">
-              4<span className="u">×</span>
+              6<span className="u">×</span>
             </div>
             <p>{t.specs.platforms}</p>
           </div>

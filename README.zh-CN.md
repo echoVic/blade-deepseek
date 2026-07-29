@@ -28,6 +28,12 @@ Windows PowerShell 使用：
 irm https://orcaagent.dev/install.ps1 | iex
 ```
 
+在项目目录中执行以下命令，为该工作区配置受限沙箱 capability：
+
+```powershell
+& ([scriptblock]::Create((irm https://orcaagent.dev/install.ps1))) -SetupSandbox
+```
+
 npm 包支持 macOS、Linux 和 Windows 的 ARM64 与 x64 平台。也可以从
 [GitHub Releases](https://github.com/echoVic/orca-agent/releases/latest) 下载预编译文件。
 

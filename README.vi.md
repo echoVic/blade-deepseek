@@ -29,6 +29,12 @@ Trên Windows PowerShell:
 irm https://orcaagent.dev/install.ps1 | iex
 ```
 
+Trong thư mục dự án, cấu hình sandbox giới hạn bằng lệnh:
+
+```powershell
+& ([scriptblock]::Create((irm https://orcaagent.dev/install.ps1))) -SetupSandbox
+```
+
 Gói npm hỗ trợ macOS, Linux và Windows trên ARM64 và x64. Các tệp dựng sẵn cũng có tại
 [GitHub Releases](https://github.com/echoVic/orca-agent/releases/latest).
 

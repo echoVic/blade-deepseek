@@ -84,9 +84,10 @@ jobs:
           cargo test -p orca-runtime --test runtime_surface_commit thread_and_policy_owner_leases_fail_closed_and_wall_rollback_has_no_authority --locked -- --nocapture
           cargo test --test history_contract history_rename_search_and_compress_work_for_latest --locked -- --nocapture
       - name: Run the full Windows test suite
+        timeout-minutes: 45
         env:
           RUST_BACKTRACE: "1"
-        run: cargo test --workspace --all-targets --locked -- --test-threads=1
+        run: cargo test --workspace --all-targets --locked -- --test-threads=1 --nocapture
 
   native-arm64:
     runs-on: windows-11-arm
@@ -136,6 +137,7 @@ jobs:
           cargo test -p orca-runtime --test runtime_surface_commit thread_and_policy_owner_leases_fail_closed_and_wall_rollback_has_no_authority --locked -- --nocapture
           cargo test --test history_contract history_rename_search_and_compress_work_for_latest --locked -- --nocapture
       - name: Run the full native ARM64 test suite
+        timeout-minutes: 45
         env:
           RUST_BACKTRACE: "1"
-        run: cargo test --workspace --all-targets --locked -- --test-threads=1
+        run: cargo test --workspace --all-targets --locked -- --test-threads=1 --nocapture

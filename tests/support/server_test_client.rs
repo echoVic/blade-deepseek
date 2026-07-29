@@ -12,6 +12,7 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+use orca_platform::process::ProcessJob;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -261,19 +262,26 @@ impl Drop for ReaderCompletion {
 struct SpawnedChildGuard {
     child: Option<Child>,
     process_group_id: u32,
+    process_job: Option<ProcessJob>,
 }
 
 impl SpawnedChildGuard {
-    fn new(child: Child) -> Self {
+    fn new(child: Child, process_job: ProcessJob) -> Self {
         let process_group_id = child.id();
         Self {
             child: Some(child),
             process_group_id,
+            process_job: Some(process_job),
         }
     }
 
-    fn take(&mut self) -> Child {
-        self.child.take().expect("spawned child must be available")
+    fn take(&mut self) -> (Child, ProcessJob) {
+        (
+            self.child.take().expect("spawned child must be available"),
+            self.process_job
+                .take()
+                .expect("spawned process job must be available"),
+        )
     }
 }
 
@@ -283,6 +291,9 @@ impl Drop for SpawnedChildGuard {
             let _ = signal_process_group(self.process_group_id, TERMINATE_SIGNAL);
             thread::sleep(Duration::from_millis(20));
             let _ = signal_process_group(self.process_group_id, KILL_SIGNAL);
+            if let Some(process_job) = self.process_job.as_ref() {
+                let _ = process_job.terminate(1);
+            }
             let _ = child.kill();
             let _ = wait_child_retry(child);
         }
@@ -293,6 +304,7 @@ pub struct ServerTestClient {
     child: Option<Child>,
     status: Option<ExitStatus>,
     process_group_id: Option<u32>,
+    process_job: Option<ProcessJob>,
     stdin: Option<ChildStdin>,
     inbox: Arc<EventInbox>,
     pending: VecDeque<PendingEvent>,
@@ -317,8 +329,8 @@ impl ServerTestClient {
             command.process_group(0);
         }
 
-        let child = command.spawn()?;
-        let mut guard = SpawnedChildGuard::new(child);
+        let (child, process_job) = ProcessJob::spawn(command)?;
+        let mut guard = SpawnedChildGuard::new(child, process_job);
         let stdin = guard.child.as_mut().and_then(|child| child.stdin.take());
         let stdout = guard
             .child
@@ -369,10 +381,12 @@ impl ServerTestClient {
         };
 
         let process_group_id = guard.process_group_id;
+        let (child, process_job) = guard.take();
         Ok(Self {
-            child: Some(guard.take()),
+            child: Some(child),
             status: None,
             process_group_id: Some(process_group_id),
+            process_job: Some(process_job),
             stdin,
             inbox,
             pending: VecDeque::new(),
@@ -976,6 +990,12 @@ impl ServerTestClient {
                 first_error = Some(error);
             }
         }
+        if let Some(process_job) = self.process_job.as_ref()
+            && let Err(error) = process_job.terminate(1)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
 
         let child = self
             .child
@@ -986,6 +1006,7 @@ impl ServerTestClient {
         self.status = Some(status);
         self.child.take();
         self.process_group_id.take();
+        self.process_job.take();
         if let Some(error) = first_error {
             Err(error)
         } else {

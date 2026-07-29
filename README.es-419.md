@@ -29,6 +29,12 @@ En Windows PowerShell:
 irm https://orcaagent.dev/install.ps1 | iex
 ```
 
+Desde el directorio de un proyecto, configura su sandbox restringido con:
+
+```powershell
+& ([scriptblock]::Create((irm https://orcaagent.dev/install.ps1))) -SetupSandbox
+```
+
 El paquete npm es compatible con macOS, Linux y Windows en ARM64 y x64. También hay
 archivos precompilados en [GitHub Releases](https://github.com/echoVic/orca-agent/releases/latest).
 

@@ -29,6 +29,12 @@ Windows PowerShell の場合：
 irm https://orcaagent.dev/install.ps1 | iex
 ```
 
+プロジェクトディレクトリで、制限付きサンドボックスを構成します。
+
+```powershell
+& ([scriptblock]::Create((irm https://orcaagent.dev/install.ps1))) -SetupSandbox
+```
+
 npm パッケージは macOS、Linux、Windows の ARM64 / x64 に対応しています。
 ビルド済みアーカイブは [GitHub Releases](https://github.com/echoVic/orca-agent/releases/latest) からも入手できます。
 

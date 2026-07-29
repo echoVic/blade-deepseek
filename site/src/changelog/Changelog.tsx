@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.0":
+        "Orca now ships native Windows x64 and ARM64 support across the CLI, TUI, shell sessions, sandboxing, updates, persistence, npm packages and GitHub release archives. PowerShell 7, Windows PowerShell and cmd.exe resolve through explicit dialect-aware commands; ConPTY provides interactive terminal sessions; AltGr input, clipboard access, process-tree cleanup, atomic replacement and cross-process locks follow Windows semantics. The PowerShell installer verifies checksums, installs the runtime plus sandbox helpers and can provision, repair or remove the per-workspace sandbox capability. Native x64 and ARM64 CI run the platform contracts and full workspace tests before release.",
       "v0.2.56":
         "The CLI binary is now limited to argument parsing and library forwarding: configuration, launch, update, history, trust, workflow, protocol and worker ownership live in orca-runtime and orca-tui. Stateless JSONL submissions now own their complete turn lifecycle without requiring a persisted thread, including exact EOF cancellation and settlement. macOS Seatbelt execution now uses the absolute system binary, parameterized path rules, protected metadata write roots and fail-closed enforcement, while trust and command-output failures propagate instead of being reported as success.",
       "v0.2.55":
@@ -556,6 +558,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.0":
+        "Orca 现在原生支持 Windows x64 与 ARM64，覆盖 CLI、TUI、Shell Session、沙箱、更新、持久化、npm 包和 GitHub Release。PowerShell 7、Windows PowerShell 与 cmd.exe 使用各自的命令方言，ConPTY 提供交互终端，AltGr 输入、剪贴板、进程树清理、原子替换和跨进程锁按 Windows 语义实现。PowerShell 安装器会校验 checksum，安装主程序与沙箱 helper，并支持配置、修复或移除按工作区绑定的沙箱 capability。发布前由原生 x64 和 ARM64 runner 执行平台契约与完整工作区测试。",
       "v0.2.56":
         "CLI 二进制现在只负责参数解析和转发：配置、启动、更新、历史、信任、workflow、协议与 worker 生命周期都下沉到 orca-runtime 和 orca-tui。无状态 JSONL submit 不再依赖已持久化 thread，由 runtime 完整拥有 turn，并在 EOF 时精确取消和结算。macOS Seatbelt 改用系统绝对路径、参数化路径规则、受保护 metadata 写入根目录与 fail-closed 强制；信任和命令输出失败也会向上返回，不再误报成功。",
       "v0.2.55":

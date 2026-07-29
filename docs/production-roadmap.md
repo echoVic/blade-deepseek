@@ -4,17 +4,26 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-29
-Current baseline: v0.2.56 keeps the executable as a thin parser and forwarding
-layer while `orca-runtime` and `orca-tui` own configuration, launch, update,
-history, trust, workflow, protocol, and worker behavior. Stateless JSONL
-submissions now complete through the runtime without requiring a persisted
-thread, including EOF cancellation and terminal settlement.
+Current baseline: v0.3.0 adds native Windows x64 and ARM64 support across the
+CLI, TUI, shell sessions, sandboxing, update flow, persistence, npm packages,
+release archives, and CI. Shell resolution preserves PowerShell 7, Windows
+PowerShell, cmd.exe, and explicit Git Bash dialects; ConPTY owns interactive
+terminal I/O and resize; Job Objects own process-tree cleanup; AltGr and
+clipboard input follow Windows behavior.
 
-The macOS command boundary now invokes `/usr/bin/sandbox-exec` directly, builds
-Seatbelt profiles from parameterized paths, permits only explicit protected
-metadata write roots, and fails closed when enforcement is unavailable. Shell
-sessions, workflow commands, and direct command execution share that sandbox
-contract; trust and output-publication failures propagate to their callers.
+The Windows sandbox uses restricted tokens or AppContainer according to the
+requested filesystem and network policy. The PowerShell installer verifies the
+release checksum, installs the runner and setup helper, and can provision,
+repair, or remove a workspace capability receipt. Missing setup and unsupported
+domain-restricted network policy fail closed. Atomic replacement and OS locks
+cover the runtime's durable stores, while native x64 and ARM64 runners execute
+platform contracts and the full workspace test suite.
+
+Earlier v0.2.56 kept the executable as a thin parser and forwarding layer while
+`orca-runtime` and `orca-tui` took ownership of configuration, launch, update,
+history, trust, workflow, protocol, and worker behavior. Stateless JSONL turns
+settle through the runtime without a persisted thread, and macOS Seatbelt uses
+parameterized path rules with fail-closed enforcement.
 
 Earlier v0.2.52 separates Goal continuation admission from
 cross-turn progress detection. A turn now ends as advanced, resumably

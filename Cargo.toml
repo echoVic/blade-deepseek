@@ -42,7 +42,7 @@ windows-sys = "0.61"
 
 [package]
 name = "blade-deepseek"
-version = "0.2.56"
+version = "0.3.0"
 edition = "2024"
 description = "Orca: a DeepSeek-native coding agent"
 license = "MIT"
@@ -61,6 +61,7 @@ clap = { workspace = true }
 [dev-dependencies]
 orca-approval = { path = "crates/orca-approval" }
 orca-mcp = { path = "crates/orca-mcp" }
+orca-platform = { path = "crates/orca-platform" }
 orca-provider = { path = "crates/orca-provider" }
 orca-tools = { path = "crates/orca-tools" }
 tempfile = { workspace = true }
