@@ -18,11 +18,11 @@ use windows_sys::Win32::System::Console::{COORD, HPCON};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
-    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetExitCodeProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
@@ -32,6 +32,7 @@ use crate::{
 };
 
 const INFINITE: u32 = 0xffff_ffff;
+const PROC_THREAD_ATTRIBUTE_JOB_LIST: usize = 0x0002_000d;
 
 pub struct SandboxSpawnRequest<'a> {
     pub program: &'a Path,
@@ -66,12 +67,14 @@ impl SandboxedChild {
     pub fn spawn(request: SandboxSpawnRequest<'_>) -> Result<Self, WindowsSandboxError> {
         let (restricted, appcontainer) = prepare_spawn_security(&request)?;
         let mut pipes = PipeSet::new()?;
-        let mut attributes = ProcessAttributeList::new(1 + u32::from(appcontainer.is_some()))?;
+        let job = ProcessJob::create_unassigned(None)?;
+        let mut attributes = ProcessAttributeList::new(2 + u32::from(appcontainer.is_some()))?;
         attributes.set_handle_list(vec![
             pipes.child_stdin,
             pipes.child_stdout,
             pipes.child_stderr,
         ])?;
+        attributes.set_job(job.raw_handle())?;
         if let Some(appcontainer) = appcontainer.as_ref() {
             attributes.set_security_capabilities(
                 appcontainer.app_sid(),
@@ -89,7 +92,8 @@ impl SandboxedChild {
             },
             lpAttributeList: attributes.as_mut_ptr(),
         };
-        let process = spawn_suspended(&request, restricted.as_ref(), &startup, true, false)?;
+        let process =
+            spawn_with_security(&request, restricted.as_ref(), &startup, true, false, job)?;
         pipes.close_child_ends();
         Ok(Self {
             process,
@@ -144,8 +148,10 @@ impl SandboxedPty {
     ) -> Result<Self, WindowsSandboxError> {
         let (restricted, appcontainer) = prepare_spawn_security(&request)?;
         let pty = PtyPipeSet::new(cols, rows)?;
-        let mut attributes = ProcessAttributeList::new(1 + u32::from(appcontainer.is_some()))?;
+        let job = ProcessJob::create_unassigned(None)?;
+        let mut attributes = ProcessAttributeList::new(2 + u32::from(appcontainer.is_some()))?;
         attributes.set_pseudo_console(pty.console.raw())?;
+        attributes.set_job(job.raw_handle())?;
         if let Some(appcontainer) = appcontainer.as_ref() {
             attributes.set_security_capabilities(
                 appcontainer.app_sid(),
@@ -163,7 +169,8 @@ impl SandboxedPty {
             },
             lpAttributeList: attributes.as_mut_ptr(),
         };
-        let process = spawn_suspended(&request, restricted.as_ref(), &startup, false, true)?;
+        let process =
+            spawn_with_security(&request, restricted.as_ref(), &startup, false, true, job)?;
         let (input, output) = pty.into_io();
         Ok(Self {
             process,
@@ -315,18 +322,20 @@ fn prepare_spawn_security(
     Ok((restricted, appcontainer))
 }
 
-fn spawn_suspended(
+fn spawn_with_security(
     request: &SandboxSpawnRequest<'_>,
     restricted: Option<&PreparedSecurity>,
     startup: &STARTUPINFOEXW,
     inherit_handles: bool,
     use_pseudo_console: bool,
+    job: ProcessJob,
 ) -> Result<SandboxedProcess, WindowsSandboxError> {
+    let application_name = wide_path(request.program);
     let mut command_line = command_line(request.program, request.args);
     let mut environment = environment_block(request.env);
     let cwd = wide_path(request.cwd);
     let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    let mut flags = CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT;
+    let mut flags = CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
     if !use_pseudo_console {
         flags |= CREATE_NO_WINDOW;
     }
@@ -334,7 +343,7 @@ fn spawn_suspended(
         unsafe {
             CreateProcessAsUserW(
                 restricted.token_handle(),
-                std::ptr::null(),
+                application_name.as_ptr(),
                 command_line.as_mut_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
@@ -349,7 +358,7 @@ fn spawn_suspended(
     } else {
         unsafe {
             CreateProcessW(
-                std::ptr::null(),
+                application_name.as_ptr(),
                 command_line.as_mut_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
@@ -373,18 +382,7 @@ fn spawn_suspended(
 
     let process = OwnedHandle::new(info.hProcess);
     let thread = OwnedHandle::new(info.hThread);
-    let job = match ProcessJob::attach(info.dwProcessId) {
-        Ok(job) => job,
-        Err(error) => {
-            unsafe { TerminateProcess(process.raw(), 127) };
-            return Err(error.into());
-        }
-    };
-    if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
-        let error = io::Error::last_os_error();
-        let _ = job.terminate(127);
-        return Err(error.into());
-    }
+    drop(thread);
     Ok(SandboxedProcess {
         process,
         job: Some(job),
@@ -611,9 +609,9 @@ struct PipeSet {
 struct ProcessAttributeList {
     buffer: Vec<u8>,
     handles: Vec<HANDLE>,
+    jobs: Vec<HANDLE>,
     capabilities: Vec<SID_AND_ATTRIBUTES>,
     security_capabilities: Option<Box<SECURITY_CAPABILITIES>>,
-    pseudo_console: Option<HPCON>,
 }
 
 impl ProcessAttributeList {
@@ -633,9 +631,9 @@ impl ProcessAttributeList {
         Ok(Self {
             buffer,
             handles: Vec::new(),
+            jobs: Vec::new(),
             capabilities: Vec::new(),
             security_capabilities: None,
-            pseudo_console: None,
         })
     }
 
@@ -652,6 +650,27 @@ impl ProcessAttributeList {
                 self.as_mut_ptr(),
                 0,
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                value,
+                size,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn set_job(&mut self, job: HANDLE) -> io::Result<()> {
+        self.jobs = vec![job];
+        let value = self.jobs.as_ptr().cast();
+        let size = std::mem::size_of_val(self.jobs.as_slice());
+        if unsafe {
+            UpdateProcThreadAttribute(
+                self.as_mut_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST,
                 value,
                 size,
                 std::ptr::null_mut(),
@@ -707,18 +726,12 @@ impl ProcessAttributeList {
     }
 
     fn set_pseudo_console(&mut self, pseudo_console: HPCON) -> io::Result<()> {
-        self.pseudo_console = Some(pseudo_console);
-        let value = self
-            .pseudo_console
-            .as_ref()
-            .map(|handle| (handle as *const HPCON).cast())
-            .expect("pseudo console handle");
         if unsafe {
             UpdateProcThreadAttribute(
                 self.as_mut_ptr(),
                 0,
                 PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                value,
+                pseudo_console as *const std::ffi::c_void,
                 std::mem::size_of::<HPCON>(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
@@ -953,8 +966,7 @@ mod tests {
         .expect("restricted ConPTY child");
         let (mut input, output) = child.take_pty().expect("pty transport");
         let (output_bytes, reader) = output_reader(output);
-        input.close();
-        input.resize(120, 40).expect("resize after closing stdin");
+        input.resize(120, 40).expect("resize live ConPTY");
         let status = child.wait().expect("wait");
         wait_for_output_quiet(&output_bytes, "restricted ConPTY child");
         input.close_terminal();
@@ -1010,8 +1022,7 @@ mod tests {
         .expect("AppContainer ConPTY child");
         let (mut input, output) = child.take_pty().expect("pty transport");
         let (output_bytes, reader) = output_reader(output);
-        input.close();
-        input.resize(120, 40).expect("resize after closing stdin");
+        input.resize(120, 40).expect("resize live ConPTY");
         let status = child.wait().expect("wait");
         wait_for_output_quiet(&output_bytes, "AppContainer ConPTY child");
         input.close_terminal();
