@@ -36,7 +36,9 @@ fn suggest_denies_write_in_jsonl_mode() {
 
 #[test]
 fn auto_edit_allows_sandboxed_shell_in_jsonl_mode() {
+    let home = TempDir::new().expect("temp home");
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
         .args([
             "exec",
             "--output-format",
@@ -58,9 +60,7 @@ fn auto_edit_allows_sandboxed_shell_in_jsonl_mode() {
             && event["payload"]["decision"] == "allow"
             && event["payload"]["reason"] == "auto-edit permits shell"
     }));
-    assert!(events.iter().any(|event| {
-        event["type"] == "tool.call.completed" && event["payload"]["status"] == "completed"
-    }));
+    assert_allowed_shell_terminal(&events);
     assert_eq!(events.last().unwrap()["payload"]["status"], "success");
 }
 
@@ -102,9 +102,7 @@ decision = "allow"
     assert!(events.iter().any(|event| {
         event["type"] == "approval.resolved" && event["payload"]["decision"] == "allow"
     }));
-    assert!(events.iter().any(|event| {
-        event["type"] == "tool.call.completed" && event["payload"]["status"] == "completed"
-    }));
+    assert_allowed_shell_terminal(&events);
     assert_eq!(events.last().unwrap()["payload"]["status"], "success");
 }
 
@@ -157,4 +155,24 @@ fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
         .collect()
+}
+
+fn assert_allowed_shell_terminal(events: &[Value]) {
+    let terminal = events
+        .iter()
+        .find(|event| event["type"] == "tool.call.completed")
+        .unwrap_or_else(|| panic!("missing shell terminal event: {events:#?}"));
+
+    #[cfg(windows)]
+    {
+        assert_eq!(terminal["payload"]["status"], "failed", "{events:#?}");
+        let terminal_text = terminal.to_string();
+        assert!(
+            terminal_text.contains("Windows sandbox") && terminal_text.contains("setup"),
+            "Windows shell without a provisioned capability must fail closed: {events:#?}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    assert_eq!(terminal["payload"]["status"], "completed", "{events:#?}");
 }

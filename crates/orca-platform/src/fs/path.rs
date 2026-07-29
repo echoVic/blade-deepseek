@@ -153,7 +153,16 @@ impl PathPolicy {
 
     #[cfg(windows)]
     pub fn open_no_follow(self, path: &Path) -> Result<VerifiedPath, PlatformError> {
-        windows::open_no_follow(path, self)
+        windows::open_no_follow(path, self, windows::DEFAULT_ACCESS_MODE)
+    }
+
+    #[cfg(windows)]
+    pub fn open_no_follow_with_access(
+        self,
+        path: &Path,
+        access_mode: u32,
+    ) -> Result<VerifiedPath, PlatformError> {
+        windows::open_no_follow(path, self, access_mode)
     }
 }
 
@@ -433,9 +442,12 @@ mod windows {
 
     use super::*;
 
+    pub(super) const DEFAULT_ACCESS_MODE: u32 = FILE_READ_ATTRIBUTES;
+
     pub(super) fn open_no_follow(
         path: &Path,
         policy: PathPolicy,
+        access_mode: u32,
     ) -> Result<VerifiedPath, PlatformError> {
         let text = path
             .to_str()
@@ -446,7 +458,7 @@ mod windows {
         policy.identity(text)?;
 
         let file = std::fs::OpenOptions::new()
-            .access_mode(FILE_READ_ATTRIBUTES)
+            .access_mode(access_mode)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)

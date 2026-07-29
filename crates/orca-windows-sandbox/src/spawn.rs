@@ -889,8 +889,8 @@ mod tests {
     fn windows_argument_quoting_preserves_backslashes() {
         assert_eq!(quote_windows_arg("plain"), "plain");
         assert_eq!(
-            quote_windows_arg("C:\\Program Files\\orca"),
-            "\"C:\\\\Program Files\\orca\""
+            quote_windows_arg(r"C:\Program Files\orca"),
+            r#""C:\Program Files\orca""#
         );
         assert_eq!(quote_windows_arg("a\"b"), "\"a\\\"b\"");
     }

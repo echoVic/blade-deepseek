@@ -23,6 +23,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -251,7 +252,8 @@ fn ensure_acl_entry(
     mode: i32,
     inherited: bool,
 ) -> Result<(), WindowsSandboxError> {
-    let verified = PathPolicy::windows_sandbox().open_no_follow(path)?;
+    let verified = PathPolicy::windows_sandbox()
+        .open_no_follow_with_access(path, FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC)?;
     let handle = verified.file().as_raw_handle() as HANDLE;
     let mut old_dacl: *mut ACL = std::ptr::null_mut();
     let mut security_descriptor: *mut c_void = std::ptr::null_mut();

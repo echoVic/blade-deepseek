@@ -39,7 +39,7 @@ jobs:
     runs-on: windows-latest
     defaults:
       run:
-        shell: powershell
+        shell: pwsh
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -51,6 +51,8 @@ jobs:
           node-version: 22
       - name: Validate reviewed platform boundaries
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           node scripts/test-validate-windows-platform-boundaries.mjs
           node scripts/validate-windows-platform-boundaries.mjs
       - name: Check the full workspace
@@ -59,6 +61,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked
       - name: Run native Windows platform contracts
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo test -p orca-platform --locked -- --nocapture
           cargo test -p orca-windows-runner --locked -- --nocapture
           cargo test -p orca-windows-sandbox-setup --locked -- --nocapture
@@ -84,7 +88,7 @@ jobs:
     runs-on: windows-11-arm
     defaults:
       run:
-        shell: powershell
+        shell: pwsh
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -98,16 +102,22 @@ jobs:
           node-version: 22
       - name: Validate reviewed platform boundaries
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           node scripts/test-validate-windows-platform-boundaries.mjs
           node scripts/validate-windows-platform-boundaries.mjs
       - name: Check the native ARM64 workspace
         run: cargo check --workspace --all-targets --locked
       - name: Build and start the native ARM64 binary
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo build --release --locked
           & "./target/release/orca.exe" --version
       - name: Run native ARM64 platform smoke tests
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo test -p orca-platform --locked -- --nocapture
           cargo test -p orca-windows-runner --locked -- --nocapture
           cargo test -p orca-windows-sandbox-setup --locked -- --nocapture
