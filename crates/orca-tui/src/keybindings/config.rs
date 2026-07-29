@@ -216,6 +216,7 @@ impl Keymap {
         Arc::new(Self { bindings })
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_single(
         &self,
         context: ShortcutContext,
@@ -233,15 +234,28 @@ impl Keymap {
             .map(|(_, action)| *action)
     }
 
+    #[cfg(test)]
     pub(crate) fn binding_count(&self) -> usize {
         self.bindings.values().map(Vec::len).sum()
     }
 
+    #[cfg(test)]
     pub(crate) fn has_action(&self, action: ShortcutAction) -> bool {
         self.bindings
             .values()
             .flatten()
             .any(|(_, candidate)| *candidate == action)
+    }
+
+    pub(crate) fn action_keys(&self, action: ShortcutAction) -> Vec<String> {
+        self.sequences_for_action(action)
+            .into_iter()
+            .map(|sequence| sequence.to_string())
+            .collect()
+    }
+
+    pub(crate) fn action_uses_built_ins(&self, action: ShortcutAction) -> bool {
+        self.sequences_for_action(action) == Self::built_in().sequences_for_action(action)
     }
 
     pub(crate) fn descriptor_keys(&self, descriptor: &ShortcutDescriptor) -> Option<String> {
@@ -271,23 +285,16 @@ impl Keymap {
             .filter(|action| *action == ShortcutAction::Global(GlobalShortcut::Cancel))
     }
 
-    pub(super) fn matching_sequences(
+    pub(super) fn matching_sequences_in(
         &self,
         context: ShortcutContext,
         prefix: &[KeyStroke],
     ) -> Vec<(KeySequence, ShortcutAction)> {
         let mut matches = self
             .bindings
-            .get(&ShortcutContext::Global)
+            .get(&context)
             .into_iter()
             .flatten()
-            .chain(
-                (context != ShortcutContext::Global)
-                    .then(|| self.bindings.get(&context))
-                    .flatten()
-                    .into_iter()
-                    .flatten(),
-            )
             .filter(|(sequence, _)| sequence.0.starts_with(prefix))
             .cloned()
             .collect::<Vec<_>>();

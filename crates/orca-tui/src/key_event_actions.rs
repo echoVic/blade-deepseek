@@ -9,14 +9,28 @@ use orca_core::config::RunConfig;
 
 use crate::approval_mode_actions::cycle_approval_mode;
 use crate::global_actions::{GlobalShortcutFlow, handle_global_shortcut};
+use crate::keybindings::{
+    InputOwnerFingerprint, KeymapRuntime, ShortcutInvocation, ShortcutResolution,
+};
 use crate::operation_controller::TuiOperationInterrupt;
-use crate::shortcuts::{GlobalShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
+use crate::shortcuts::ShortcutAction;
+#[cfg(test)]
+use crate::shortcuts::{GlobalShortcut, ShortcutContext, resolve_shortcut};
 use crate::types::{AppState, AppStatus, PanelMode, UserAction};
 use crate::vim::VimState;
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) enum KeyEventFlow {
     Continue,
     Exit(i32),
+    Unhandled,
+}
+
+pub(crate) enum DynamicKeyEventFlow {
+    Continue,
+    Exit(i32),
+    Context(ShortcutInvocation),
     Unhandled,
 }
 
@@ -264,8 +278,86 @@ mod tests {
         );
         assert_eq!(state.transcript_search.query(), before);
     }
+
+    #[test]
+    fn dynamic_global_chord_replaces_default_and_opens_search() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let operation = TestOperationInterrupt::default();
+        let mut vim = VimState::new(false);
+        let keymap = crate::keybindings::parse_keymap(
+            br#"{"version":1,"bindings":{"global.open-transcript-search":["ctrl+x ctrl+f"]}}"#,
+        )
+        .unwrap();
+        let mut runtime = crate::keybindings::KeymapRuntime::new(keymap);
+        let owner = crate::app::input_owner_fingerprint(&state, &vim);
+        let now = std::time::Instant::now();
+
+        assert!(matches!(
+            handle_key_event_preflight_dynamic(
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                now,
+                owner,
+                &mut runtime,
+                &mut state,
+                &mut config,
+                &shared,
+                &action_tx,
+                &operation,
+                &mut vim,
+                || Ok(()),
+            )
+            .unwrap(),
+            DynamicKeyEventFlow::Unhandled,
+        ));
+        assert!(!state.transcript_search.open);
+
+        assert!(matches!(
+            handle_key_event_preflight_dynamic(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                now,
+                owner,
+                &mut runtime,
+                &mut state,
+                &mut config,
+                &shared,
+                &action_tx,
+                &operation,
+                &mut vim,
+                || Ok(()),
+            )
+            .unwrap(),
+            DynamicKeyEventFlow::Continue,
+        ));
+        assert!(matches!(
+            handle_key_event_preflight_dynamic(
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                now + std::time::Duration::from_millis(1),
+                owner,
+                &mut runtime,
+                &mut state,
+                &mut config,
+                &shared,
+                &action_tx,
+                &operation,
+                &mut vim,
+                || Ok(()),
+            )
+            .unwrap(),
+            DynamicKeyEventFlow::Continue,
+        ));
+        assert!(state.transcript_search.open);
+    }
 }
 
+#[cfg(test)]
 pub(crate) fn handle_key_event_preflight<F>(
     key: KeyEvent,
     state: &mut AppState,
@@ -348,4 +440,127 @@ where
     }
 
     Ok(KeyEventFlow::Unhandled)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_key_event_preflight_dynamic<F>(
+    key: KeyEvent,
+    now: std::time::Instant,
+    owner: InputOwnerFingerprint,
+    keymap: &mut KeymapRuntime,
+    state: &mut AppState,
+    config: &mut RunConfig,
+    shared_config: &Arc<Mutex<RunConfig>>,
+    action_tx: &mpsc::Sender<UserAction>,
+    operation: &impl TuiOperationInterrupt,
+    vim_state: &mut VimState,
+    clear_terminal: F,
+) -> io::Result<DynamicKeyEventFlow>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return Ok(DynamicKeyEventFlow::Continue);
+    }
+
+    if let ShortcutResolution::Action(invocation) = keymap.resolve_cancel(key) {
+        return execute_global_invocation(
+            invocation,
+            state,
+            action_tx,
+            operation,
+            vim_state,
+            clear_terminal,
+        );
+    }
+
+    match keymap.advance_pending(owner, key, now) {
+        ShortcutResolution::Action(invocation) => {
+            return if matches!(invocation.action, ShortcutAction::Global(_)) {
+                execute_global_invocation(
+                    invocation,
+                    state,
+                    action_tx,
+                    operation,
+                    vim_state,
+                    clear_terminal,
+                )
+            } else {
+                Ok(DynamicKeyEventFlow::Context(invocation))
+            };
+        }
+        ShortcutResolution::Pending => return Ok(DynamicKeyEventFlow::Continue),
+        ShortcutResolution::RetryCurrentKey | ShortcutResolution::NoMatch => {}
+    }
+
+    if handle_transcript_search_key(key, state) == SearchKeyFlow::Handled {
+        vim_state.cancel_pending_command();
+        return Ok(DynamicKeyEventFlow::Continue);
+    }
+
+    match keymap.resolve_new_global(owner, key, now) {
+        ShortcutResolution::Action(invocation) => {
+            return execute_global_invocation(
+                invocation,
+                state,
+                action_tx,
+                operation,
+                vim_state,
+                clear_terminal,
+            );
+        }
+        ShortcutResolution::Pending => return Ok(DynamicKeyEventFlow::Continue),
+        ShortcutResolution::RetryCurrentKey | ShortcutResolution::NoMatch => {}
+    }
+
+    if state.show_shortcuts && key.code == KeyCode::Esc {
+        vim_state.cancel_pending_command();
+        state.show_shortcuts = false;
+        return Ok(DynamicKeyEventFlow::Continue);
+    }
+    if key.code == KeyCode::Esc && state.selection.is_some() {
+        vim_state.cancel_pending_command();
+        state.invalidate_selection();
+        return Ok(DynamicKeyEventFlow::Continue);
+    }
+    if key.code == KeyCode::BackTab
+        && matches!(
+            state.status,
+            AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
+        )
+    {
+        vim_state.cancel_pending_command();
+        cycle_approval_mode(config, shared_config, state);
+        return Ok(DynamicKeyEventFlow::Continue);
+    }
+    if state.status == AppStatus::Idle
+        && state.panel_mode == PanelMode::Workflows
+        && key.code == KeyCode::Esc
+    {
+        vim_state.cancel_pending_command();
+        state.show_conversation();
+        return Ok(DynamicKeyEventFlow::Continue);
+    }
+    Ok(DynamicKeyEventFlow::Unhandled)
+}
+
+fn execute_global_invocation<F>(
+    invocation: ShortcutInvocation,
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+    operation: &impl TuiOperationInterrupt,
+    vim_state: &mut VimState,
+    clear_terminal: F,
+) -> io::Result<DynamicKeyEventFlow>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    let ShortcutAction::Global(shortcut) = invocation.action else {
+        return Ok(DynamicKeyEventFlow::Unhandled);
+    };
+    vim_state.cancel_pending_command();
+    match handle_global_shortcut(shortcut, state, action_tx, operation, clear_terminal)? {
+        GlobalShortcutFlow::Continue => Ok(DynamicKeyEventFlow::Continue),
+        GlobalShortcutFlow::Exit(code) => Ok(DynamicKeyEventFlow::Exit(code)),
+    }
 }

@@ -336,6 +336,7 @@ impl LegacyBinding {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn as_key_event(self) -> KeyEvent {
         KeyEvent::new(self.key, self.modifiers)
     }
@@ -485,6 +486,13 @@ pub fn shortcut_hints() -> impl Iterator<Item = ResolvedShortcutHint> {
 }
 
 pub fn shortcut_lines(scopes: &[ShortcutScope]) -> Vec<Line<'static>> {
+    shortcut_lines_with_keymap(scopes, &crate::keybindings::Keymap::built_in())
+}
+
+pub(crate) fn shortcut_lines_with_keymap(
+    scopes: &[ShortcutScope],
+    keymap: &crate::keybindings::Keymap,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let sections = [
         (ShortcutScope::Global, "Global"),
@@ -505,13 +513,15 @@ pub fn shortcut_lines(scopes: &[ShortcutScope]) -> Vec<Line<'static>> {
             title,
             Style::default().fg(Color::Cyan),
         )));
-        for hint in shortcut_hints().filter(|hint| hint.scope == section_scope) {
+        for descriptor in
+            shortcut_descriptors().filter(|descriptor| descriptor.scope == section_scope)
+        {
+            let Some(keys) = keymap.descriptor_keys(descriptor) else {
+                continue;
+            };
             lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {:<18}", hint.keys),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(hint.action, Style::default().fg(Color::White)),
+                Span::styled(format!("  {keys:<18}"), Style::default().fg(Color::Yellow)),
+                Span::styled(descriptor.label, Style::default().fg(Color::White)),
             ]));
         }
     }
@@ -1124,5 +1134,33 @@ mod tests {
                 hint.keys, hint.scope
             );
         }
+    }
+
+    #[test]
+    fn dynamic_shortcut_lines_keep_defaults_and_render_replacements() {
+        let built_in = crate::keybindings::Keymap::built_in();
+        let default_text = shortcut_lines_with_keymap(&[ShortcutScope::Idle], &built_in)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let legacy_text = shortcut_lines(&[ShortcutScope::Idle])
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(default_text, legacy_text);
+
+        let custom = crate::keybindings::parse_keymap(
+            br#"{"version":1,"bindings":{"idle.submit":["ctrl+s"],"idle.backtrack":[]}}"#,
+        )
+        .unwrap();
+        let custom_text = shortcut_lines_with_keymap(&[ShortcutScope::Idle], &custom)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(custom_text.contains("ctrl+s"));
+        assert!(!custom_text.contains("backtrack previous prompt"));
     }
 }

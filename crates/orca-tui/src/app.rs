@@ -42,14 +42,22 @@ use crate::input_event_actions::{
 };
 use crate::input_runtime::{InputControl, InputRuntime, InputRuntimeOptions};
 use crate::interaction_broker::TuiInteractionBroker;
+use crate::key_event_actions::{DynamicKeyEventFlow, handle_key_event_preflight_dynamic};
+#[cfg(test)]
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
+use crate::keybindings::{
+    InputOwnerFingerprint, KeymapReloader, KeymapRuntime, ModalOwner, ReloadOutcome,
+    ShortcutInvocation,
+};
 use crate::mention_search_manager::MentionSearchManager;
 use crate::operation_controller::{TuiOperationController, TuiTurnControl};
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::runtime_interaction_adapter::{
     TuiApprovalHandler, TuiMcpElicitationHandler, TuiPermissionRequestHandler, TuiUserInputHandler,
 };
-use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
+#[cfg(test)]
+use crate::status_key_actions::handle_status_key;
+use crate::status_key_actions::{StatusKeyFlow, handle_status_key_dynamic};
 use crate::submitted_turn::SubmittedTurn;
 use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
 use crate::theme::Theme;
@@ -62,6 +70,53 @@ use crate::workspace_status;
 enum PendingInsertEscapeRouting {
     Continue,
     Consumed,
+}
+
+pub(crate) fn input_owner_fingerprint(
+    state: &AppState,
+    vim_state: &VimState,
+) -> InputOwnerFingerprint {
+    let context = match state.status {
+        AppStatus::Idle | AppStatus::WaitingUserInput => crate::shortcuts::ShortcutContext::Idle,
+        AppStatus::Running | AppStatus::Compacting => crate::shortcuts::ShortcutContext::Running,
+        AppStatus::WaitingApproval => crate::shortcuts::ShortcutContext::Approval,
+        AppStatus::Setup | AppStatus::SessionPicker => crate::shortcuts::ShortcutContext::Global,
+    };
+    let modal = if state.status == AppStatus::Setup {
+        ModalOwner::Setup
+    } else if state.status == AppStatus::SessionPicker {
+        ModalOwner::SessionPicker
+    } else if state.status == AppStatus::WaitingApproval {
+        ModalOwner::Approval
+    } else if state.transcript_search.open {
+        ModalOwner::TranscriptSearch
+    } else if state.show_shortcuts {
+        ModalOwner::Shortcuts
+    } else if state.slash_menu.is_some() {
+        ModalOwner::SlashMenu
+    } else if state.mention.phase.is_some() || !state.mention.candidates.is_empty() {
+        ModalOwner::MentionMenu
+    } else if state.panel_mode != crate::types::PanelMode::Conversation {
+        ModalOwner::WorkflowPanel
+    } else {
+        ModalOwner::None
+    };
+    InputOwnerFingerprint {
+        context,
+        modal,
+        panel: state.panel_mode,
+        vim_mode: vim_state.enabled.then_some(vim_state.mode),
+    }
+}
+
+fn keybinding_poll_timeout(
+    frame_timeout: Duration,
+    now: Instant,
+    chord_deadline: Option<Instant>,
+) -> Duration {
+    chord_deadline
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .map_or(frame_timeout, |chord_wait| frame_timeout.min(chord_wait))
 }
 
 fn refresh_after_insert_escape_flush(
@@ -195,6 +250,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         model_name,
         workspace_status.cwd,
     );
+    let mut keymap_runtime = KeymapRuntime::new(Arc::clone(&state.keymap));
+    let mut keymap_reloader = crate::keybindings::keybindings_path()
+        .map(|path| KeymapReloader::start(path, Instant::now()));
+    if let Some(reloader) = &mut keymap_reloader {
+        reloader.request_reload(Instant::now());
+    }
     state.workspace_git = workspace_status.git;
     state.approval_mode = config.approval_mode;
     state.reasoning_effort = config.reasoning_effort;
@@ -342,6 +403,23 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
             let exit_code = 'main: loop {
                 let now = Instant::now();
+                keymap_runtime.expire_pending(now);
+                if let Some(reloader) = &mut keymap_reloader {
+                    reloader.request_reload(now);
+                    if let Some(observation) = reloader.try_recv() {
+                        match keymap_runtime.apply_observation(observation) {
+                            ReloadOutcome::Unchanged => {}
+                            ReloadOutcome::Applied | ReloadOutcome::RestoredDefaults => {
+                                state.keymap = keymap_runtime.keymap();
+                                scheduler.mark_dirty();
+                            }
+                            ReloadOutcome::Rejected(message) => {
+                                state.push_message(ChatMessage::System(message));
+                                scheduler.mark_dirty();
+                            }
+                        }
+                    }
+                }
                 if flush_expired_insert_escape(
                     now,
                     &mut vim_state,
@@ -380,7 +458,11 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                     &input_rx,
                     &focus_rx,
                     &input_control_rx,
-                    scheduler.poll_timeout(now, animation_active),
+                    keybinding_poll_timeout(
+                        scheduler.poll_timeout(now, animation_active),
+                        now,
+                        keymap_runtime.next_deadline(),
+                    ),
                     MAX_INPUT_EVENTS_PER_BATCH,
                 ) {
                     Ok(InputWake::Events(events)) => events
@@ -388,6 +470,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         .filter(should_queue_input_event)
                         .collect(),
                     Ok(InputWake::Suspend { acknowledge }) => {
+                        keymap_runtime.clear_for_suspend();
                         acknowledge.send(()).map_err(|_| {
                             io::Error::new(
                                 io::ErrorKind::BrokenPipe,
@@ -433,6 +516,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         match event {
                             IterationEvent::Input(input_event) => match input_event {
                                 BatchedInputEvent::ScrollLines(lines) => {
+                                    keymap_runtime.clear_for_non_key();
                                     flush_pending_insert_escape_before_non_key(
                                         &mut vim_state,
                                         &mut textarea,
@@ -444,6 +528,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 }
                                 BatchedInputEvent::Event(ev) => {
                                     if consume_focus_event(&ev, presentation) {
+                                        keymap_runtime.clear_for_non_key();
                                         return Ok(None);
                                     }
                                     if resolve_pending_insert_escape_before_routing(
@@ -459,6 +544,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                         return Ok(None);
                                     }
                                     if matches!(ev, Event::Paste(_)) {
+                                        keymap_runtime.clear_for_non_key();
                                         flush_pending_insert_escape_before_non_key(
                                             &mut vim_state,
                                             &mut textarea,
@@ -471,9 +557,11 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                         return Ok(None);
                                     }
                                     if handle_resize_event(&ev, &mut state) {
+                                        keymap_runtime.clear_for_non_key();
                                         return Ok(None);
                                     }
                                     if matches!(ev, Event::Mouse(_)) {
+                                        keymap_runtime.clear_for_non_key();
                                         flush_pending_insert_escape_before_non_key(
                                             &mut vim_state,
                                             &mut textarea,
@@ -493,27 +581,35 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                             return Ok(None);
                                         }
                                         MouseFlow::SyntheticEnter => {
+                                            keymap_runtime.clear_for_non_key();
                                             vim_state.cancel_pending_command();
                                             // A click confirmed the focused row; run
                                             // the exact same path a real Enter takes.
                                             let enter_key =
                                                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
                                             let enter_event = Event::Key(enter_key);
-                                            if let StatusKeyFlow::Exit(code) = handle_status_key(
-                                                &enter_event,
-                                                &enter_key,
-                                                &mut state,
-                                                &mut config,
-                                                &shared_config,
-                                                &action_tx,
-                                                agent_runtime.controller(),
-                                                &preloaded_transcript,
-                                                &mut textarea,
-                                                &mut vim_state,
-                                                &theme,
-                                                initial_prompt.clone(),
-                                                || clear_terminal_scrollback(terminal),
-                                            )? {
+                                            let owner = input_owner_fingerprint(&state, &vim_state);
+                                            if let StatusKeyFlow::Exit(code) =
+                                                handle_status_key_dynamic(
+                                                    &enter_event,
+                                                    &enter_key,
+                                                    Instant::now(),
+                                                    owner,
+                                                    &mut keymap_runtime,
+                                                    None,
+                                                    &mut state,
+                                                    &mut config,
+                                                    &shared_config,
+                                                    &action_tx,
+                                                    agent_runtime.controller(),
+                                                    &preloaded_transcript,
+                                                    &mut textarea,
+                                                    &mut vim_state,
+                                                    &theme,
+                                                    initial_prompt.clone(),
+                                                    || clear_terminal_scrollback(terminal),
+                                                )?
+                                            {
                                                 return Ok(Some(code));
                                             }
                                             return Ok(None);
@@ -522,8 +618,13 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                     let Event::Key(key) = &ev else {
                                         return Ok(None);
                                     };
-                                    match handle_key_event_preflight(
+                                    let owner = input_owner_fingerprint(&state, &vim_state);
+                                    let contextual_invocation: Option<ShortcutInvocation>;
+                                    match handle_key_event_preflight_dynamic(
                                         *key,
+                                        Instant::now(),
+                                        owner,
+                                        &mut keymap_runtime,
                                         &mut state,
                                         &mut config,
                                         &shared_config,
@@ -532,14 +633,24 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                         &mut vim_state,
                                         || clear_terminal_scrollback(terminal),
                                     )? {
-                                        KeyEventFlow::Continue => return Ok(None),
-                                        KeyEventFlow::Exit(code) => return Ok(Some(code)),
-                                        KeyEventFlow::Unhandled => {}
+                                        DynamicKeyEventFlow::Continue => return Ok(None),
+                                        DynamicKeyEventFlow::Exit(code) => return Ok(Some(code)),
+                                        DynamicKeyEventFlow::Context(invocation) => {
+                                            contextual_invocation = Some(invocation);
+                                        }
+                                        DynamicKeyEventFlow::Unhandled => {
+                                            contextual_invocation = None;
+                                        }
                                     }
 
-                                    if let StatusKeyFlow::Exit(code) = handle_status_key(
+                                    let owner = input_owner_fingerprint(&state, &vim_state);
+                                    if let StatusKeyFlow::Exit(code) = handle_status_key_dynamic(
                                         &ev,
                                         key,
+                                        Instant::now(),
+                                        owner,
+                                        &mut keymap_runtime,
+                                        contextual_invocation,
                                         &mut state,
                                         &mut config,
                                         &shared_config,
@@ -598,6 +709,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                     Instant::now(),
                 );
                 if let Some(code) = iteration.exit_code {
+                    keymap_runtime.clear_for_non_key();
                     break 'main code;
                 }
                 // A finished drag staged its text here; write it out via OSC 52 (plus
@@ -1019,6 +1131,71 @@ mod tests {
     use crate::types::{ApprovalOption, PendingTuiInput, SlashMenu, SlashMenuItem, SubMenu};
     use crate::types::{TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
     use crate::workflow_notifications::drain_pending_workflow_notifications;
+
+    #[test]
+    fn keybinding_owner_tracks_status_modal_panel_and_vim_mode() {
+        let (tx, _rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut vim = VimState::new(true);
+
+        let idle = input_owner_fingerprint(&state, &vim);
+        assert_eq!(idle.context, crate::shortcuts::ShortcutContext::Idle);
+        assert_eq!(idle.modal, crate::keybindings::ModalOwner::None);
+        assert_eq!(idle.vim_mode, Some(crate::vim::VimMode::Normal));
+
+        state.show_shortcuts = true;
+        assert_eq!(
+            input_owner_fingerprint(&state, &vim).modal,
+            crate::keybindings::ModalOwner::Shortcuts,
+        );
+        state.show_shortcuts = false;
+        state.open_transcript_search();
+        assert_eq!(
+            input_owner_fingerprint(&state, &vim).modal,
+            crate::keybindings::ModalOwner::TranscriptSearch,
+        );
+        state.close_transcript_search();
+        state.set_status(AppStatus::WaitingApproval);
+        assert_eq!(
+            input_owner_fingerprint(&state, &vim).context,
+            crate::shortcuts::ShortcutContext::Approval,
+        );
+        assert_eq!(
+            input_owner_fingerprint(&state, &vim).modal,
+            crate::keybindings::ModalOwner::Approval,
+        );
+        vim.mode = crate::vim::VimMode::Insert;
+        assert_eq!(
+            input_owner_fingerprint(&state, &vim).vim_mode,
+            Some(crate::vim::VimMode::Insert),
+        );
+    }
+
+    #[test]
+    fn chord_deadline_caps_frame_poll_timeout() {
+        let now = Instant::now();
+        assert_eq!(
+            keybinding_poll_timeout(
+                Duration::from_millis(16),
+                now,
+                Some(now + Duration::from_millis(5)),
+            ),
+            Duration::from_millis(5),
+        );
+        assert_eq!(
+            keybinding_poll_timeout(Duration::from_millis(16), now, Some(now)),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            keybinding_poll_timeout(Duration::from_millis(16), now, None),
+            Duration::from_millis(16),
+        );
+    }
     use crate::workflow_notifications::{
         is_workflow_notification_turn_boundary, queue_workflow_terminal_notification,
         remove_pending_workflow_notification_by_id, submit_pending_workflow_notification,
@@ -1633,6 +1810,24 @@ mod tests {
         assert!(focus < paste);
         assert!(focus < resize);
         assert!(focus < key);
+    }
+
+    #[test]
+    fn synthetic_enter_uses_dynamic_status_routing() {
+        let production = include_str!("app.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production app source");
+        let branch_start = production
+            .find("MouseFlow::SyntheticEnter =>")
+            .expect("synthetic enter branch");
+        let branch = &production[branch_start..production[branch_start..]
+            .find("\n                                        }\n                                    }")
+            .map(|offset| branch_start + offset)
+            .expect("synthetic enter branch end")];
+
+        assert!(branch.contains("handle_status_key_dynamic("));
+        assert!(!branch.contains("handle_status_key("));
     }
 
     #[test]

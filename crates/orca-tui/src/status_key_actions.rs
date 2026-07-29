@@ -8,10 +8,19 @@ use tui_textarea::TextArea;
 use orca_core::config::RunConfig;
 use orca_runtime::history::SessionTranscript;
 
-use crate::approval_dialog_actions::handle_approval_dialog_key;
-use crate::idle_key_actions::handle_idle_key;
+use crate::approval_dialog_actions::{
+    handle_approval_dialog_key, handle_approval_dialog_key_dynamic, handle_approval_shortcut,
+};
+use crate::idle_key_actions::{
+    handle_idle_key, handle_idle_key_dynamic, handle_idle_shortcut_invocation,
+};
+use crate::keybindings::{
+    InputOwnerFingerprint, KeymapRuntime, ShortcutInvocation, ShortcutResolution,
+};
 use crate::operation_controller::TuiOperationInterrupt;
-use crate::queued_input_actions::handle_running_key;
+use crate::queued_input_actions::{
+    handle_running_key, handle_running_key_dynamic, handle_running_shortcut_invocation,
+};
 use crate::running_actions::handle_running_shortcut;
 use crate::session_picker_actions::handle_session_picker_key;
 use crate::setup_actions::{SetupFlow, handle_setup_key};
@@ -136,6 +145,159 @@ where
             && compacting_shortcut_allowed(shortcut)
         {
             handle_running_shortcut(shortcut, state, action_tx, operation);
+        }
+    }
+
+    Ok(StatusKeyFlow::Continue)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_status_key_dynamic<F>(
+    ev: &Event,
+    key: &KeyEvent,
+    now: std::time::Instant,
+    owner: InputOwnerFingerprint,
+    keymap: &mut KeymapRuntime,
+    invocation: Option<ShortcutInvocation>,
+    state: &mut AppState,
+    config: &mut RunConfig,
+    shared_config: &Arc<Mutex<RunConfig>>,
+    action_tx: &mpsc::Sender<UserAction>,
+    operation: &impl TuiOperationInterrupt,
+    preloaded_transcript: &Arc<Mutex<Option<SessionTranscript>>>,
+    textarea: &mut TextArea,
+    vim_state: &mut VimState,
+    theme: &Theme,
+    initial_prompt: Option<String>,
+    clear_terminal: F,
+) -> io::Result<StatusKeyFlow>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    if state.status == AppStatus::Setup || state.status == AppStatus::SessionPicker {
+        return handle_status_key(
+            ev,
+            key,
+            state,
+            config,
+            shared_config,
+            action_tx,
+            operation,
+            preloaded_transcript,
+            textarea,
+            vim_state,
+            theme,
+            initial_prompt,
+            clear_terminal,
+        );
+    }
+
+    if state.status == AppStatus::WaitingApproval {
+        vim_state.cancel_pending_command();
+        if let Some(ShortcutInvocation {
+            action: ShortcutAction::Approval(shortcut),
+            ..
+        }) = invocation
+        {
+            handle_approval_shortcut(shortcut, state, action_tx);
+        } else {
+            handle_approval_dialog_key_dynamic(key, now, owner, keymap, state, action_tx);
+        }
+        return Ok(StatusKeyFlow::Continue);
+    }
+
+    if let Some(invocation) = invocation {
+        match invocation.action {
+            ShortcutAction::Idle(_) => {
+                handle_idle_shortcut_invocation(
+                    invocation,
+                    state,
+                    config,
+                    shared_config,
+                    action_tx,
+                    textarea,
+                    vim_state,
+                    theme,
+                );
+            }
+            ShortcutAction::Running(shortcut) => {
+                if state.status != AppStatus::Compacting || compacting_shortcut_allowed(shortcut) {
+                    handle_running_shortcut_invocation(
+                        invocation, state, config, action_tx, operation, textarea, vim_state, theme,
+                    );
+                }
+            }
+            ShortcutAction::Global(_) | ShortcutAction::Approval(_) => {}
+        }
+        return Ok(StatusKeyFlow::Continue);
+    }
+
+    if matches!(
+        state.status,
+        AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
+    ) && let Some(intent) = vim_state.transcript_search_intent(key.code)
+    {
+        let handled = match intent {
+            VimTranscriptSearchIntent::Open => {
+                state.open_transcript_search();
+                true
+            }
+            VimTranscriptSearchIntent::Next if state.transcript_search.has_query() => {
+                state.search_next();
+                true
+            }
+            VimTranscriptSearchIntent::Previous if state.transcript_search.has_query() => {
+                state.search_previous();
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            vim_state.cancel_pending_command();
+            return Ok(StatusKeyFlow::Continue);
+        }
+    }
+
+    if matches!(state.status, AppStatus::Idle | AppStatus::WaitingUserInput) {
+        handle_idle_key_dynamic(
+            ev,
+            key,
+            now,
+            owner,
+            keymap,
+            state,
+            config,
+            shared_config,
+            action_tx,
+            textarea,
+            vim_state,
+            theme,
+        );
+        return Ok(StatusKeyFlow::Continue);
+    }
+
+    if state.status == AppStatus::Running {
+        handle_running_key_dynamic(
+            ev, key, now, owner, keymap, state, config, action_tx, operation, textarea, vim_state,
+            theme,
+        );
+    }
+
+    if state.status == AppStatus::Compacting {
+        vim_state.cancel_pending_command();
+        match keymap.resolve_new_context(owner, *key, now) {
+            ShortcutResolution::Action(invocation) => {
+                if let ShortcutAction::Running(shortcut) = invocation.action
+                    && compacting_shortcut_allowed(shortcut)
+                {
+                    handle_running_shortcut_invocation(
+                        invocation, state, config, action_tx, operation, textarea, vim_state, theme,
+                    );
+                }
+            }
+            ShortcutResolution::Pending
+            | ShortcutResolution::RetryCurrentKey
+            | ShortcutResolution::NoMatch => {}
         }
     }
 

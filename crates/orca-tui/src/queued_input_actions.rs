@@ -5,7 +5,9 @@ use tui_textarea::TextArea;
 
 use crate::composer_input_actions::{apply_composer_key_input, insert_composer_newline};
 use crate::composer_textarea::{make_textarea, make_textarea_with_text, textarea_text};
-use crate::keybindings::ShortcutInvocation;
+use crate::keybindings::{
+    InputOwnerFingerprint, KeymapRuntime, ShortcutInvocation, ShortcutResolution,
+};
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::operation_controller::TuiOperationInterrupt;
 use crate::queued_input::QueuedUserMessage;
@@ -154,6 +156,47 @@ pub(crate) fn handle_running_key(
         return apply_composer_key_input(ev, key, state, config, textarea, vim_state, theme);
     }
     false
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_running_key_dynamic(
+    ev: &Event,
+    key: &KeyEvent,
+    now: std::time::Instant,
+    owner: InputOwnerFingerprint,
+    keymap: &mut KeymapRuntime,
+    state: &mut AppState,
+    config: &RunConfig,
+    action_tx: &mpsc::Sender<UserAction>,
+    operation: &impl TuiOperationInterrupt,
+    textarea: &mut TextArea,
+    vim_state: &mut VimState,
+    theme: &Theme,
+) -> bool {
+    if state.show_shortcuts {
+        return true;
+    }
+    if state.panel_mode == PanelMode::Conversation
+        && (!state.mention.candidates.is_empty()
+            || (state.mention.phase.is_some() && key.code == KeyCode::Esc))
+        && handle_mention_menu_key(ev, key, state, textarea, vim_state, theme)
+    {
+        vim_state.cancel_pending_command();
+        return true;
+    }
+    match keymap.resolve_new_context(owner, *key, now) {
+        ShortcutResolution::Action(invocation) => handle_running_shortcut_invocation(
+            invocation, state, config, action_tx, operation, textarea, vim_state, theme,
+        ),
+        ShortcutResolution::Pending => true,
+        ShortcutResolution::RetryCurrentKey | ShortcutResolution::NoMatch => {
+            if state.panel_mode == PanelMode::Conversation {
+                apply_composer_key_input(ev, key, state, config, textarea, vim_state, theme)
+            } else {
+                false
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

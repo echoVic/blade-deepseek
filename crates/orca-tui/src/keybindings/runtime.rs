@@ -80,8 +80,15 @@ pub(crate) enum ReloadOutcome {
 #[derive(Clone, Debug)]
 struct PendingChord {
     owner: InputOwnerFingerprint,
+    scope: PendingScope,
     strokes: Vec<KeyStroke>,
     deadline: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingScope {
+    Global,
+    Context,
 }
 
 pub(crate) struct KeymapRuntime {
@@ -103,7 +110,39 @@ impl KeymapRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve(
+        &mut self,
+        owner: InputOwnerFingerprint,
+        event: KeyEvent,
+        now: Instant,
+    ) -> ShortcutResolution {
+        match self.resolve_cancel(event) {
+            ShortcutResolution::NoMatch => {}
+            resolution => return resolution,
+        }
+        match self.advance_pending(owner, event, now) {
+            ShortcutResolution::NoMatch => {}
+            resolution => return resolution,
+        }
+        match self.resolve_new_global(owner, event, now) {
+            ShortcutResolution::NoMatch => self.resolve_new_context(owner, event, now),
+            resolution => resolution,
+        }
+    }
+
+    pub(crate) fn resolve_cancel(&mut self, event: KeyEvent) -> ShortcutResolution {
+        if matches!(event.kind, KeyEventKind::Release) {
+            return ShortcutResolution::NoMatch;
+        }
+        let Some(action) = self.keymap.cancel_action(event) else {
+            return ShortcutResolution::NoMatch;
+        };
+        self.pending = None;
+        ShortcutResolution::Action(ShortcutInvocation::key(action, event))
+    }
+
+    pub(crate) fn advance_pending(
         &mut self,
         owner: InputOwnerFingerprint,
         event: KeyEvent,
@@ -115,47 +154,84 @@ impl KeymapRuntime {
         if self
             .pending
             .as_ref()
-            .is_some_and(|pending| pending.owner != owner)
+            .is_some_and(|pending| pending.owner != owner || now > pending.deadline)
         {
             self.pending = None;
+            return ShortcutResolution::NoMatch;
         }
-        if let Some(action) = self.keymap.cancel_action(event) {
+        let Some(pending) = self.pending.as_ref() else {
+            return ShortcutResolution::NoMatch;
+        };
+        let Some(stroke) = KeyStroke::from_event(event) else {
+            return ShortcutResolution::NoMatch;
+        };
+        let mut prefix = pending.strokes.clone();
+        prefix.push(stroke);
+        let context = match pending.scope {
+            PendingScope::Global => ShortcutContext::Global,
+            PendingScope::Context => owner.context,
+        };
+        let matches = self.keymap.matching_sequences_in(context, &prefix);
+        if matches.is_empty() {
             self.pending = None;
-            return ShortcutResolution::Action(ShortcutInvocation::key(action, event));
+            return ShortcutResolution::RetryCurrentKey;
         }
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| now > pending.deadline)
+        if let Some((_, action)) = matches
+            .iter()
+            .find(|(sequence, _)| sequence.len() == prefix.len())
         {
+            let action = *action;
             self.pending = None;
+            return ShortcutResolution::Action(ShortcutInvocation::chord(action));
+        }
+        let pending = self.pending.as_mut().expect("pending chord exists");
+        pending.strokes = prefix;
+        pending.deadline = now + CHORD_TIMEOUT;
+        ShortcutResolution::Pending
+    }
+
+    pub(crate) fn resolve_new_global(
+        &mut self,
+        owner: InputOwnerFingerprint,
+        event: KeyEvent,
+        now: Instant,
+    ) -> ShortcutResolution {
+        self.resolve_new_in(
+            owner,
+            ShortcutContext::Global,
+            PendingScope::Global,
+            event,
+            now,
+        )
+    }
+
+    pub(crate) fn resolve_new_context(
+        &mut self,
+        owner: InputOwnerFingerprint,
+        event: KeyEvent,
+        now: Instant,
+    ) -> ShortcutResolution {
+        if owner.context == ShortcutContext::Global {
+            return ShortcutResolution::NoMatch;
+        }
+        self.resolve_new_in(owner, owner.context, PendingScope::Context, event, now)
+    }
+
+    fn resolve_new_in(
+        &mut self,
+        owner: InputOwnerFingerprint,
+        context: ShortcutContext,
+        scope: PendingScope,
+        event: KeyEvent,
+        now: Instant,
+    ) -> ShortcutResolution {
+        if self.pending.is_some() {
+            return ShortcutResolution::NoMatch;
         }
         let Some(stroke) = KeyStroke::from_event(event) else {
             return ShortcutResolution::NoMatch;
         };
-
-        if let Some(pending) = self.pending.as_mut() {
-            let mut prefix = pending.strokes.clone();
-            prefix.push(stroke);
-            let matches = self.keymap.matching_sequences(owner.context, &prefix);
-            if matches.is_empty() {
-                self.pending = None;
-                return ShortcutResolution::RetryCurrentKey;
-            }
-            if let Some((_, action)) = matches
-                .iter()
-                .find(|(sequence, _)| sequence.len() == prefix.len())
-            {
-                let action = *action;
-                self.pending = None;
-                return ShortcutResolution::Action(ShortcutInvocation::chord(action));
-            }
-            pending.strokes = prefix;
-            pending.deadline = now + CHORD_TIMEOUT;
-            return ShortcutResolution::Pending;
-        }
-
-        let matches = self.keymap.matching_sequences(owner.context, &[stroke]);
+        let matches = self.keymap.matching_sequences_in(context, &[stroke]);
         if let Some((_, action)) = matches.iter().find(|(sequence, _)| sequence.len() == 1) {
             return ShortcutResolution::Action(ShortcutInvocation::key(*action, event));
         }
@@ -164,6 +240,7 @@ impl KeymapRuntime {
         }
         self.pending = Some(PendingChord {
             owner,
+            scope,
             strokes: vec![stroke],
             deadline: now + CHORD_TIMEOUT,
         });
@@ -182,6 +259,20 @@ impl KeymapRuntime {
         self.pending.as_ref().map(|pending| pending.deadline)
     }
 
+    pub(crate) fn expire_pending(&mut self, now: Instant) -> bool {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| now > pending.deadline)
+        {
+            self.pending = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_pending_chord(&self) -> bool {
         self.pending.is_some()
     }
@@ -192,8 +283,13 @@ impl KeymapRuntime {
         self.pending = None;
     }
 
+    #[cfg(test)]
     pub(crate) const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn keymap(&self) -> Arc<Keymap> {
+        Arc::clone(&self.keymap)
     }
 
     pub(crate) fn apply_observation(&mut self, observation: FileObservation) -> ReloadOutcome {
@@ -350,6 +446,22 @@ mod tests {
     }
 
     #[test]
+    fn explicit_expiry_clears_deadline_without_input() {
+        let mut runtime = runtime_with(r#"{"idle.submit":["ctrl+x ctrl+s"]}"#);
+        let now = Instant::now();
+        assert_eq!(
+            runtime.resolve_new_context(idle_owner(), ctrl('x'), now),
+            ShortcutResolution::Pending,
+        );
+        let deadline = runtime.next_deadline().unwrap();
+
+        assert!(!runtime.expire_pending(deadline));
+        assert!(runtime.next_deadline().is_some());
+        assert!(runtime.expire_pending(deadline + Duration::from_millis(1)));
+        assert_eq!(runtime.next_deadline(), None);
+    }
+
+    #[test]
     fn release_is_ignored_and_repeat_advances() {
         let mut runtime = runtime_with(r#"{"idle.submit":["ctrl+x ctrl+s"]}"#);
         let now = Instant::now();
@@ -437,5 +549,57 @@ mod tests {
 
         assert!(!runtime.has_pending_chord());
         assert_eq!(runtime.generation(), generation + 1);
+    }
+
+    #[test]
+    fn staged_resolution_preserves_cancel_pending_global_and_context_order() {
+        let mut runtime = runtime_with(
+            r#"{
+                "global.open-transcript-search":["ctrl+x ctrl+f"],
+                "idle.submit":["ctrl+x ctrl+s"]
+            }"#,
+        );
+        let now = Instant::now();
+        let owner = idle_owner();
+
+        assert_eq!(
+            runtime.resolve_cancel(ctrl('x')),
+            ShortcutResolution::NoMatch,
+        );
+        assert_eq!(
+            runtime.advance_pending(owner, ctrl('x'), now),
+            ShortcutResolution::NoMatch,
+        );
+        assert_eq!(
+            runtime.resolve_new_global(owner, ctrl('x'), now),
+            ShortcutResolution::Pending,
+        );
+        assert_eq!(
+            runtime.advance_pending(owner, ctrl('f'), now + Duration::from_millis(1)),
+            ShortcutResolution::Action(ShortcutInvocation::chord(ShortcutAction::Global(
+                GlobalShortcut::OpenTranscriptSearch
+            ),)),
+        );
+
+        assert_eq!(
+            runtime.resolve_new_context(owner, ctrl('x'), now),
+            ShortcutResolution::Pending,
+        );
+        assert_eq!(
+            runtime.advance_pending(owner, ctrl('s'), now + Duration::from_millis(1)),
+            ShortcutResolution::Action(ShortcutInvocation::chord(ShortcutAction::Idle(
+                IdleShortcut::Submit
+            ),)),
+        );
+
+        runtime.resolve_new_context(owner, ctrl('x'), now);
+        assert!(matches!(
+            runtime.resolve_cancel(ctrl('c')),
+            ShortcutResolution::Action(ShortcutInvocation {
+                action: ShortcutAction::Global(GlobalShortcut::Cancel),
+                ..
+            })
+        ));
+        assert!(!runtime.has_pending_chord());
     }
 }

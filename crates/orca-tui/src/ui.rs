@@ -1433,7 +1433,9 @@ fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
     let text = Style::default().fg(theme.text);
     let muted = Style::default().fg(theme.muted);
 
-    vec![
+    let composer_tip = welcome_composer_tip(&state.keymap);
+    let shortcuts_tip = welcome_shortcuts_tip(&state.keymap);
+    let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled("   ___                ", cyan)),
         Line::from(Span::styled("  / _ \\ _ __ ___ __ _ ", cyan)),
@@ -1454,10 +1456,14 @@ fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
         ]),
         Line::from(""),
         Line::from(Span::styled("  Tips", Style::default().fg(theme.success))),
-        Line::from(Span::styled(
-            "  • Enter to send, Alt+Enter (or Shift+Enter) for newline",
+    ];
+    if let Some(composer_tip) = composer_tip {
+        lines.push(Line::from(Span::styled(
+            format!("  • {composer_tip}"),
             muted,
-        )),
+        )));
+    }
+    lines.extend([
         Line::from(Span::styled(
             "  • / commands, @ to mention files, $ to invoke skills",
             muted,
@@ -1466,12 +1472,44 @@ fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
             "  • /model to switch model, /compact to compress context",
             muted,
         )),
-        Line::from(Span::styled(
-            "  • Ctrl+K or F1 for keyboard shortcuts",
-            muted,
-        )),
+        Line::from(Span::styled(format!("  • {shortcuts_tip}"), muted)),
         Line::from(""),
-    ]
+    ]);
+    lines
+}
+
+fn welcome_composer_tip(keymap: &crate::keybindings::Keymap) -> Option<String> {
+    let submit = crate::shortcuts::ShortcutAction::Idle(crate::shortcuts::IdleShortcut::Submit);
+    let newline = crate::shortcuts::ShortcutAction::Idle(crate::shortcuts::IdleShortcut::Newline);
+    if keymap.action_uses_built_ins(submit) && keymap.action_uses_built_ins(newline) {
+        return Some("Enter to send, Alt+Enter (or Shift+Enter) for newline".to_string());
+    }
+    let submit_keys = keymap.action_keys(submit);
+    let newline_keys = keymap.action_keys(newline);
+    match (submit_keys.is_empty(), newline_keys.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(format!("{} to send", submit_keys.join(" / "))),
+        (true, false) => Some(format!("{} for newline", newline_keys.join(" / "))),
+        (false, false) => Some(format!(
+            "{} to send, {} for newline",
+            submit_keys.join(" / "),
+            newline_keys.join(" / "),
+        )),
+    }
+}
+
+fn welcome_shortcuts_tip(keymap: &crate::keybindings::Keymap) -> String {
+    let action =
+        crate::shortcuts::ShortcutAction::Global(crate::shortcuts::GlobalShortcut::ToggleShortcuts);
+    if keymap.action_uses_built_ins(action) {
+        return "Ctrl+K or F1 for keyboard shortcuts".to_string();
+    }
+    let keys = keymap.action_keys(action);
+    if keys.is_empty() {
+        "Keyboard shortcuts".to_string()
+    } else {
+        format!("{} for keyboard shortcuts", keys.join(" / "))
+    }
 }
 
 /// Render the lines for a contiguous slice of messages. Used both to flush a settled
@@ -2834,7 +2872,7 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
         ));
     }
     lower_priority.push(Span::styled(
-        format!("{separator}F1 shortcuts"),
+        format!("{separator}{}", status_shortcuts_hint(&state.keymap)),
         Style::default().fg(theme.muted),
     ));
 
@@ -2847,6 +2885,20 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+fn status_shortcuts_hint(keymap: &crate::keybindings::Keymap) -> String {
+    let action =
+        crate::shortcuts::ShortcutAction::Global(crate::shortcuts::GlobalShortcut::ToggleShortcuts);
+    if keymap.action_uses_built_ins(action) {
+        return "F1 shortcuts".to_string();
+    }
+    let keys = keymap.action_keys(action);
+    if keys.is_empty() {
+        "shortcuts".to_string()
+    } else {
+        format!("{} shortcuts", keys.join(" / "))
+    }
 }
 
 /// Humanize token counts for the status bar: 950 → "950", 8_664 → "8.7k",
@@ -2964,7 +3016,7 @@ fn render_shortcuts(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let width = 58u16.min(area.width.saturating_sub(4));
     let max_height = area.height.saturating_sub(4);
     let scopes = active_shortcut_scopes(state);
-    let lines = shortcuts::shortcut_lines(&scopes);
+    let lines = shortcuts::shortcut_lines_with_keymap(&scopes, &state.keymap);
     let height = ((lines.len() as u16) + 2).min(max_height).max(3);
     let popup_area = centered_rect(area, width, height);
 
@@ -5160,6 +5212,50 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("v9.8.7-test"));
+    }
+
+    #[test]
+    fn custom_keymap_updates_welcome_status_and_overlay_together() {
+        let mut state = test_state();
+        state.keymap = crate::keybindings::parse_keymap(
+            br#"{
+                "version": 1,
+                "bindings": {
+                    "idle.submit": ["ctrl+s"],
+                    "idle.newline": ["ctrl+x ctrl+n"],
+                    "global.toggle-shortcuts": ["ctrl+x ctrl+k"]
+                }
+            }"#,
+        )
+        .unwrap();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        let welcome = build_welcome_lines(&state, &theme)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(welcome.contains("ctrl+s to send"));
+        assert!(welcome.contains("ctrl+x ctrl+n for newline"));
+        assert!(welcome.contains("ctrl+x ctrl+k for keyboard shortcuts"));
+        assert!(!welcome.contains("Enter to send"));
+        assert!(!welcome.contains("Ctrl+K or F1"));
+
+        let status = status_line(&state, &theme, 180).to_string();
+        assert!(status.contains("ctrl+x ctrl+k shortcuts"));
+        assert!(!status.contains("F1 shortcuts"));
+
+        let overlay = shortcuts::shortcut_lines_with_keymap(
+            &[ShortcutScope::Global, ShortcutScope::Idle],
+            &state.keymap,
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(overlay.contains("ctrl+s"));
+        assert!(overlay.contains("ctrl+x ctrl+n"));
+        assert!(overlay.contains("ctrl+x ctrl+k"));
     }
 
     #[test]

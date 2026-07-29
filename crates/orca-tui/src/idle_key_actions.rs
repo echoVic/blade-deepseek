@@ -12,6 +12,7 @@ use crate::composer_input_actions::{
 use crate::composer_textarea::{make_textarea_with_text, textarea_text};
 use crate::idle_navigation_actions::handle_idle_navigation_shortcut;
 use crate::idle_submit_actions::handle_idle_submit;
+use crate::keybindings::{InputOwnerFingerprint, KeymapRuntime, ShortcutResolution};
 use crate::keybindings::{InvocationOrigin, ShortcutInvocation};
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::queued_input_actions::restore_latest_queued_message;
@@ -77,6 +78,68 @@ pub(crate) fn handle_idle_key(
         );
     } else {
         apply_composer_key_input(ev, key, state, config, textarea, vim_state, theme);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_idle_key_dynamic(
+    ev: &Event,
+    key: &KeyEvent,
+    now: std::time::Instant,
+    owner: InputOwnerFingerprint,
+    keymap: &mut KeymapRuntime,
+    state: &mut AppState,
+    config: &mut RunConfig,
+    shared_config: &Arc<Mutex<RunConfig>>,
+    action_tx: &mpsc::Sender<UserAction>,
+    textarea: &mut TextArea,
+    vim_state: &mut VimState,
+    theme: &Theme,
+) -> bool {
+    if state.slash_menu.is_some()
+        && handle_slash_menu_key(
+            ev,
+            key,
+            state,
+            config,
+            shared_config,
+            action_tx,
+            textarea,
+            vim_state,
+            theme,
+        )
+    {
+        vim_state.cancel_pending_command();
+        return true;
+    }
+    if (!state.mention.candidates.is_empty()
+        || (state.mention.phase.is_some() && key.code == KeyCode::Esc))
+        && handle_mention_menu_key(ev, key, state, textarea, vim_state, theme)
+    {
+        vim_state.cancel_pending_command();
+        return true;
+    }
+    if handle_workflows_panel_key(key.code, state, action_tx) {
+        vim_state.cancel_pending_command();
+        return true;
+    }
+
+    match keymap.resolve_new_context(owner, *key, now) {
+        ShortcutResolution::Action(invocation) => handle_idle_shortcut_invocation(
+            invocation,
+            state,
+            config,
+            shared_config,
+            action_tx,
+            textarea,
+            vim_state,
+            theme,
+        ),
+        ShortcutResolution::Pending => true,
+        ShortcutResolution::RetryCurrentKey | ShortcutResolution::NoMatch => {
+            apply_composer_key_input(ev, key, state, config, textarea, vim_state, theme);
+            true
+        }
     }
 }
 
@@ -429,5 +492,66 @@ mod tests {
         ));
 
         assert_eq!(textarea_text(&textarea), "prior prompt");
+    }
+
+    #[test]
+    fn dynamic_idle_chord_starts_after_menus_and_submits_on_completion() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("send me", &vim, &theme);
+        let keymap = crate::keybindings::parse_keymap(
+            br#"{"version":1,"bindings":{"idle.submit":["ctrl+x ctrl+s"]}}"#,
+        )
+        .unwrap();
+        let mut runtime = crate::keybindings::KeymapRuntime::new(keymap);
+        let owner = crate::app::input_owner_fingerprint(&state, &vim);
+        let now = std::time::Instant::now();
+
+        assert!(handle_idle_key_dynamic(
+            &Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL,)),
+            &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            now,
+            owner,
+            &mut runtime,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+        let continuation = runtime.advance_pending(
+            owner,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            now + std::time::Duration::from_millis(1),
+        );
+        let crate::keybindings::ShortcutResolution::Action(invocation) = continuation else {
+            panic!("expected completed contextual chord");
+        };
+        assert!(handle_idle_shortcut_invocation(
+            invocation,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SubmitWithMentions { ref prompt, .. }) if prompt == "send me"
+        ));
     }
 }

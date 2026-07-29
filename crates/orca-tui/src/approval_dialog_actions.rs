@@ -3,6 +3,7 @@ use crossbeam_channel as mpsc;
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::approval_actions::resolve_approval_option;
+use crate::keybindings::{InputOwnerFingerprint, KeymapRuntime, ShortcutResolution};
 use crate::shortcuts::{ApprovalShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::types::{AppState, ApprovalOption, UserAction};
 
@@ -25,6 +26,40 @@ pub(crate) fn handle_approval_dialog_key(
         resolve_shortcut(ShortcutContext::Approval, *key)
     {
         handle_approval_shortcut(shortcut, state, action_tx);
+    }
+}
+
+pub(crate) fn handle_approval_dialog_key_dynamic(
+    key: &KeyEvent,
+    now: std::time::Instant,
+    owner: InputOwnerFingerprint,
+    keymap: &mut KeymapRuntime,
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+) -> bool {
+    if let KeyCode::Char(character) = key.code
+        && let Some(option) = state
+            .approval_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.option_for_key(character))
+    {
+        resolve_approval_option(state, action_tx, option);
+        return true;
+    }
+    if key.code == KeyCode::Char('d') {
+        resolve_approval_option(state, action_tx, ApprovalOption::Deny);
+        return true;
+    }
+    match keymap.resolve_new_context(owner, *key, now) {
+        ShortcutResolution::Action(invocation) => {
+            let ShortcutAction::Approval(shortcut) = invocation.action else {
+                return false;
+            };
+            handle_approval_shortcut(shortcut, state, action_tx);
+            true
+        }
+        ShortcutResolution::Pending => true,
+        ShortcutResolution::RetryCurrentKey | ShortcutResolution::NoMatch => false,
     }
 }
 
@@ -140,5 +175,73 @@ mod tests {
                 .approval_allowlist
                 .contains(&AppState::approval_key_tool("shell"))
         );
+    }
+
+    #[test]
+    fn fixed_d_key_keeps_deny_meaning() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state();
+        let key = KeyEvent::new(KeyCode::Char('d'), crossterm::event::KeyModifiers::NONE);
+        let mut runtime =
+            crate::keybindings::KeymapRuntime::new(crate::keybindings::Keymap::built_in());
+        let owner = crate::keybindings::InputOwnerFingerprint {
+            context: ShortcutContext::Approval,
+            modal: crate::keybindings::ModalOwner::Approval,
+            panel: crate::types::PanelMode::Conversation,
+            vim_mode: None,
+        };
+
+        assert!(handle_approval_dialog_key_dynamic(
+            &key,
+            std::time::Instant::now(),
+            owner,
+            &mut runtime,
+            &mut state,
+            &action_tx,
+        ));
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::ResolveBackgroundApproval { id, approved })
+                if id == "approval" && !approved
+        ));
+    }
+
+    #[test]
+    fn dynamic_approval_chord_moves_without_synthetic_key() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = state();
+        let keymap = crate::keybindings::parse_keymap(
+            br#"{"version":1,"bindings":{"approval.select-deny":["g g"]}}"#,
+        )
+        .unwrap();
+        let mut runtime = crate::keybindings::KeymapRuntime::new(keymap);
+        let owner = crate::keybindings::InputOwnerFingerprint {
+            context: ShortcutContext::Approval,
+            modal: crate::keybindings::ModalOwner::Approval,
+            panel: crate::types::PanelMode::Conversation,
+            vim_mode: None,
+        };
+        let now = std::time::Instant::now();
+        let key = KeyEvent::new(KeyCode::Char('g'), crossterm::event::KeyModifiers::NONE);
+
+        assert!(handle_approval_dialog_key_dynamic(
+            &key,
+            now,
+            owner,
+            &mut runtime,
+            &mut state,
+            &action_tx,
+        ));
+        let continuation =
+            runtime.advance_pending(owner, key, now + std::time::Duration::from_millis(1));
+        let crate::keybindings::ShortcutResolution::Action(invocation) = continuation else {
+            panic!("expected completed approval chord");
+        };
+        let ShortcutAction::Approval(shortcut) = invocation.action else {
+            panic!("expected approval action");
+        };
+        handle_approval_shortcut(shortcut, &mut state, &action_tx);
+        assert_eq!(state.approval_dialog.as_ref().unwrap().selected, 1);
     }
 }
