@@ -280,7 +280,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
     if needs_setup {
         state.status = AppStatus::Setup;
-        state.setup_step = 0;
+        state.initialize_onboarding(&config);
     }
 
     let initial_prompt = if config.prompt.trim().is_empty() {

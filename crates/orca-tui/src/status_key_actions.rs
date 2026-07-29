@@ -67,7 +67,7 @@ where
             theme,
             initial_prompt,
         )? {
-            SetupFlow::Continue => Ok(StatusKeyFlow::Continue),
+            SetupFlow::Continue | SetupFlow::PreviewTheme(_) => Ok(StatusKeyFlow::Continue),
             SetupFlow::Exit(code) => Ok(StatusKeyFlow::Exit(code)),
         };
     }

@@ -435,6 +435,12 @@ impl OnboardingState {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_model_for_test(&mut self, model: String) {
+        self.draft.model = model;
+        self.selected = self.index_for_current_value();
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_outcomes_for_test(&mut self, auth: SaveOutcome, preferences: SaveOutcome) {
         self.auth_outcome = auth;
         self.preferences_outcome = preferences;

@@ -20,6 +20,7 @@ use orca_runtime::history::SessionSummary;
 
 use crate::diagnostics::FpsHudSnapshot;
 use crate::display_text::{compact_long_text, truncate_to_display_width};
+use crate::onboarding::{OnboardingOptionRow, OnboardingStep};
 use crate::selection::{TranscriptSelection, apply_style_to_line_range};
 use crate::shortcuts::{self, ShortcutScope};
 use crate::syntax_highlight::highlight_code;
@@ -3624,150 +3625,137 @@ fn render_setup(
 ) -> Option<HardwareCursorProjection> {
     let area = frame.area();
 
-    match state.setup_step {
-        0 => {
-            let width = 60u16.min(area.width.saturating_sub(4));
-            let height = 16u16.min(area.height.saturating_sub(2));
-            let popup_area = centered_rect(area, width, height);
-
-            let content = vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "   ___                ",
-                    Style::default().fg(Color::Cyan),
-                )),
-                Line::from(Span::styled(
-                    "  / _ \\ _ __ ___ __ _ ",
-                    Style::default().fg(Color::Cyan),
-                )),
-                Line::from(Span::styled(
-                    " | | | | '__/ __/ _` |",
-                    Style::default().fg(Color::Cyan),
-                )),
-                Line::from(Span::styled(
-                    " | |_| | | | (_| (_| |",
-                    Style::default().fg(Color::Cyan),
-                )),
-                Line::from(Span::styled(
-                    "  \\___/|_|  \\___\\__,_|",
-                    Style::default().fg(Color::Cyan),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  A DeepSeek-native coding agent",
-                    Style::default().fg(Color::White),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Let's get you set up!",
-                    Style::default().fg(Color::Green),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Press Enter to continue...",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ];
-
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Welcome ")
-                .border_style(Style::default().fg(Color::Cyan));
-
-            let paragraph = Paragraph::new(content).block(block);
-            frame.render_widget(paragraph, popup_area);
+    match state.onboarding.step() {
+        OnboardingStep::Welcome => {
+            render_setup_message(frame, area, theme, "Welcome", "Press Enter to continue");
             None
         }
-        1 => {
-            let width = 60u16.min(area.width.saturating_sub(4));
-            let height = 14u16.min(area.height.saturating_sub(2));
-            let popup_area = centered_rect(area, width, height);
-
-            let inner =
-                Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(Rect::new(
-                    popup_area.x + 1,
-                    popup_area.y + 1,
-                    popup_area.width.saturating_sub(2),
-                    popup_area.height.saturating_sub(2),
-                ));
-
-            let content = vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Step 1: API Key",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Orca needs a DeepSeek API key to function.",
-                    Style::default().fg(Color::White),
-                )),
-                Line::from(Span::styled(
-                    "  https://platform.deepseek.com/api_keys",
-                    Style::default().fg(Color::Blue),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Paste below and press Enter:",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ];
-
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Setup ")
-                .border_style(Style::default().fg(Color::Cyan));
-
-            let paragraph = Paragraph::new(content).block(block);
-            frame.render_widget(paragraph, popup_area);
-            render_textarea_surface(frame, inner[1], textarea, None, None, theme, true)
-        }
-        2 => {
-            let width = 60u16.min(area.width.saturating_sub(4));
-            let height = 12u16.min(area.height.saturating_sub(2));
-            let popup_area = centered_rect(area, width, height);
-
-            let content = vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  ✓ API key saved successfully!",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Saved to: ~/.orca/auth.json",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  You're all set! Orca is ready to use.",
-                    Style::default().fg(Color::White),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Press Enter to start...",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ];
-
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Setup Complete ")
-                .border_style(Style::default().fg(Color::Green));
-
-            let paragraph = Paragraph::new(content).block(block);
-            frame.render_widget(paragraph, popup_area);
+        OnboardingStep::Provider => {
+            render_setup_rows(
+                frame,
+                area,
+                theme,
+                "Provider",
+                state.onboarding.option_rows(),
+            );
             None
         }
-        _ => None,
+        OnboardingStep::ApiKey => render_setup_api_key(frame, area, textarea, theme),
+        OnboardingStep::Model => {
+            render_setup_rows(frame, area, theme, "Model", state.onboarding.option_rows());
+            None
+        }
+        OnboardingStep::Theme => {
+            render_setup_rows(frame, area, theme, "Theme", state.onboarding.option_rows());
+            None
+        }
+        OnboardingStep::Review => {
+            let mut rows = state.onboarding.review_rows();
+            if let Some(error) = state.onboarding.error_label() {
+                rows.push(error.to_string());
+            }
+            render_setup_text_rows(frame, area, theme, "Review", rows);
+            None
+        }
+        OnboardingStep::Complete => {
+            render_setup_text_rows(
+                frame,
+                area,
+                theme,
+                "Complete",
+                state.onboarding.completion_rows(),
+            );
+            None
+        }
     }
+}
+
+fn setup_popup_area(area: Rect, row_count: usize) -> Rect {
+    let width = 60u16.min(area.width.saturating_sub(2));
+    let desired_height = (row_count as u16).saturating_add(2);
+    let height = desired_height.min(area.height.saturating_sub(2));
+    centered_rect(area, width, height)
+}
+
+fn setup_block<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(format!(" {title} "))
+        .border_style(Style::default().fg(theme.border))
+}
+
+fn render_setup_message(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, message: &str) {
+    let popup = setup_popup_area(area, 1);
+    frame.render_widget(
+        Paragraph::new(Line::styled(message, Style::default().fg(theme.text)))
+            .block(setup_block(title, theme)),
+        popup,
+    );
+}
+
+fn render_setup_rows(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    title: &str,
+    rows: Vec<OnboardingOptionRow>,
+) {
+    let lines = rows
+        .iter()
+        .map(|row| {
+            let marker = if row.selected { "› " } else { "  " };
+            let color = if row.selected { theme.user } else { theme.text };
+            Line::from(vec![
+                Span::styled(marker, Style::default().fg(color)),
+                Span::styled(row.label, Style::default().fg(color)),
+                Span::styled(
+                    format!(" — {}", row.description),
+                    Style::default().fg(theme.muted),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let popup = setup_popup_area(area, lines.len());
+    frame.render_widget(
+        Paragraph::new(lines).block(setup_block(title, theme)),
+        popup,
+    );
+}
+
+fn render_setup_text_rows(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    title: &str,
+    rows: Vec<String>,
+) {
+    let lines = rows
+        .into_iter()
+        .map(|row| Line::styled(row, Style::default().fg(theme.text)))
+        .collect::<Vec<_>>();
+    let popup = setup_popup_area(area, lines.len());
+    frame.render_widget(
+        Paragraph::new(lines).block(setup_block(title, theme)),
+        popup,
+    );
+}
+
+fn render_setup_api_key(
+    frame: &mut Frame,
+    area: Rect,
+    textarea: &TextArea,
+    theme: &Theme,
+) -> Option<HardwareCursorProjection> {
+    let popup = setup_popup_area(area, 3);
+    let inner = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(1),
+        popup.width.saturating_sub(2),
+        popup.height.saturating_sub(2),
+    );
+    frame.render_widget(setup_block("API Key", theme), popup);
+    render_textarea_surface(frame, inner, textarea, None, None, theme, true)
 }
 
 struct PendingCodeBlock {
@@ -8308,7 +8296,9 @@ mod tests {
     fn setup_cursor_uses_masked_api_key_cell() {
         let mut state = test_state();
         state.status = AppStatus::Setup;
-        state.setup_step = 1;
+        state
+            .onboarding
+            .set_step_for_test(crate::onboarding::OnboardingStep::ApiKey);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let mut textarea = crate::composer_textarea::make_setup_textarea(&theme);
         textarea.insert_str("密钥abc");
@@ -8319,7 +8309,7 @@ mod tests {
             .draw(|frame| render(frame, &mut state, &textarea, &theme))
             .unwrap();
 
-        let cursor = Position::new(12, 14);
+        let cursor = Position::new(12, 9);
         terminal.backend_mut().assert_cursor_position(cursor);
         let buffer = terminal.backend().buffer();
         let rendered = buffer
@@ -8338,15 +8328,15 @@ mod tests {
     }
 
     #[test]
-    fn setup_cursor_events_match_the_active_setup_step() {
+    fn setup_cursor_events_match_the_active_onboarding_step() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let mut textarea = crate::composer_textarea::make_setup_textarea(&theme);
         textarea.insert_str("密钥abc");
 
-        for setup_step in [0, 1, 2] {
+        for step in crate::onboarding::OnboardingStep::ALL {
             let mut state = test_state();
             state.status = AppStatus::Setup;
-            state.setup_step = setup_step;
+            state.onboarding.set_step_for_test(step);
             let (backend, events) = RecordingBackend::new(70, 20);
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
 
@@ -8360,7 +8350,7 @@ mod tests {
                 .filter(|event| matches!(event, CursorEvent::Move(_)))
                 .copied()
                 .collect::<Vec<_>>();
-            if setup_step == 1 {
+            if step == crate::onboarding::OnboardingStep::ApiKey {
                 assert_eq!(
                     cursor_events
                         .iter()
@@ -8379,7 +8369,7 @@ mod tests {
                 );
                 assert_eq!(
                     moves,
-                    [CursorEvent::Move(Position::new(12, 14))],
+                    [CursorEvent::Move(Position::new(12, 9))],
                     "{cursor_events:?}"
                 );
                 let rendered = terminal
@@ -8415,6 +8405,36 @@ mod tests {
                 );
                 assert!(moves.is_empty(), "{cursor_events:?}");
             }
+        }
+    }
+
+    #[test]
+    fn typed_setup_renderer_handles_every_step_at_tiny_geometry_without_secret() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut textarea = crate::composer_textarea::make_setup_textarea(&theme);
+        textarea.insert_str("sk-render-secret");
+
+        for step in crate::onboarding::OnboardingStep::ALL {
+            let mut state = test_state();
+            state.status = AppStatus::Setup;
+            state.onboarding.set_step_for_test(step);
+            state.onboarding.set_api_key("sk-draft-secret".to_string());
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 6)).unwrap();
+
+            terminal
+                .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                .unwrap();
+
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(!rendered.contains("sk-render-secret"), "{step:?}");
+            assert!(!rendered.contains("sk-draft-secret"), "{step:?}");
         }
     }
 

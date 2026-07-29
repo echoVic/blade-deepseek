@@ -7,6 +7,7 @@ use orca_core::config::RunConfig;
 
 use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{insert_composer_paste, insert_pasted_text};
+use crate::onboarding::OnboardingStep;
 use crate::selection::{SelectionGranularity, TranscriptSelection};
 use crate::terminal_presentation::TerminalPresentation;
 use crate::types::{AppState, AppStatus, PanelMode};
@@ -112,6 +113,52 @@ mod search_paste_tests {
         assert_eq!(state.transcript_search.query(), "one two");
         assert_eq!(textarea_text(&textarea), "composer");
         assert!(state.pending_pastes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod setup_paste_tests {
+    use crossterm::event::Event;
+    use tui_textarea::TextArea;
+
+    use super::handle_paste_event;
+    use crate::composer_textarea::textarea_text;
+    use crate::onboarding::OnboardingStep;
+    use crate::test_support::test_run_config;
+    use crate::types::{AppState, AppStatus};
+
+    #[test]
+    fn setup_paste_is_owned_only_by_the_typed_api_key_step() {
+        for step in OnboardingStep::ALL {
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            let mut state = AppState::new(
+                tx,
+                "test".to_string(),
+                "auto".to_string(),
+                "/tmp".to_string(),
+            );
+            state.status = AppStatus::Setup;
+            state.onboarding.set_step_for_test(step);
+            let config = test_run_config();
+            let mut textarea = TextArea::default();
+
+            assert!(handle_paste_event(
+                &Event::Paste("secret".to_string()),
+                &mut state,
+                &config,
+                &mut textarea,
+            ));
+
+            assert_eq!(
+                textarea_text(&textarea),
+                if step == OnboardingStep::ApiKey {
+                    "secret"
+                } else {
+                    ""
+                },
+                "{step:?}",
+            );
+        }
     }
 }
 
@@ -317,7 +364,7 @@ pub(crate) fn handle_paste_event(
         return true;
     }
     match state.status {
-        AppStatus::Setup if state.setup_step == 1 => {
+        AppStatus::Setup if state.onboarding.step() == OnboardingStep::ApiKey => {
             insert_pasted_text(textarea, pasted);
         }
         AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput => {

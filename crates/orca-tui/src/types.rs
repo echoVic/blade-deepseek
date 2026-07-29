@@ -758,7 +758,6 @@ pub struct AppState {
     /// Tool / "tool\u{0}target" keys the user chose to always allow this
     /// session. Checked when a new approval arrives so the dialog is skipped.
     pub approval_allowlist: std::collections::HashSet<String>,
-    pub setup_step: u8,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) onboarding: OnboardingState,
     pub show_shortcuts: bool,
@@ -918,7 +917,6 @@ impl AppState {
             approval_dialog: None,
             pending_input: None,
             approval_allowlist: std::collections::HashSet::new(),
-            setup_step: 0,
             onboarding: OnboardingState::new(
                 ProviderKind::DeepSeek,
                 orca_core::model::AUTO_MODEL,
@@ -3308,7 +3306,6 @@ mod tests {
     #[test]
     fn app_state_onboarding_defaults_and_initializes_from_effective_config() {
         let mut state = state();
-        assert_eq!(state.setup_step, 0);
         assert_eq!(
             state.onboarding.step(),
             crate::onboarding::OnboardingStep::Welcome,
