@@ -23,6 +23,7 @@ mod windows {
         process.input.resize(120, 40).unwrap();
         process.input.close();
         let status = wait_for_exit(&mut process.child, "native ConPTY command");
+        std::thread::sleep(Duration::from_millis(200));
         process.input.close_terminal();
         let output = reader.join().expect("join ConPTY output reader");
         assert!(status.success(), "ConPTY command failed: {status:?}");

@@ -947,6 +947,7 @@ mod tests {
         input.close();
         input.resize(120, 40).expect("resize after closing stdin");
         let status = child.wait().expect("wait");
+        std::thread::sleep(std::time::Duration::from_millis(200));
         input.close_terminal();
         let text = reader.join().expect("join ConPTY output reader");
         assert!(status.success(), "{text}");
@@ -1007,6 +1008,7 @@ mod tests {
         input.close();
         input.resize(120, 40).expect("resize after closing stdin");
         let status = child.wait().expect("wait");
+        std::thread::sleep(std::time::Duration::from_millis(200));
         input.close_terminal();
         let text = reader.join().expect("join ConPTY output reader");
         assert!(status.success(), "{text}");

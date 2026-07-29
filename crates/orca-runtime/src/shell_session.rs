@@ -994,6 +994,11 @@ impl ShellSession {
             self.child.wait()
         } else {
             let status = self.child.wait()?;
+            #[cfg(windows)]
+            if self.effective_terminal.is_pty() {
+                // ConPTY can publish its final bytes after the process handle signals.
+                thread::sleep(Duration::from_millis(200));
+            }
             self.stop_and_join_readers();
             Ok(status)
         }
