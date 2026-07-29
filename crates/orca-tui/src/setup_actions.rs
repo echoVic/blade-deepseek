@@ -127,6 +127,9 @@ where
         },
         _ if state.onboarding.step() == OnboardingStep::ApiKey => {
             textarea.input(Input::from(ev.clone()));
+            if textarea.lines().iter().any(|line| !line.trim().is_empty()) {
+                state.onboarding.clear_api_key_error();
+            }
         }
         _ => {}
     }
@@ -147,10 +150,6 @@ fn apply_review<AuthSave, PreferencesSave>(
         Ok(patch) => patch,
         Err(_) => return,
     };
-    let Some(api_key) = state.onboarding.api_key().map(str::to_string) else {
-        state.onboarding.set_error(OnboardingError::MissingApiKey);
-        return;
-    };
     let provider = state.onboarding.draft_provider();
     let model = state.onboarding.draft_model().to_string();
     let theme = state.onboarding.selected_theme();
@@ -169,20 +168,30 @@ fn apply_review<AuthSave, PreferencesSave>(
             .set_error(OnboardingError::SharedConfigUnavailable);
         return;
     };
+    let Some(api_key) = state.onboarding.take_api_key() else {
+        drop(shared);
+        state.onboarding.set_error(OnboardingError::MissingApiKey);
+        return;
+    };
 
     config.provider = provider;
     config.model = selection.clone();
     config.theme = theme;
-    config.api_key = Some(api_key.clone());
     shared.provider = provider;
     shared.model = selection;
     shared.theme = theme;
     shared.api_key = Some(api_key.clone());
+    config.api_key = Some(api_key);
     drop(shared);
 
     state.model_name = model;
     state.auth_configured = true;
-    let auth_outcome = SaveOutcome::from(save_auth(&api_key));
+    let auth_outcome = SaveOutcome::from(save_auth(
+        config
+            .api_key
+            .as_deref()
+            .expect("validated API key must remain in runtime config"),
+    ));
     let preferences_outcome = SaveOutcome::from(save_preferences(&patch));
     if !state
         .onboarding
@@ -207,6 +216,7 @@ mod tests {
     struct SaveCalls {
         auth: usize,
         preferences: usize,
+        auth_key_matches_expected: bool,
     }
 
     fn setup_harness() -> (
@@ -275,8 +285,10 @@ mod tests {
             vim,
             theme,
             initial_prompt,
-            move |_| {
-                auth_calls.lock().unwrap().auth += 1;
+            move |api_key| {
+                let mut calls = auth_calls.lock().unwrap();
+                calls.auth += 1;
+                calls.auth_key_matches_expected = api_key == "sk-test-secret";
                 auth_result
             },
             move |_| {
@@ -483,6 +495,51 @@ mod tests {
     }
 
     #[test]
+    fn typing_after_missing_api_key_clears_the_safe_error() {
+        let (mut state, mut config, shared, action_tx, _rx, mut textarea, vim) = setup_harness();
+        let theme = Theme::named(ThemeName::Dark);
+        let calls = Arc::new(Mutex::new(SaveCalls::default()));
+        state.onboarding.set_step_for_test(OnboardingStep::ApiKey);
+
+        press_setup_key(
+            KeyCode::Enter,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &vim,
+            &theme,
+            None,
+            &calls,
+            Ok(()),
+            Ok(()),
+        );
+        assert_eq!(
+            state.onboarding.review_error(),
+            Some(OnboardingError::MissingApiKey),
+        );
+
+        press_setup_key(
+            KeyCode::Char('x'),
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &vim,
+            &theme,
+            None,
+            &calls,
+            Ok(()),
+            Ok(()),
+        );
+
+        assert_eq!(state.onboarding.review_error(), None);
+        assert_eq!(textarea_text(&textarea), "x");
+    }
+
+    #[test]
     fn api_key_textarea_accepts_j_and_k_as_regular_input() {
         let (mut state, mut config, shared, action_tx, _rx, mut textarea, vim) = setup_harness();
         let theme = Theme::named(ThemeName::Dark);
@@ -608,7 +665,9 @@ mod tests {
         assert_eq!(state.onboarding.preferences_outcome(), &SaveOutcome::Saved);
         assert_eq!(calls.lock().unwrap().auth, 1);
         assert_eq!(calls.lock().unwrap().preferences, 1);
+        assert!(calls.lock().unwrap().auth_key_matches_expected);
         assert!(state.onboarding.api_key().is_none());
+        assert!(state.onboarding.take_api_key().is_none());
         assert!(action_rx.try_recv().is_err());
     }
 
@@ -658,6 +717,29 @@ mod tests {
         );
         assert_eq!(calls.lock().unwrap().auth, 0);
         assert_eq!(calls.lock().unwrap().preferences, 0);
+        assert!(state.onboarding.api_key().is_some());
+    }
+
+    #[test]
+    fn production_review_path_consumes_the_staged_api_key() {
+        let source = include_str!("setup_actions.rs");
+        let consuming_call = ["state.onboarding.", "take_api_key()"].concat();
+        let cloning_call = [".api_key()", ".map(str::to_string)"].concat();
+        let runtime_clone = ["api_key", ".clone()"].concat();
+
+        assert!(
+            source.contains(&consuming_call),
+            "apply_review must transfer the staged credential",
+        );
+        assert!(
+            !source.contains(&cloning_call),
+            "apply_review must not clone the onboarding draft credential",
+        );
+        assert_eq!(
+            source.matches(&runtime_clone).count(),
+            1,
+            "current and shared runtime config require exactly one credential clone",
+        );
     }
 
     #[test]

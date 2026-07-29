@@ -3652,7 +3652,7 @@ fn render_setup(
             .border_style(Style::default().fg(theme.border)),
         shell.panel,
     );
-    let error = (step == OnboardingStep::Review)
+    let error = matches!(step, OnboardingStep::ApiKey | OnboardingStep::Review)
         .then(|| state.onboarding.error_label())
         .flatten();
     render_onboarding_shell_text(frame, shell, step, error, theme);
@@ -8589,6 +8589,9 @@ mod tests {
         let mut state = test_state();
         state.status = AppStatus::Setup;
         state.onboarding.set_step_for_test(OnboardingStep::ApiKey);
+        state
+            .onboarding
+            .set_error(crate::onboarding::OnboardingError::MissingApiKey);
         let theme = Theme::named(ThemeName::Dark);
         let mut textarea = crate::composer_textarea::make_setup_textarea(&theme);
         textarea.insert_str("密钥abc");
@@ -8826,6 +8829,11 @@ mod tests {
         let api_key_rendered = buffer_text(&render_setup_test_frame(&mut api_key, &theme, 80, 24));
         assert!(api_key_rendered.contains("3/7 · API Key"));
         assert!(api_key_rendered.contains("↑/↓ or j/k · Enter · Esc"));
+
+        api_key.onboarding.set_api_key("   ".to_string());
+        assert!(!api_key.onboarding.advance());
+        let api_key_error = buffer_text(&render_setup_test_frame(&mut api_key, &theme, 80, 24));
+        assert!(api_key_error.contains("API key is required"));
 
         let mut review = test_state();
         review.status = AppStatus::Setup;

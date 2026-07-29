@@ -320,6 +320,12 @@ impl OnboardingState {
         self.error = Some(error);
     }
 
+    pub(crate) fn clear_api_key_error(&mut self) {
+        if self.error == Some(OnboardingError::MissingApiKey) {
+            self.error = None;
+        }
+    }
+
     pub(crate) fn validate_review(&mut self) -> Result<UserPreferencePatch, OnboardingError> {
         if self.step != OnboardingStep::Review {
             return self.fail_review_validation(OnboardingError::InvalidStep);
