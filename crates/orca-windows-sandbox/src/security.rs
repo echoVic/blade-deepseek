@@ -2,6 +2,7 @@ use std::ffi::c_void;
 use std::io;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use orca_platform::fs::PathPolicy;
 use windows_sys::Win32::Foundation::{
@@ -197,6 +198,12 @@ fn apply_plan_acls(
 }
 
 fn appcontainer_sid() -> Result<LocalSid, WindowsSandboxError> {
+    static PROFILE_REGISTRATION: OnceLock<Mutex<()>> = OnceLock::new();
+    let _registration = PROFILE_REGISTRATION
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     const PROFILE_NAME: &str = "Orca.WindowsSandbox.v1";
     const ERROR_ALREADY_EXISTS_HRESULT: i32 = 0x8007_00b7_u32 as i32;
     let name = wide(PROFILE_NAME);

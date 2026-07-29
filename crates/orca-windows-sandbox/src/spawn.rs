@@ -61,6 +61,7 @@ pub struct SandboxedPty {
 pub struct SandboxedPtyInput {
     console: Option<PseudoConsole>,
     writer: Option<std::fs::File>,
+    closed: bool,
 }
 
 impl SandboxedChild {
@@ -220,6 +221,12 @@ impl Drop for SandboxedPty {
 
 impl SandboxedPtyInput {
     pub fn write_all(&mut self, input: &[u8]) -> io::Result<()> {
+        if self.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "sandbox PTY input is closed",
+            ));
+        }
         let writer = self
             .writer
             .as_mut()
@@ -236,12 +243,16 @@ impl SandboxedPtyInput {
     }
 
     pub fn close_terminal(&mut self) {
+        self.closed = true;
         self.writer.take();
         self.console.take();
     }
 
     pub fn close(&mut self) {
-        self.writer.take();
+        // Closing the ConPTY input pipe can deliver an interrupt-like terminal
+        // status to a still-running child. Stop accepting writes here and keep
+        // the pipe alive until terminal cleanup after the child exits.
+        self.closed = true;
     }
 }
 
@@ -435,6 +446,7 @@ impl PtyPipeSet {
             SandboxedPtyInput {
                 console: Some(self.console),
                 writer: Some(self.input),
+                closed: false,
             },
             self.output,
         )

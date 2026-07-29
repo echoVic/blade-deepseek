@@ -104,10 +104,17 @@ mod windows {
     pub struct WindowsPtyInput {
         console: Option<PseudoConsole>,
         writer: Option<std::fs::File>,
+        closed: bool,
     }
 
     impl WindowsPtyInput {
         pub fn write_all(&mut self, input: &[u8]) -> io::Result<()> {
+            if self.closed {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "ConPTY input is closed",
+                ));
+            }
             let writer = self.writer.as_mut().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "ConPTY input is closed")
             })?;
@@ -116,10 +123,14 @@ mod windows {
         }
 
         pub fn close(&mut self) {
-            self.writer.take();
+            // Closing the input pipe while the child is active can turn a
+            // normal ConPTY exit into an interrupt status. Retain the native
+            // handle until terminal cleanup while rejecting further writes.
+            self.closed = true;
         }
 
         pub fn close_terminal(&mut self) {
+            self.closed = true;
             self.writer.take();
             self.console.take();
         }
@@ -246,6 +257,7 @@ mod windows {
                 WindowsPtyInput {
                     console: Some(self.console),
                     writer: Some(self.input),
+                    closed: false,
                 },
                 self.output,
             )
