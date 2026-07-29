@@ -1196,6 +1196,236 @@ mod tests {
             Duration::from_millis(16),
         );
     }
+
+    #[test]
+    fn shared_global_and_idle_prefixes_are_both_reachable_through_app_routing() {
+        let keymap = crate::keybindings::parse_keymap(
+            br#"{
+                "version": 1,
+                "bindings": {
+                    "global.open-transcript-search": ["ctrl+x ctrl+f"],
+                    "idle.submit": ["ctrl+x ctrl+s"]
+                }
+            }"#,
+        )
+        .unwrap();
+        let now = Instant::now();
+        let operation = crate::test_support::TestOperationInterrupt::default();
+        let theme = Theme::named(ThemeName::Dark);
+
+        let (search_tx, _search_rx) = mpsc::unbounded();
+        let mut search_state = AppState::new(
+            search_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut search_config = test_config(HistoryMode::Disabled);
+        let search_shared = Arc::new(Mutex::new(search_config.clone()));
+        let mut search_vim = VimState::new(false);
+        let mut search_runtime = KeymapRuntime::new(Arc::clone(&keymap));
+        let owner = input_owner_fingerprint(&search_state, &search_vim);
+        for (offset, character) in [(0, 'x'), (1, 'f')] {
+            let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
+            assert!(matches!(
+                handle_key_event_preflight_dynamic(
+                    key,
+                    now + Duration::from_millis(offset),
+                    owner,
+                    &mut search_runtime,
+                    &mut search_state,
+                    &mut search_config,
+                    &search_shared,
+                    &search_tx,
+                    &operation,
+                    &mut search_vim,
+                    || Ok(()),
+                )
+                .unwrap(),
+                DynamicKeyEventFlow::Continue,
+            ));
+        }
+        assert!(search_state.transcript_search.open);
+
+        let (submit_tx, submit_rx) = mpsc::unbounded();
+        let mut submit_state = AppState::new(
+            submit_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut submit_config = test_config(HistoryMode::Disabled);
+        let submit_shared = Arc::new(Mutex::new(submit_config.clone()));
+        let mut submit_vim = VimState::new(false);
+        let mut submit_runtime = KeymapRuntime::new(keymap);
+        let mut textarea = make_textarea_with_text("send me", &submit_vim, &theme);
+        let preloaded = Arc::new(Mutex::new(None));
+        let owner = input_owner_fingerprint(&submit_state, &submit_vim);
+        let prefix = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            handle_key_event_preflight_dynamic(
+                prefix,
+                now,
+                owner,
+                &mut submit_runtime,
+                &mut submit_state,
+                &mut submit_config,
+                &submit_shared,
+                &submit_tx,
+                &operation,
+                &mut submit_vim,
+                || Ok(()),
+            )
+            .unwrap(),
+            DynamicKeyEventFlow::Continue,
+        ));
+        let suffix = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let DynamicKeyEventFlow::Context(invocation) = handle_key_event_preflight_dynamic(
+            suffix,
+            now + Duration::from_millis(1),
+            owner,
+            &mut submit_runtime,
+            &mut submit_state,
+            &mut submit_config,
+            &submit_shared,
+            &submit_tx,
+            &operation,
+            &mut submit_vim,
+            || Ok(()),
+        )
+        .unwrap() else {
+            panic!("idle chord must complete as a contextual invocation");
+        };
+        handle_status_key_dynamic(
+            &Event::Key(suffix),
+            &suffix,
+            now + Duration::from_millis(1),
+            owner,
+            &mut submit_runtime,
+            Some(invocation),
+            &mut submit_state,
+            &mut submit_config,
+            &submit_shared,
+            &submit_tx,
+            &operation,
+            &preloaded,
+            &mut textarea,
+            &mut submit_vim,
+            &theme,
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(
+            submit_rx.try_recv(),
+            Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "send me"
+        ));
+    }
+
+    #[test]
+    fn contextual_chord_mismatch_retries_current_key_exactly_once() {
+        let keymap = crate::keybindings::parse_keymap(
+            br#"{"version":1,"bindings":{"idle.submit":["ctrl+x ctrl+s"]}}"#,
+        )
+        .unwrap();
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut config = test_config(HistoryMode::Disabled);
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let operation = crate::test_support::TestOperationInterrupt::default();
+        let preloaded = Arc::new(Mutex::new(None));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("base", &vim, &theme);
+        let mut runtime = KeymapRuntime::new(keymap);
+        let owner = input_owner_fingerprint(&state, &vim);
+        let now = Instant::now();
+
+        let prefix = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            handle_key_event_preflight_dynamic(
+                prefix,
+                now,
+                owner,
+                &mut runtime,
+                &mut state,
+                &mut config,
+                &shared,
+                &action_tx,
+                &operation,
+                &mut vim,
+                || Ok(()),
+            )
+            .unwrap(),
+            DynamicKeyEventFlow::Unhandled,
+        ));
+        handle_status_key_dynamic(
+            &Event::Key(prefix),
+            &prefix,
+            now,
+            owner,
+            &mut runtime,
+            None,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &operation,
+            &preloaded,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+
+        let mismatch = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+        assert!(matches!(
+            handle_key_event_preflight_dynamic(
+                mismatch,
+                now + Duration::from_millis(1),
+                owner,
+                &mut runtime,
+                &mut state,
+                &mut config,
+                &shared,
+                &action_tx,
+                &operation,
+                &mut vim,
+                || Ok(()),
+            )
+            .unwrap(),
+            DynamicKeyEventFlow::Unhandled,
+        ));
+        handle_status_key_dynamic(
+            &Event::Key(mismatch),
+            &mismatch,
+            now + Duration::from_millis(1),
+            owner,
+            &mut runtime,
+            None,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &operation,
+            &preloaded,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(textarea_text(&textarea), "basez");
+    }
     use crate::workflow_notifications::{
         is_workflow_notification_turn_boundary, queue_workflow_terminal_notification,
         remove_pending_workflow_notification_by_id, submit_pending_workflow_notification,

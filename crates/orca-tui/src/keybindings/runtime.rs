@@ -89,6 +89,7 @@ struct PendingChord {
 enum PendingScope {
     Global,
     Context,
+    GlobalAndContext,
 }
 
 pub(crate) struct KeymapRuntime {
@@ -170,8 +171,21 @@ impl KeymapRuntime {
         let context = match pending.scope {
             PendingScope::Global => ShortcutContext::Global,
             PendingScope::Context => owner.context,
+            PendingScope::GlobalAndContext => owner.context,
         };
-        let matches = self.keymap.matching_sequences_in(context, &prefix);
+        let mut matches = self.keymap.matching_sequences_in(context, &prefix);
+        if pending.scope == PendingScope::GlobalAndContext {
+            matches.extend(
+                self.keymap
+                    .matching_sequences_in(ShortcutContext::Global, &prefix),
+            );
+            matches.sort_by_key(|(sequence, action)| {
+                (
+                    sequence.to_string(),
+                    action.configurable_id().unwrap_or("").to_string(),
+                )
+            });
+        }
         if matches.is_empty() {
             self.pending = None;
             return ShortcutResolution::RetryCurrentKey;
@@ -196,13 +210,38 @@ impl KeymapRuntime {
         event: KeyEvent,
         now: Instant,
     ) -> ShortcutResolution {
-        self.resolve_new_in(
+        let Some(stroke) = KeyStroke::from_event(event) else {
+            return ShortcutResolution::NoMatch;
+        };
+        let global_matches = self
+            .keymap
+            .matching_sequences_in(ShortcutContext::Global, &[stroke]);
+        if let Some((_, action)) = global_matches
+            .iter()
+            .find(|(sequence, _)| sequence.len() == 1)
+        {
+            return ShortcutResolution::Action(ShortcutInvocation::key(*action, event));
+        }
+        if global_matches.is_empty() {
+            return ShortcutResolution::NoMatch;
+        }
+        let carries_context = matches!(owner.modal, ModalOwner::None | ModalOwner::Approval)
+            && owner.context != ShortcutContext::Global
+            && !self
+                .keymap
+                .matching_sequences_in(owner.context, &[stroke])
+                .is_empty();
+        self.pending = Some(PendingChord {
             owner,
-            ShortcutContext::Global,
-            PendingScope::Global,
-            event,
-            now,
-        )
+            scope: if carries_context {
+                PendingScope::GlobalAndContext
+            } else {
+                PendingScope::Global
+            },
+            strokes: vec![stroke],
+            deadline: now + CHORD_TIMEOUT,
+        });
+        ShortcutResolution::Pending
     }
 
     pub(crate) fn resolve_new_context(
@@ -601,5 +640,94 @@ mod tests {
             })
         ));
         assert!(!runtime.has_pending_chord());
+    }
+
+    #[test]
+    fn shared_global_prefix_keeps_contextual_chord_reachable() {
+        let mut runtime = runtime_with(
+            r#"{
+                "global.open-transcript-search":["ctrl+x ctrl+f"],
+                "idle.submit":["ctrl+x ctrl+s"]
+            }"#,
+        );
+        let now = Instant::now();
+
+        assert_eq!(
+            runtime.resolve(idle_owner(), ctrl('x'), now),
+            ShortcutResolution::Pending,
+        );
+        assert_eq!(
+            runtime.resolve(idle_owner(), ctrl('s'), now + Duration::from_millis(1),),
+            ShortcutResolution::Action(ShortcutInvocation::chord(ShortcutAction::Idle(
+                IdleShortcut::Submit,
+            ))),
+        );
+    }
+
+    #[test]
+    fn shared_global_prefix_does_not_carry_context_through_a_menu_owner() {
+        let mut runtime = runtime_with(
+            r#"{
+                "global.open-transcript-search":["ctrl+x ctrl+f"],
+                "idle.submit":["ctrl+x ctrl+s"]
+            }"#,
+        );
+        let now = Instant::now();
+        let owner = InputOwnerFingerprint {
+            modal: ModalOwner::MentionMenu,
+            ..idle_owner()
+        };
+
+        assert_eq!(
+            runtime.resolve_new_global(owner, ctrl('x'), now),
+            ShortcutResolution::Pending,
+        );
+        assert_eq!(
+            runtime.advance_pending(owner, ctrl('s'), now + Duration::from_millis(1)),
+            ShortcutResolution::RetryCurrentKey,
+        );
+    }
+
+    #[test]
+    fn shared_global_prefix_keeps_running_and_approval_chords_reachable() {
+        for (context, modal, action_id, expected) in [
+            (
+                ShortcutContext::Running,
+                ModalOwner::None,
+                "running.interrupt",
+                ShortcutAction::Running(crate::shortcuts::RunningShortcut::Interrupt),
+            ),
+            (
+                ShortcutContext::Approval,
+                ModalOwner::Approval,
+                "approval.confirm",
+                ShortcutAction::Approval(crate::shortcuts::ApprovalShortcut::Confirm),
+            ),
+        ] {
+            let source = format!(
+                r#"{{
+                    "global.open-transcript-search":["ctrl+x ctrl+f"],
+                    "{action_id}":["ctrl+x ctrl+s"]
+                }}"#
+            );
+            let mut runtime = runtime_with(&source);
+            let owner = InputOwnerFingerprint {
+                context,
+                modal,
+                panel: PanelMode::Conversation,
+                vim_mode: None,
+            };
+            let now = Instant::now();
+
+            assert_eq!(
+                runtime.resolve(owner, ctrl('x'), now),
+                ShortcutResolution::Pending,
+            );
+            assert_eq!(
+                runtime.resolve(owner, ctrl('s'), now + Duration::from_millis(1)),
+                ShortcutResolution::Action(ShortcutInvocation::chord(expected)),
+                "{context:?}",
+            );
+        }
     }
 }

@@ -696,6 +696,40 @@ mod tests {
     }
 
     #[test]
+    fn every_documented_action_id_is_accepted_independently_of_default_bindings() {
+        for action in crate::shortcuts::configurable_actions() {
+            let id = action
+                .configurable_id()
+                .expect("registry contains configurable actions only");
+            let sequences = if id == "global.cancel" {
+                r#"["ctrl+c"]"#
+            } else {
+                "[]"
+            };
+            let source = format!(r#"{{"version":1,"bindings":{{"{id}":{sequences}}}}}"#);
+            parse_keymap(source.as_bytes())
+                .unwrap_or_else(|error| panic!("{id} must parse: {error}"));
+        }
+    }
+
+    #[test]
+    fn idle_scroll_actions_parse_and_resolve_as_chords() {
+        let keymap = parse_keymap(
+            br#"{
+                "version": 1,
+                "bindings": {
+                    "idle.scroll-up": ["ctrl+x ctrl+r"],
+                    "idle.scroll-down": ["ctrl+x ctrl+t"]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(keymap.has_action(ShortcutAction::Idle(IdleShortcut::ScrollUp)));
+        assert!(keymap.has_action(ShortcutAction::Idle(IdleShortcut::ScrollDown)));
+    }
+
+    #[test]
     fn validates_conflicts_prefixes_and_reserved_strokes() {
         for (source, expected) in [
             (

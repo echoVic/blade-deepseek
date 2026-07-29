@@ -388,6 +388,47 @@ pub(crate) fn configurable_legacy_bindings() -> impl Iterator<Item = LegacyBindi
         )
 }
 
+const CONFIGURABLE_ACTIONS: &[ShortcutAction] = &[
+    ShortcutAction::Global(GlobalShortcut::Cancel),
+    ShortcutAction::Global(GlobalShortcut::OpenTranscriptSearch),
+    ShortcutAction::Global(GlobalShortcut::ToggleShortcuts),
+    ShortcutAction::Global(GlobalShortcut::ScrollBottom),
+    ShortcutAction::Global(GlobalShortcut::ScrollTop),
+    ShortcutAction::Global(GlobalShortcut::ClearScreen),
+    ShortcutAction::Idle(IdleShortcut::Submit),
+    ShortcutAction::Idle(IdleShortcut::Newline),
+    ShortcutAction::Idle(IdleShortcut::EditLatestQueued),
+    ShortcutAction::Idle(IdleShortcut::HistoryPrevious),
+    ShortcutAction::Idle(IdleShortcut::HistoryNext),
+    ShortcutAction::Idle(IdleShortcut::ScrollUp),
+    ShortcutAction::Idle(IdleShortcut::ScrollDown),
+    ShortcutAction::Idle(IdleShortcut::PageUp),
+    ShortcutAction::Idle(IdleShortcut::PageDown),
+    ShortcutAction::Idle(IdleShortcut::HalfPageUp),
+    ShortcutAction::Idle(IdleShortcut::HalfPageDown),
+    ShortcutAction::Idle(IdleShortcut::Backtrack),
+    ShortcutAction::Idle(IdleShortcut::ExpandToolOutput),
+    ShortcutAction::Running(RunningShortcut::BackgroundCurrentTurn),
+    ShortcutAction::Running(RunningShortcut::Interrupt),
+    ShortcutAction::Running(RunningShortcut::SubmitQueued),
+    ShortcutAction::Running(RunningShortcut::Newline),
+    ShortcutAction::Running(RunningShortcut::EditLatestQueued),
+    ShortcutAction::Running(RunningShortcut::ScrollUp),
+    ShortcutAction::Running(RunningShortcut::ScrollDown),
+    ShortcutAction::Running(RunningShortcut::PageUp),
+    ShortcutAction::Running(RunningShortcut::PageDown),
+    ShortcutAction::Running(RunningShortcut::HalfPageUp),
+    ShortcutAction::Running(RunningShortcut::HalfPageDown),
+    ShortcutAction::Approval(ApprovalShortcut::SelectAllow),
+    ShortcutAction::Approval(ApprovalShortcut::SelectDeny),
+    ShortcutAction::Approval(ApprovalShortcut::ToggleSelection),
+    ShortcutAction::Approval(ApprovalShortcut::Confirm),
+];
+
+pub(crate) fn configurable_actions() -> impl Iterator<Item = ShortcutAction> {
+    CONFIGURABLE_ACTIONS.iter().copied()
+}
+
 impl ShortcutAction {
     pub(crate) const fn configurable_id(self) -> Option<&'static str> {
         Some(match self {
@@ -442,9 +483,7 @@ impl ShortcutAction {
 }
 
 pub(crate) fn action_for_id(id: &str) -> Option<ShortcutAction> {
-    configurable_legacy_bindings()
-        .map(|binding| binding.action)
-        .find(|action| action.configurable_id() == Some(id))
+    configurable_actions().find(|action| action.configurable_id() == Some(id))
 }
 
 pub fn resolve_shortcut(context: ShortcutContext, event: KeyEvent) -> Option<ShortcutAction> {
