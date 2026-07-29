@@ -385,7 +385,6 @@ mod windows {
 
     struct ProcessAttributeList {
         buffer: Vec<u8>,
-        pseudo_console: Option<Box<HPCON>>,
         jobs: Vec<HANDLE>,
     }
 
@@ -412,7 +411,6 @@ mod windows {
             }
             Ok(Self {
                 buffer,
-                pseudo_console: None,
                 jobs: Vec::new(),
             })
         }
@@ -422,18 +420,12 @@ mod windows {
         }
 
         fn set_pseudo_console(&mut self, pseudo_console: HPCON) -> io::Result<()> {
-            self.pseudo_console = Some(Box::new(pseudo_console));
-            let value = self
-                .pseudo_console
-                .as_ref()
-                .map(|handle| (&**handle as *const HPCON).cast())
-                .expect("pseudo console handle");
             if unsafe {
                 UpdateProcThreadAttribute(
                     self.as_mut_ptr(),
                     0,
                     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                    value,
+                    pseudo_console as *const std::ffi::c_void,
                     std::mem::size_of::<HPCON>(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
