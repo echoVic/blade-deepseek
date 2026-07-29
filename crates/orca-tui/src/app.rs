@@ -34,7 +34,9 @@ use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{
     make_setup_textarea, make_textarea, textarea_cursor_byte_index, textarea_text,
 };
-use crate::diagnostics::KeybindingsDiagnostic;
+use crate::diagnostics::{
+    DiagnosticSnapshot, KeybindingsDiagnostic, KeybindingsLocation, SnapshotInput,
+};
 use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
 use crate::hosted_runtime::{TuiHostedEventObserver, TuiHostedOperationOutcome};
 use crate::input_event_actions::{
@@ -60,6 +62,7 @@ use crate::runtime_interaction_adapter::{
 use crate::status_key_actions::handle_status_key;
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key_dynamic};
 use crate::submitted_turn::SubmittedTurn;
+use crate::terminal_capabilities::{TerminalProfile, resolve_base_theme};
 use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
@@ -199,13 +202,13 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         theme: config.theme,
         focus_events: config.terminal_notifications,
     })?;
-    let theme = Theme::resolve(config.theme, pending_input_runtime.profile());
+    let terminal_identity = qwertty::caps::identity_from_env(None, qwertty::caps::std_env_source);
+    let terminal_profile = pending_input_runtime.profile();
+    let presentation_profile = TerminalPresentationProfile::from_identity(&terminal_identity);
+    let theme = Theme::resolve(config.theme, terminal_profile);
     let input_rx = pending_input_runtime.events().clone();
     let focus_rx = pending_input_runtime.focus_events().clone();
     let input_control_rx = pending_input_runtime.controls().clone();
-    let presentation_profile = TerminalPresentationProfile::from_identity(
-        &qwertty::caps::identity_from_env(None, qwertty::caps::std_env_source),
-    );
     let presentation =
         TerminalPresentation::new(config.terminal_notifications, presentation_profile);
 
@@ -254,8 +257,13 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let mut keymap_runtime = KeymapRuntime::new(Arc::clone(&state.keymap));
     let keybindings_location = keybindings_location();
     state.keybindings_diagnostic = KeybindingsDiagnostic::built_ins(keymap_runtime.generation());
-    state.diagnostics =
-        std::mem::take(&mut state.diagnostics).with_keybindings_location(keybindings_location);
+    state.diagnostics = diagnostic_snapshot_for_startup(
+        &config,
+        &terminal_identity,
+        terminal_profile,
+        presentation_profile,
+        keybindings_location,
+    );
     let mut keymap_reloader = crate::keybindings::keybindings_path()
         .map(|path| KeymapReloader::start(path, Instant::now()));
     if let Some(reloader) = &mut keymap_reloader {
@@ -365,6 +373,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
     let mut vim_state =
         VimState::with_insert_escape(config.vim_mode, config.vim_insert_escape.clone());
+    state.sync_vim_mode(&vim_state);
     let mut textarea = if needs_setup {
         make_setup_textarea(&theme)
     } else {
@@ -398,9 +407,16 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                     Ok(())
                 },
                 |terminal| {
-                    terminal
-                        .draw(|f| ui::render(f, &mut state, &textarea, &theme))
-                        .map(|_| ())
+                    let (_, started_at, completed_at) =
+                        measure_successful_draw(Instant::now, || {
+                            terminal
+                                .draw(|f| ui::render(f, &mut state, &textarea, &theme))
+                                .map(|_| ())
+                        })?;
+                    state
+                        .frame_metrics
+                        .record_successful_draw(started_at, completed_at);
+                    Ok(())
                 },
             )?;
             let started_at = Instant::now();
@@ -414,7 +430,13 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                     reloader.request_reload(now);
                     if let Some(observation) = reloader.try_recv() {
                         match keymap_runtime.apply_observation(observation) {
-                            ReloadOutcome::Unchanged => {}
+                            ReloadOutcome::Unchanged => {
+                                if !keymap_runtime.last_observation_rejected() {
+                                    state
+                                        .keybindings_diagnostic
+                                        .accepted_unchanged(keymap_runtime.generation());
+                                }
+                            }
                             ReloadOutcome::Applied => {
                                 state
                                     .keybindings_diagnostic
@@ -459,6 +481,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                 // from the screen), and the edge drag so scrolling continues while the
                 // pointer sits still on the transcript's first/last row.
                 let animation_active = state.status == AppStatus::Running
+                    || state.fps_hud_enabled
                     || state.copy_notice.is_some()
                     || state.drag_edge_scroll.is_some()
                     || edit_highlight_animation_active(&state)
@@ -490,6 +513,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         .collect(),
                     Ok(InputWake::Suspend { acknowledge }) => {
                         keymap_runtime.clear_for_suspend();
+                        state.frame_metrics.reset_rolling();
                         acknowledge.send(()).map_err(|_| {
                             io::Error::new(
                                 io::ErrorKind::BrokenPipe,
@@ -546,6 +570,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                     handle_scroll_lines(&mut state, lines, Instant::now());
                                 }
                                 BatchedInputEvent::Event(ev) => {
+                                    state.sync_vim_mode(&vim_state);
                                     if consume_focus_event(&ev, presentation) {
                                         keymap_runtime.clear_for_non_key();
                                         return Ok(None);
@@ -714,6 +739,10 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         Ok(None)
                     },
                 )?;
+                state
+                    .frame_metrics
+                    .record_iteration(iteration.input_events, iteration.runtime_events);
+                state.sync_vim_mode(&vim_state);
                 let mention_enabled = MentionSearchManager::is_enabled(&state);
                 mention_search
                     .set_roots(mention_search_roots(&config, &workspace_root), &mut state);
@@ -740,7 +769,15 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                 let _ =
                     presentation.write_pending(terminal.backend_mut().inner_mut(), state.status);
                 if let Some(draw_at) = iteration.draw_at {
-                    terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
+                    let (_, started_at, completed_at) =
+                        measure_successful_draw(Instant::now, || {
+                            terminal
+                                .draw(|f| ui::render(f, &mut state, &textarea, &theme))
+                                .map(|_| ())
+                        })?;
+                    state
+                        .frame_metrics
+                        .record_successful_draw(started_at, completed_at);
                     scheduler.did_draw(draw_at);
                 }
             };
@@ -763,6 +800,42 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     agent_runtime.shutdown()?;
 
     Ok(exit_code)
+}
+
+fn diagnostic_snapshot_for_startup(
+    config: &RunConfig,
+    terminal_identity: &qwertty::TerminalIdentity,
+    terminal_profile: TerminalProfile,
+    presentation_profile: TerminalPresentationProfile,
+    keybindings_location: KeybindingsLocation,
+) -> DiagnosticSnapshot {
+    DiagnosticSnapshot::new(SnapshotInput {
+        app_version: &config.app_version,
+        terminal_identity,
+        terminal_profile,
+        presentation_profile,
+        requested_theme: config.theme,
+        resolved_theme: resolve_base_theme(config.theme, terminal_profile.background),
+        terminal_notifications: config.terminal_notifications,
+        desktop_notifications: config.desktop_notifications,
+        focus_events_requested: config.terminal_notifications,
+        vim_mode: config.vim_mode,
+        keybindings_location,
+    })
+}
+
+fn measure_successful_draw<T, F, Clock>(
+    mut now: Clock,
+    draw: F,
+) -> io::Result<(T, Instant, Instant)>
+where
+    F: FnOnce() -> io::Result<T>,
+    Clock: FnMut() -> Instant,
+{
+    let started_at = now();
+    let value = draw()?;
+    let completed_at = now();
+    Ok((value, started_at, completed_at))
 }
 
 fn resume_terminal_render(
@@ -1150,6 +1223,180 @@ mod tests {
     use crate::types::{ApprovalOption, PendingTuiInput, SlashMenu, SlashMenuItem, SubMenu};
     use crate::types::{TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
     use crate::workflow_notifications::drain_pending_workflow_notifications;
+
+    fn production_app_source() -> &'static str {
+        include_str!("app.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production app source")
+    }
+
+    #[test]
+    fn startup_captures_one_identity_for_presentation_and_diagnostics() {
+        let production = production_app_source();
+        assert_eq!(
+            production
+                .matches("qwertty::caps::identity_from_env(")
+                .count(),
+            1,
+        );
+        let identity = production.find("let terminal_identity =").unwrap();
+        let presentation = production
+            .find("TerminalPresentationProfile::from_identity(&terminal_identity)")
+            .unwrap();
+        let diagnostics = production.find("DiagnosticSnapshot::new(").unwrap();
+        assert!(identity < presentation && identity < diagnostics);
+    }
+
+    #[test]
+    fn production_diagnostics_use_effective_profile_without_reprobe() {
+        let production = production_app_source();
+        assert_eq!(production.matches("InputRuntime::start").count(), 1);
+        assert!(!production.contains("probe_capabilities("));
+        assert!(!production.contains("probe_background("));
+    }
+
+    #[test]
+    fn startup_snapshot_projects_effective_profile_and_orca_home_location() {
+        use crate::diagnostics::KeybindingsLocation;
+        use crate::terminal_capabilities::{
+            TerminalBackground, TerminalColorLevel, TerminalProfile,
+        };
+
+        let identity = qwertty::caps::identity_from_env(None, |key| match key {
+            "TERM_PROGRAM" => Some("ghostty".to_string()),
+            "TMUX" => Some("session".to_string()),
+            _ => None,
+        });
+        let snapshot = diagnostic_snapshot_for_startup(
+            &test_config(HistoryMode::Disabled),
+            &identity,
+            TerminalProfile {
+                background: TerminalBackground::Dark,
+                color_level: TerminalColorLevel::Ansi256,
+            },
+            TerminalPresentationProfile::from_identity(&identity),
+            KeybindingsLocation::OrcaHome,
+        );
+
+        assert_eq!(snapshot.terminal_program(), "Ghostty");
+        assert_eq!(snapshot.multiplexers(), ["tmux"]);
+        assert_eq!(snapshot.color_level(), TerminalColorLevel::Ansi256);
+        assert_eq!(snapshot.requested_theme(), ThemeName::Dark);
+        assert_eq!(snapshot.resolved_theme(), ThemeName::Dark);
+        assert_eq!(
+            snapshot.keybindings_location(),
+            KeybindingsLocation::OrcaHome,
+        );
+    }
+
+    #[test]
+    fn doctor_vim_projection_tracks_real_mode_transitions() {
+        use crate::vim::VimMode;
+
+        let theme = Theme::named(ThemeName::Dark);
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+
+        let disabled = VimState::new(false);
+        state.sync_vim_mode(&disabled);
+        assert_eq!(state.vim_mode, None);
+
+        let mut vim = VimState::new(true);
+        let mut textarea = make_textarea_with_text("word", &vim, &theme);
+        state.sync_vim_mode(&vim);
+        assert_eq!(state.vim_mode, Some(VimMode::Normal));
+
+        for (key, expected) in [
+            (KeyCode::Char('i'), VimMode::Insert),
+            (KeyCode::Esc, VimMode::Normal),
+            (KeyCode::Char('v'), VimMode::Visual),
+            (KeyCode::Esc, VimMode::Normal),
+        ] {
+            let event = Event::Key(KeyEvent::new(key, KeyModifiers::NONE));
+            vim.handle(Input::from(event), &mut textarea, &theme);
+            state.sync_vim_mode(&vim);
+            assert_eq!(state.vim_mode, Some(expected));
+        }
+    }
+
+    #[test]
+    fn vim_projection_sync_is_owned_by_app_not_leaf_handlers() {
+        let app = production_app_source();
+        assert!(app.contains("state.sync_vim_mode(&vim_state)"));
+        for source in [
+            include_str!("slash_command_actions.rs"),
+            include_str!("idle_key_actions.rs"),
+            include_str!("queued_input_actions.rs"),
+            include_str!("mention_menu_actions.rs"),
+            include_str!("slash_menu_actions.rs"),
+        ] {
+            assert!(!source.contains("sync_vim_mode("));
+        }
+    }
+
+    #[test]
+    fn successful_draw_records_once_and_failed_draw_records_nothing() {
+        use std::collections::VecDeque;
+
+        let start = Instant::now();
+        let mut metrics = crate::diagnostics::FrameMetrics::default();
+        let mut times = VecDeque::from([
+            start,
+            start + Duration::from_millis(3),
+            start + Duration::from_millis(10),
+            start + Duration::from_millis(11),
+        ]);
+        let (_, started, completed) =
+            measure_successful_draw(|| times.pop_front().unwrap(), || Ok(())).unwrap();
+        metrics.record_successful_draw(started, completed);
+        measure_successful_draw(
+            || times.pop_front().unwrap(),
+            || Err::<(), _>(io::Error::other("draw failed")),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            metrics
+                .snapshot(start + Duration::from_millis(11))
+                .total_draws,
+            1,
+        );
+    }
+
+    #[test]
+    fn production_draws_and_iteration_counts_are_recorded_once() {
+        let source = production_app_source();
+        assert_eq!(source.matches("measure_successful_draw(").count(), 2);
+        assert_eq!(source.matches(".record_successful_draw(").count(), 2);
+        assert_eq!(source.matches(".record_iteration(").count(), 1);
+    }
+
+    #[test]
+    fn doctor_suspend_resets_rolling_before_acknowledgement() {
+        let source = production_app_source();
+        let suspend = source.find("InputWake::Suspend").unwrap();
+        let reset = source[suspend..]
+            .find("frame_metrics.reset_rolling()")
+            .unwrap();
+        let acknowledge = source[suspend..].find("acknowledge.send").unwrap();
+        assert!(reset < acknowledge);
+    }
+
+    #[test]
+    fn fps_hud_controls_animation_without_changing_frame_interval() {
+        let source = production_app_source();
+        let animation = source.find("let animation_active =").unwrap();
+        let receive = source.find("receive_prioritized_input_or_control").unwrap();
+        assert!(source[animation..receive].contains("state.fps_hud_enabled"));
+        assert_eq!(source.matches("const FRAME_INTERVAL:").count(), 1);
+        assert!(source.contains("Duration::from_millis(16)"));
+    }
 
     #[test]
     fn doctor_keybindings_projection_is_wired_to_reload_outcomes() {

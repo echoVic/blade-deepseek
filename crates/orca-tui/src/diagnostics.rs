@@ -123,9 +123,16 @@ impl DiagnosticSnapshot {
         self.keybindings_location
     }
 
-    pub(crate) fn with_keybindings_location(mut self, location: KeybindingsLocation) -> Self {
-        self.keybindings_location = location;
-        self
+    pub(crate) const fn color_level(&self) -> TerminalColorLevel {
+        self.color_level
+    }
+
+    pub(crate) const fn requested_theme(&self) -> ThemeName {
+        self.requested_theme
+    }
+
+    pub(crate) const fn resolved_theme(&self) -> ThemeName {
+        self.resolved_theme
     }
 }
 
@@ -274,6 +281,11 @@ impl KeybindingsDiagnostic {
     pub(crate) fn rejected(&mut self, generation: u64) {
         self.generation = generation;
         self.reload = KeybindingsReload::Rejected;
+    }
+
+    pub(crate) fn accepted_unchanged(&mut self, generation: u64) {
+        self.generation = generation;
+        self.reload = KeybindingsReload::Ok;
     }
 }
 
@@ -752,6 +764,28 @@ mod tests {
     }
 
     #[test]
+    fn first_draw_after_suspend_restarts_rolling_samples_and_keeps_lifetime_counters() {
+        let start = Instant::now();
+        let mut metrics = super::FrameMetrics::default();
+        metrics.record_successful_draw(start, start + Duration::from_millis(2));
+        metrics.record_iteration(3, 4);
+        metrics.reset_rolling();
+        metrics.record_successful_draw(
+            start + Duration::from_secs(1),
+            start + Duration::from_secs(1) + Duration::from_millis(5),
+        );
+
+        let snapshot = metrics.snapshot(start + Duration::from_secs(1) + Duration::from_millis(5));
+        assert_eq!(snapshot.fps, 0.0);
+        assert_eq!(snapshot.render_ms, 5.0);
+        assert_eq!(snapshot.p95_ms, 5.0);
+        assert_eq!(snapshot.total_draws, 2);
+        assert_eq!(snapshot.input_events, 3);
+        assert_eq!(snapshot.runtime_events, 4);
+        assert_eq!(metrics.sample_lengths_for_test(), (1, 1));
+    }
+
+    #[test]
     fn doctor_report_has_fixed_safe_line_order_and_bounded_size() {
         let report = format_doctor_report(
             &known_snapshot(),
@@ -899,6 +933,18 @@ mod tests {
                 reload: KeybindingsReload::Restored,
             },
         );
+    }
+
+    #[test]
+    fn accepted_unchanged_reload_clears_rejected_without_changing_active_state() {
+        let mut diagnostic = KeybindingsDiagnostic::built_ins(0);
+        diagnostic.applied_custom(1);
+        diagnostic.rejected(1);
+        diagnostic.accepted_unchanged(1);
+
+        assert_eq!(diagnostic.active, KeybindingsActive::Custom);
+        assert_eq!(diagnostic.generation, 1);
+        assert_eq!(diagnostic.reload, KeybindingsReload::Ok);
     }
 
     #[test]

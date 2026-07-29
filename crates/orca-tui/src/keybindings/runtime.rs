@@ -326,6 +326,10 @@ impl KeymapRuntime {
         self.generation
     }
 
+    pub(crate) fn last_observation_rejected(&self) -> bool {
+        matches!(self.last_observation, Some(FileObservation::Rejected(_)))
+    }
+
     pub(crate) fn keymap(&self) -> Arc<Keymap> {
         Arc::clone(&self.keymap)
     }
@@ -382,7 +386,8 @@ mod tests {
     use crate::vim::VimMode;
 
     use super::{
-        InputOwnerFingerprint, KeymapRuntime, ModalOwner, ShortcutInvocation, ShortcutResolution,
+        FileObservation, InputOwnerFingerprint, KeymapRuntime, ModalOwner, ReloadOutcome,
+        ShortcutInvocation, ShortcutResolution,
     };
 
     fn ctrl(character: char) -> KeyEvent {
@@ -587,6 +592,27 @@ mod tests {
 
         assert!(!runtime.has_pending_chord());
         assert_eq!(runtime.generation(), generation + 1);
+    }
+
+    #[test]
+    fn unchanged_reload_exposes_whether_the_observation_is_still_rejected() {
+        let mut runtime = KeymapRuntime::new(crate::keybindings::config::Keymap::built_in());
+        let rejected = FileObservation::Rejected("bad config".to_string());
+        assert!(matches!(
+            runtime.apply_observation(rejected.clone()),
+            ReloadOutcome::Rejected(_),
+        ));
+        assert!(matches!(
+            runtime.apply_observation(rejected),
+            ReloadOutcome::Unchanged,
+        ));
+        assert!(runtime.last_observation_rejected());
+
+        assert_eq!(
+            runtime.apply_observation(FileObservation::Missing),
+            ReloadOutcome::Unchanged,
+        );
+        assert!(!runtime.last_observation_rejected());
     }
 
     #[test]

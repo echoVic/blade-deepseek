@@ -35,7 +35,7 @@ use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::TranscriptRenderCache;
 #[cfg(test)]
 use crate::transcript_view::TranscriptRenderContext;
-use crate::vim::VimMode;
+use crate::vim::{VimMode, VimState};
 use crate::workspace_status::GitIdentity;
 
 const SUBAGENT_ACTIVITY_TAIL_LIMIT: usize = 6;
@@ -996,6 +996,10 @@ impl AppState {
     pub(crate) fn toggle_fps_hud(&mut self) -> bool {
         self.fps_hud_enabled = !self.fps_hud_enabled;
         self.fps_hud_enabled
+    }
+
+    pub(crate) fn sync_vim_mode(&mut self, vim_state: &VimState) {
+        self.vim_mode = vim_state.enabled.then_some(vim_state.mode);
     }
 
     pub(crate) fn configure_syntax_highlighting(
