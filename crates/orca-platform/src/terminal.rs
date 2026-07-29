@@ -16,7 +16,7 @@ mod windows {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
-        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
         DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
         InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
         PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread, STARTUPINFOEXW,
@@ -175,10 +175,7 @@ mod windows {
         let mut environment = environment_block(command);
         let cwd = command.get_current_dir().map(wide_path);
         let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        let flags = CREATE_UNICODE_ENVIRONMENT
-            | CREATE_SUSPENDED
-            | CREATE_NO_WINDOW
-            | EXTENDED_STARTUPINFO_PRESENT;
+        let flags = CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT;
         // Keep the primary thread suspended until the process-tree owner has
         // accepted it; otherwise a fast shell can launch an unowned child.
         if unsafe {

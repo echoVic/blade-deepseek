@@ -89,7 +89,7 @@ impl SandboxedChild {
             },
             lpAttributeList: attributes.as_mut_ptr(),
         };
-        let process = spawn_suspended(&request, restricted.as_ref(), &startup, true)?;
+        let process = spawn_suspended(&request, restricted.as_ref(), &startup, true, false)?;
         pipes.close_child_ends();
         Ok(Self {
             process,
@@ -163,7 +163,7 @@ impl SandboxedPty {
             },
             lpAttributeList: attributes.as_mut_ptr(),
         };
-        let process = spawn_suspended(&request, restricted.as_ref(), &startup, false)?;
+        let process = spawn_suspended(&request, restricted.as_ref(), &startup, false, true)?;
         let (input, output) = pty.into_io();
         Ok(Self {
             process,
@@ -320,15 +320,16 @@ fn spawn_suspended(
     restricted: Option<&PreparedSecurity>,
     startup: &STARTUPINFOEXW,
     inherit_handles: bool,
+    use_pseudo_console: bool,
 ) -> Result<SandboxedProcess, WindowsSandboxError> {
     let mut command_line = command_line(request.program, request.args);
     let mut environment = environment_block(request.env);
     let cwd = wide_path(request.cwd);
     let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    let flags = CREATE_UNICODE_ENVIRONMENT
-        | CREATE_SUSPENDED
-        | CREATE_NO_WINDOW
-        | EXTENDED_STARTUPINFO_PRESENT;
+    let mut flags = CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT;
+    if !use_pseudo_console {
+        flags |= CREATE_NO_WINDOW;
+    }
     let created = if let Some(restricted) = restricted {
         unsafe {
             CreateProcessAsUserW(
