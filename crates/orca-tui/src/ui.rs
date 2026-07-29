@@ -18,6 +18,7 @@ use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
 use orca_file_search::SearchPhase;
 use orca_runtime::history::SessionSummary;
 
+use crate::diagnostics::FpsHudSnapshot;
 use crate::display_text::{compact_long_text, truncate_to_display_width};
 use crate::selection::{TranscriptSelection, apply_style_to_line_range};
 use crate::shortcuts::{self, ShortcutScope};
@@ -42,12 +43,12 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     state.search_area = None;
     if state.status == AppStatus::Setup {
         let hardware_cursor = render_setup(frame, state, textarea, theme);
-        finish_frame(frame, hardware_cursor);
+        finish_frame(frame, state, theme, hardware_cursor);
         return;
     }
     if state.status == AppStatus::SessionPicker {
         render_session_picker(frame, state, theme);
-        finish_frame(frame, None);
+        finish_frame(frame, state, theme, None);
         return;
     }
 
@@ -142,7 +143,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     if state.show_shortcuts {
         render_shortcuts(frame, state, theme);
     }
-    finish_frame(frame, hardware_cursor);
+    finish_frame(frame, state, theme, hardware_cursor);
 }
 
 fn main_layout(
@@ -4244,7 +4245,69 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
     }
 }
 
-fn finish_frame(frame: &mut Frame, hardware_cursor: Option<HardwareCursorProjection>) {
+fn fps_hud_area(frame: Rect, text_width: usize, hardware_cursor: Option<Position>) -> Option<Rect> {
+    if frame.height < 2 || text_width == 0 {
+        return None;
+    }
+    let width = u16::try_from(text_width).ok()?;
+    if width > frame.width {
+        return None;
+    }
+    let top_right = Rect::new(frame.right() - width, frame.y, width, 1);
+    if !hardware_cursor.is_some_and(|cursor| top_right.contains(cursor)) {
+        return Some(top_right);
+    }
+    let top_left = Rect::new(frame.x, frame.y, width, 1);
+    (!hardware_cursor.is_some_and(|cursor| top_left.contains(cursor))).then_some(top_left)
+}
+
+fn fps_hud_style(theme: &Theme) -> Style {
+    theme.color_level.adapt_style(
+        Style::default()
+            .fg(theme.text)
+            .bg(theme.border)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn render_fps_hud(
+    frame: &mut Frame,
+    state: &AppState,
+    theme: &Theme,
+    hardware_cursor: Option<Position>,
+) {
+    if !state.fps_hud_enabled {
+        return;
+    }
+    let snapshot: FpsHudSnapshot = state.frame_metrics.snapshot(std::time::Instant::now());
+    let text = snapshot.hud_text();
+    let Some(area) = fps_hud_area(
+        frame.area(),
+        UnicodeWidthStr::width(text.as_str()),
+        hardware_cursor,
+    ) else {
+        return;
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(text).style(fps_hud_style(theme)), area);
+}
+
+fn finish_frame(
+    frame: &mut Frame,
+    state: &AppState,
+    theme: &Theme,
+    hardware_cursor: Option<HardwareCursorProjection>,
+) {
+    render_fps_hud(
+        frame,
+        state,
+        theme,
+        hardware_cursor.map(|cursor| cursor.position),
+    );
+    apply_hardware_cursor(frame, hardware_cursor);
+}
+
+fn apply_hardware_cursor(frame: &mut Frame, hardware_cursor: Option<HardwareCursorProjection>) {
     if let Some(cursor) = hardware_cursor {
         frame.set_cursor_position(cursor.position);
     }
@@ -4276,6 +4339,129 @@ mod tests {
         let cursor = production.find("frame.set_cursor_position(").unwrap();
         assert!(cursor > render_start);
         assert!(!production[cursor..].contains("frame.render_widget("));
+    }
+
+    #[test]
+    fn fps_hud_uses_top_right_then_top_left_and_hides_on_double_collision() {
+        let frame = Rect::new(5, 7, 80, 20);
+        let text_width = UnicodeWidthStr::width(" FPS 59.8 · 2.3ms · p95 4.1ms ");
+        let top_right = fps_hud_area(frame, text_width, None).unwrap();
+        assert_eq!(top_right.right(), frame.right());
+
+        let right_cursor = Position::new(top_right.x, top_right.y);
+        let top_left = fps_hud_area(frame, text_width, Some(right_cursor)).unwrap();
+        assert_eq!(top_left.x, frame.x);
+
+        let overlapping_width = 50;
+        let overlap_cursor = Position::new(frame.x + 40, frame.y);
+        assert_eq!(
+            fps_hud_area(frame, overlapping_width, Some(overlap_cursor)),
+            None,
+        );
+    }
+
+    #[test]
+    fn fps_hud_geometry_obeys_display_width_and_compact_bounds() {
+        let frame = Rect::new(5, 7, 20, 2);
+        assert_eq!(fps_hud_area(frame, 21, None), None);
+        assert_eq!(fps_hud_area(Rect::new(5, 7, 20, 1), 20, None), None);
+        assert_eq!(fps_hud_area(frame, 20, None), Some(Rect::new(5, 7, 20, 1)),);
+        let unicode = " FPS 60 · 你好 ";
+        assert_eq!(
+            fps_hud_area(frame, UnicodeWidthStr::width(unicode), None)
+                .unwrap()
+                .width,
+            UnicodeWidthStr::width(unicode) as u16,
+        );
+    }
+
+    #[test]
+    fn fps_hud_styles_fit_every_terminal_color_level() {
+        use crate::terminal_capabilities::{
+            TerminalBackground, TerminalColorLevel, TerminalProfile,
+        };
+
+        for color_level in [
+            TerminalColorLevel::TrueColor,
+            TerminalColorLevel::Ansi256,
+            TerminalColorLevel::Ansi16,
+            TerminalColorLevel::Monochrome,
+        ] {
+            let theme = Theme::resolve(
+                ThemeName::Dark,
+                TerminalProfile {
+                    background: TerminalBackground::Dark,
+                    color_level,
+                },
+            );
+            let style = fps_hud_style(&theme);
+            assert_eq!(color_level.adapt_style(style), style, "{color_level:?}");
+        }
+    }
+
+    #[test]
+    fn disabled_hud_is_buffer_and_geometry_identical() {
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+        let mut baseline = test_state();
+        let mut disabled = test_state();
+        disabled.fps_hud_enabled = false;
+        let mut baseline_terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut disabled_terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+
+        baseline_terminal
+            .draw(|frame| render(frame, &mut baseline, &textarea, &theme))
+            .unwrap();
+        disabled_terminal
+            .draw(|frame| render(frame, &mut disabled, &textarea, &theme))
+            .unwrap();
+
+        assert_eq!(
+            baseline_terminal.backend().buffer(),
+            disabled_terminal.backend().buffer(),
+        );
+        assert_eq!(
+            baseline_terminal.get_cursor_position().unwrap(),
+            disabled_terminal.get_cursor_position().unwrap(),
+        );
+        assert_eq!(baseline.frame_area, disabled.frame_area);
+        assert_eq!(baseline.transcript_area, disabled.transcript_area);
+        assert_eq!(baseline.input_area, disabled.input_area);
+        assert_eq!(baseline.search_area, disabled.search_area);
+        assert_eq!(baseline.jump_to_bottom_area, disabled.jump_to_bottom_area);
+    }
+
+    #[test]
+    fn enabled_fps_hud_overlays_top_row_and_preserves_composer_cursor() {
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+        let mut baseline = test_state();
+        let mut state = test_state();
+        state.fps_hud_enabled = true;
+        let mut baseline_terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+
+        baseline_terminal
+            .draw(|frame| render(frame, &mut baseline, &textarea, &theme))
+            .unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+
+        let top_row = (0..80)
+            .map(|column| terminal.backend().buffer()[(column, 0)].symbol())
+            .collect::<String>();
+        assert!(top_row.contains("FPS 0.0"), "{top_row:?}");
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            baseline_terminal.get_cursor_position().unwrap(),
+        );
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7789,7 +7975,7 @@ mod tests {
                     &theme,
                     true,
                 );
-                finish_frame(frame, hardware_cursor);
+                apply_hardware_cursor(frame, hardware_cursor);
             })
             .unwrap();
         assert_eq!(
@@ -7808,7 +7994,7 @@ mod tests {
                     &theme,
                     true,
                 );
-                finish_frame(frame, hardware_cursor);
+                apply_hardware_cursor(frame, hardware_cursor);
             })
             .unwrap();
 
@@ -7844,7 +8030,7 @@ mod tests {
                     &theme,
                     true,
                 );
-                finish_frame(frame, hardware_cursor);
+                apply_hardware_cursor(frame, hardware_cursor);
             })
             .unwrap();
 
@@ -8490,7 +8676,7 @@ mod tests {
                     &theme,
                     false,
                 );
-                finish_frame(frame, hardware_cursor);
+                apply_hardware_cursor(frame, hardware_cursor);
             })
             .expect("draw");
 

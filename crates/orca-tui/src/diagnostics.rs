@@ -192,6 +192,15 @@ pub(crate) struct FpsHudSnapshot {
     pub(crate) runtime_events: u64,
 }
 
+impl FpsHudSnapshot {
+    pub(crate) fn hud_text(self) -> String {
+        format!(
+            " FPS {:.1} · {:.1}ms · p95 {:.1}ms ",
+            self.fps, self.render_ms, self.p95_ms
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum KeybindingsActive {
     BuiltIns,
@@ -890,6 +899,19 @@ mod tests {
                 reload: KeybindingsReload::Restored,
             },
         );
+    }
+
+    #[test]
+    fn hud_text_is_stable_and_uses_render_duration() {
+        let text = FpsHudSnapshot {
+            fps: 59.84,
+            render_ms: 2.34,
+            p95_ms: 4.06,
+            ..Default::default()
+        }
+        .hud_text();
+
+        assert_eq!(text, " FPS 59.8 · 2.3ms · p95 4.1ms ");
     }
 
     #[test]
