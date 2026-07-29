@@ -10,6 +10,21 @@ pub struct ProcessJob {
 }
 
 impl ProcessJob {
+    /// Creates an unattached Windows Job Object for use with an atomic process
+    /// attribute list. The caller must include [`Self::raw_handle`] in
+    /// `PROC_THREAD_ATTRIBUTE_JOB_LIST` when it creates the process.
+    #[cfg(windows)]
+    pub fn create_unassigned(name: Option<&str>) -> io::Result<Self> {
+        Ok(Self {
+            platform: platform::ProcessJob::create(name)?,
+        })
+    }
+
+    #[cfg(windows)]
+    pub fn raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.platform.raw_handle()
+    }
+
     /// Spawns a child inside a new operating-system process-tree boundary.
     ///
     /// On Windows the child is created suspended, assigned to a Job Object,
@@ -226,7 +241,7 @@ mod platform {
             Ok(job)
         }
 
-        fn create(name: Option<&str>) -> io::Result<Self> {
+        pub(super) fn create(name: Option<&str>) -> io::Result<Self> {
             if let Some(name) = name {
                 validate_name(name)?;
             }
@@ -257,6 +272,10 @@ mod platform {
                 return Err(io::Error::last_os_error());
             }
             Ok(Self { handle })
+        }
+
+        pub(super) fn raw_handle(&self) -> HANDLE {
+            self.handle
         }
 
         pub(super) fn open_named(name: &str) -> io::Result<Self> {

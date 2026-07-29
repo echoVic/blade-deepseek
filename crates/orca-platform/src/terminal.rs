@@ -8,24 +8,25 @@ mod windows {
     use std::process::Command;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, STILL_ACTIVE, SetHandleInformation,
-        WAIT_OBJECT_0,
+        CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, INVALID_HANDLE_VALUE, STILL_ACTIVE,
+        SetHandleInformation, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::System::Console::{COORD, HPCON};
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
-        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-        InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread, STARTUPINFOEXW,
-        STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
+        LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+        UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
     use crate::process::ProcessJob;
 
     const INFINITE: u32 = 0xffff_ffff;
+    const PROC_THREAD_ATTRIBUTE_JOB_LIST: usize = 0x0002_000d;
     const KERNEL32_DLL: &[u16] = &[
         b'k' as u16,
         b'e' as u16,
@@ -162,11 +163,17 @@ mod windows {
         job_name: Option<&str>,
     ) -> io::Result<SpawnedWindowsPty> {
         let pty = PtyPipeSet::new(cols, rows)?;
-        let mut attributes = ProcessAttributeList::new(1)?;
+        let process_job = ProcessJob::create_unassigned(job_name)?;
+        let mut attributes = ProcessAttributeList::new(2)?;
         attributes.set_pseudo_console(pty.console.raw())?;
+        attributes.set_job(process_job.raw_handle())?;
         let startup = STARTUPINFOEXW {
             StartupInfo: STARTUPINFOW {
                 cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
+                dwFlags: STARTF_USESTDHANDLES,
+                hStdInput: INVALID_HANDLE_VALUE,
+                hStdOutput: INVALID_HANDLE_VALUE,
+                hStdError: INVALID_HANDLE_VALUE,
                 ..unsafe { std::mem::zeroed() }
             },
             lpAttributeList: attributes.as_mut_ptr(),
@@ -175,9 +182,7 @@ mod windows {
         let mut environment = environment_block(command);
         let cwd = command.get_current_dir().map(wide_path);
         let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        let flags = CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT;
-        // Keep the primary thread suspended until the process-tree owner has
-        // accepted it; otherwise a fast shell can launch an unowned child.
+        let flags = CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
         if unsafe {
             CreateProcessW(
                 std::ptr::null(),
@@ -198,22 +203,6 @@ mod windows {
 
         let process = OwnedHandle::new(info.hProcess);
         let thread = OwnedHandle::new(info.hThread);
-        let process_job = match job_name {
-            Some(name) => ProcessJob::attach_named(info.dwProcessId, name),
-            None => ProcessJob::attach(info.dwProcessId),
-        };
-        let process_job = match process_job {
-            Ok(job) => job,
-            Err(error) => {
-                unsafe { TerminateProcess(process.raw(), 127) };
-                return Err(error);
-            }
-        };
-        if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
-            let error = io::Error::last_os_error();
-            let _ = process_job.terminate(127);
-            return Err(error);
-        }
         drop(thread);
         let (input, output) = pty.into_io();
         Ok(SpawnedWindowsPty {
@@ -397,6 +386,7 @@ mod windows {
     struct ProcessAttributeList {
         buffer: Vec<u8>,
         pseudo_console: Option<Box<HPCON>>,
+        jobs: Vec<HANDLE>,
     }
 
     impl ProcessAttributeList {
@@ -423,6 +413,7 @@ mod windows {
             Ok(Self {
                 buffer,
                 pseudo_console: None,
+                jobs: Vec::new(),
             })
         }
 
@@ -444,6 +435,28 @@ mod windows {
                     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
                     value,
                     std::mem::size_of::<HPCON>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn set_job(&mut self, job: HANDLE) -> io::Result<()> {
+            self.jobs = vec![job];
+            let value = self.jobs.as_ptr().cast();
+            let size = std::mem::size_of_val(self.jobs.as_slice());
+            if unsafe {
+                UpdateProcThreadAttribute(
+                    self.as_mut_ptr(),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                    value,
+                    size,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                 )
