@@ -415,14 +415,15 @@ impl PtyPipeSet {
                 return Err(error);
             }
         }
+        let console_input = OwnedHandle::new(console_input);
+        let console_output = OwnedHandle::new(console_output);
         let console = match PseudoConsole::new(console_input, console_output, cols, rows) {
             Ok(console) => console,
             Err(error) => {
-                close_handles([console_input, parent_input, parent_output, console_output]);
+                close_handles([parent_input, parent_output]);
                 return Err(error);
             }
         };
-        close_handles([console_input, console_output]);
         Ok(Self {
             console,
             input: unsafe { std::fs::File::from_raw_handle(parent_input) },
@@ -467,6 +468,8 @@ fn close_handles(handles: impl IntoIterator<Item = HANDLE>) {
 struct PseudoConsole {
     raw: HPCON,
     api: ConPtyApi,
+    _input: OwnedHandle,
+    _output: OwnedHandle,
 }
 
 // ConPTY handles are kernel-owned resources, and this value is transferred
@@ -476,20 +479,26 @@ unsafe impl Send for PseudoConsole {}
 
 impl PseudoConsole {
     fn new(
-        input: HANDLE,
-        output: HANDLE,
+        input: OwnedHandle,
+        output: OwnedHandle,
         cols: Option<u16>,
         rows: Option<u16>,
     ) -> io::Result<Self> {
         let api = conpty_api()?;
         let mut raw = 0;
-        let result = unsafe { (api.create)(pty_size(cols, rows), input, output, 0, &mut raw) };
+        let result =
+            unsafe { (api.create)(pty_size(cols, rows), input.raw(), output.raw(), 0, &mut raw) };
         if result < 0 {
             return Err(io::Error::other(format!(
                 "CreatePseudoConsole failed with HRESULT {result:#x}"
             )));
         }
-        Ok(Self { raw, api })
+        Ok(Self {
+            raw,
+            api,
+            _input: input,
+            _output: output,
+        })
     }
 
     fn raw(&self) -> HPCON {
@@ -947,7 +956,6 @@ mod tests {
         input.close();
         input.resize(120, 40).expect("resize after closing stdin");
         let status = child.wait().expect("wait");
-        std::thread::sleep(std::time::Duration::from_millis(200));
         input.close_terminal();
         let text = reader.join().expect("join ConPTY output reader");
         assert!(status.success(), "{text}");
@@ -1008,7 +1016,6 @@ mod tests {
         input.close();
         input.resize(120, 40).expect("resize after closing stdin");
         let status = child.wait().expect("wait");
-        std::thread::sleep(std::time::Duration::from_millis(200));
         input.close_terminal();
         let text = reader.join().expect("join ConPTY output reader");
         assert!(status.success(), "{text}");

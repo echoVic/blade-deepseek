@@ -247,10 +247,7 @@ mod windows {
                     return Err(io::Error::last_os_error());
                 }
             }
-            let console =
-                PseudoConsole::new(console_input.raw(), console_output.raw(), cols, rows)?;
-            drop(console_input);
-            drop(console_output);
+            let console = PseudoConsole::new(console_input, console_output, cols, rows)?;
             Ok(Self {
                 console,
                 input: unsafe { std::fs::File::from_raw_handle(parent_input.take()) },
@@ -287,24 +284,33 @@ mod windows {
     struct PseudoConsole {
         raw: HPCON,
         api: ConPtyApi,
+        _input: OwnedHandle,
+        _output: OwnedHandle,
     }
 
     impl PseudoConsole {
         fn new(
-            input: HANDLE,
-            output: HANDLE,
+            input: OwnedHandle,
+            output: OwnedHandle,
             cols: Option<u16>,
             rows: Option<u16>,
         ) -> io::Result<Self> {
             let api = conpty_api()?;
             let mut raw = 0;
-            let result = unsafe { (api.create)(pty_size(cols, rows), input, output, 0, &mut raw) };
+            let result = unsafe {
+                (api.create)(pty_size(cols, rows), input.raw(), output.raw(), 0, &mut raw)
+            };
             if result < 0 {
                 Err(io::Error::other(format!(
                     "CreatePseudoConsole failed with HRESULT {result:#x}"
                 )))
             } else {
-                Ok(Self { raw, api })
+                Ok(Self {
+                    raw,
+                    api,
+                    _input: input,
+                    _output: output,
+                })
             }
         }
 
