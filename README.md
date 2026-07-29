@@ -42,6 +42,21 @@ In the TUI, `@` searches files, skills, plugins, and MCP resources. Use
 `/workflows` for background work, and `/trust` to manage the current folder's
 sandbox permissions.
 
+### First-run onboarding
+
+When the TUI starts without an effective API key, first-run onboarding follows exactly seven steps:
+Welcome → Provider → API Key → Model → Theme → Review → Complete.
+DeepSeek is the only production provider; development-only providers are not
+shown. Model choices are `auto`,
+`deepseek-v4-flash`, and `deepseek-v4-pro`. Theme choices are Auto, Dark,
+Light, Solarized, and Catppuccin.
+
+Before Review, the API key is draft-only; pressing Esc at any earlier step
+exits with zero writes. Setup performs no network validation. Confirming Review
+writes the provider, model, and theme to `config.toml`, while the API key is
+stored separately in `auth.json`. If either save fails, the selected values
+remain applied to the current session. Complete reports only sanitized error categories.
+
 ### Doctor diagnostics
 
 `/doctor` emits one safe, copyable diagnostics report from facts already

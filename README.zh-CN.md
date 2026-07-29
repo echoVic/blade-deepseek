@@ -40,6 +40,18 @@ orca --mode=acp                           # 连接 ACP 客户端
 使用 `/plan` 进行只读规划，使用 `/goal` 管理持久目标，使用 `/workflows`
 查看后台任务，使用 `/trust` 管理当前目录的沙箱权限。
 
+### 首次启动设置
+
+当 TUI 启动时未检测到有效 API 密钥，首次启动设置固定经过七步：
+欢迎 → 服务商 → API 密钥 → 模型 → 主题 → 确认 → 完成。
+DeepSeek 是唯一的生产服务商，不会显示仅供开发使用的服务商。模型可选 `auto`、
+`deepseek-v4-flash`、`deepseek-v4-pro`；主题可选 Auto、Dark、Light、Solarized、
+Catppuccin。
+
+进入确认步骤前，API 密钥仅保存在草稿中；在之前任一步骤按 Esc 退出不会产生任何写入。
+设置期间不进行网络验证。确认后，服务商、模型和主题写入 `config.toml`，API 密钥
+单独写入 `auth.json`。任一保存失败时，所选值仍应用于当前会话。完成步骤仅显示不含敏感信息的错误类型。
+
 ### Doctor 诊断
 
 `/doctor` 会根据当前 TUI 会话已经捕获的事实，输出一份安全且便于复制的诊断报告。

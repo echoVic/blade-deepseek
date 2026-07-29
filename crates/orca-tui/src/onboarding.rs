@@ -516,6 +516,77 @@ mod tests {
         OnboardingState::new(ProviderKind::DeepSeek, "auto", ThemeName::Auto)
     }
 
+    fn markdown_heading_level(line: &str) -> Option<usize> {
+        let line = line.trim_end_matches(['\r', '\n']);
+        let level = line.bytes().take_while(|byte| *byte == b'#').count();
+        (level > 0 && level <= 6 && line.as_bytes().get(level) == Some(&b' ')).then_some(level)
+    }
+
+    fn markdown_fence(line: &str) -> Option<(u8, usize, &str)> {
+        let line = line.trim_end_matches(['\r', '\n']);
+        let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+        if indent > 3 {
+            return None;
+        }
+        let content = &line[indent..];
+        let marker = *content.as_bytes().first()?;
+        if !matches!(marker, b'`' | b'~') {
+            return None;
+        }
+        let length = content.bytes().take_while(|byte| *byte == marker).count();
+        (length >= 3).then_some((marker, length, &content[length..]))
+    }
+
+    fn markdown_section<'a>(readme: &'a str, heading: &str) -> Result<&'a str, &'static str> {
+        let target_level = markdown_heading_level(heading).ok_or("invalid heading")?;
+        let mut fence = None;
+        let mut offset = 0;
+        let mut start = None;
+        let mut end = None;
+        let mut matches = 0;
+
+        for line in readme.split_inclusive('\n') {
+            if let Some((marker, length)) = fence {
+                if let Some((candidate, candidate_length, suffix)) = markdown_fence(line)
+                    && candidate == marker
+                    && candidate_length >= length
+                    && suffix.trim().is_empty()
+                {
+                    fence = None;
+                }
+                offset += line.len();
+                continue;
+            }
+
+            if let Some((marker, length, _)) = markdown_fence(line) {
+                fence = Some((marker, length));
+                offset += line.len();
+                continue;
+            }
+
+            let line_without_ending = line.trim_end_matches(['\r', '\n']);
+            if line_without_ending == heading {
+                matches += 1;
+                start.get_or_insert(offset);
+            } else if start.is_some()
+                && end.is_none()
+                && markdown_heading_level(line).is_some_and(|level| level <= target_level)
+            {
+                end = Some(offset);
+            }
+            offset += line.len();
+        }
+
+        match matches {
+            0 => Err("missing heading"),
+            1 => {
+                let start = start.expect("matched heading start");
+                Ok(&readme[start..end.unwrap_or(readme.len())])
+            }
+            _ => Err("duplicate heading"),
+        }
+    }
+
     #[test]
     fn onboarding_has_exact_seven_step_order() {
         assert_eq!(
@@ -563,6 +634,120 @@ mod tests {
                 ThemeName::Catppuccin,
             ],
         );
+    }
+
+    #[test]
+    fn markdown_section_requires_one_exact_heading_outside_fences() {
+        let fenced_only = "# Guide\n\n```markdown\n### Setup\n```\n";
+        assert_eq!(
+            markdown_section(fenced_only, "### Setup"),
+            Err("missing heading")
+        );
+
+        let duplicate = "# Guide\n\n### Setup\none\n\n### Setup\ntwo\n";
+        assert_eq!(
+            markdown_section(duplicate, "### Setup"),
+            Err("duplicate heading")
+        );
+
+        let prefix = "# Guide\n\n### Setup details\nwrong\n";
+        assert_eq!(
+            markdown_section(prefix, "### Setup"),
+            Err("missing heading")
+        );
+    }
+
+    #[test]
+    fn markdown_section_stops_at_same_or_higher_level_heading() {
+        let readme =
+            "# Guide\n\n### Setup\ninside\n\n#### Detail\nstill inside\n\n## Next\noutside\n";
+        assert_eq!(
+            markdown_section(readme, "### Setup"),
+            Ok("### Setup\ninside\n\n#### Detail\nstill inside\n\n"),
+        );
+    }
+
+    #[test]
+    fn readmes_document_expanded_first_run_onboarding_contract() {
+        fn assert_required(name: &str, section: &str, required: &[&str]) {
+            for token in required {
+                assert!(
+                    section.contains(token),
+                    "{name} onboarding docs must contain {token:?}",
+                );
+            }
+        }
+
+        fn assert_safe_examples(name: &str, section: &str) {
+            for forbidden in ["Mock", "Fixture", "/Users/", "/home/", "C:\\", "sk-"] {
+                assert!(
+                    !section.contains(forbidden),
+                    "{name} onboarding docs must not contain {forbidden:?}",
+                );
+            }
+        }
+
+        let english = markdown_section(
+            include_str!("../../../README.md"),
+            "### First-run onboarding",
+        )
+        .expect("unique English onboarding heading");
+        assert_required(
+            "README.md",
+            english,
+            &[
+                "When the TUI starts without an effective API key, first-run onboarding follows exactly seven steps",
+                "Welcome → Provider → API Key → Model → Theme → Review → Complete",
+                "DeepSeek is the only production provider",
+                "auto",
+                "deepseek-v4-flash",
+                "deepseek-v4-pro",
+                "Auto",
+                "Dark",
+                "Light",
+                "Solarized",
+                "Catppuccin",
+                "config.toml",
+                "auth.json",
+                "no network validation",
+                "current session",
+                "reports only sanitized error categories",
+                "Esc",
+                "zero writes",
+                "draft-only",
+            ],
+        );
+        assert_safe_examples("README.md", english);
+
+        let chinese =
+            markdown_section(include_str!("../../../README.zh-CN.md"), "### 首次启动设置")
+                .expect("unique Chinese onboarding heading");
+        assert_required(
+            "README.zh-CN.md",
+            chinese,
+            &[
+                "当 TUI 启动时未检测到有效 API 密钥，首次启动设置固定经过七步",
+                "欢迎 → 服务商 → API 密钥 → 模型 → 主题 → 确认 → 完成",
+                "DeepSeek 是唯一的生产服务商",
+                "auto",
+                "deepseek-v4-flash",
+                "deepseek-v4-pro",
+                "Auto",
+                "Dark",
+                "Light",
+                "Solarized",
+                "Catppuccin",
+                "config.toml",
+                "auth.json",
+                "不进行网络验证",
+                "当前会话",
+                "不会产生任何写入",
+                "仅显示不含敏感信息的错误类型",
+                "Esc",
+                "仅保存在草稿中",
+            ],
+        );
+        assert_safe_examples("README.zh-CN.md", chinese);
     }
 
     #[test]
