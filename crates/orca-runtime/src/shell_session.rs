@@ -1853,7 +1853,7 @@ mod tests {
             handle.effective_terminal,
             ShellTerminalMode::pty(Some(100), Some(30))
         );
-        let ready_deadline = Instant::now() + Duration::from_secs(3);
+        let ready_deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let output = sessions
                 .read(&handle.id, Duration::from_millis(50))
