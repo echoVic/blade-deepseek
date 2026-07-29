@@ -939,12 +939,16 @@ mod tests {
         )
         .expect("restricted ConPTY child");
         let (mut input, mut output) = child.take_pty().expect("pty transport");
+        let reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            output.read_to_string(&mut text).expect("pty output");
+            text
+        });
         input.close();
         input.resize(120, 40).expect("resize after closing stdin");
         let status = child.wait().expect("wait");
         input.close_terminal();
-        let mut text = String::new();
-        output.read_to_string(&mut text).expect("pty output");
+        let text = reader.join().expect("join ConPTY output reader");
         assert!(status.success(), "{text}");
         assert!(text.contains("restricted-conpty-ok"), "{text:?}");
     }
@@ -995,12 +999,16 @@ mod tests {
         )
         .expect("AppContainer ConPTY child");
         let (mut input, mut output) = child.take_pty().expect("pty transport");
+        let reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            output.read_to_string(&mut text).expect("pty output");
+            text
+        });
         input.close();
         input.resize(120, 40).expect("resize after closing stdin");
         let status = child.wait().expect("wait");
         input.close_terminal();
-        let mut text = String::new();
-        output.read_to_string(&mut text).expect("pty output");
+        let text = reader.join().expect("join ConPTY output reader");
         assert!(status.success(), "{text}");
         assert!(text.contains("appcontainer-conpty-ok"), "{text:?}");
     }

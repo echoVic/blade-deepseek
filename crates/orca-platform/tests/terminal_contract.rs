@@ -15,13 +15,16 @@ mod windows {
         command.args(["/D", "/S", "/C", "echo ORCA_CONPTY_OK"]);
 
         let mut process = spawn_windows_pty(&command, Some(100), Some(30)).unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut output = String::new();
+            process.reader.read_to_string(&mut output).unwrap();
+            output
+        });
         process.input.resize(120, 40).unwrap();
         process.input.close();
         let status = wait_for_exit(&mut process.child, "native ConPTY command");
         process.input.close_terminal();
-
-        let mut output = String::new();
-        process.reader.read_to_string(&mut output).unwrap();
+        let output = reader.join().expect("join ConPTY output reader");
         assert!(status.success(), "ConPTY command failed: {status:?}");
         assert!(output.contains("ORCA_CONPTY_OK"), "output was {output:?}");
     }
