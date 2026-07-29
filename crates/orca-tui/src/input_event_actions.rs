@@ -118,14 +118,47 @@ mod search_paste_tests {
 
 #[cfg(test)]
 mod setup_paste_tests {
-    use crossterm::event::Event;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use orca_core::config::ThemeName;
+    use std::sync::{Arc, Mutex};
     use tui_textarea::TextArea;
 
     use super::handle_paste_event;
     use crate::composer_textarea::textarea_text;
-    use crate::onboarding::OnboardingStep;
+    use crate::onboarding::{OnboardingError, OnboardingStep};
+    use crate::setup_actions::handle_setup_key;
     use crate::test_support::test_run_config;
+    use crate::theme::Theme;
     use crate::types::{AppState, AppStatus};
+    use crate::vim::VimState;
+
+    fn setup_api_key_error(state: &mut AppState, textarea: &mut TextArea) {
+        state.status = AppStatus::Setup;
+        state.onboarding.set_step_for_test(OnboardingStep::ApiKey);
+        let mut config = test_run_config();
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, _action_rx) = crossbeam_channel::unbounded();
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        handle_setup_key(
+            &Event::Key(key),
+            &key,
+            state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+            textarea,
+            &VimState::new(false),
+            &Theme::named(ThemeName::Dark),
+            None,
+        )
+        .expect("blank API key submission");
+
+        assert_eq!(
+            state.onboarding.review_error(),
+            Some(OnboardingError::MissingApiKey),
+        );
+    }
 
     #[test]
     fn setup_paste_is_owned_only_by_the_typed_api_key_step() {
@@ -160,6 +193,57 @@ mod setup_paste_tests {
             );
             assert_eq!(state.onboarding.api_key(), None, "{step:?}");
         }
+    }
+
+    #[test]
+    fn api_key_paste_clears_missing_key_error_after_inserting_nonblank_text() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            tx,
+            "test".to_string(),
+            "auto".to_string(),
+            "/tmp".to_string(),
+        );
+        let config = test_run_config();
+        let mut textarea = TextArea::default();
+        setup_api_key_error(&mut state, &mut textarea);
+
+        assert!(handle_paste_event(
+            &Event::Paste("secret".to_string()),
+            &mut state,
+            &config,
+            &mut textarea,
+        ));
+
+        assert_eq!(textarea_text(&textarea), "secret");
+        assert_eq!(state.onboarding.review_error(), None);
+    }
+
+    #[test]
+    fn whitespace_only_api_key_paste_keeps_missing_key_error() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            tx,
+            "test".to_string(),
+            "auto".to_string(),
+            "/tmp".to_string(),
+        );
+        let config = test_run_config();
+        let mut textarea = TextArea::default();
+        setup_api_key_error(&mut state, &mut textarea);
+
+        assert!(handle_paste_event(
+            &Event::Paste("  \n\t".to_string()),
+            &mut state,
+            &config,
+            &mut textarea,
+        ));
+
+        assert_eq!(textarea_text(&textarea), "  \n\t");
+        assert_eq!(
+            state.onboarding.review_error(),
+            Some(OnboardingError::MissingApiKey),
+        );
     }
 }
 
@@ -367,6 +451,9 @@ pub(crate) fn handle_paste_event(
     match state.status {
         AppStatus::Setup if state.onboarding.step() == OnboardingStep::ApiKey => {
             insert_pasted_text(textarea, pasted);
+            if textarea.lines().iter().any(|line| !line.trim().is_empty()) {
+                state.onboarding.clear_api_key_error();
+            }
         }
         AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput => {
             if insert_composer_paste(textarea, &mut state.pending_pastes, pasted) {
