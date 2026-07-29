@@ -288,20 +288,22 @@ assert.ok(
   "Windows ConPTY ownership must not use a spawn-before-Job abstraction",
 );
 for (const marker of [
-  "CREATE_SUSPENDED",
-  "ProcessJob::attach_named(info.dwProcessId, name)",
-  "ResumeThread(thread.raw())",
+  "PROC_THREAD_ATTRIBUTE_JOB_LIST",
+  "ProcessJob::create_unassigned(job_name)",
+  "attributes.set_job(process_job.raw_handle())",
+  "STARTF_USESTDHANDLES",
 ]) {
   assert.ok(
     terminalSource.includes(marker),
     `Windows ConPTY spawn must contain ${marker}`,
   );
 }
-assert.ok(
-  terminalSource.indexOf("ProcessJob::attach_named(info.dwProcessId, name)") <
-    terminalSource.indexOf("ResumeThread(thread.raw())"),
-  "Windows ConPTY child must enter its Job Object before its primary thread resumes",
-);
+for (const marker of ["CREATE_SUSPENDED", "ResumeThread(thread.raw())", "ProcessJob::attach(info.dwProcessId)"]) {
+  assert.ok(
+    !terminalSource.includes(marker),
+    `Windows ConPTY spawn must atomically assign its Job Object instead of using ${marker}`,
+  );
+}
 
 const clipboardSource = readFileSync(
   path.join(repoRoot, "crates/orca-tui/src/clipboard.rs"),
@@ -496,6 +498,14 @@ assert.ok(
   releaseWindowsArm64Gate,
   "release workflow must define a native Windows ARM64 gate",
 );
+for (const gate of [releaseWindowsX64Gate[0], releaseWindowsArm64Gate[0]]) {
+  assert.ok(gate.includes("shell: pwsh"), "release Windows behavior gates must use PowerShell 7");
+  assert.ok(
+    gate.includes('$ErrorActionPreference = "Stop"') &&
+      gate.includes("$PSNativeCommandUseErrorActionPreference = $true"),
+    "release Windows behavior gates must fail on every native command error",
+  );
+}
 for (const marker of [
   "prompt_names_powershell_7_as_the_active_shell_dialect",
   "altgr_char_is_normalized_to_text_input_on_windows_only",
