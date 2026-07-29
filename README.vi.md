@@ -9,7 +9,7 @@ viết bằng Rust, chạy cục bộ và phát hành theo giấy phép MIT.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md)
 
-[Trang web](https://orcaagent.dev/) · [Nhật ký thay đổi](https://orcaagent.dev/changelog/) · [Bản phát hành](https://github.com/echoVic/blade-deepseek/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
+[Trang web](https://orcaagent.dev/) · [Nhật ký thay đổi](https://orcaagent.dev/changelog/) · [Bản phát hành](https://github.com/echoVic/orca-agent/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
 
 ## Cài đặt
 
@@ -23,8 +23,14 @@ Hoặc cài trực tiếp tệp nhị phân gốc:
 curl -fsSL https://orcaagent.dev/install.sh | sh
 ```
 
-Gói npm hỗ trợ macOS và Linux trên ARM64 và x64. Các tệp dựng sẵn cũng có tại
-[GitHub Releases](https://github.com/echoVic/blade-deepseek/releases/latest).
+Trên Windows PowerShell:
+
+```powershell
+irm https://orcaagent.dev/install.ps1 | iex
+```
+
+Gói npm hỗ trợ macOS, Linux và Windows trên ARM64 và x64. Các tệp dựng sẵn cũng có tại
+[GitHub Releases](https://github.com/echoVic/orca-agent/releases/latest).
 
 ## Sử dụng
 
@@ -36,6 +42,9 @@ orca exec "sửa bài kiểm thử đang lỗi"      # chạy không giao diện
 orca exec --verifier "cargo test" "sửa nó" # kiểm tra trước khi hoàn tất
 orca --mode=acp                           # kết nối máy khách ACP
 ```
+
+Trên Windows PowerShell, đặt khóa bằng
+`$env:DEEPSEEK_API_KEY = "sk-..."`; các lệnh `orca` vẫn giữ nguyên.
 
 Trong TUI, `@` tìm kiếm tệp, Skills, Plugins và MCP Resources. Dùng `/plan`
 để lập kế hoạch chỉ đọc, `/goal` cho mục tiêu lâu dài, `/workflows` cho công việc
@@ -79,8 +88,8 @@ Tài liệu chi tiết:
 Đọc [CONTRIBUTING.md](CONTRIBUTING.md) trước khi đóng góp. Hãy mở Issue trước
 đối với thay đổi lớn hoặc có ảnh hưởng đến khả năng tương thích.
 
-- [Báo lỗi](https://github.com/echoVic/blade-deepseek/issues/new?template=bug_report.yml)
-- [Đề xuất tính năng](https://github.com/echoVic/blade-deepseek/issues/new?template=feature_request.yml)
+- [Báo lỗi](https://github.com/echoVic/orca-agent/issues/new?template=bug_report.yml)
+- [Đề xuất tính năng](https://github.com/echoVic/orca-agent/issues/new?template=feature_request.yml)
 - [Nhận hỗ trợ](SUPPORT.md)
 - [Báo cáo lỗ hổng](SECURITY.md)
 

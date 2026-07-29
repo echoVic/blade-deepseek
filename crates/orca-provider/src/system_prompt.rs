@@ -1,18 +1,29 @@
 use std::path::Path;
 
 use chrono::Local;
+use orca_platform::shell::{ShellKind, ShellResolver, ShellSpec};
 use orca_tools::registry;
 
 use crate::tool_schema::{ToolSchemaMode, tool_visible_in_schema_mode};
 
 pub fn build_system_prompt(cwd: &Path) -> String {
+    let shell = ShellResolver::for_current_host()
+        .resolve_from_environment()
+        .ok();
+    build_system_prompt_with_shell(cwd, shell.as_ref())
+}
+
+pub fn build_system_prompt_with_shell(cwd: &Path, shell: Option<&ShellSpec>) -> String {
     let tools = render_tool_prompt_section();
+    let shell_environment = render_shell_environment(shell);
+    let shell_guidance = render_shell_guidance(shell);
     format!(
         r#"You are Orca, an expert software engineering agent running in a terminal-based coding assistant. You are precise, safe, and helpful.
 
 ## Environment
 - Working directory: {cwd}
 - Operating system: {os}
+- {shell_environment}
 - Today's date: {today}
 
 # How you work
@@ -85,7 +96,8 @@ Start validation as specific as possible to the code you changed, then broaden:
 
 {tools}
 
-Use `bash` for tests, builds, project scripts, and complex shell-only tasks. For file inspection, prefer `read_file`, `glob`, and `grep`.
+Use `bash` for tests, builds, project scripts, and complex shell-only tasks. It executes commands in the resolved host shell shown above; the tool name is protocol-stable and does not promise Bash syntax. For file inspection, prefer `read_file`, `glob`, and `grep`.
+{shell_guidance}
 
 When using `web_search` for requests about latest news, recent updates, current status, today, this week, this month, or "最新/最近/今天", include a `fresh_days` value that matches the requested recency instead of relying on the query text alone. Examples: use `fresh_days: 1` for today/current breakage, `fresh_days: 7` for this week/recent updates, and `fresh_days: 30` for latest news or recent releases unless the user asks for a broader range.
 
@@ -120,6 +132,27 @@ If there's a logical next step you can help with, suggest it briefly."#,
     )
 }
 
+fn render_shell_environment(shell: Option<&ShellSpec>) -> String {
+    match shell {
+        Some(shell) => format!(
+            "Active shell: {} ({})",
+            shell.tool_name(),
+            shell.prompt_dialect()
+        ),
+        None => "Active shell: unavailable (prefer dedicated file tools over shell commands)"
+            .to_string(),
+    }
+}
+
+fn render_shell_guidance(shell: Option<&ShellSpec>) -> &'static str {
+    if shell.is_some_and(|shell| matches!(shell.kind(), ShellKind::PowerShell(_) | ShellKind::Cmd))
+    {
+        "On native Windows shells, Unix utilities are not guaranteed to exist. Do not assume `grep`, `head`, `tail`, `sed`, `awk`, or `find` are available. Use the dedicated file tools, and use the active shell's quoting, chaining, path, and environment-variable syntax."
+    } else {
+        ""
+    }
+}
+
 fn render_tool_prompt_section() -> String {
     let registry = registry::default_tool_registry();
     let mut output = String::new();
@@ -135,6 +168,18 @@ fn render_tool_prompt_section() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_platform::host::{Architecture, HostPlatform, OperatingSystem};
+    use orca_platform::shell::ShellResolver;
+    use std::path::PathBuf;
+
+    fn windows_shell(available: &'static str) -> orca_platform::shell::ShellSpec {
+        ShellResolver::new(
+            HostPlatform::new(OperatingSystem::Windows, Architecture::X86_64),
+            move |name| (name == available).then(|| PathBuf::from(available)),
+        )
+        .resolve(None)
+        .expect("resolve Windows shell")
+    }
 
     #[test]
     fn prompt_recommends_glob_and_hides_list_files() {
@@ -161,6 +206,42 @@ mod tests {
 
         assert!(prompt.contains("### bash"));
         assert!(prompt.contains("tests, builds, project scripts"));
+    }
+
+    #[test]
+    fn prompt_names_powershell_7_as_the_active_shell_dialect() {
+        let prompt = build_system_prompt_with_shell(
+            std::path::Path::new(r"C:\repo"),
+            Some(&windows_shell("pwsh.exe")),
+        );
+
+        assert!(prompt.contains("Active shell: powershell"));
+        assert!(prompt.contains("PowerShell 7 syntax"));
+        assert!(prompt.contains("tool name is protocol-stable"));
+        assert!(prompt.contains("Unix utilities are not guaranteed"));
+    }
+
+    #[test]
+    fn prompt_warns_against_powershell_7_operators_on_windows_powershell() {
+        let prompt = build_system_prompt_with_shell(
+            std::path::Path::new(r"C:\repo"),
+            Some(&windows_shell("powershell.exe")),
+        );
+
+        assert!(prompt.contains("Windows PowerShell 5.1 syntax"));
+        assert!(prompt.contains("Do not use PowerShell 7-only operators such as && or ||"));
+    }
+
+    #[test]
+    fn prompt_names_cmd_as_the_active_shell_dialect() {
+        let prompt = build_system_prompt_with_shell(
+            std::path::Path::new(r"C:\repo"),
+            Some(&windows_shell("cmd.exe")),
+        );
+
+        assert!(prompt.contains("Active shell: cmd"));
+        assert!(prompt.contains("cmd.exe syntax"));
+        assert!(prompt.contains("cmd quoting rules"));
     }
 
     #[test]

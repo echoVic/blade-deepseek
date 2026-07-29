@@ -9,7 +9,7 @@ Orca에 작업을 주면 코드를 읽고, 파일을 수정하고, 명령을 실
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md)
 
-[웹사이트](https://orcaagent.dev/) · [변경 기록](https://orcaagent.dev/changelog/) · [릴리스](https://github.com/echoVic/blade-deepseek/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
+[웹사이트](https://orcaagent.dev/) · [변경 기록](https://orcaagent.dev/changelog/) · [릴리스](https://github.com/echoVic/orca-agent/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
 
 ## 설치
 
@@ -23,8 +23,14 @@ npm install -g @blade-ai/orca
 curl -fsSL https://orcaagent.dev/install.sh | sh
 ```
 
-npm 패키지는 macOS와 Linux의 ARM64 및 x64를 지원합니다. 미리 빌드된 파일은
-[GitHub Releases](https://github.com/echoVic/blade-deepseek/releases/latest)에서도 받을 수 있습니다.
+Windows PowerShell에서는 다음을 사용합니다.
+
+```powershell
+irm https://orcaagent.dev/install.ps1 | iex
+```
+
+npm 패키지는 macOS, Linux, Windows의 ARM64 및 x64를 지원합니다. 미리 빌드된 파일은
+[GitHub Releases](https://github.com/echoVic/orca-agent/releases/latest)에서도 받을 수 있습니다.
 
 ## 사용법
 
@@ -36,6 +42,9 @@ orca exec "실패한 테스트 수정"              # 헤드리스 실행
 orca exec --verifier "cargo test" "수정하기" # 완료 전 검증
 orca --mode=acp                           # ACP 클라이언트 연결
 ```
+
+Windows PowerShell에서는 `$env:DEEPSEEK_API_KEY = "sk-..."`로 키를 설정합니다.
+이후 `orca` 명령은 동일합니다.
 
 TUI에서 `@`로 파일, Skills, Plugins, MCP Resources를 검색할 수 있습니다.
 `/plan`은 읽기 전용 계획, `/goal`은 지속 목표, `/workflows`는 백그라운드 작업,
@@ -77,8 +86,8 @@ TUI에서 `@`로 파일, Skills, Plugins, MCP Resources를 검색할 수 있습�
 기여하기 전에 [CONTRIBUTING.md](CONTRIBUTING.md)를 읽어 주세요. 규모가 크거나
 호환성에 영향을 주는 변경은 먼저 Issue를 열어 주세요.
 
-- [버그 신고](https://github.com/echoVic/blade-deepseek/issues/new?template=bug_report.yml)
-- [기능 제안](https://github.com/echoVic/blade-deepseek/issues/new?template=feature_request.yml)
+- [버그 신고](https://github.com/echoVic/orca-agent/issues/new?template=bug_report.yml)
+- [기능 제안](https://github.com/echoVic/orca-agent/issues/new?template=feature_request.yml)
 - [도움 받기](SUPPORT.md)
 - [보안 취약점 신고](SECURITY.md)
 

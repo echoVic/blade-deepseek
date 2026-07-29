@@ -12,6 +12,7 @@ use orca_core::workflow_types::{
     WorkflowEvidencePhase, WorkflowEvidenceToolEvent, WorkflowInput, WorkflowRunState,
     WorkflowRunStatus, WorkflowTaskLifecycleEvidence,
 };
+use orca_platform::fs::{AtomicWritePolicy, atomic_write};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -903,19 +904,7 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     }
     let content = serde_json::to_string_pretty(value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("state");
-    let temp_path = path.with_file_name(format!(
-        ".{file_name}.tmp-{}-{}",
-        std::process::id(),
-        now_ms()
-    ));
-    fs::write(&temp_path, content)?;
-    fs::rename(&temp_path, path).inspect_err(|_| {
-        let _ = fs::remove_file(&temp_path);
-    })
+    atomic_write(path, content.as_bytes(), AtomicWritePolicy::NoFollow).map_err(io::Error::other)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {

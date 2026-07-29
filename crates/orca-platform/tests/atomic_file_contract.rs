@@ -1,6 +1,7 @@
+use std::io::{self, Write};
 use std::path::Path;
 
-use orca_platform::fs::{AtomicWritePolicy, atomic_write, open_nofollow};
+use orca_platform::fs::{AtomicWritePolicy, atomic_write, atomic_write_with, open_nofollow};
 
 #[test]
 fn atomic_replace_never_leaves_a_partial_file_or_temp_artifact() {
@@ -11,6 +12,45 @@ fn atomic_replace_never_leaves_a_partial_file_or_temp_artifact() {
     atomic_write(&path, br#"{"revision":2}"#, AtomicWritePolicy::NoFollow).expect("replace");
 
     assert_eq!(std::fs::read(&path).expect("read"), br#"{"revision":2}"#);
+    assert_no_temp_artifacts(temp.path());
+}
+
+#[test]
+fn atomic_write_with_streams_and_replaces_the_destination() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("transcript.jsonl");
+    std::fs::write(&path, b"old").expect("old content");
+
+    atomic_write_with(&path, AtomicWritePolicy::NoFollow, |file| {
+        file.write_all(b"first\n")?;
+        file.write_all(b"second\n")
+    })
+    .expect("streamed replace");
+
+    assert_eq!(std::fs::read(&path).expect("read"), b"first\nsecond\n");
+    assert_no_temp_artifacts(temp.path());
+}
+
+#[test]
+fn failed_atomic_write_with_keeps_the_old_destination_and_cleans_the_temp_file() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("transcript.jsonl");
+    std::fs::write(&path, b"old").expect("old content");
+
+    let error = atomic_write_with(&path, AtomicWritePolicy::NoFollow, |file| {
+        file.write_all(b"partial")?;
+        Err(io::Error::other("injected writer failure"))
+    })
+    .expect_err("writer failure");
+
+    assert!(matches!(
+        error,
+        orca_platform::PlatformError::Io {
+            kind: io::ErrorKind::Other,
+            ..
+        }
+    ));
+    assert_eq!(std::fs::read(&path).expect("old destination"), b"old");
     assert_no_temp_artifacts(temp.path());
 }
 
@@ -43,6 +83,31 @@ fn no_follow_rejects_symlink_destinations_and_opening_symlinks() {
     assert!(atomic_write(&link, b"new", AtomicWritePolicy::NoFollow).is_err());
     assert!(open_nofollow(&link).is_err());
     assert_eq!(std::fs::read(&target).expect("target remains"), b"old");
+    assert_no_temp_artifacts(temp.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn replace_destination_replaces_a_symlink_without_touching_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let target = temp.path().join("target.json");
+    let link = temp.path().join("link.json");
+    std::fs::write(&target, b"target").expect("target");
+    symlink(&target, &link).expect("symlink");
+
+    atomic_write(&link, b"replacement", AtomicWritePolicy::ReplaceDestination)
+        .expect("replace symlink directory entry");
+
+    assert_eq!(std::fs::read(&link).expect("replacement"), b"replacement");
+    assert_eq!(std::fs::read(&target).expect("target remains"), b"target");
+    assert!(
+        !std::fs::symlink_metadata(&link)
+            .expect("replacement metadata")
+            .file_type()
+            .is_symlink()
+    );
     assert_no_temp_artifacts(temp.path());
 }
 
@@ -94,12 +159,16 @@ fn no_follow_atomic_write_rejects_a_directory_junction() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let error = atomic_write(&junction, b"new", AtomicWritePolicy::NoFollow)
-        .expect_err("junction must be rejected");
-    assert!(matches!(
-        error,
-        orca_platform::PlatformError::ReparsePointRejected { .. }
-    ));
+    for policy in [
+        AtomicWritePolicy::NoFollow,
+        AtomicWritePolicy::ReplaceDestination,
+    ] {
+        let error = atomic_write(&junction, b"new", policy).expect_err("junction must be rejected");
+        assert!(matches!(
+            error,
+            orca_platform::PlatformError::ReparsePointRejected { .. }
+        ));
+    }
     assert_no_temp_artifacts(temp.path());
 }
 

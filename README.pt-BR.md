@@ -9,7 +9,7 @@ O Orca é escrito em Rust, executa localmente e usa a licença MIT.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md)
 
-[Site](https://orcaagent.dev/) · [Alterações](https://orcaagent.dev/changelog/) · [Versões](https://github.com/echoVic/blade-deepseek/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
+[Site](https://orcaagent.dev/) · [Alterações](https://orcaagent.dev/changelog/) · [Versões](https://github.com/echoVic/orca-agent/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
 
 ## Instalação
 
@@ -23,8 +23,14 @@ Você também pode instalar o binário nativo diretamente:
 curl -fsSL https://orcaagent.dev/install.sh | sh
 ```
 
-O pacote npm oferece suporte a macOS e Linux em ARM64 e x64. Arquivos
-pré-compilados também estão disponíveis no [GitHub Releases](https://github.com/echoVic/blade-deepseek/releases/latest).
+No Windows PowerShell:
+
+```powershell
+irm https://orcaagent.dev/install.ps1 | iex
+```
+
+O pacote npm oferece suporte a macOS, Linux e Windows em ARM64 e x64. Arquivos
+pré-compilados também estão disponíveis no [GitHub Releases](https://github.com/echoVic/orca-agent/releases/latest).
 
 ## Uso
 
@@ -36,6 +42,9 @@ orca exec "corrija o teste com falha"      # executar sem interface
 orca exec --verifier "cargo test" "corrija" # verificar antes de concluir
 orca --mode=acp                           # conectar um cliente ACP
 ```
+
+No Windows PowerShell, defina a chave com
+`$env:DEEPSEEK_API_KEY = "sk-..."`; os comandos `orca` são os mesmos.
 
 Na TUI, `@` pesquisa arquivos, Skills, Plugins e MCP Resources. Use `/plan`
 para planejamento somente leitura, `/goal` para um objetivo persistente,
@@ -83,8 +92,8 @@ Mais detalhes:
 Leia [CONTRIBUTING.md](CONTRIBUTING.md) antes de contribuir. Abra primeiro uma
 Issue para alterações grandes ou que possam afetar a compatibilidade.
 
-- [Relatar um bug](https://github.com/echoVic/blade-deepseek/issues/new?template=bug_report.yml)
-- [Sugerir um recurso](https://github.com/echoVic/blade-deepseek/issues/new?template=feature_request.yml)
+- [Relatar um bug](https://github.com/echoVic/orca-agent/issues/new?template=bug_report.yml)
+- [Sugerir um recurso](https://github.com/echoVic/orca-agent/issues/new?template=feature_request.yml)
 - [Obter ajuda](SUPPORT.md)
 - [Relatar uma vulnerabilidade](SECURITY.md)
 

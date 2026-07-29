@@ -10,9 +10,9 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use orca_platform::fs::{AtomicWritePolicy, atomic_write};
 use serde::{Deserialize, Serialize};
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
@@ -92,20 +92,8 @@ fn save_path(path: &Path, store: &TrustFile) -> Result<(), String> {
     }
     let serialized =
         toml::to_string_pretty(store).map_err(|e| format!("serializing folder trust: {e}"))?;
-    let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
-    let mut temp = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temp_path)
-        .map_err(|e| format!("creating {}: {e}", temp_path.display()))?;
-    temp.write_all(serialized.as_bytes())
-        .and_then(|()| temp.sync_all())
-        .map_err(|e| format!("writing {}: {e}", temp_path.display()))?;
-    fs::rename(&temp_path, path).map_err(|e| {
-        let _ = fs::remove_file(&temp_path);
-        format!("replacing {}: {e}", path.display())
-    })
+    atomic_write(path, serialized.as_bytes(), AtomicWritePolicy::NoFollow)
+        .map_err(|error| format!("replacing {}: {error}", path.display()))
 }
 
 fn save(store: &TrustFile) -> Result<(), String> {

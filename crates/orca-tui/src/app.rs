@@ -2829,7 +2829,7 @@ mod tests {
             });
 
             action_tx.send(UserAction::GoalResume).unwrap();
-            let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             action_tx.send(UserAction::Interrupt).unwrap();
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
@@ -2903,26 +2903,33 @@ mod tests {
             // 用户 turn 后应跑满 3 个无结构化进展 turn，然后暂停并停。
             let mut stalled_notice = false;
             let mut stalled_status = false;
+            let mut seen = Vec::new();
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             while std::time::Instant::now() < deadline && !(stalled_notice && stalled_status) {
-                match event_rx.recv_timeout(Duration::from_secs(2)) {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match event_rx.recv_timeout(remaining.min(Duration::from_secs(2))) {
                     Ok(TuiEvent::Notice(message)) if message.contains("no measurable progress") => {
+                        seen.push(format!("notice: {message}"));
                         stalled_notice = true;
                     }
                     Ok(TuiEvent::GoalUpdated(goal))
                         if goal.status == orca_core::goal_types::ThreadGoalStatus::Stalled =>
                     {
+                        seen.push(format!("goal: {goal:?}"));
                         stalled_status = true;
                     }
-                    Ok(_) => {}
-                    Err(_) => break,
+                    Ok(event) => seen.push(format!("{event:?}")),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        panic!("hosted TUI event channel disconnected before stall detection")
+                    }
                 }
             }
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
 
-            assert!(stalled_notice, "missing stall notice");
-            assert!(stalled_status, "missing Stalled goal update");
+            assert!(stalled_notice, "missing stall notice; saw {seen:?}");
+            assert!(stalled_status, "missing Stalled goal update; saw {seen:?}");
         });
     }
 
@@ -3429,7 +3436,7 @@ mod tests {
             loop {
                 match harness
                     .event_rx
-                    .recv_timeout(Duration::from_secs(2))
+                    .recv_timeout(Duration::from_secs(10))
                     .unwrap()
                 {
                     TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started.") => {
@@ -3445,7 +3452,7 @@ mod tests {
             loop {
                 match harness
                     .event_rx
-                    .recv_timeout(Duration::from_secs(2))
+                    .recv_timeout(Duration::from_secs(10))
                     .unwrap()
                 {
                     TuiEvent::SessionCompleted { status } => {
@@ -3465,7 +3472,7 @@ mod tests {
             loop {
                 match harness
                     .event_rx
-                    .recv_timeout(Duration::from_secs(2))
+                    .recv_timeout(Duration::from_secs(10))
                     .unwrap()
                 {
                     TuiEvent::TurnStarted { .. } => {

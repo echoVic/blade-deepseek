@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use orca_core::config::file::ConfigOverrides;
 use orca_core::config::{HistoryMode, OutputFormat, ProviderKind};
 use orca_core::workflow_types::{WorkflowInput, WorkflowRunState};
+use orca_platform::fs::{AtomicWritePolicy, atomic_write};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1106,34 +1107,7 @@ fn migrate_legacy_workflow_cli_launch_record(run_dir: &Path) -> Result<Option<St
         .map(ToString::to_string);
 
     let replacement = serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("cli-launch.json");
-    let temp_path = path.with_file_name(format!(
-        ".{file_name}.tmp-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    let write_result = (|| -> io::Result<()> {
-        use std::fs::OpenOptions;
-
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
-        fs::set_permissions(&temp_path, opened_metadata.permissions())?;
-        file.write_all(&replacement)?;
-        file.sync_all()?;
-        fs::rename(&temp_path, &path)?;
-        #[cfg(unix)]
-        if let Some(parent) = path.parent() {
-            fs::File::open(parent)?.sync_all()?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&temp_path);
+    if let Err(error) = atomic_write(&path, &replacement, AtomicWritePolicy::NoFollow) {
         return Err(format!(
             "failed to sanitize workflow launch record at {}: {error}",
             path.display()

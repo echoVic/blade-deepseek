@@ -15,7 +15,8 @@ use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_core::thread_identity::{ConversationItemId, TurnId};
 use orca_core::thread_item_projection::CompletedModelResponse;
 use orca_core::tool_types::ToolResult;
-use uuid::Uuid;
+use orca_platform::fs::ExclusiveFileLock;
+use orca_platform::fs::{AtomicWritePolicy, atomic_write_with};
 
 use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 
@@ -59,10 +60,9 @@ pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()
     }
 
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    lock_file(&file)?;
+    let _lock = acquire_file_lock(path, &file)?;
     write_record_line(&mut file, record)?;
-    file.flush()?;
-    unlock_file(&file)
+    file.flush()
 }
 
 pub(crate) fn write_durable_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
@@ -74,15 +74,11 @@ pub(crate) fn write_durable_record(path: &Path, record: &SessionRecord) -> io::R
         .read(true)
         .write(true)
         .open(path)?;
-    lock_file(&file)?;
-    let result = (|| {
-        repair_incomplete_final_record(&mut file)?;
-        write_record_line(&mut file, record)?;
-        file.flush()?;
-        file.sync_data()
-    })();
-    let unlock = unlock_file(&file);
-    result.and(unlock)
+    let _lock = acquire_file_lock(path, &file)?;
+    repair_incomplete_final_record(&mut file)?;
+    write_record_line(&mut file, record)?;
+    file.flush()?;
+    file.sync_data()
 }
 
 fn repair_incomplete_final_record(file: &mut File) -> io::Result<()> {
@@ -254,29 +250,19 @@ fn line_has_invalid_tool_terminal(line: &str) -> bool {
 
 pub(crate) fn rewrite_records(path: &Path, records: &[SessionRecord]) -> io::Result<()> {
     let lock = OpenOptions::new().read(true).write(true).open(path)?;
-    lock_file(&lock)?;
+    let _lock = acquire_file_lock(path, &lock)?;
 
-    let result = (|| {
-        let temp_path = temp_rewrite_path(path);
-        {
-            let temp = File::create(&temp_path)?;
-            if let Err(error) = write_records_to(temp, path, records) {
-                let _ = fs::remove_file(&temp_path);
-                return Err(error);
-            }
-        }
-        if let Err(error) = fs::rename(&temp_path, path) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(error);
-        }
-        Ok(())
-    })();
-
-    let unlock_result = unlock_file(&lock);
-    result.and(unlock_result)
+    atomic_write_with(path, AtomicWritePolicy::NoFollow, |temporary| {
+        write_records_to(temporary, path, records)
+    })
+    .map_err(io::Error::other)
 }
 
-fn write_records_to(file: File, target_path: &Path, records: &[SessionRecord]) -> io::Result<()> {
+fn write_records_to(
+    file: &mut File,
+    target_path: &Path,
+    records: &[SessionRecord],
+) -> io::Result<()> {
     if target_path.extension().and_then(|ext| ext.to_str()) == Some("zst") {
         let mut encoder = zstd::stream::write::Encoder::new(file, 3)?;
         for record in records {
@@ -291,14 +277,6 @@ fn write_records_to(file: File, target_path: &Path, records: &[SessionRecord]) -
         writer.flush()?;
     }
     Ok(())
-}
-
-fn temp_rewrite_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("session.jsonl");
-    path.with_file_name(format!("{file_name}.tmp-{}", Uuid::new_v4()))
 }
 
 pub(crate) fn read_history_lines(path: &Path) -> io::Result<Vec<String>> {
@@ -756,56 +734,16 @@ fn looks_like_standalone_secret(token: &str) -> bool {
                 || lower.contains("test")))
 }
 
-pub(crate) fn lock_file(file: &File) -> io::Result<()> {
-    lock_file_impl(file)
-}
-
-pub(crate) fn unlock_file(file: &File) -> io::Result<()> {
-    unlock_file_impl(file)
-}
-
-#[cfg(unix)]
-fn lock_file_impl(file: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    unsafe {
-        if flock(file.as_raw_fd(), LOCK_EX) == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-}
-
-#[cfg(unix)]
-fn unlock_file_impl(file: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    unsafe {
-        if flock(file.as_raw_fd(), LOCK_UN) == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-}
-
-#[cfg(unix)]
-unsafe extern "C" {
-    fn flock(fd: i32, operation: i32) -> i32;
-}
-
-#[cfg(unix)]
-const LOCK_EX: i32 = 2;
-#[cfg(unix)]
-const LOCK_UN: i32 = 8;
-
-#[cfg(not(unix))]
-fn lock_file_impl(_file: &File) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn unlock_file_impl(_file: &File) -> io::Result<()> {
-    Ok(())
+pub(crate) fn acquire_file_lock(path: &Path, _file: &File) -> io::Result<ExclusiveFileLock> {
+    #[cfg(windows)]
+    let lock = {
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        ExclusiveFileLock::acquire(Path::new(&lock_path))
+    };
+    #[cfg(not(windows))]
+    let lock = ExclusiveFileLock::acquire_file(path, _file.try_clone()?);
+    lock.map_err(io::Error::other)
 }
 
 #[derive(Clone, Debug)]
@@ -821,7 +759,7 @@ fn restore_plaintext_transcript(path: PathBuf) -> io::Result<PathBuf> {
     }
     let plain_path = path.with_extension("");
     let lock = OpenOptions::new().read(true).write(true).open(&path)?;
-    lock_file(&lock)?;
+    let _lock = acquire_file_lock(&path, &lock)?;
     let result = (|| {
         let input = File::open(&path)?;
         let output = File::create(&plain_path)?;
@@ -832,12 +770,7 @@ fn restore_plaintext_transcript(path: PathBuf) -> io::Result<PathBuf> {
         fs::remove_file(&path)?;
         Ok(plain_path)
     })();
-    let unlock_result = unlock_file(&lock);
-    match (result, unlock_result) {
-        (Ok(path), Ok(())) => Ok(path),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-    }
+    result
 }
 
 impl SessionWriter {
@@ -1212,7 +1145,7 @@ impl EventPublicationStore for SessionWriter {
 
 fn append_usage_baseline(path: &Path) -> io::Result<()> {
     let mut file = OpenOptions::new().read(true).append(true).open(path)?;
-    lock_file(&file)?;
+    let _lock = acquire_file_lock(path, &file)?;
     let result = (|| {
         let Some(usage) = read_transcript(path)?.usage else {
             return Ok(());
@@ -1220,8 +1153,7 @@ fn append_usage_baseline(path: &Path) -> io::Result<()> {
         write_record_line(&mut file, &SessionRecord::UsageBaseline(usage))?;
         file.flush()
     })();
-    let unlock_result = unlock_file(&file);
-    result.and(unlock_result)
+    result
 }
 
 #[cfg(test)]

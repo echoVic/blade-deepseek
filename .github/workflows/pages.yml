@@ -9,6 +9,7 @@ on:
       - "site/**"
       - ".github/workflows/pages.yml"
       - "install.sh"
+      - "install.ps1"
 
 permissions:
   contents: read
@@ -36,6 +37,7 @@ jobs:
       - name: Add custom domain and installer
         run: |
           cp install.sh site/dist/install.sh
+          cp install.ps1 site/dist/install.ps1
           printf 'orcaagent.dev\n' > site/dist/CNAME
       - uses: actions/configure-pages@v6
         with:

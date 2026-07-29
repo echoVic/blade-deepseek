@@ -174,6 +174,10 @@ fn run_upgrade_command(action: &UpdateAction) -> i32 {
             println!("Upgrade successful. Please restart orca.");
             0
         }
+        UpdateRunOutcome::Started => {
+            println!("Upgrade started. Orca will be replaced after this process exits.");
+            0
+        }
         UpdateRunOutcome::Failed(code) => {
             eprintln!(
                 "orca: upgrade failed{}",

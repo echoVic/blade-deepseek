@@ -22,58 +22,8 @@
       "(?:std::fs::rename|fs::rename)\\(\\s*&?temp_path\\b"
     ]
   ],
-  "foundation_exceptions": [
-    ["folder-trust-temp-rename", "crates/orca-core/src/config/folder_trust.rs", "direct_temp_rename", 1],
-    ["runtime-surface-temp-rename", "crates/orca-runtime/src/runtime_surface/store.rs", "direct_temp_rename", 1],
-    ["workflow-state-temp-rename", "crates/orca-runtime/src/workflow/state.rs", "direct_temp_rename", 1],
-    ["tasks-temp-rename", "crates/orca-runtime/src/tasks.rs", "direct_temp_rename", 1],
-    ["workflow-command-temp-rename", "crates/orca-runtime/src/workflow/command.rs", "direct_temp_rename", 1],
-    ["thread-writer-temp-rename", "crates/orca-runtime/src/thread_store/writer.rs", "direct_temp_rename", 1],
-    ["workflow-ipc-temp-rename", "crates/orca-runtime/src/workflow/ipc.rs", "direct_temp_rename", 2]
-  ],
+  "foundation_exceptions": [],
   "deferred_boundaries": [
-    [
-      "goal-actor-unix-lock",
-      "crates/orca-runtime/src/goal_actor.rs",
-      "unix_libc_process",
-      3,
-      "windows-test-portability"
-    ],
-    [
-      "goal-actor-non-unix-lock-stub",
-      "crates/orca-runtime/src/goal_actor.rs",
-      "non_unix_lock_stub",
-      1,
-      "windows-test-portability"
-    ],
-    [
-      "runtime-surface-owner-flock-ffi",
-      "crates/orca-runtime/src/runtime_surface/store.rs",
-      "unix_flock_ffi",
-      1,
-      "windows-test-portability"
-    ],
-    [
-      "runtime-surface-non-unix-lock-stub",
-      "crates/orca-runtime/src/runtime_surface/store.rs",
-      "non_unix_lock_stub",
-      2,
-      "windows-test-portability"
-    ],
-    [
-      "thread-writer-flock-ffi",
-      "crates/orca-runtime/src/thread_store/writer.rs",
-      "unix_flock_ffi",
-      1,
-      "windows-test-portability"
-    ],
-    [
-      "thread-writer-non-unix-lock-stub",
-      "crates/orca-runtime/src/thread_store/writer.rs",
-      "non_unix_lock_stub",
-      2,
-      "windows-test-portability"
-    ],
     [
       "workflow-command-shell-fixture",
       "crates/orca-runtime/src/workflow/command.rs",

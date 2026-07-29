@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-ORCA_REPO="${ORCA_REPO:-echoVic/blade-deepseek}"
+ORCA_REPO="${ORCA_REPO:-echoVic/orca-agent}"
 ORCA_VERSION="${ORCA_VERSION:-latest}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 

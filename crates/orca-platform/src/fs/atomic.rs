@@ -10,6 +10,7 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtomicWritePolicy {
     NoFollow,
+    ReplaceDestination,
 }
 
 pub fn atomic_write(
@@ -17,6 +18,19 @@ pub fn atomic_write(
     contents: &[u8],
     policy: AtomicWritePolicy,
 ) -> Result<(), PlatformError> {
+    atomic_write_with(destination, policy, |temporary| {
+        temporary.write_all(contents)
+    })
+}
+
+pub fn atomic_write_with<F>(
+    destination: &Path,
+    policy: AtomicWritePolicy,
+    write_contents: F,
+) -> Result<(), PlatformError>
+where
+    F: FnOnce(&mut File) -> io::Result<()>,
+{
     let parent = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -34,8 +48,7 @@ pub fn atomic_write(
             .set_permissions(permissions)
             .map_err(|error| PlatformError::io("preserve destination permissions", error))?;
     }
-    temporary
-        .write_all(contents)
+    write_contents(&mut temporary)
         .map_err(|error| PlatformError::io("write atomic temporary file", error))?;
     flush_file(&temporary)?;
     drop(temporary);
@@ -57,7 +70,15 @@ fn inspect_destination(
 ) -> Result<ExistingDestination, PlatformError> {
     match destination.symlink_metadata() {
         Ok(metadata) => {
-            if matches!(policy, AtomicWritePolicy::NoFollow) && is_link_or_reparse(&metadata) {
+            if is_link_or_reparse(&metadata) {
+                if matches!(policy, AtomicWritePolicy::ReplaceDestination)
+                    && supports_link_replacement()
+                {
+                    return Ok(ExistingDestination {
+                        existed: true,
+                        permissions: None,
+                    });
+                }
                 return Err(PlatformError::ReparsePointRejected {
                     path: destination.to_path_buf(),
                 });
@@ -86,12 +107,22 @@ fn is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
+#[cfg(unix)]
+fn supports_link_replacement() -> bool {
+    true
+}
+
 #[cfg(windows)]
 fn is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn supports_link_replacement() -> bool {
+    false
 }
 
 fn create_temporary(

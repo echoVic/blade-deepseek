@@ -21,6 +21,20 @@ use crate::{
     web_search, write_file,
 };
 
+#[cfg(test)]
+mod windows_shell_prompt_contract_tests {
+    use super::*;
+
+    #[test]
+    fn bash_tool_description_does_not_claim_a_posix_shell_on_every_host() {
+        let registry = default_tool_registry();
+        let bash = registry.resolve("bash").expect("bash tool");
+
+        assert!(bash.tool.description().contains("resolved host shell"));
+        assert!(!bash.tool.description().contains("via sh -c"));
+    }
+}
+
 #[allow(dead_code)]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> &ToolSpec;
@@ -591,7 +605,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         cooperative_builtin_spec(
             "bash",
-            "Execute a shell command via sh -c. Use for running tests, builds, git operations, etc.",
+            "Execute a command in the resolved host shell. Use for running tests, builds, git operations, etc.",
             json!({
                 "type": "object",
                 "properties": {

@@ -1532,6 +1532,7 @@ dependencies = [
  "dirs",
  "orca-core",
  "orca-mcp",
+ "orca-platform",
  "orca-tools",
  "reqwest",
  "serde",

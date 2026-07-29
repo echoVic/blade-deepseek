@@ -25,8 +25,8 @@ use super::types::{
     TurnItemsView,
 };
 use super::writer::{
-    conversation_record_from_semantic_event, lock_file, read_history_lines, read_records,
-    read_session_meta, read_transcript, rewrite_records, unlock_file, write_durable_record,
+    acquire_file_lock, conversation_record_from_semantic_event, read_history_lines, read_records,
+    read_session_meta, read_transcript, rewrite_records, write_durable_record,
 };
 use super::{LiveThread, ORCA_HOME_ENV};
 
@@ -409,7 +409,7 @@ pub fn compress_session(selector: &str) -> io::Result<PathBuf> {
     }
     let compressed_path = path.with_extension("jsonl.zst");
     let lock = OpenOptions::new().read(true).write(true).open(&path)?;
-    lock_file(&lock)?;
+    let _lock = acquire_file_lock(&path, &lock)?;
     let result = (|| {
         let input = File::open(&path)?;
         let output = File::create(&compressed_path)?;
@@ -420,12 +420,7 @@ pub fn compress_session(selector: &str) -> io::Result<PathBuf> {
         fs::remove_file(&path)?;
         Ok(compressed_path)
     })();
-    let unlock_result = unlock_file(&lock);
-    match (result, unlock_result) {
-        (Ok(path), Ok(())) => Ok(path),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-    }
+    result
 }
 
 pub(crate) fn load_thread_records(

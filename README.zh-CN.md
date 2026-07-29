@@ -8,7 +8,7 @@ Orca 使用 Rust 构建，在本地运行，并采用 MIT 许可证。
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md)
 
-[官网](https://orcaagent.dev/) · [更新日志](https://orcaagent.dev/changelog/) · [版本发布](https://github.com/echoVic/blade-deepseek/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
+[官网](https://orcaagent.dev/) · [更新日志](https://orcaagent.dev/changelog/) · [版本发布](https://github.com/echoVic/orca-agent/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
 
 ## 安装
 
@@ -22,8 +22,14 @@ npm install -g @blade-ai/orca
 curl -fsSL https://orcaagent.dev/install.sh | sh
 ```
 
-npm 包支持 macOS 和 Linux 的 ARM64 与 x64 平台。也可以从
-[GitHub Releases](https://github.com/echoVic/blade-deepseek/releases/latest) 下载预编译文件。
+Windows PowerShell 使用：
+
+```powershell
+irm https://orcaagent.dev/install.ps1 | iex
+```
+
+npm 包支持 macOS、Linux 和 Windows 的 ARM64 与 x64 平台。也可以从
+[GitHub Releases](https://github.com/echoVic/orca-agent/releases/latest) 下载预编译文件。
 
 ## 使用
 
@@ -35,6 +41,9 @@ orca exec "修复失败的测试"                 # 无界面运行
 orca exec --verifier "cargo test" "修复它" # 完成前执行验证
 orca --mode=acp                           # 连接 ACP 客户端
 ```
+
+Windows PowerShell 使用 `$env:DEEPSEEK_API_KEY = "sk-..."` 设置密钥；
+后续 `orca` 命令相同。
 
 在 TUI 中，`@` 可以搜索文件、Skills、Plugins 和 MCP Resources。
 使用 `/plan` 进行只读规划，使用 `/goal` 管理持久目标，使用 `/workflows`
@@ -74,8 +83,8 @@ orca --mode=acp                           # 连接 ACP 客户端
 贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。对于较大或涉及兼容性的改动，
 请先提交 Issue。
 
-- [报告问题](https://github.com/echoVic/blade-deepseek/issues/new?template=bug_report.yml)
-- [提出功能建议](https://github.com/echoVic/blade-deepseek/issues/new?template=feature_request.yml)
+- [报告问题](https://github.com/echoVic/orca-agent/issues/new?template=bug_report.yml)
+- [提出功能建议](https://github.com/echoVic/orca-agent/issues/new?template=feature_request.yml)
 - [获取帮助](SUPPORT.md)
 - [报告安全漏洞](SECURITY.md)
 

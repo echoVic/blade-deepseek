@@ -9,7 +9,7 @@ Orca は Rust 製で、ローカルで動作し、MIT ライセンスで提供�
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md)
 
-[Web サイト](https://orcaagent.dev/) · [変更履歴](https://orcaagent.dev/changelog/) · [リリース](https://github.com/echoVic/blade-deepseek/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
+[Web サイト](https://orcaagent.dev/) · [変更履歴](https://orcaagent.dev/changelog/) · [リリース](https://github.com/echoVic/orca-agent/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
 
 ## インストール
 
@@ -23,8 +23,14 @@ npm install -g @blade-ai/orca
 curl -fsSL https://orcaagent.dev/install.sh | sh
 ```
 
-npm パッケージは macOS と Linux の ARM64 / x64 に対応しています。
-ビルド済みアーカイブは [GitHub Releases](https://github.com/echoVic/blade-deepseek/releases/latest) からも入手できます。
+Windows PowerShell の場合：
+
+```powershell
+irm https://orcaagent.dev/install.ps1 | iex
+```
+
+npm パッケージは macOS、Linux、Windows の ARM64 / x64 に対応しています。
+ビルド済みアーカイブは [GitHub Releases](https://github.com/echoVic/orca-agent/releases/latest) からも入手できます。
 
 ## 使い方
 
@@ -36,6 +42,9 @@ orca exec "失敗しているテストを修正"        # ヘッドレスで実�
 orca exec --verifier "cargo test" "修正する" # 完了前に検証
 orca --mode=acp                           # ACP クライアントを接続
 ```
+
+Windows PowerShell では `$env:DEEPSEEK_API_KEY = "sk-..."` でキーを設定します。
+以降の `orca` コマンドは同じです。
 
 TUI では `@` でファイル、Skills、Plugins、MCP Resources を検索できます。
 `/plan` は読み取り専用の計画、`/goal` は永続的な目標、`/workflows` は
@@ -76,8 +85,8 @@ TUI では `@` でファイル、Skills、Plugins、MCP Resources を検索で�
 コントリビューションの前に [CONTRIBUTING.md](CONTRIBUTING.md) をお読みください。
 大規模または互換性に影響する変更は、先に Issue を作成してください。
 
-- [バグを報告](https://github.com/echoVic/blade-deepseek/issues/new?template=bug_report.yml)
-- [機能を提案](https://github.com/echoVic/blade-deepseek/issues/new?template=feature_request.yml)
+- [バグを報告](https://github.com/echoVic/orca-agent/issues/new?template=bug_report.yml)
+- [機能を提案](https://github.com/echoVic/orca-agent/issues/new?template=feature_request.yml)
 - [サポートを受ける](SUPPORT.md)
 - [脆弱性を報告](SECURITY.md)
 

@@ -46,7 +46,7 @@ version = "0.2.56"
 edition = "2024"
 description = "Orca: a DeepSeek-native coding agent"
 license = "MIT"
-repository = "https://github.com/echoVic/blade-deepseek"
+repository = "https://github.com/echoVic/orca-agent"
 
 [[bin]]
 name = "orca"

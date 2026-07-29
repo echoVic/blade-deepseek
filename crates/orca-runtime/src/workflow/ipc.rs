@@ -3,8 +3,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use orca_platform::fs::{AtomicWritePolicy, atomic_write};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -258,26 +258,7 @@ fn write_mailbox_state(path: &Path, state: &WorkflowMailboxState) -> io::Result<
     }
     let content = serde_json::to_string_pretty(state)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("mailbox");
-    let temp_path = path.with_file_name(format!(
-        ".{file_name}.tmp-{}-{}",
-        std::process::id(),
-        now_ms()
-    ));
-    fs::write(&temp_path, content)?;
-    fs::rename(&temp_path, path).inspect_err(|_| {
-        let _ = fs::remove_file(&temp_path);
-    })
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
+    atomic_write(path, content.as_bytes(), AtomicWritePolicy::NoFollow).map_err(io::Error::other)
 }
 
 fn normalize_channel(channel: &str) -> Result<String, String> {
@@ -464,19 +445,7 @@ fn write_task_list_state(path: &Path, state: &WorkflowTaskListState) -> io::Resu
     }
     let content = serde_json::to_string_pretty(state)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("task-lists");
-    let temp_path = path.with_file_name(format!(
-        ".{file_name}.tmp-{}-{}",
-        std::process::id(),
-        now_ms()
-    ));
-    fs::write(&temp_path, content)?;
-    fs::rename(&temp_path, path).inspect_err(|_| {
-        let _ = fs::remove_file(&temp_path);
-    })
+    atomic_write(path, content.as_bytes(), AtomicWritePolicy::NoFollow).map_err(io::Error::other)
 }
 
 fn tasks_to_value(tasks: &[WorkflowTaskItem]) -> Value {

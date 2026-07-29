@@ -108,6 +108,97 @@ assert.throws(
 validateManifest(baseline);
 validateCurrentInventory(baseline, { repoRoot });
 
+const migratedLockBoundaries = [
+  ["crates/orca-runtime/src/goal_actor.rs", "goal runtime"],
+  ["crates/orca-runtime/src/runtime_surface/store.rs", "runtime surface owner"],
+  ["crates/orca-runtime/src/thread_store/writer.rs", "thread store writer"],
+];
+for (const [relativePath, label] of migratedLockBoundaries) {
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  assert.ok(
+    source.includes("orca_platform::fs::ExclusiveFileLock"),
+    `${label} must use the cross-platform exclusive file lock`,
+  );
+}
+const closedLockBoundaryIds = new Set([
+  "goal-actor-unix-lock",
+  "goal-actor-non-unix-lock-stub",
+  "runtime-surface-owner-flock-ffi",
+  "runtime-surface-non-unix-lock-stub",
+  "thread-writer-flock-ffi",
+  "thread-writer-non-unix-lock-stub",
+]);
+for (const [boundaryId] of baseline.deferred_boundaries) {
+  assert.ok(
+    !closedLockBoundaryIds.has(boundaryId),
+    `${boundaryId} must be removed after migrating to the cross-platform lock`,
+  );
+}
+const runtimeSurfaceSource = readFileSync(
+  path.join(repoRoot, "crates/orca-runtime/src/runtime_surface/store.rs"),
+  "utf8",
+);
+assert.ok(
+  /atomic_write\(\s*path,/.test(runtimeSurfaceSource),
+  "runtime surface owner epochs must use the cross-platform atomic replacement primitive",
+);
+assert.ok(
+  !baseline.foundation_exceptions.some(
+    ([boundaryId]) => boundaryId === "runtime-surface-temp-rename",
+  ),
+  "runtime surface temp rename must leave the foundation exception list",
+);
+
+const atomicPersistenceBoundaries = [
+  [
+    "crates/orca-core/src/config/folder_trust.rs",
+    "atomic_write",
+    "folder trust",
+  ],
+  [
+    "crates/orca-runtime/src/workflow/state.rs",
+    "atomic_write",
+    "workflow state",
+  ],
+  ["crates/orca-runtime/src/tasks.rs", "atomic_write", "task state"],
+  [
+    "crates/orca-runtime/src/workflow/command.rs",
+    "atomic_write",
+    "workflow launch record",
+  ],
+  [
+    "crates/orca-runtime/src/thread_store/writer.rs",
+    "atomic_write_with",
+    "thread transcript rewrite",
+  ],
+  [
+    "crates/orca-runtime/src/workflow/ipc.rs",
+    "atomic_write",
+    "workflow IPC state",
+  ],
+];
+for (const [relativePath, primitive, label] of atomicPersistenceBoundaries) {
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  assert.ok(
+    source.includes(primitive),
+    `${label} must use the cross-platform atomic replacement primitive`,
+  );
+}
+const closedTempRenameBoundaryIds = new Set([
+  "folder-trust-temp-rename",
+  "workflow-state-temp-rename",
+  "tasks-temp-rename",
+  "workflow-command-temp-rename",
+  "thread-writer-temp-rename",
+  "workflow-ipc-temp-rename",
+]);
+for (const [boundaryId] of baseline.foundation_exceptions) {
+  assert.ok(
+    !closedTempRenameBoundaryIds.has(boundaryId),
+    `${boundaryId} must leave the foundation exception list`,
+  );
+}
+
 const atomicJobSpawnContracts = [
   ["crates/orca-core/src/verification.rs", "ProcessJob::spawn(&mut child_command)"],
   ["crates/orca-mcp/src/transport.rs", "ProcessJob::spawn(&mut child_command)"],
@@ -360,8 +451,58 @@ for (const marker of [
   "restricted_windows_pty_session_keeps_terminal_and_resizes",
   "orca-windows-runner",
   "orca-windows-sandbox-setup",
+  "prompt_names_powershell_7_as_the_active_shell_dialect",
+  "altgr_char_is_normalized_to_text_input_on_windows_only",
+  "windows_standalone_update_uses_downloaded_powershell_installer",
+  "windows_npm_update_waits_for_running_orca_before_replacing_package",
 ]) {
   assert.ok(workflow.includes(marker), `Windows CI workflow must contain ${marker}`);
+}
+const windowsX64Job = workflow.match(/  native-x64:\n([\s\S]*?)\n  native-arm64:/);
+assert.ok(windowsX64Job, "Windows CI must define a native x64 job");
+const windowsArm64Job = workflow.match(/  native-arm64:\n([\s\S]*)$/);
+assert.ok(windowsArm64Job, "Windows CI must define a native ARM64 job");
+const nativeLockBehaviorTests = [
+  "goal_runtime_lease_is_shared_in_process_and_exclusive_across_processes",
+  "thread_and_policy_owner_leases_fail_closed_and_wall_rollback_has_no_authority",
+  "history_rename_search_and_compress_work_for_latest",
+];
+for (const marker of nativeLockBehaviorTests) {
+  assert.ok(
+    windowsX64Job[1].includes(marker),
+    `Windows x64 CI must run the native lock behavior ${marker}`,
+  );
+  assert.ok(
+    windowsArm64Job[1].includes(marker),
+    `Windows ARM64 CI must run the native lock behavior ${marker}`,
+  );
+}
+const releaseWindowsX64Gate = releaseWorkflow.match(
+  /- name: Run native Windows x64 behavior gates[\s\S]*?(?=\n      - name:)/,
+);
+assert.ok(releaseWindowsX64Gate, "release workflow must define a native Windows x64 gate");
+const releaseWindowsArm64Gate = releaseWorkflow.match(
+  /- name: Run native Windows ARM64 behavior gates[\s\S]*?(?=\n      - name:)/,
+);
+assert.ok(
+  releaseWindowsArm64Gate,
+  "release workflow must define a native Windows ARM64 gate",
+);
+for (const marker of [
+  "prompt_names_powershell_7_as_the_active_shell_dialect",
+  "altgr_char_is_normalized_to_text_input_on_windows_only",
+  "windows_standalone_update_uses_downloaded_powershell_installer",
+  "windows_npm_update_waits_for_running_orca_before_replacing_package",
+  ...nativeLockBehaviorTests,
+]) {
+  assert.ok(
+    releaseWindowsX64Gate[0].includes(marker),
+    `release x64 gate must run the native Windows behavior contract ${marker}`,
+  );
+  assert.ok(
+    releaseWindowsArm64Gate[0].includes(marker),
+    `release ARM64 gate must run the native Windows behavior contract ${marker}`,
+  );
 }
 for (const marker of [
   "orca-windows-runner.exe",

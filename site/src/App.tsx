@@ -19,6 +19,7 @@ import {
 
 const npmCommand = "npm install -g @blade-ai/orca";
 const curlCommand = "curl -fsSL https://orcaagent.dev/install.sh | sh";
+const powershellCommand = "irm https://orcaagent.dev/install.ps1 | iex";
 
 const canonicalUrl = `${canonicalOrigin}/`;
 
@@ -130,7 +131,7 @@ const copy = {
         {
           k: "01",
           title: "Install",
-          body: "Use npm for the fastest path, or switch to the native curl installer below.",
+          body: "Use npm for the fastest path, or choose the native curl or PowerShell installer below.",
           code: ["npm install -g @blade-ai/orca"],
         },
         {
@@ -279,7 +280,7 @@ const copy = {
     specsLabel: "Technical specs",
     specs: {
       context: "Context window, auto-compacted past the 80% threshold.",
-      platforms: "Native binaries: macOS and Linux, arm64 and x64.",
+      platforms: "Native binaries: macOS, Linux, and Windows, arm64 and x64.",
       tools: "Built-in, MCP, and external tools share one spec-driven registry.",
       rust: "Written in Rust, running as a single local binary.",
     },
@@ -292,7 +293,7 @@ const copy = {
       copied: "✓ Copied",
       failed: "Failed",
       platforms:
-        "Supported platforms: macOS arm64/x64 and Linux arm64/x64. Downloads are available on",
+        "Supported platforms: macOS, Linux, and Windows on arm64/x64. Downloads are available on",
       releases: "GitHub Releases",
     },
     community: {
@@ -403,7 +404,7 @@ const copy = {
         {
           k: "01",
           title: "安装",
-          body: "npm 是最快路径；如果想直接安装原生二进制，也可以用下方 curl 方式。",
+          body: "npm 是最快路径；直接安装原生二进制时，可在下方选择 curl 或 PowerShell。",
           code: ["npm install -g @blade-ai/orca"],
         },
         {
@@ -551,7 +552,7 @@ const copy = {
     specsLabel: "技术规格",
     specs: {
       context: "上下文窗口，超过 80% 阈值后自动压缩。",
-      platforms: "原生二进制：macOS 与 Linux，arm64 / x64。",
+      platforms: "原生二进制：macOS、Linux 与 Windows，arm64 / x64。",
       tools: "内置、MCP 和 external 工具共用规格驱动注册表。",
       rust: "Rust 编写，以单个本地二进制运行。",
     },
@@ -563,7 +564,7 @@ const copy = {
       copy: "复制",
       copied: "✓ 已复制",
       failed: "复制失败",
-      platforms: "支持平台：macOS arm64/x64 和 Linux arm64/x64。下载文件位于",
+      platforms: "支持平台：macOS、Linux 与 Windows arm64/x64。下载文件位于",
       releases: "GitHub Releases",
     },
     community: {
@@ -630,13 +631,15 @@ const builtinTools = [
   "external",
 ];
 
-type InstallMode = "npm" | "curl";
+const installModes = ["npm", "curl", "powershell"] as const;
+type InstallMode = (typeof installModes)[number];
 type CopyState = "idle" | "copied" | "failed";
 type CodeTab = "exec" | "goal" | "history" | "config";
 
 const installTabIds = {
   npm: "install-tab-npm",
   curl: "install-tab-curl",
+  powershell: "install-tab-powershell",
 } as const;
 
 const installPanelId = "install-panel";
@@ -948,8 +951,14 @@ function App() {
   const tabRefs = useRef<Record<InstallMode, HTMLButtonElement | null>>({
     npm: null,
     curl: null,
+    powershell: null,
   });
-  const command = mode === "npm" ? npmCommand : curlCommand;
+  const commands: Record<InstallMode, string> = {
+    npm: npmCommand,
+    curl: curlCommand,
+    powershell: powershellCommand,
+  };
+  const command = commands[mode];
   const t = copy[locale];
   const tuiBlocks = useMemo(() => makeTuiBlocks(t), [t]);
   const tui = useTuiAnimation(tuiBlocks, t.tui.user);
@@ -1004,18 +1013,21 @@ function App() {
   ) {
     let nextMode: InstallMode | null = null;
 
+    const currentIndex = installModes.indexOf(currentMode);
     switch (event.key) {
       case "ArrowLeft":
       case "ArrowUp":
+        nextMode = installModes[(currentIndex - 1 + installModes.length) % installModes.length];
+        break;
       case "ArrowRight":
       case "ArrowDown":
-        nextMode = currentMode === "npm" ? "curl" : "npm";
+        nextMode = installModes[(currentIndex + 1) % installModes.length];
         break;
       case "Home":
         nextMode = "npm";
         break;
       case "End":
-        nextMode = "curl";
+        nextMode = installModes[installModes.length - 1];
         break;
       default:
         return;
@@ -1374,12 +1386,28 @@ function App() {
               >
                 curl
               </button>
+              <button
+                id={installTabIds.powershell}
+                className={mode === "powershell" ? "active" : ""}
+                onClick={() => setInstallMode("powershell")}
+                onKeyDown={(event) => handleInstallTabKeyDown(event, "powershell")}
+                aria-selected={mode === "powershell"}
+                aria-controls={installPanelId}
+                role="tab"
+                tabIndex={mode === "powershell" ? 0 : -1}
+                type="button"
+                ref={(element) => {
+                  tabRefs.current.powershell = element;
+                }}
+              >
+                PowerShell
+              </button>
             </div>
             <div
               className="command-row"
               id={installPanelId}
               role="tabpanel"
-              aria-labelledby={mode === "npm" ? installTabIds.npm : installTabIds.curl}
+              aria-labelledby={installTabIds[mode]}
               tabIndex={0}
             >
               <code>{command}</code>

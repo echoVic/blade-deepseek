@@ -64,6 +64,7 @@ pub(crate) fn apply_composer_key_input(
     vim_state: &mut VimState,
     theme: &Theme,
 ) -> bool {
+    let normalized_event = normalize_windows_altgr_event(ev);
     let changed = if key.code == KeyCode::Tab {
         let text = textarea_text(textarea);
         let cursor = textarea_cursor_byte_index(textarea);
@@ -91,16 +92,58 @@ pub(crate) fn apply_composer_key_input(
                 make_textarea_with_text_at_cursor(&edit.text, edit.cursor, vim_state, theme);
             true
         } else {
-            textarea.input(Input::from(ev.clone()))
+            textarea.input(Input::from(normalized_event.clone()))
         }
     } else if vim_state.enabled {
-        vim_state.handle(Input::from(ev.clone()), textarea, theme)
+        vim_state.handle(Input::from(normalized_event.clone()), textarea, theme)
     } else {
-        textarea.input(Input::from(ev.clone()))
+        textarea.input(Input::from(normalized_event))
     };
     if changed {
         state.reset_history_navigation();
         refresh_input_menus(textarea, state, config);
     }
     changed
+}
+
+fn normalize_windows_altgr_event(ev: &Event) -> Event {
+    #[cfg(windows)]
+    if let Event::Key(key) = ev
+        && matches!(key.code, KeyCode::Char(_))
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT)
+    {
+        let mut normalized = *key;
+        normalized
+            .modifiers
+            .remove(crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT);
+        return Event::Key(normalized);
+    }
+
+    ev.clone()
+}
+
+#[cfg(test)]
+mod windows_input_tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    #[test]
+    fn altgr_char_is_normalized_to_text_input_on_windows_only() {
+        let event = Event::Key(KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        let normalized = normalize_windows_altgr_event(&event);
+
+        if cfg!(windows) {
+            assert_eq!(
+                normalized,
+                Event::Key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE))
+            );
+        } else {
+            assert_eq!(normalized, event);
+        }
+    }
 }

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -11,6 +10,7 @@ use orca_core::goal_runtime::{
     GoalTurnStatus, GoalUpdateAck, GoalUpdateIntent, GoalUsage, GoalVerificationResult,
 };
 use orca_core::goal_types::ThreadGoal;
+use orca_platform::fs::ExclusiveFileLock;
 use sha2::{Digest, Sha256};
 
 use crate::goal_store::{
@@ -146,7 +146,7 @@ struct GoalRuntimeLease {
 }
 
 struct GoalRuntimeLeaseInner {
-    _file: File,
+    _lock: ExclusiveFileLock,
     owner_epoch: u64,
 }
 
@@ -167,22 +167,15 @@ impl GoalRuntimeLease {
         }
 
         let lock_path = database_path.with_extension("runtime.lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|error| GoalActorError::OwnerActive {
+        let lock = ExclusiveFileLock::try_acquire(&lock_path).map_err(|error| {
+            GoalActorError::OwnerActive {
                 path: lock_path.display().to_string(),
                 message: error.to_string(),
-            })?;
-        try_lock_runtime_file(&file).map_err(|error| GoalActorError::OwnerActive {
-            path: lock_path.display().to_string(),
-            message: error.to_string(),
+            }
         })?;
         let owner_epoch = store.claim_surface_owner_epoch()?;
         let inner = Arc::new(GoalRuntimeLeaseInner {
-            _file: file,
+            _lock: lock,
             owner_epoch,
         });
         registry.insert(database_path, Arc::downgrade(&inner));
@@ -200,23 +193,6 @@ fn absolute_path(path: &Path) -> std::io::Result<PathBuf> {
     } else {
         Ok(std::env::current_dir()?.join(path))
     }
-}
-
-#[cfg(unix)]
-fn try_lock_runtime_file(file: &File) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn try_lock_runtime_file(_file: &File) -> std::io::Result<()> {
-    Ok(())
 }
 
 struct ActiveGoalTurn {

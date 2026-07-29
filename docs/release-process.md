@@ -88,14 +88,14 @@ git push origin vX.Y.Z
 
 The `release.yml` workflow triggers on the tag push and:
 1. Runs tests
-2. Builds binaries for all four targets
+2. Builds binaries for all six targets, including native Windows x64 and ARM64
 3. Creates a GitHub Release with binary assets
 4. Stages, smoke-tests, and publishes npm packages
 
 Monitor progress:
 
 ```sh
-gh run list --repo echoVic/blade-deepseek --limit 5
+gh run list --repo echoVic/orca-agent --limit 5
 ```
 
 ### 8. Post-publish verification
@@ -103,7 +103,7 @@ gh run list --repo echoVic/blade-deepseek --limit 5
 ```sh
 node scripts/release/verify-published.mjs \
   --version X.Y.Z \
-  --repo echoVic/blade-deepseek \
+  --repo echoVic/orca-agent \
   --package @blade-ai/orca \
   --bin orca
 ```

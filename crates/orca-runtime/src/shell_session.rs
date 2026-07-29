@@ -307,13 +307,8 @@ impl RuntimeShellSessionManager {
 
         #[cfg(windows)]
         if !matches!(command.sandbox, ShellSandboxMode::DangerFullAccess) {
-            let restricted = spawn_windows_sandbox(
-                &command,
-                &metadata_writable_directories,
-                &shell,
-                tasks.clone(),
-                &task.id,
-            );
+            let restricted =
+                spawn_windows_sandbox(&command, &metadata_writable_directories, &shell);
             let (child, process_job, stdin, stdout_reader, stderr_reader, effective_terminal) =
                 match restricted {
                     Ok(value) => value,
@@ -330,6 +325,7 @@ impl RuntimeShellSessionManager {
                 task.id.clone(),
                 ShellOutputStream::Stdout,
                 Arc::clone(&reader_stop),
+                false,
             ));
             let stderr_handle = stderr_reader.map(|reader| {
                 spawn_output_reader(
@@ -338,8 +334,22 @@ impl RuntimeShellSessionManager {
                     task.id.clone(),
                     ShellOutputStream::Stderr,
                     Arc::clone(&reader_stop),
+                    false,
                 )
             });
+            if let Err(error) = tasks.mark_worker_spawned(&task.id, child.id()?) {
+                cleanup_failed_shell_start(
+                    child,
+                    process_job,
+                    stdin,
+                    reader_stop,
+                    stdout_handle,
+                    stderr_handle,
+                );
+                let error = io::Error::other(error);
+                let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
+                return Err(error);
+            }
             let id = format!("shell-{}", Uuid::new_v4());
             self.sessions.insert(
                 id.clone(),
@@ -422,12 +432,7 @@ impl RuntimeShellSessionManager {
         }
         let stdio = configure_shell_stdio(&mut process, requested_terminal)?;
         let effective_terminal = stdio.effective_terminal();
-        let initialized = spawn_configured_shell(process, stdio, |pid| {
-            tasks
-                .mark_worker_spawned(&task.id, pid)
-                .map_err(io::Error::other)?;
-            Ok(())
-        });
+        let initialized = spawn_configured_shell(process, stdio);
         let (child, process_job, stdin, stdout_reader, stderr_reader) = match initialized {
             Ok(initialized) => initialized,
             Err(error) => {
@@ -443,6 +448,7 @@ impl RuntimeShellSessionManager {
             task.id.clone(),
             ShellOutputStream::Stdout,
             Arc::clone(&reader_stop),
+            cfg!(unix) && effective_terminal.is_pty(),
         ));
         let stderr_handle = stderr_reader.map(|reader| {
             spawn_output_reader(
@@ -451,8 +457,22 @@ impl RuntimeShellSessionManager {
                 task.id.clone(),
                 ShellOutputStream::Stderr,
                 Arc::clone(&reader_stop),
+                cfg!(unix) && effective_terminal.is_pty(),
             )
         });
+        if let Err(error) = tasks.mark_worker_spawned(&task.id, child.id()?) {
+            cleanup_failed_shell_start(
+                child,
+                process_job,
+                stdin,
+                reader_stop,
+                stdout_handle,
+                stderr_handle,
+            );
+            let error = io::Error::other(error);
+            let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
+            return Err(error);
+        }
         let id = format!("shell-{}", Uuid::new_v4());
         self.sessions.insert(
             id.clone(),
@@ -514,7 +534,7 @@ impl RuntimeShellSessionManager {
         self.sessions
             .iter_mut()
             .map(|(id, session)| {
-                let status = match session.child.try_wait() {
+                let status = match session.try_wait() {
                     Ok(Some(status)) if status.success() => TaskStatus::Completed,
                     Ok(Some(_)) => TaskStatus::Failed,
                     Ok(None) | Err(_) => TaskStatus::Running,
@@ -550,7 +570,7 @@ impl RuntimeShellSessionManager {
         let ids = self
             .sessions
             .iter_mut()
-            .filter_map(|(id, session)| match session.child.try_wait() {
+            .filter_map(|(id, session)| match session.try_wait() {
                 Ok(Some(status)) if should_reap(id) => Some(Ok((id.clone(), status))),
                 Ok(Some(_)) => None,
                 Ok(None) => None,
@@ -606,7 +626,7 @@ impl RuntimeShellSessionManager {
             .unwrap_or_else(Instant::now);
         loop {
             let session = self.session_mut(id)?;
-            if let Some(status) = session.child.try_wait()? {
+            if let Some(status) = session.try_wait()? {
                 return self.finish_terminal_session(id, status, remove_completed_output);
             }
             if session.output_size() > 0 || Instant::now() >= deadline {
@@ -661,7 +681,7 @@ impl RuntimeShellSessionManager {
         let task_id = self.session_mut(id)?.task_id.clone();
         let mut output_offset = 0;
         loop {
-            let completed = self.session_mut(id)?.child.try_wait()?.is_some();
+            let completed = self.session_mut(id)?.try_wait()?.is_some();
             output_offset = self.emit_available_output(&task_id, output_offset, on_output)?;
             if completed {
                 break;
@@ -676,8 +696,7 @@ impl RuntimeShellSessionManager {
         }
 
         let mut session = self.take_session(id)?;
-        let status = session.child.wait()?;
-        session.join_readers();
+        let status = session.finish_after_exit()?;
         self.emit_available_output(&task_id, output_offset, on_output)?;
         let tasks = session.tasks.clone();
         let output = session.output(
@@ -725,8 +744,8 @@ impl RuntimeShellSessionManager {
         ));
         let mut session = self.take_session(id)?;
         let tasks = session.tasks.clone();
-        if let Some(status) = wait_for_process_exit(&mut session, Duration::from_millis(150))? {
-            session.join_readers();
+        if wait_for_process_exit(&mut session, Duration::from_millis(150))?.is_some() {
+            let status = session.finish_after_exit()?;
             let output = session.output(
                 id,
                 if status.success() {
@@ -767,11 +786,11 @@ impl RuntimeShellSessionManager {
     fn finish_terminal_session(
         &mut self,
         id: &str,
-        status: ShellExitStatus,
+        _observed_status: ShellExitStatus,
         remove_completed_output: bool,
     ) -> io::Result<ShellSessionOutput> {
         let mut session = self.take_session(id)?;
-        session.join_readers();
+        let status = session.finish_after_exit()?;
         let tasks = session.tasks.clone();
         let output = session.output(
             id,
@@ -853,8 +872,6 @@ fn spawn_windows_sandbox(
     command: &ShellSessionCommand,
     metadata_writable_directories: &[PathBuf],
     shell: &ShellSpec,
-    tasks: TaskRegistry,
-    task_id: &str,
 ) -> io::Result<(
     ShellChild,
     ProcessJob,
@@ -911,10 +928,6 @@ fn spawn_windows_sandbox(
     let terminal = resolve_terminal_support(command.terminal, native_pty_supported())?;
     if let ShellTerminalMode::Pty { cols, rows } = terminal {
         let mut child = SandboxedPty::spawn(request(), cols, rows).map_err(io::Error::other)?;
-        let pid = child.id();
-        tasks
-            .mark_worker_spawned(task_id, pid)
-            .map_err(io::Error::other)?;
         let process_job = child.take_process_job()?;
         let (input, output) = child.take_pty()?;
         return Ok((
@@ -928,10 +941,6 @@ fn spawn_windows_sandbox(
     }
 
     let mut child = SandboxedChild::spawn(request()).map_err(io::Error::other)?;
-    let pid = child.id();
-    tasks
-        .mark_worker_spawned(task_id, pid)
-        .map_err(io::Error::other)?;
     let process_job = child.take_process_job()?;
     let (stdin, stdout, stderr) = child.take_stdio()?;
     Ok((
@@ -961,6 +970,10 @@ impl ShellSession {
     fn join_readers(&mut self) {
         self.terminate_child_tree();
         let _ = self.child.wait();
+        self.stop_and_join_readers();
+    }
+
+    fn stop_and_join_readers(&mut self) {
         self.stdin.close();
         self.reader_stop.store(true, Ordering::Release);
         if let Some(handle) = self.stdout_handle.take() {
@@ -969,6 +982,28 @@ impl ShellSession {
         if let Some(handle) = self.stderr_handle.take() {
             let _ = handle.join();
         }
+    }
+
+    fn finish_after_exit(&mut self) -> io::Result<ShellExitStatus> {
+        if cfg!(unix) && self.effective_terminal.is_pty() {
+            self.stdin.close();
+            thread::sleep(Duration::from_millis(50));
+            self.stop_and_join_readers();
+            self.terminate_child_tree();
+            self.child.wait()
+        } else {
+            let status = self.child.wait()?;
+            self.stop_and_join_readers();
+            Ok(status)
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ShellExitStatus>> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if self.effective_terminal.is_pty() {
+            return child_status_without_reaping(self.child.id()?);
+        }
+        self.child.try_wait()
     }
 
     fn output(
@@ -1033,16 +1068,33 @@ impl SpawnedShellChild {
         Self { child: Some(child) }
     }
 
-    fn child(&self) -> &ShellChild {
-        self.child.as_ref().expect("spawned shell child")
-    }
-
     fn child_mut(&mut self) -> &mut ShellChild {
         self.child.as_mut().expect("spawned shell child")
     }
 
     fn into_child(mut self) -> ShellChild {
         self.child.take().expect("spawned shell child")
+    }
+}
+
+fn cleanup_failed_shell_start(
+    mut child: ShellChild,
+    process_job: ProcessJob,
+    mut stdin: ShellInput,
+    reader_stop: Arc<AtomicBool>,
+    stdout_handle: Option<thread::JoinHandle<()>>,
+    stderr_handle: Option<thread::JoinHandle<()>>,
+) {
+    let _ = process_job.terminate(137);
+    child.kill();
+    let _ = child.wait();
+    stdin.close();
+    reader_stop.store(true, Ordering::Release);
+    if let Some(handle) = stdout_handle {
+        let _ = handle.join();
+    }
+    if let Some(handle) = stderr_handle {
+        let _ = handle.join();
     }
 }
 
@@ -1283,36 +1335,9 @@ fn configure_shell_stdio(
     }
 }
 
-#[cfg(test)]
-fn initialize_spawned_shell(
-    child: Child,
-    stdio: ShellStdio,
-    register_worker: impl FnOnce(u32) -> io::Result<()>,
-) -> io::Result<(
-    Child,
-    ShellInput,
-    Box<dyn Read + Send>,
-    Option<Box<dyn Read + Send>>,
-)> {
-    let mut child = SpawnedShellChild::new(ShellChild::Process(child));
-    register_worker(child.child().id()?)?;
-    let (stdin, stdout_reader, stderr_reader) = stdio.finish(child.child_mut())?;
-    let child = match child.into_child() {
-        ShellChild::Process(child) => child,
-        #[cfg(windows)]
-        ShellChild::WindowsPty(_) => unreachable!("standard spawn returned a ConPTY child"),
-        #[cfg(windows)]
-        ShellChild::WindowsSandbox(_) | ShellChild::WindowsSandboxPty(_) => {
-            unreachable!("standard spawn returned a sandbox child")
-        }
-    };
-    Ok((child, stdin, stdout_reader, stderr_reader))
-}
-
 fn spawn_configured_shell(
     mut process: std::process::Command,
     stdio: ShellStdio,
-    register_worker: impl FnOnce(u32) -> io::Result<()>,
 ) -> io::Result<(
     ShellChild,
     ProcessJob,
@@ -1326,10 +1351,8 @@ fn spawn_configured_shell(
             unreachable!("matched ConPTY stdio")
         };
         let spawned = spawn_windows_pty(&process, cols, rows)?;
-        let mut child = SpawnedShellChild::new(ShellChild::WindowsPty(spawned.child));
-        register_worker(child.child().id()?)?;
         return Ok((
-            child.into_child(),
+            ShellChild::WindowsPty(spawned.child),
             spawned.process_job,
             ShellInput::WindowsPty(spawned.input),
             spawned.reader,
@@ -1339,7 +1362,6 @@ fn spawn_configured_shell(
 
     let (child, process_job) = ProcessJob::spawn(&mut process)?;
     let mut child = SpawnedShellChild::new(ShellChild::Process(child));
-    register_worker(child.child().id()?)?;
     let (stdin, stdout_reader, stderr_reader) = stdio.finish(child.child_mut())?;
     Ok((
         child.into_child(),
@@ -1549,12 +1571,16 @@ fn spawn_output_reader<R: Read + Send + 'static>(
     task_id: String,
     stream: ShellOutputStream,
     stop: Arc<AtomicBool>,
+    zero_is_transient: bool,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         let mut pending = Vec::new();
         loop {
             match reader.read(&mut buffer) {
+                Ok(0) if zero_is_transient && !stop.load(Ordering::Acquire) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
                 Ok(0) => break,
                 Ok(n) => {
                     pending.extend_from_slice(&buffer[..n]);
@@ -1595,7 +1621,7 @@ fn wait_for_process_exit(
         .checked_add(timeout)
         .unwrap_or_else(Instant::now);
     loop {
-        if let Some(status) = session.child.try_wait()? {
+        if let Some(status) = session.try_wait()? {
             return Ok(Some(status));
         }
         if Instant::now() >= deadline {
@@ -1603,6 +1629,31 @@ fn wait_for_process_exit(
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn child_status_without_reaping(pid: u32) -> io::Result<Option<ShellExitStatus>> {
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(None);
+    }
+    let status = unsafe { info.si_status() };
+    let exited = info.si_code == libc::CLD_EXITED;
+    Ok(Some(ShellExitStatus {
+        success: exited && status == 0,
+        code: exited.then_some(status),
+    }))
 }
 
 fn drain_valid_utf8_output(
@@ -1819,19 +1870,42 @@ mod tests {
             .current_dir(temp.path());
         let stdio = configure_shell_stdio(&mut process, ShellTerminalMode::pipe())
             .expect("configure shell stdio");
-        let child = process.spawn().expect("spawn shell child");
-
-        let error = match initialize_spawned_shell(child, stdio, |_| {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !started_marker.exists() {
-                assert!(Instant::now() < deadline, "shell child did not start");
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(io::Error::other("injected registration failure"))
-        }) {
-            Ok(_) => panic!("registration should fail"),
-            Err(error) => error,
-        };
+        let (child, process_job, stdin, stdout_reader, stderr_reader) =
+            spawn_configured_shell(process, stdio).expect("spawn configured shell");
+        let output_store = TaskOutputStore::new();
+        let reader_stop = Arc::new(AtomicBool::new(false));
+        let stdout_handle = Some(spawn_output_reader(
+            stdout_reader,
+            output_store.clone(),
+            "registration-failure".to_string(),
+            ShellOutputStream::Stdout,
+            Arc::clone(&reader_stop),
+            false,
+        ));
+        let stderr_handle = stderr_reader.map(|reader| {
+            spawn_output_reader(
+                reader,
+                output_store,
+                "registration-failure".to_string(),
+                ShellOutputStream::Stderr,
+                Arc::clone(&reader_stop),
+                false,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !started_marker.exists() {
+            assert!(Instant::now() < deadline, "shell child did not start");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let error = io::Error::other("injected registration failure");
+        cleanup_failed_shell_start(
+            child,
+            process_job,
+            stdin,
+            reader_stop,
+            stdout_handle,
+            stderr_handle,
+        );
         assert_eq!(error.to_string(), "injected registration failure");
 
         std::fs::write(&release_marker, "release").expect("release descendant");

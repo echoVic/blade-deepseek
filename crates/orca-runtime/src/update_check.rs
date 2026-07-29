@@ -4,7 +4,9 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-const RELEASES_URL: &str = "https://api.github.com/repos/echoVic/blade-deepseek/releases/latest";
+use orca_platform::host::{HostPlatform, OperatingSystem};
+
+const RELEASES_URL: &str = "https://api.github.com/repos/echoVic/orca-agent/releases/latest";
 const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/@blade-ai/orca/latest";
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 const UPDATE_CACHE_FILE: &str = "update-cache.json";
@@ -38,13 +40,19 @@ pub struct UpdateCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UpdateRunOutcome {
     Updated,
+    Started,
     Failed(Option<i32>),
     StartFailed(String),
 }
 
 impl UpdateAction {
     pub fn command(&self) -> UpdateCommand {
+        self.command_for_os(HostPlatform::current().os)
+    }
+
+    fn command_for_os(&self, os: OperatingSystem) -> UpdateCommand {
         match self {
+            Self::NpmGlobalLatest if os == OperatingSystem::Windows => windows_npm_update_command(),
             Self::NpmGlobalLatest => UpdateCommand {
                 program: "npm",
                 args: vec![
@@ -59,7 +67,7 @@ impl UpdateAction {
                         .to_string(),
             },
             Self::StandaloneInstaller { install_dir } => {
-                standalone_update_command(install_dir.clone())
+                standalone_update_command_for_os(install_dir.clone(), os)
             }
         }
     }
@@ -87,7 +95,14 @@ fn update_action_from_env_and_exe(
     }
 }
 
-fn standalone_update_command(install_dir: Option<PathBuf>) -> UpdateCommand {
+fn standalone_update_command_for_os(
+    install_dir: Option<PathBuf>,
+    os: OperatingSystem,
+) -> UpdateCommand {
+    if os == OperatingSystem::Windows {
+        return windows_standalone_update_command(install_dir);
+    }
+
     let script = if install_dir.is_some() {
         "tmp=$(mktemp) && trap 'rm -f \"$tmp\"' EXIT INT TERM && curl -fsSL https://orcaagent.dev/install.sh -o \"$tmp\" && ORCA_NON_INTERACTIVE=1 INSTALL_DIR=\"$1\" sh \"$tmp\""
     } else {
@@ -113,6 +128,61 @@ fn standalone_update_command(install_dir: Option<PathBuf>) -> UpdateCommand {
         program: "sh",
         args,
         display,
+    }
+}
+
+fn windows_powershell_args(script: String) -> Vec<String> {
+    vec![
+        "-NoLogo".to_string(),
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-Command".to_string(),
+        script,
+    ]
+}
+
+fn powershell_single_quoted(value: &Path) -> String {
+    format!("'{}'", value.to_string_lossy().replace('\'', "''"))
+}
+
+fn windows_standalone_update_command(install_dir: Option<PathBuf>) -> UpdateCommand {
+    let install_dir_arg = install_dir
+        .as_deref()
+        .map(|path| format!(" -InstallDir {}", powershell_single_quoted(path)))
+        .unwrap_or_default();
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; $tmp = [System.IO.Path]::GetTempFileName(); try {{ Invoke-WebRequest -UseBasicParsing -Uri 'https://orcaagent.dev/install.ps1' -OutFile $tmp; & $tmp{install_dir_arg} -WaitForPid {} -NonInteractive; if (-not $?) {{ exit 1 }} }} finally {{ Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }}",
+        std::process::id()
+    );
+    let display = match install_dir {
+        Some(path) => format!(
+            "powershell.exe -NoProfile -ExecutionPolicy Bypass -File <downloaded install.ps1> -InstallDir {} -WaitForPid <orca-pid> -NonInteractive",
+            path.display()
+        ),
+        None => "powershell.exe -NoProfile -ExecutionPolicy Bypass -File <downloaded install.ps1> -WaitForPid <orca-pid> -NonInteractive"
+            .to_string(),
+    };
+
+    UpdateCommand {
+        program: "powershell.exe",
+        args: windows_powershell_args(script),
+        display,
+    }
+}
+
+fn windows_npm_update_command() -> UpdateCommand {
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; Wait-Process -Id {} -ErrorAction SilentlyContinue; npm install -g '@blade-ai/orca@latest' --registry 'https://registry.npmjs.org'; exit $LASTEXITCODE",
+        std::process::id()
+    );
+
+    UpdateCommand {
+        program: "powershell.exe",
+        args: windows_powershell_args(script),
+        display: "npm install -g @blade-ai/orca@latest --registry https://registry.npmjs.org"
+            .to_string(),
     }
 }
 
@@ -150,6 +220,13 @@ fn update_preflight_with(
 
 pub fn run_update(action: &UpdateAction) -> UpdateRunOutcome {
     let command = action.command();
+    if cfg!(windows) {
+        return match Command::new(command.program).args(&command.args).spawn() {
+            Ok(_) => UpdateRunOutcome::Started,
+            Err(error) => UpdateRunOutcome::StartFailed(error.to_string()),
+        };
+    }
+
     match Command::new(command.program).args(&command.args).status() {
         Ok(status) if status.success() => UpdateRunOutcome::Updated,
         Ok(status) => UpdateRunOutcome::Failed(status.code()),
@@ -195,7 +272,7 @@ fn check_latest_npm(current_version: &str) -> Result<Option<UpdateInfo>, String>
     }
     Ok(Some(UpdateInfo {
         current,
-        url: format!("https://github.com/echoVic/blade-deepseek/releases/tag/v{latest}"),
+        url: format!("https://github.com/echoVic/orca-agent/releases/tag/v{latest}"),
         latest,
     }))
 }
@@ -401,6 +478,58 @@ mod tests {
                 .iter()
                 .any(|arg| arg.contains("| ORCA_NON_INTERACTIVE"))
         );
+    }
+
+    #[test]
+    fn windows_standalone_update_uses_downloaded_powershell_installer() {
+        let command = standalone_update_command_for_os(
+            Some(std::path::PathBuf::from(r"C:\Program Files\O'rka\bin")),
+            orca_platform::host::OperatingSystem::Windows,
+        );
+
+        assert_eq!(command.program, "powershell.exe");
+        assert!(command.args.iter().any(|arg| {
+            arg.contains("Invoke-WebRequest")
+                && arg.contains("https://orcaagent.dev/install.ps1")
+                && arg.contains("-OutFile $tmp")
+        }));
+        assert!(command.args.iter().any(|arg| {
+            arg.contains("& $tmp -InstallDir 'C:\\Program Files\\O''rka\\bin'")
+                && arg.contains("-WaitForPid")
+                && arg.contains("-NonInteractive")
+        }));
+        assert!(
+            command
+                .args
+                .iter()
+                .any(|arg| arg.contains("Remove-Item -LiteralPath $tmp"))
+        );
+        assert!(!command.args.iter().any(|arg| arg.contains("install.sh")));
+        assert!(
+            !command
+                .args
+                .iter()
+                .any(|arg| arg.contains("Invoke-Expression"))
+        );
+    }
+
+    #[test]
+    fn windows_npm_update_waits_for_running_orca_before_replacing_package() {
+        let command = UpdateAction::NpmGlobalLatest
+            .command_for_os(orca_platform::host::OperatingSystem::Windows);
+
+        assert_eq!(command.program, "powershell.exe");
+        assert!(
+            command
+                .args
+                .iter()
+                .any(|arg| arg.contains("Wait-Process -Id"))
+        );
+        assert!(command.args.iter().any(|arg| {
+            arg.contains(
+                "npm install -g '@blade-ai/orca@latest' --registry 'https://registry.npmjs.org'",
+            )
+        }));
     }
 
     #[test]

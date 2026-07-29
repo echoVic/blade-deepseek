@@ -1,11 +1,14 @@
 use super::*;
 use crate::thread_store::JsonlThreadStore;
+use orca_platform::PlatformError;
+use orca_platform::fs::ExclusiveFileLock;
+use orca_platform::fs::{AtomicWritePolicy, atomic_write};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -4128,7 +4131,7 @@ pub enum OwnerLeaseError {
 
 enum OwnerLeaseBackend {
     Durable {
-        lock_file: File,
+        _lock: ExclusiveFileLock,
         epoch_path: PathBuf,
     },
     ProcessLocalThread,
@@ -4207,29 +4210,14 @@ impl ExclusiveOwnerLease {
         if !lease_paths_match(&lock_path, &epoch_path) {
             return Err(OwnerLeaseError::IdentityMismatch);
         }
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
-        }
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
-        try_lock_exclusive(&lock_file)?;
-
-        let epoch_result = advance_owner_epoch(&epoch_path);
-        let owner_epoch = match epoch_result {
-            Ok(epoch) => epoch,
-            Err(error) => {
-                unlock_exclusive(&lock_file);
-                return Err(error);
-            }
-        };
+        let lock = ExclusiveFileLock::try_acquire(&lock_path).map_err(|error| match error {
+            PlatformError::LockContended { .. } => OwnerLeaseError::AlreadyOwned,
+            _ => OwnerLeaseError::DurableEpochUnavailable,
+        })?;
+        let owner_epoch = advance_owner_epoch(&epoch_path)?;
         Ok(Self {
             backend: OwnerLeaseBackend::Durable {
-                lock_file,
+                _lock: lock,
                 epoch_path,
             },
             owner_epoch,
@@ -4288,7 +4276,7 @@ impl ExclusiveOwnerLease {
 impl Drop for ExclusiveOwnerLease {
     fn drop(&mut self) {
         match &self.backend {
-            OwnerLeaseBackend::Durable { lock_file, .. } => unlock_exclusive(lock_file),
+            OwnerLeaseBackend::Durable { .. } => {}
             OwnerLeaseBackend::ProcessLocalThread => {
                 if let Some(thread_id) = self.thread_id.as_ref() {
                     PROCESS_LOCAL_THREAD_OWNERS
@@ -4324,34 +4312,13 @@ fn advance_owner_epoch(path: &Path) -> Result<u64, OwnerLeaseError> {
     let next = read_owner_epoch(path)?
         .checked_add(1)
         .ok_or(OwnerLeaseError::EpochExhausted)?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or(OwnerLeaseError::DurableEpochUnavailable)?;
-    let temp_path = parent.join(format!(
-        ".{file_name}.{}.tmp",
-        uuid::Uuid::now_v7().as_simple()
-    ));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)
-            .map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
-        write!(file, "{next}\n").map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
-        file.sync_all()
-            .map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
-        drop(file);
-        std::fs::rename(&temp_path, path).map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
-        Ok(next)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temp_path);
-    }
-    result
+    atomic_write(
+        path,
+        format!("{next}\n").as_bytes(),
+        AtomicWritePolicy::ReplaceDestination,
+    )
+    .map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
+    Ok(next)
 }
 
 fn lease_paths_match(lock_path: &Path, epoch_path: &Path) -> bool {
@@ -4365,40 +4332,3 @@ fn lease_paths_match(lock_path: &Path, epoch_path: &Path) -> bool {
             .extension()
             .is_some_and(|extension| extension == "epoch")
 }
-
-#[cfg(unix)]
-fn try_lock_exclusive(file: &File) -> Result<(), OwnerLeaseError> {
-    use std::os::fd::AsRawFd;
-    const LOCK_EX: i32 = 2;
-    const LOCK_NB: i32 = 4;
-    unsafe {
-        if owner_flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) == 0 {
-            Ok(())
-        } else {
-            Err(OwnerLeaseError::AlreadyOwned)
-        }
-    }
-}
-
-#[cfg(unix)]
-fn unlock_exclusive(file: &File) {
-    use std::os::fd::AsRawFd;
-    const LOCK_UN: i32 = 8;
-    unsafe {
-        let _ = owner_flock(file.as_raw_fd(), LOCK_UN);
-    }
-}
-
-#[cfg(unix)]
-unsafe extern "C" {
-    #[link_name = "flock"]
-    fn owner_flock(fd: i32, operation: i32) -> i32;
-}
-
-#[cfg(not(unix))]
-fn try_lock_exclusive(_file: &File) -> Result<(), OwnerLeaseError> {
-    Err(OwnerLeaseError::DurableEpochUnavailable)
-}
-
-#[cfg(not(unix))]
-fn unlock_exclusive(_file: &File) {}
