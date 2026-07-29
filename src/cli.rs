@@ -203,8 +203,8 @@ pub struct Cli {
     cwd: Option<PathBuf>,
 
     /// Provider implementation (internal, for testing).
-    #[arg(long, value_enum, default_value_t = ProviderKind::DeepSeek, hide = true)]
-    provider: ProviderKind,
+    #[arg(long, value_enum, hide = true)]
+    provider: Option<ProviderKind>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -283,8 +283,8 @@ struct ExecArgs {
     save_history: bool,
 
     /// Provider implementation (internal, for testing).
-    #[arg(long, value_enum, default_value_t = ProviderKind::DeepSeek, hide = true)]
-    provider: ProviderKind,
+    #[arg(long, value_enum, hide = true)]
+    provider: Option<ProviderKind>,
 
     /// Prompt to execute.
     prompt: Vec<String>,
@@ -368,8 +368,8 @@ struct WorkflowRunArgs {
     cwd: Option<PathBuf>,
 
     /// Provider implementation (internal, for testing).
-    #[arg(long, value_enum, default_value_t = ProviderKind::DeepSeek, hide = true)]
-    provider: ProviderKind,
+    #[arg(long, value_enum, hide = true)]
+    provider: Option<ProviderKind>,
 
     /// Model to use (overrides config file and ORCA_MODEL env).
     #[arg(long)]
@@ -687,23 +687,27 @@ fn load_effective_file_config(
 }
 
 fn env_overrides() -> Result<ConfigOverrides, String> {
+    env_overrides_from(|name| env::var(name).ok())
+}
+
+fn env_overrides_from(get_env: impl Fn(&str) -> Option<String>) -> Result<ConfigOverrides, String> {
     Ok(ConfigOverrides {
-        model: env::var("ORCA_MODEL")
-            .ok()
-            .or_else(|| env::var("DEEPSEEK_MODEL").ok()),
-        mode: match env::var("ORCA_MODE") {
-            Ok(mode) => Some(parse_approval_mode_value(&mode)?),
-            Err(_) => None,
+        provider: match get_env("ORCA_PROVIDER") {
+            Some(value) => Some(
+                ProviderKind::from_str(&value, true)
+                    .map_err(|_| format!("unsupported provider '{value}'"))?,
+            ),
+            None => None,
         },
-        api_key: env::var("ORCA_API_KEY")
-            .ok()
-            .or_else(|| env::var("DEEPSEEK_API_KEY").ok()),
-        base_url: env::var("ORCA_BASE_URL")
-            .ok()
-            .or_else(|| env::var("DEEPSEEK_BASE_URL").ok()),
-        reasoning_effort: match env::var("ORCA_REASONING_EFFORT")
-            .ok()
-            .or_else(|| env::var("DEEPSEEK_REASONING_EFFORT").ok())
+        model: get_env("ORCA_MODEL").or_else(|| get_env("DEEPSEEK_MODEL")),
+        mode: match get_env("ORCA_MODE") {
+            Some(mode) => Some(parse_approval_mode_value(&mode)?),
+            None => None,
+        },
+        api_key: get_env("ORCA_API_KEY").or_else(|| get_env("DEEPSEEK_API_KEY")),
+        base_url: get_env("ORCA_BASE_URL").or_else(|| get_env("DEEPSEEK_BASE_URL")),
+        reasoning_effort: match get_env("ORCA_REASONING_EFFORT")
+            .or_else(|| get_env("DEEPSEEK_REASONING_EFFORT"))
         {
             Some(value) => Some(parse_reasoning_effort_value(&value)?),
             None => None,
@@ -809,6 +813,7 @@ fn run_exec(args: ExecArgs) -> i32 {
     let file_config = match load_effective_file_config(
         &config_cwd,
         ConfigOverrides {
+            provider: args.provider,
             model: args.model,
             mode: args.approval_mode,
             api_key: args.api_key,
@@ -849,7 +854,7 @@ fn run_exec(args: ExecArgs) -> i32 {
         cwd: args.cwd,
         output_format: output_format.into(),
         approval_mode: file_config.mode.unwrap_or_default(),
-        provider: args.provider,
+        provider: file_config.provider,
         verifier: args.verifier,
         model,
         model_runtime: file_config.model_runtime,
@@ -1122,6 +1127,7 @@ fn run_workflow_command(args: WorkflowRunArgs) -> i32 {
             return 1;
         }
     };
+    let resolved_provider = run_config.provider;
     let workflow_args = match parse_optional_json_arg(args.args.as_deref()) {
         Ok(value) => value,
         Err(error) => {
@@ -1153,7 +1159,7 @@ fn run_workflow_command(args: WorkflowRunArgs) -> i32 {
     spawn_workflow_worker(
         &cwd,
         session_id,
-        args.provider,
+        resolved_provider,
         args.model,
         run_config.api_key,
         args.base_url,
@@ -1503,7 +1509,7 @@ fn run_workflow_worker(args: WorkflowWorkerArgs) -> i32 {
     };
     let config = match build_workflow_run_config(
         &args.cwd,
-        args.provider,
+        Some(args.provider),
         args.model.clone(),
         worker_api_key,
         args.base_url.clone(),
@@ -1555,14 +1561,33 @@ fn run_workflow_worker(args: WorkflowWorkerArgs) -> i32 {
 
 fn build_workflow_run_config(
     cwd: &Path,
-    provider: ProviderKind,
+    provider_override: Option<ProviderKind>,
     model_override: Option<String>,
     api_key_override: Option<String>,
     base_url_override: Option<String>,
 ) -> Result<RunConfig, String> {
-    let file_config = load_effective_file_config(
+    build_workflow_run_config_with_loader(
+        cwd,
+        provider_override,
+        model_override,
+        api_key_override,
+        base_url_override,
+        load_effective_file_config,
+    )
+}
+
+fn build_workflow_run_config_with_loader(
+    cwd: &Path,
+    provider_override: Option<ProviderKind>,
+    model_override: Option<String>,
+    api_key_override: Option<String>,
+    base_url_override: Option<String>,
+    load_config: impl FnOnce(&Path, ConfigOverrides) -> Result<file::FileConfig, String>,
+) -> Result<RunConfig, String> {
+    let file_config = load_config(
         cwd,
         ConfigOverrides {
+            provider: provider_override,
             model: model_override,
             mode: None,
             api_key: api_key_override,
@@ -1581,7 +1606,7 @@ fn build_workflow_run_config(
         cwd: Some(cwd.to_path_buf()),
         output_format: OutputFormat::Jsonl,
         approval_mode: file_config.mode.unwrap_or_default(),
-        provider,
+        provider: file_config.provider,
         verifier: None,
         model,
         model_runtime: file_config.model_runtime,
@@ -1622,6 +1647,7 @@ fn build_worker_run_config(
     let file_config = load_effective_file_config(
         cwd,
         ConfigOverrides {
+            provider: None,
             model: model_override,
             mode: None,
             api_key: api_key_override,
@@ -2235,6 +2261,7 @@ fn run_placeholder(cli: Cli) -> i32 {
     let file_config = match load_effective_file_config(
         &cwd,
         ConfigOverrides {
+            provider: cli.provider,
             model: cli.model,
             mode,
             api_key: cli.api_key,
@@ -2274,7 +2301,7 @@ fn run_placeholder(cli: Cli) -> i32 {
         cwd: None,
         output_format: OutputFormat::Text,
         approval_mode: file_config.mode.unwrap_or_default(),
-        provider: cli.provider,
+        provider: file_config.provider,
         verifier: None,
         model,
         model_runtime: file_config.model_runtime,
@@ -2519,6 +2546,7 @@ fn run_server(cli: Cli) -> i32 {
     let file_config = match load_effective_file_config(
         &cwd,
         ConfigOverrides {
+            provider: cli.provider,
             model: cli.model,
             mode: None,
             api_key: cli.api_key,
@@ -2547,7 +2575,7 @@ fn run_server(cli: Cli) -> i32 {
         cwd: Some(cwd),
         output_format: OutputFormat::Jsonl,
         approval_mode: file_config.mode.unwrap_or_default(),
-        provider: cli.provider,
+        provider: file_config.provider,
         verifier: None,
         model,
         model_runtime: file_config.model_runtime,
@@ -2592,6 +2620,7 @@ fn run_acp(cli: Cli) -> i32 {
     let file_config = match load_effective_file_config(
         &cwd,
         ConfigOverrides {
+            provider: cli.provider,
             model: cli.model,
             mode: None,
             api_key: cli.api_key,
@@ -2620,7 +2649,7 @@ fn run_acp(cli: Cli) -> i32 {
         cwd: Some(cwd),
         output_format: OutputFormat::Jsonl,
         approval_mode: file_config.mode.unwrap_or_default(),
-        provider: cli.provider,
+        provider: file_config.provider,
         verifier: None,
         model,
         model_runtime: file_config.model_runtime,
@@ -2656,7 +2685,184 @@ fn run_acp(cli: Cli) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::file::{FileConfig, apply_override_layers};
     use orca_runtime::update_check::UpdateInfo;
+
+    #[test]
+    fn user_facing_provider_flags_are_optional_but_workers_remain_resolved() {
+        let source = include_str!("cli.rs");
+        for struct_name in [
+            "pub struct Cli",
+            "struct ExecArgs",
+            "struct WorkflowRunArgs",
+        ] {
+            let start = source.find(struct_name).unwrap();
+            let provider = source[start..]
+                .find("provider: Option<ProviderKind>")
+                .unwrap();
+            assert!(provider < source[start..].find("\n}").unwrap());
+        }
+        for struct_name in [
+            "struct WorkflowWorkerArgs",
+            "struct SubagentWorkerArgs",
+            "struct WorkflowCliLaunchRecord",
+        ] {
+            let start = source.find(struct_name).unwrap();
+            let provider = source[start..].find("provider: ProviderKind").unwrap();
+            assert!(provider < source[start..].find("\n}").unwrap());
+        }
+    }
+
+    #[test]
+    fn provider_precedence_resolves_cli_then_env_then_user_default() {
+        let user = FileConfig {
+            provider: ProviderKind::Mock,
+            ..FileConfig::default()
+        };
+        let workflow_without_override =
+            Cli::try_parse_from(["orca", "workflow", "run", "example-workflow"]).unwrap();
+        let workflow_with_override = Cli::try_parse_from([
+            "orca",
+            "workflow",
+            "run",
+            "--provider",
+            "deepseek",
+            "example-workflow",
+        ])
+        .unwrap();
+        let workflow_provider = |cli: Cli| match cli.command {
+            Some(Command::Workflow(WorkflowArgs {
+                command: WorkflowCommand::Run(args),
+            })) => args.provider,
+            _ => panic!("expected workflow run"),
+        };
+
+        assert_eq!(workflow_provider(workflow_without_override), None);
+        assert_eq!(
+            workflow_provider(workflow_with_override),
+            Some(ProviderKind::DeepSeek)
+        );
+        assert_eq!(
+            apply_override_layers(
+                user.clone(),
+                ConfigOverrides {
+                    provider: Some(ProviderKind::DeepSeekFixture),
+                    ..ConfigOverrides::default()
+                },
+                ConfigOverrides {
+                    provider: Some(ProviderKind::DeepSeek),
+                    ..ConfigOverrides::default()
+                },
+            )
+            .provider,
+            ProviderKind::DeepSeek,
+        );
+        assert_eq!(
+            apply_override_layers(
+                user.clone(),
+                ConfigOverrides {
+                    provider: Some(ProviderKind::DeepSeekFixture),
+                    ..ConfigOverrides::default()
+                },
+                ConfigOverrides::default(),
+            )
+            .provider,
+            ProviderKind::DeepSeekFixture,
+        );
+        assert_eq!(
+            apply_override_layers(user, ConfigOverrides::default(), ConfigOverrides::default(),)
+                .provider,
+            ProviderKind::Mock,
+        );
+    }
+
+    #[test]
+    fn workflow_without_provider_override_uses_user_config_provider() {
+        let user = FileConfig {
+            provider: ProviderKind::DeepSeekFixture,
+            ..FileConfig::default()
+        };
+
+        let config = build_workflow_run_config_with_loader(
+            Path::new("/tmp/workspace"),
+            None,
+            None,
+            None,
+            None,
+            |_, overrides| {
+                Ok(apply_override_layers(
+                    user,
+                    ConfigOverrides::default(),
+                    overrides,
+                ))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(config.provider, ProviderKind::DeepSeekFixture);
+    }
+
+    #[test]
+    fn workflow_provider_override_wins_over_user_config_provider() {
+        let user = FileConfig {
+            provider: ProviderKind::DeepSeekFixture,
+            ..FileConfig::default()
+        };
+
+        let config = build_workflow_run_config_with_loader(
+            Path::new("/tmp/workspace"),
+            Some(ProviderKind::DeepSeek),
+            None,
+            None,
+            None,
+            |_, overrides| {
+                Ok(apply_override_layers(
+                    user,
+                    ConfigOverrides::default(),
+                    overrides,
+                ))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(config.provider, ProviderKind::DeepSeek);
+    }
+
+    #[test]
+    fn env_overrides_parse_provider() {
+        let overrides = env_overrides_from(|name| match name {
+            "ORCA_PROVIDER" => Some("mock".to_string()),
+            _ => None,
+        })
+        .unwrap();
+
+        assert_eq!(overrides.provider, Some(ProviderKind::Mock));
+    }
+
+    #[test]
+    fn production_run_configs_use_resolved_file_provider() {
+        let production = include_str!("cli.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("production cli source");
+        assert_eq!(
+            production.matches("provider: file_config.provider").count(),
+            5,
+        );
+    }
+
+    #[test]
+    fn workflow_launch_passes_resolved_provider_to_worker() {
+        let source = include_str!("cli.rs");
+        let launch = source
+            .split("fn run_workflow_command")
+            .nth(1)
+            .and_then(|source| source.split("fn workflow_list_command").next())
+            .expect("workflow launch source");
+
+        assert!(launch.contains("let resolved_provider = run_config.provider"));
+        assert!(launch.contains("resolved_provider,"));
+    }
 
     #[test]
     fn tui_preflight_prompts_when_update_is_available() {

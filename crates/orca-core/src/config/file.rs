@@ -9,8 +9,8 @@ use crate::approval_rules::PermissionRules;
 use crate::approval_types::ApprovalMode;
 use crate::config::{
     DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN, DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS,
-    MAX_WORKFLOW_AGENT_RETRIES, ModelRuntimeConfig, PermissionProfileConfig, ReasoningEffort,
-    ThemeName, ToolConfig, WorkflowConfig, WorkflowTeamConfig,
+    MAX_WORKFLOW_AGENT_RETRIES, ModelRuntimeConfig, PermissionProfileConfig, ProviderKind,
+    ReasoningEffort, ThemeName, ToolConfig, WorkflowConfig, WorkflowTeamConfig,
 };
 use crate::subagent_config::SubagentConfig;
 
@@ -19,6 +19,7 @@ const ORCA_HOME_ENV: &str = "ORCA_HOME";
 #[derive(Clone, Debug, Deserialize)]
 #[serde(from = "RawFileConfig")]
 pub struct FileConfig {
+    pub provider: ProviderKind,
     pub model: Option<String>,
     pub mode: Option<ApprovalMode>,
     pub api_key: Option<String>,
@@ -58,6 +59,8 @@ pub struct FileConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 struct RawFileConfig {
+    #[serde(default = "default_provider")]
+    pub provider: ProviderKind,
     pub model: Option<String>,
     pub mode: Option<ApprovalMode>,
     pub api_key: Option<String>,
@@ -105,6 +108,7 @@ struct RawFileConfig {
 impl Default for FileConfig {
     fn default() -> Self {
         Self {
+            provider: default_provider(),
             model: None,
             mode: None,
             api_key: None,
@@ -139,6 +143,7 @@ impl From<RawFileConfig> for FileConfig {
         );
 
         Self {
+            provider: raw.provider,
             model: raw.model,
             mode: raw.mode,
             api_key: raw.api_key,
@@ -165,6 +170,7 @@ impl From<RawFileConfig> for FileConfig {
 
 #[derive(Clone, Debug, Default)]
 pub struct ConfigOverrides {
+    pub provider: Option<ProviderKind>,
     pub model: Option<String>,
     pub mode: Option<ApprovalMode>,
     pub api_key: Option<String>,
@@ -261,6 +267,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_provider() -> ProviderKind {
+    ProviderKind::DeepSeek
+}
+
 fn config_dir() -> Option<PathBuf> {
     std::env::var_os(ORCA_HOME_ENV)
         .map(PathBuf::from)
@@ -343,6 +353,7 @@ fn merge_toml_values(base: &mut Value, overlay: Value) {
 
 fn remove_project_denied_fields(value: &mut Value) {
     if let Some(table) = value.as_table_mut() {
+        table.remove("provider");
         table.remove("api_key");
         table.remove("base_url");
         table.remove("hooks");
@@ -405,6 +416,9 @@ pub fn apply_override_layers(
 }
 
 fn apply_overrides(config: &mut FileConfig, overrides: ConfigOverrides) {
+    if let Some(provider) = overrides.provider {
+        config.provider = provider;
+    }
     if overrides.model.is_some() {
         config.model = overrides.model;
     }
@@ -450,6 +464,68 @@ pub fn save_api_key(api_key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProviderKind;
+
+    #[test]
+    fn provider_defaults_to_deepseek_and_parses_explicit_values() {
+        assert_eq!(
+            toml::from_str::<FileConfig>("").unwrap().provider,
+            ProviderKind::DeepSeek,
+        );
+        assert_eq!(
+            toml::from_str::<FileConfig>("provider = \"deep-seek\"")
+                .unwrap()
+                .provider,
+            ProviderKind::DeepSeek,
+        );
+        assert_eq!(
+            toml::from_str::<FileConfig>("provider = \"mock\"")
+                .unwrap()
+                .provider,
+            ProviderKind::Mock,
+        );
+    }
+
+    #[test]
+    fn provider_override_layers_follow_file_env_cli_order() {
+        let base = FileConfig {
+            provider: ProviderKind::DeepSeek,
+            ..FileConfig::default()
+        };
+        let env = ConfigOverrides {
+            provider: Some(ProviderKind::DeepSeekFixture),
+            ..ConfigOverrides::default()
+        };
+        let cli = ConfigOverrides {
+            provider: Some(ProviderKind::Mock),
+            ..ConfigOverrides::default()
+        };
+
+        assert_eq!(
+            apply_override_layers(base, env, cli).provider,
+            ProviderKind::Mock,
+        );
+    }
+
+    #[test]
+    fn trusted_project_config_cannot_override_user_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let user_dir = directory.path().join("user");
+        let project = directory.path().join("project");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(project.join(".orca")).unwrap();
+        std::fs::write(user_dir.join("config.toml"), "provider = \"deep-seek\"\n").unwrap();
+        std::fs::write(project.join(".orca/config.toml"), "provider = \"mock\"\n").unwrap();
+        crate::config::folder_trust::set_trust_with_config_dir(
+            &project,
+            &user_dir,
+            crate::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+
+        let config = load_layered_config_from_paths(&user_dir.join("config.toml"), &project);
+        assert_eq!(config.provider, ProviderKind::DeepSeek);
+    }
 
     fn load_toml(path: &Path) -> FileConfig {
         let Ok(content) = fs::read_to_string(path) else {
@@ -1202,6 +1278,7 @@ decision = "allow"
         };
 
         let env = ConfigOverrides {
+            provider: None,
             model: Some("deepseek-v4-pro".to_string()),
             mode: Some(crate::approval_types::ApprovalMode::AutoEdit),
             api_key: Some("sk-env".to_string()),
@@ -1209,6 +1286,7 @@ decision = "allow"
             reasoning_effort: None,
         };
         let cli = ConfigOverrides {
+            provider: None,
             model: Some("auto".to_string()),
             mode: Some(crate::approval_types::ApprovalMode::Plan),
             api_key: Some("sk-cli".to_string()),
