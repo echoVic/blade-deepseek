@@ -22,6 +22,9 @@ struct WindowsSandboxTestHome {
     _lock: MutexGuard<'static, ()>,
 }
 
+#[cfg(not(windows))]
+struct WindowsSandboxTestHome;
+
 #[cfg(windows)]
 impl WindowsSandboxTestHome {
     fn new(workspace: &Path) -> Self {
@@ -61,7 +64,9 @@ fn prepare_windows_sandbox(workspace: &Path) -> WindowsSandboxTestHome {
 }
 
 #[cfg(not(windows))]
-fn prepare_windows_sandbox(_workspace: &Path) {}
+fn prepare_windows_sandbox(_workspace: &Path) -> WindowsSandboxTestHome {
+    WindowsSandboxTestHome
+}
 
 fn platform_shell_script(unix: &str, windows: &str) -> String {
     if cfg!(windows) {
