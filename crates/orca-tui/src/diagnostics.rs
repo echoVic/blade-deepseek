@@ -961,6 +961,27 @@ mod tests {
     }
 
     #[test]
+    fn readmes_document_doctor_and_session_only_fps_hud() {
+        for (name, readme) in [
+            ("README.md", include_str!("../../../README.md")),
+            ("README.zh-CN.md", include_str!("../../../README.zh-CN.md")),
+        ] {
+            for required in [
+                "/doctor",
+                "/doctor fps",
+                "/doctor fps on",
+                "/doctor fps off",
+                "session-only",
+                "default",
+                "secrets",
+                "re-probe",
+            ] {
+                assert!(readme.contains(required), "{name}: {required}");
+            }
+        }
+    }
+
+    #[test]
     fn doctor_formatter_source_has_no_runtime_io_or_probe_calls() {
         let source = include_str!("diagnostics.rs")
             .split("\n#[cfg(test)]\nmod tests {")

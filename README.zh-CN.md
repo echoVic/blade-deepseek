@@ -40,6 +40,24 @@ orca --mode=acp                           # 连接 ACP 客户端
 使用 `/plan` 进行只读规划，使用 `/goal` 管理持久目标，使用 `/workflows`
 查看后台任务，使用 `/trust` 管理当前目录的沙箱权限。
 
+### Doctor 诊断
+
+`/doctor` 会根据当前 TUI 会话已经捕获的事实，输出一份安全且便于复制的诊断报告。
+报告包含 Orca 版本与平台、终端与多路复用器、实际生效的颜色/背景/主题、通知与输入
+能力、视口/会话/快捷键状态，以及有界的帧指标。报告不会包含 secrets、原始环境变量、
+对话 transcript、当前工作目录或绝对文件路径；命令不会运行 Shell、读取文件或
+re-probe 终端。
+
+可选的 FPS HUD 默认为关闭（default-off），并且仅对当前会话生效
+（session-only）：
+
+- `/doctor fps` 切换显示状态。
+- `/doctor fps on` 开启显示。
+- `/doctor fps off` 关闭显示。
+
+FPS 表示成功输出到终端的帧率；`render-ms` 表示实际 `terminal.draw` 耗时，
+不是调度器唤醒时间或帧间隔。
+
 ## 核心能力
 
 - 直接适配 DeepSeek 的推理和工具调用语义，支持 SSE 流式输出、前缀缓存友好提示词、

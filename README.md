@@ -42,6 +42,26 @@ In the TUI, `@` searches files, skills, plugins, and MCP resources. Use
 `/workflows` for background work, and `/trust` to manage the current folder's
 sandbox permissions.
 
+### Doctor diagnostics
+
+`/doctor` emits one safe, copyable diagnostics report from facts already
+captured by the current TUI session. It includes the Orca version and platform,
+terminal and multiplexer identity, effective color/background/theme,
+notification and input posture, viewport/session/keybindings state, and bounded
+frame metrics. It excludes secrets, raw environment values, conversation
+transcripts, the current working directory, and absolute filesystem paths. The
+command does not run shell commands, access files, or re-probe the terminal.
+
+The optional FPS HUD is default-off and session-only:
+
+- `/doctor fps` toggles it.
+- `/doctor fps on` enables it.
+- `/doctor fps off` disables it.
+
+FPS is the rate of successful terminal output frames. `render-ms` is the actual
+duration of `terminal.draw`, not scheduler wake-up time or the interval between
+frames.
+
 ## What it does
 
 - Uses DeepSeek's reasoning and tool-use semantics directly, with SSE streaming,
