@@ -51,8 +51,9 @@ shown. Model choices are `auto`,
 `deepseek-v4-flash`, and `deepseek-v4-pro`. Theme choices are Auto, Dark,
 Light, Solarized, and Catppuccin.
 
-Before Review, the API key is draft-only; pressing Esc at any earlier step
-exits with zero writes. Setup performs no network validation. Confirming Review
+Before Review, the API key is draft-only. Pressing Esc before confirming Review
+exits with zero writes, including when the Review page is open
+but before pressing Enter. Setup performs no network validation. Confirming Review
 writes the provider, model, and theme to `config.toml`, while the API key is
 stored separately in `auth.json`. If either save fails, the selected values
 remain applied to the current session. Complete reports only sanitized error categories.

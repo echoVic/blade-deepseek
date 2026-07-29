@@ -4,9 +4,12 @@
 
 **Goal:** Replace the numeric API-key-only setup flow with a typed seven-step wizard that selects the production provider, API key, model, and theme; previews themes from captured terminal capabilities; and safely persists user defaults.
 
-**Architecture:** `orca-core` gains provider-aware layered configuration and hardened atomic user-file writers. `orca-tui` gains a pure `onboarding.rs` state model, while `setup_actions.rs` owns key routing, `app.rs` owns theme/capability effects, and `ui.rs` renders the typed wizard. API keys remain draft-only until Review, never enter review text or `config.toml`, and save failures are projected as fixed safe categories.
+**Architecture:** `orca-core` gains provider-aware layered configuration and hardened atomic user-file writers. `orca-tui` gains a pure `onboarding.rs` state model, while `setup_actions.rs` owns key routing, `app.rs` owns theme/capability effects, and `ui.rs` renders the typed wizard. API keys remain draft-only until Review is confirmed with Enter, never enter review text or `config.toml`, and save failures are projected as fixed safe categories.
 
 **Tech Stack:** Rust 2024, clap, serde, `toml_edit`, ratatui, crossterm, tui-textarea, existing `TerminalProfile`, `Theme`, `ModelSelection`, hosted TUI runtime, and strict RED/GREEN TDD.
+
+> **Post-implementation hardening alignment (2026-07-30):** production hardening landed on 2026-07-29; the committed production implementation and tests use owner-only `0600` rewrites, supported macOS/Linux ACL reset, sidecar locks, destination revalidation, platform atomic exchange/no-replace operations, rollback, and parent-directory sync.
+> This production-aligned plan describes the final committed implementation; original execution history remains in git.
 
 ---
 
@@ -583,11 +586,13 @@ pub enum UserConfigSaveError {
     UnsafeExistingPath,
     ExistingFileTooLarge,
     InvalidExistingContent,
+    ConcurrentModification,
     CreateDirectoryFailed,
     CreateTemporaryFileFailed,
     ReadFailed,
     WriteFailed,
     ReplaceFailed,
+    RollbackFailed,
 }
 
 impl UserConfigSaveError {
@@ -597,11 +602,13 @@ impl UserConfigSaveError {
             Self::UnsafeExistingPath => "unsafe existing config path",
             Self::ExistingFileTooLarge => "existing config is too large",
             Self::InvalidExistingContent => "invalid existing config",
+            Self::ConcurrentModification => "config changed during save",
             Self::CreateDirectoryFailed => "could not create config directory",
             Self::CreateTemporaryFileFailed => "could not create temporary config",
             Self::ReadFailed => "could not read existing config",
             Self::WriteFailed => "could not write config",
             Self::ReplaceFailed => "could not replace config",
+            Self::RollbackFailed => "could not restore concurrent config",
         }
     }
 }
@@ -663,146 +670,70 @@ fn patch_user_preferences(
 }
 ```
 
-- [ ] **Step 5: Implement bounded regular-file reads and atomic replacement**
+- [ ] **Step 5: Implement the production-aligned owner-only concurrent writer**
 
-Import:
+This step reflects the post-implementation hardening above. Do not retain an
+existing mode or ACL. Existing and new config/auth files, temporary files, and
+sidecar locks are rewritten owner-only (`0600`) on Unix; supported macOS/Linux
+builds also clear inherited or extended ACLs. This deliberately tightens unsafe
+legacy metadata and never broadens access.
 
-```rust
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
-```
-
-Add:
+The bounded reader returns bytes plus a stable file identity, not permissions:
 
 ```rust
-static USER_FILE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
-
 fn read_optional_regular_file(
     path: &Path,
     max_bytes: usize,
-) -> Result<Option<(Vec<u8>, Option<std::fs::Permissions>)>, UserConfigSaveError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(None);
-        }
-        Err(_) => return Err(UserConfigSaveError::ReadFailed),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(UserConfigSaveError::UnsafeExistingPath);
-    }
-    if metadata.len() > max_bytes as u64 {
-        return Err(UserConfigSaveError::ExistingFileTooLarge);
-    }
+) -> Result<Option<ExistingUserFile>, UserConfigSaveError>;
 
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|_| UserConfigSaveError::ReadFailed)?;
-    let opened = file
-        .metadata()
-        .map_err(|_| UserConfigSaveError::ReadFailed)?;
-    if !opened.is_file() {
-        return Err(UserConfigSaveError::UnsafeExistingPath);
-    }
-    let mut bytes = Vec::with_capacity(opened.len().min(max_bytes as u64) as usize);
-    file.take((max_bytes + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| UserConfigSaveError::ReadFailed)?;
-    if bytes.len() > max_bytes {
-        return Err(UserConfigSaveError::ExistingFileTooLarge);
-    }
-    Ok(Some((bytes, Some(opened.permissions()))))
+#[cfg(unix)]
+fn apply_secure_user_file_metadata(file: &File) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    clear_user_file_acl(file)
 }
+```
 
-fn open_unique_user_temp(
-    path: &Path,
-) -> Result<(std::path::PathBuf, File), UserConfigSaveError> {
-    let parent = path
-        .parent()
-        .ok_or(UserConfigSaveError::CreateDirectoryFailed)?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or(UserConfigSaveError::CreateTemporaryFileFailed)?;
-    for _ in 0..64 {
-        let counter = USER_FILE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temp_path = parent.join(format!(
-            ".{name}.tmp-{}-{counter}",
-            std::process::id(),
-        ));
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&temp_path) {
-            Ok(file) => return Ok((temp_path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => return Err(UserConfigSaveError::CreateTemporaryFileFailed),
-        }
-    }
-    Err(UserConfigSaveError::CreateTemporaryFileFailed)
-}
+Acquire a safe per-target sidecar lock before reading. Write and sync a unique
+same-directory temporary file, revalidate the destination against the original
+identity, then use platform atomic exchange for an existing file or platform
+atomic no-replace installation for a missing file. Revalidate the displaced
+original after exchange; on mismatch, exchange it back. Sync the parent after
+installation, cleanup, or rollback. Return `ConcurrentModification` for a
+detected race and `RollbackFailed` when restoration cannot be proven.
 
-fn atomic_replace_user_file(
+The testable preference entry point therefore has this shape:
+
+```rust
+fn save_user_preferences_at_with_ops(
     path: &Path,
-    bytes: &[u8],
-    existing_permissions: Option<std::fs::Permissions>,
+    patch: &UserPreferencePatch,
+    operations: &impl AtomicUserFileOps,
 ) -> Result<(), UserConfigSaveError> {
     let parent = path
         .parent()
         .ok_or(UserConfigSaveError::CreateDirectoryFailed)?;
-    fs::create_dir_all(parent)
-        .map_err(|_| UserConfigSaveError::CreateDirectoryFailed)?;
-    let (temp_path, mut temp) = open_unique_user_temp(path)?;
-    let result = (|| {
-        if let Some(permissions) = existing_permissions {
-            temp.set_permissions(permissions)
-                .map_err(|_| UserConfigSaveError::WriteFailed)?;
+    fs::create_dir_all(parent).map_err(|_| UserConfigSaveError::CreateDirectoryFailed)?;
+    let _lock = acquire_user_config_lock(path)?;
+    let existing = read_optional_regular_file(path, MAX_USER_CONFIG_BYTES)?;
+    let (source, expected) = match existing {
+        Some(existing) => {
+            let source = String::from_utf8(existing.bytes.clone())
+                .map_err(|_| UserConfigSaveError::InvalidExistingContent)?;
+            (source, ExpectedUserFile::Existing(existing))
         }
-        temp.write_all(bytes)
-            .and_then(|()| temp.sync_all())
-            .map_err(|_| UserConfigSaveError::WriteFailed)?;
-        drop(temp);
-        fs::rename(&temp_path, path)
-            .map_err(|_| UserConfigSaveError::ReplaceFailed)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result
+        None => (String::new(), ExpectedUserFile::Missing),
+    };
+    let output = patch_user_preferences(&source, patch)?;
+    atomic_replace_user_file_with_ops(path, output.as_bytes(), &expected, operations)
 }
-```
 
-Expose testable and production entry points:
-
-```rust
 fn save_user_preferences_at(
     path: &Path,
     patch: &UserPreferencePatch,
 ) -> Result<(), UserConfigSaveError> {
-    let existing = read_optional_regular_file(path, MAX_USER_CONFIG_BYTES)?;
-    let (source, permissions) = match existing {
-        Some((bytes, permissions)) => (
-            String::from_utf8(bytes)
-                .map_err(|_| UserConfigSaveError::InvalidExistingContent)?,
-            permissions,
-        ),
-        None => (String::new(), None),
-    };
-    let output = patch_user_preferences(&source, patch)?;
-    atomic_replace_user_file(path, output.as_bytes(), permissions)
+    save_user_preferences_at_with_ops(path, patch, &RealAtomicUserFileOps)
 }
 
 pub fn save_user_preferences(
@@ -820,10 +751,16 @@ pub fn save_user_preferences(
 cargo test -p orca-core preference_patch -- --nocapture
 cargo test -p orca-core preference_writer -- --nocapture
 cargo test -p orca-core invalid_existing_config_is_not_replaced -- --nocapture
+cargo test -p orca-core atomic_writer_restricts_existing_permissions_to_owner_only -- --nocapture
+cargo test -p orca-core atomic_writer_removes_inherited_extended_acl -- --nocapture
+cargo test -p orca-core user_config_lock -- --nocapture
+cargo test -p orca-core atomic_writer_syncs_parent_directory_after_replace -- --nocapture
+cargo test -p orca-core rollback -- --nocapture
 ```
 
-Expected: all patch, preservation, unsafe-path, size, and atomic-write tests
-pass.
+Expected: patch/content preservation, unsafe-path, size, owner-only `0600`, ACL
+reset, lock, revalidation, platform exchange/no-replace, rollback, cleanup, and
+parent-sync tests pass. Existing unsafe permissions are rewritten owner-only.
 
 - [ ] **Step 7: Commit safe preference persistence**
 
@@ -851,15 +788,15 @@ fn auth_writer_preserves_unrelated_entries_and_never_reports_secret() {
     let path = directory.path().join("auth.json");
     std::fs::write(
         &path,
-        r#"{"OTHER_TOKEN":"keep","DEEPSEEK_API_KEY":"old"}"#,
+        r#"{"OTHER_TOKEN":"keep","DEEPSEEK_API_KEY":"previous"}"#,
     )
     .unwrap();
 
-    save_api_key_at(&path, "sk-new-secret").unwrap();
+    save_api_key_at(&path, "replacement-fixture").unwrap();
     let value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(value["OTHER_TOKEN"], "keep");
-    assert_eq!(value["DEEPSEEK_API_KEY"], "sk-new-secret");
+    assert_eq!(value["DEEPSEEK_API_KEY"], "replacement-fixture");
 }
 
 #[test]
@@ -870,7 +807,7 @@ fn invalid_auth_json_is_left_byte_identical() {
     std::fs::write(&path, original).unwrap();
 
     assert_eq!(
-        save_api_key_at(&path, "sk-secret").unwrap_err(),
+        save_api_key_at(&path, "credential-fixture").unwrap_err(),
         UserConfigSaveError::InvalidExistingContent,
     );
     assert_eq!(std::fs::read(path).unwrap(), original);
@@ -887,7 +824,7 @@ fn auth_writer_rejects_symlink_without_touching_target() {
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         assert_eq!(
-            save_api_key_at(&link, "sk-secret").unwrap_err(),
+            save_api_key_at(&link, "credential-fixture").unwrap_err(),
             UserConfigSaveError::UnsafeExistingPath,
         );
         assert_eq!(
@@ -910,28 +847,36 @@ Expected: compilation fails because `save_api_key_at` does not exist and
 
 - [ ] **Step 3: Implement hardened auth persistence**
 
-Add:
+Reuse the final committed writer from Task 2 rather than carrying permissions forward:
 
 ```rust
 pub const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
 
-fn save_api_key_at(
+fn save_api_key_at_with_ops(
     path: &Path,
     api_key: &str,
+    operations: &impl AtomicUserFileOps,
 ) -> Result<(), UserConfigSaveError> {
+    let parent = path
+        .parent()
+        .ok_or(UserConfigSaveError::CreateDirectoryFailed)?;
+    fs::create_dir_all(parent).map_err(|_| UserConfigSaveError::CreateDirectoryFailed)?;
+    let _lock = acquire_user_config_lock(path)?;
     let existing = read_optional_regular_file(path, MAX_AUTH_FILE_BYTES)?;
-    let (mut map, permissions) = match existing {
-        Some((bytes, permissions)) => (
-            serde_json::from_slice::<HashMap<String, String>>(&bytes)
-                .map_err(|_| UserConfigSaveError::InvalidExistingContent)?,
-            permissions,
-        ),
-        None => (HashMap::new(), None),
+    let (source, expected) = match existing {
+        Some(existing) => {
+            let source = String::from_utf8(existing.bytes.clone())
+                .map_err(|_| UserConfigSaveError::InvalidExistingContent)?;
+            (Some(source), ExpectedUserFile::Existing(existing))
+        }
+        None => (None, ExpectedUserFile::Missing),
     };
-    map.insert("DEEPSEEK_API_KEY".to_string(), api_key.to_string());
-    let bytes = serde_json::to_vec_pretty(&map)
-        .map_err(|_| UserConfigSaveError::WriteFailed)?;
-    atomic_replace_user_file(path, &bytes, permissions)
+    let output = patch_api_key(source.as_deref(), api_key)?;
+    atomic_replace_user_file_with_ops(path, &output, &expected, operations)
+}
+
+fn save_api_key_at(path: &Path, api_key: &str) -> Result<(), UserConfigSaveError> {
+    save_api_key_at_with_ops(path, api_key, &RealAtomicUserFileOps)
 }
 
 pub fn save_api_key(api_key: &str) -> Result<(), UserConfigSaveError> {
@@ -941,7 +886,11 @@ pub fn save_api_key(api_key: &str) -> Result<(), UserConfigSaveError> {
 }
 ```
 
-No error formatting may interpolate `api_key`.
+No error formatting may interpolate `api_key`. The shared atomic writer applies
+owner-only `0600` and supported macOS/Linux ACL reset to existing and new auth
+files and locks, performs destination revalidation, uses platform exchange or
+no-replace installation, syncs the parent, and rolls back detected exchange
+races.
 
 - [ ] **Step 4: Update existing callers and run auth tests GREEN**
 
@@ -957,11 +906,14 @@ Run:
 ```bash
 cargo test -p orca-core auth_writer -- --nocapture
 cargo test -p orca-core invalid_auth_json -- --nocapture
+cargo test -p orca-core auth_writer_creates_missing_file_with_secure_metadata -- --nocapture
+cargo test -p orca-core auth_writer_rejects_concurrent_update -- --nocapture
 cargo test -p orca-core config::file -- --nocapture
 ```
 
-Expected: auth preservation, invalid-content, symlink, size, and legacy load
-tests pass.
+Expected: auth preservation, invalid-content, symlink, size, owner-only `0600`,
+ACL reset, lock/revalidation, exchange/no-replace, rollback, parent-sync,
+`ConcurrentModification`, `RollbackFailed`, and legacy load tests pass.
 
 - [ ] **Step 5: Commit hardened auth persistence**
 
@@ -1033,11 +985,11 @@ fn review_rows_never_include_api_key() {
         "auto",
         ThemeName::Dark,
     );
-    state.set_api_key("sk-do-not-render".to_string());
+    state.set_api_key("credential-fixture".to_string());
     let review = state.review_rows().join("\n");
     assert!(review.contains("API key: configured"));
-    assert!(!review.contains("sk-do-not-render"));
-    assert!(!format!("{:?}", state.review_rows()).contains("sk-do-not-render"));
+    assert!(!review.contains("credential-fixture"));
+    assert!(!format!("{:?}", state.review_rows()).contains("credential-fixture"));
 }
 ```
 
@@ -1072,15 +1024,17 @@ fn persistence_starts_not_attempted_and_errors_are_safe() {
         UserConfigSaveError::UnsafeExistingPath,
         UserConfigSaveError::ExistingFileTooLarge,
         UserConfigSaveError::InvalidExistingContent,
+        UserConfigSaveError::ConcurrentModification,
         UserConfigSaveError::CreateDirectoryFailed,
         UserConfigSaveError::CreateTemporaryFileFailed,
         UserConfigSaveError::ReadFailed,
         UserConfigSaveError::WriteFailed,
         UserConfigSaveError::ReplaceFailed,
+        UserConfigSaveError::RollbackFailed,
     ] {
         let label = error.safe_label();
         assert!(!label.contains('/'));
-        assert!(!label.contains("sk-"));
+        assert!(!label.contains("credential-fixture"));
         assert!(!label.chars().any(char::is_control));
     }
 }
@@ -1708,7 +1662,7 @@ fn drive_to_review(
     );
     assert_eq!(state.onboarding.step(), OnboardingStep::ApiKey);
 
-    textarea.insert_str("sk-test-secret");
+    textarea.insert_str("credential-fixture");
     press_setup_key(
         KeyCode::Enter,
         state,
@@ -1818,7 +1772,7 @@ fn enter_advances_exact_wizard_sequence_without_early_persistence() {
             .onboarding
             .review_rows()
             .join("\n")
-            .contains("sk-test-secret")
+            .contains("credential-fixture")
     );
 }
 ```
@@ -1870,7 +1824,7 @@ fn review_applies_memory_before_independent_persistence_results() {
     assert_eq!(config.provider, ProviderKind::DeepSeek);
     assert_eq!(config.model.display_name(), "deepseek-v4-flash");
     assert_eq!(config.theme, ThemeName::Solarized);
-    assert_eq!(config.api_key.as_deref(), Some("sk-test-secret"));
+    assert_eq!(config.api_key.as_deref(), Some("credential-fixture"));
     assert_eq!(shared.lock().unwrap().theme, ThemeName::Solarized);
     assert!(state.auth_configured);
     assert_eq!(state.model_name, "deepseek-v4-flash");
@@ -1933,14 +1887,14 @@ fn poisoned_shared_config_keeps_review_transaction_unapplied() {
 }
 
 #[test]
-fn esc_before_review_exits_without_persistence() {
+fn esc_before_confirming_review_exits_without_persistence() {
     for step in OnboardingStep::ALL.into_iter().take(6) {
         let (mut state, mut config, shared, action_tx, _rx, mut textarea, vim) =
             setup_harness();
         let theme = Theme::named(ThemeName::Dark);
         let calls = Arc::new(Mutex::new(SaveCalls::default()));
         state.onboarding.set_step_for_test(step);
-        state.onboarding.set_api_key("sk-test-secret".to_string());
+        state.onboarding.set_api_key("credential-fixture".to_string());
 
         assert_eq!(
             press_setup_key(
@@ -2531,14 +2485,14 @@ fn review_and_complete_never_render_secret_or_absolute_paths() {
         let mut state = test_state();
         state.status = AppStatus::Setup;
         state.onboarding.set_step_for_test(step);
-        state.onboarding.set_api_key("sk-visible-secret".to_string());
+        state.onboarding.set_api_key("credential-fixture".to_string());
         state.onboarding.set_outcomes_for_test(
             SaveOutcome::Failed(UserConfigSaveError::WriteFailed),
             SaveOutcome::Failed(UserConfigSaveError::ReplaceFailed),
         );
         let frame = render_setup_test_frame(&mut state, &theme, 80, 24);
         let text = format!("{:?}", frame.buffer);
-        assert!(!text.contains("sk-visible-secret"));
+        assert!(!text.contains("credential-fixture"));
         assert!(!text.contains("/Users/"));
         assert!(!text.contains("C:\\\\Users\\\\"));
     }
@@ -2788,7 +2742,8 @@ Add concise English and Chinese sections stating:
 - API key saves separately to `auth.json`;
 - no network validation occurs;
 - persistence failures still apply choices to the current session;
-- Esc before Review writes nothing.
+- Esc before confirming Review, including from the Review page before Enter,
+  writes nothing.
 
 - [ ] **Step 4: Run focused suites GREEN**
 
@@ -2848,7 +2803,8 @@ Use a different reviewer for:
 - typed error safety;
 - temp-name collision and cleanup;
 - TOCTOU and Unix `O_NOFOLLOW`;
-- permission preservation/new `0o600`;
+- owner-only `0600` rewrite and supported macOS/Linux ACL reset for existing
+  and new targets, temporaries, and locks;
 - TOML comment/unknown-key preservation;
 - provider migration blast radius;
 - mutable theme borrow and runtime event flow;
@@ -3106,7 +3062,8 @@ The sub-project is complete only when:
 - seven typed wizard steps replace numeric setup state;
 - only DeepSeek appears as a production provider;
 - exact supported model/theme choices render and navigate;
-- API key stays private until Review and never appears in UI/errors/TOML;
+- API key stays private until Review is confirmed with Enter and never appears
+  in UI/errors/TOML;
 - provider/model/theme/API key apply atomically to current/shared config;
 - auth and preferences persist independently with safe typed outcomes;
 - user config patch preserves valid unrelated TOML and rejects unsafe paths;

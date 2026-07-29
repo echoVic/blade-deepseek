@@ -712,7 +712,10 @@ mod tests {
                 "no network validation",
                 "current session",
                 "reports only sanitized error categories",
-                "Esc",
+                "Pressing Esc",
+                "before confirming Review",
+                "Review page is open",
+                "before pressing Enter",
                 "zero writes",
                 "draft-only",
             ],
@@ -741,13 +744,75 @@ mod tests {
                 "auth.json",
                 "不进行网络验证",
                 "当前会话",
+                "按 Esc",
+                "确认",
+                "页面",
+                "尚未按 Enter",
                 "不会产生任何写入",
                 "仅显示不含敏感信息的错误类型",
-                "Esc",
                 "仅保存在草稿中",
             ],
         );
         assert_safe_examples("README.zh-CN.md", chinese);
+    }
+
+    #[test]
+    fn implementation_plan_documents_post_implementation_safety_alignment() {
+        let plan = include_str!(
+            "../../../docs/superpowers/plans/2026-07-29-tui-onboarding-provider-model-theme.md"
+        );
+        let note_start = plan
+            .find("> **Post-implementation")
+            .expect("alignment note");
+        let note_end = plan[note_start..]
+            .find("\n\n---")
+            .map(|offset| note_start + offset)
+            .expect("alignment note boundary");
+        let alignment_note = &plan[note_start..note_end];
+        let step_five_start = plan
+            .find("- [ ] **Step 5: Implement")
+            .expect("Task 2 Step 5");
+        let step_five_end = plan[step_five_start..]
+            .find("- [ ] **Step 6:")
+            .map(|offset| step_five_start + offset)
+            .expect("Task 2 Step 5 boundary");
+        let task_two_step_five = &plan[step_five_start..step_five_end];
+        for required in [
+            "Post-implementation hardening alignment (2026-07-30)",
+            "production hardening landed on 2026-07-29",
+            "the committed production implementation and tests use",
+            "production-aligned",
+            "final committed implementation",
+            "original execution history remains in git",
+            r#"assert!(!text.contains("/Users/"));"#,
+            r#"assert!(!text.contains("C:\\\\Users\\\\"));"#,
+        ] {
+            assert!(
+                plan.contains(required),
+                "implementation plan must contain {required:?}"
+            );
+        }
+        assert!(task_two_step_five.contains("production-aligned owner-only concurrent writer"));
+        assert!(task_two_step_five.contains("post-implementation hardening"));
+        for scoped in [alignment_note, task_two_step_five] {
+            for unsupported in ["reviewed", "review-driven", "final reviewed code"] {
+                assert!(
+                    !scoped.contains(unsupported),
+                    "alignment scope must not claim {unsupported:?}",
+                );
+            }
+        }
+        for unsupported in [
+            "Post-implementation hardening revision (2026-07-29)",
+            "Review-driven hardening revision (2026-07-30)",
+            "Independent security review rejected",
+            "after that approval",
+        ] {
+            assert!(
+                !plan.contains(unsupported),
+                "implementation plan must not claim {unsupported:?}",
+            );
+        }
     }
 
     #[test]

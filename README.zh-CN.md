@@ -48,7 +48,8 @@ DeepSeek 是唯一的生产服务商，不会显示仅供开发使用的服务�
 `deepseek-v4-flash`、`deepseek-v4-pro`；主题可选 Auto、Dark、Light、Solarized、
 Catppuccin。
 
-进入确认步骤前，API 密钥仅保存在草稿中；在之前任一步骤按 Esc 退出不会产生任何写入。
+确认前，API 密钥仅保存在草稿中。在确认“确认”步骤前按 Esc 都会退出且不会产生任何写入，
+包括已进入“确认”页面但尚未按 Enter 时。
 设置期间不进行网络验证。确认后，服务商、模型和主题写入 `config.toml`，API 密钥
 单独写入 `auth.json`。任一保存失败时，所选值仍应用于当前会话。完成步骤仅显示不含敏感信息的错误类型。
 

@@ -505,10 +505,20 @@ Safety rules:
 - the parent directory is created when absent;
 - output is written to a same-directory `create_new` temporary file;
 - the temporary file is flushed and synced;
-- rename replaces the destination atomically;
+- a per-file sidecar lock serializes cooperating writers and follows the same
+  path and metadata safety rules as the target;
+- the destination is revalidated against the originally read identity before
+  replacement;
+- existing files use platform atomic exchange and missing files use platform
+  atomic no-replace installation on supported macOS and Linux;
+- an exchanged original is revalidated before cleanup; a mismatch triggers an
+  exchange rollback rather than overwriting concurrent content;
+- the parent directory is synced after installation, cleanup, or rollback;
 - temporary files are removed on failure;
-- an existing regular file's permissions are retained; a new file uses
-  user-only permissions on Unix;
+- existing and new user config files are rewritten owner-only (`0600`) on
+  Unix; inherited or extended ACLs are cleared on supported macOS and Linux;
+- this intentionally tightens unsafe legacy permissions and never broadens
+  access; sidecar lock files use the same owner-only and ACL-reset policy;
 - the API key is never accepted by this patch type.
 
 The function returns errors instead of printing or swallowing them.
@@ -524,10 +534,13 @@ pub fn save_api_key(api_key: &str) -> Result<(), UserConfigSaveError>
 It retains the separate JSON map and never includes the key in an error.
 Onboarding applies the key to the current session even when persistence fails.
 
-The auth writer receives the same regular-file, symlink, size, atomic-replace,
-sync, cleanup, and user-only Unix permission protections as the preference
-writer. It preserves unrelated valid JSON map entries. Invalid JSON is
-rejected and left byte-identical instead of being replaced with an empty map.
+The auth writer receives the same regular-file, symlink, size, lock,
+revalidation, platform exchange/no-replace, rollback, parent-sync, cleanup,
+owner-only Unix permission, and supported macOS/Linux ACL-reset protections as
+the preference writer. Existing and new `auth.json` files are therefore
+rewritten under the same intentionally stricter policy. It preserves unrelated
+valid JSON map entries. Invalid JSON is rejected and left byte-identical
+instead of being replaced with an empty map.
 
 This design does not require migration of an existing legacy `api_key` field in
 `config.toml`; layered loading continues to support it, while onboarding writes
@@ -620,6 +633,10 @@ No secret or absolute path is rendered.
 - Invalid existing config TOML: do not overwrite it; report current-session
   preferences only.
 - Symlink/special/oversized config: do not follow or overwrite it.
+- Concurrent destination change: abort with `ConcurrentModification`; after an
+  exchange, restore the displaced content before returning the error.
+- Failed restoration after exchange: retain recoverable artifacts and report
+  `RollbackFailed` rather than claiming success.
 - Terminal too small: render a bounded compact message and never panic.
 
 Failures do not append chat transcript messages during setup.
@@ -656,6 +673,12 @@ Filesystem tests with isolated `ORCA_HOME` cover:
 - invalid TOML remains byte-identical;
 - oversized, directory, symlink, and non-regular paths are rejected;
 - temporary file cleanup after failure;
+- owner-only `0600` rewrites for existing and new config/auth files on Unix;
+- inherited or extended ACL reset on supported macOS/Linux, including locks;
+- cross-process sidecar lock coordination and unsafe lock-path rejection;
+- pre-replacement revalidation, platform atomic exchange/no-replace, rollback,
+  and parent-directory sync behavior;
+- `ConcurrentModification` and `RollbackFailed` safe error categories;
 - no auth key enters `config.toml`;
 - `save_api_key` success and error reporting;
 - user provider loads into `RunConfig`;
@@ -667,13 +690,14 @@ Filesystem tests with isolated `ORCA_HOME` cover:
 Typed harness tests cover:
 
 - each Enter transition;
-- API key remains draft-only until Review;
+- API key remains draft-only until Review is confirmed with Enter;
 - Review atomically updates config/shared-config/auth projection;
 - provider/model/theme current-session projection;
 - no `SetModel` action is dispatched before a runtime thread exists;
 - preference save success and failure;
 - auth save success and failure;
-- Esc before Review performs no persistence;
+- Esc before confirming Review, including from the Review page before Enter,
+  performs no persistence;
 - initial prompt submits only on Complete Enter;
 - Complete Enter creates a textarea using the selected theme;
 - no secret appears in messages or persistence errors.
