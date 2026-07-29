@@ -47,7 +47,7 @@ pub(crate) fn handle_setup_key(
                 let lines: Vec<String> = textarea.lines().to_vec();
                 let key_input = lines.join("").trim().to_string();
                 if !key_input.is_empty() {
-                    save_api_key(&key_input);
+                    let _ = save_api_key(&key_input);
                     config.api_key = Some(key_input.clone());
                     if let Ok(mut cfg) = shared_config.lock() {
                         cfg.api_key = Some(key_input);

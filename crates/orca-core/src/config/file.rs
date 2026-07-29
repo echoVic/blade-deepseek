@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ use crate::subagent_config::SubagentConfig;
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 pub const MAX_USER_CONFIG_BYTES: usize = 1024 * 1024;
+pub const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
 
 static USER_FILE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -1211,23 +1212,54 @@ fn load_auth_key(path: &Path) -> Option<String> {
     map.get("DEEPSEEK_API_KEY").cloned()
 }
 
-pub fn save_api_key(api_key: &str) {
-    let Some(dir) = config_dir() else {
-        return;
-    };
-    let _ = fs::create_dir_all(&dir);
-    let path = dir.join("auth.json");
-
-    let mut map: HashMap<String, String> = fs::read_to_string(&path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or_default();
-
-    map.insert("DEEPSEEK_API_KEY".to_string(), api_key.to_string());
-
-    if let Ok(content) = serde_json::to_string_pretty(&map) {
-        let _ = fs::write(&path, content);
+fn patch_api_key(source: Option<&str>, api_key: &str) -> Result<Vec<u8>, UserConfigSaveError> {
+    if api_key.len() > MAX_AUTH_FILE_BYTES {
+        return Err(UserConfigSaveError::ExistingFileTooLarge);
     }
+    let mut map = if let Some(source) = source {
+        serde_json::from_str::<BTreeMap<String, String>>(source)
+            .map_err(|_| UserConfigSaveError::InvalidExistingContent)?
+    } else {
+        BTreeMap::new()
+    };
+    map.insert("DEEPSEEK_API_KEY".to_string(), api_key.to_string());
+    let output = serde_json::to_vec_pretty(&map).map_err(|_| UserConfigSaveError::WriteFailed)?;
+    if output.len() > MAX_AUTH_FILE_BYTES {
+        return Err(UserConfigSaveError::ExistingFileTooLarge);
+    }
+    Ok(output)
+}
+
+fn save_api_key_at_with_ops(
+    path: &Path,
+    api_key: &str,
+    operations: &impl AtomicUserFileOps,
+) -> Result<(), UserConfigSaveError> {
+    let parent = path
+        .parent()
+        .ok_or(UserConfigSaveError::CreateDirectoryFailed)?;
+    fs::create_dir_all(parent).map_err(|_| UserConfigSaveError::CreateDirectoryFailed)?;
+    let _lock = acquire_user_config_lock(path)?;
+    let existing = read_optional_regular_file(path, MAX_AUTH_FILE_BYTES)?;
+    let (source, expected) = match existing {
+        Some(existing) => {
+            let source = String::from_utf8(existing.bytes.clone())
+                .map_err(|_| UserConfigSaveError::InvalidExistingContent)?;
+            (Some(source), ExpectedUserFile::Existing(existing))
+        }
+        None => (None, ExpectedUserFile::Missing),
+    };
+    let output = patch_api_key(source.as_deref(), api_key)?;
+    atomic_replace_user_file_with_ops(path, &output, &expected, operations)
+}
+
+fn save_api_key_at(path: &Path, api_key: &str) -> Result<(), UserConfigSaveError> {
+    save_api_key_at_with_ops(path, api_key, &RealAtomicUserFileOps)
+}
+
+pub fn save_api_key(api_key: &str) -> Result<(), UserConfigSaveError> {
+    let directory = config_dir().ok_or(UserConfigSaveError::ConfigDirectoryUnavailable)?;
+    save_api_key_at(&directory.join("auth.json"), api_key)
 }
 
 #[cfg(test)]
@@ -1236,6 +1268,7 @@ mod tests {
     use crate::config::ProviderKind;
 
     const PUBLIC_PREFERENCE_SAVE_CHILD_ENV: &str = "ORCA_TEST_PUBLIC_PREFERENCE_SAVE_CHILD";
+    const PUBLIC_AUTH_SAVE_CHILD_ENV: &str = "ORCA_TEST_PUBLIC_AUTH_SAVE_CHILD";
     const USER_CONFIG_LOCK_CHILD_ENV: &str = "ORCA_TEST_USER_CONFIG_LOCK_CHILD";
 
     fn public_preference_save_child_mode() -> bool {
@@ -1249,6 +1282,21 @@ mod tests {
             .arg("--exact")
             .arg("--nocapture")
             .env(PUBLIC_PREFERENCE_SAVE_CHILD_ENV, "1")
+            .env(ORCA_HOME_ENV, directory);
+        command
+    }
+
+    fn public_auth_save_child_mode() -> bool {
+        std::env::var_os(PUBLIC_AUTH_SAVE_CHILD_ENV).is_some()
+    }
+
+    fn public_auth_save_child_command(directory: &Path, test_name: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg(test_name)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(PUBLIC_AUTH_SAVE_CHILD_ENV, "1")
             .env(ORCA_HOME_ENV, directory);
         command
     }
@@ -1477,6 +1525,16 @@ mod tests {
         }
     }
 
+    struct SecretBearingWriteFailureOps;
+
+    impl AtomicUserFileOps for SecretBearingWriteFailureOps {
+        fn write_and_sync(&self, _file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+            Err(std::io::Error::other(
+                String::from_utf8_lossy(bytes).into_owned(),
+            ))
+        }
+    }
+
     fn user_temp_files(directory: &Path) -> Vec<PathBuf> {
         std::fs::read_dir(directory)
             .unwrap()
@@ -1486,6 +1544,19 @@ mod tests {
                 path.file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.starts_with(".config.toml.tmp-"))
+            })
+            .collect()
+    }
+
+    fn auth_temp_files(directory: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".auth.json.tmp-"))
             })
             .collect()
     }
@@ -2987,6 +3058,278 @@ vim_insert_escape = "jj"
     fn load_auth_key_missing_file() {
         let key = load_auth_key(Path::new("/nonexistent/auth.json"));
         assert!(key.is_none());
+    }
+
+    #[test]
+    fn auth_path_entrypoint_remains_private() {
+        let source = include_str!("file.rs");
+        let public_declaration =
+            ["pub ", "fn save_api_key_at(path: &Path, api_key: &str)"].concat();
+
+        assert!(source.contains("fn save_api_key_at(path: &Path, api_key: &str)"));
+        assert!(!source.contains(&public_declaration));
+    }
+
+    #[test]
+    fn auth_writer_preserves_unrelated_entries_and_never_reports_secret() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        std::fs::write(
+            &path,
+            r#"{"z-provider-token":"keep-z","DEEPSEEK_API_KEY":"old","a-provider-token":"keep-a"}"#,
+        )
+        .unwrap();
+
+        save_api_key_at(&path, "task-3-new-secret").unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let map: std::collections::BTreeMap<String, String> = serde_json::from_str(&saved).unwrap();
+        assert_eq!(
+            map.get("a-provider-token").map(String::as_str),
+            Some("keep-a")
+        );
+        assert_eq!(
+            map.get("z-provider-token").map(String::as_str),
+            Some("keep-z")
+        );
+        assert_eq!(
+            map.get("DEEPSEEK_API_KEY").map(String::as_str),
+            Some("task-3-new-secret")
+        );
+
+        let error = save_api_key_at_with_ops(
+            &path,
+            "task-3-never-report-this-secret",
+            &SecretBearingWriteFailureOps,
+        )
+        .unwrap_err();
+        let reported = format!("{error:?} {}", error.safe_label());
+        assert!(!reported.contains("task-3-never-report-this-secret"));
+        assert!(!reported.contains(path.to_string_lossy().as_ref()));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), saved);
+        assert!(auth_temp_files(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn invalid_auth_json_is_left_byte_identical() {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, original) in [
+            ("empty.json", b"".as_slice()),
+            ("invalid-utf8.json", b"{\"key\":\"value\"}\xff".as_slice()),
+            ("invalid-json.json", b"{not-json".as_slice()),
+            ("non-string.json", b"{\"other\":42}".as_slice()),
+        ] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, original).unwrap();
+
+            assert_eq!(
+                save_api_key_at(&path, "replacement-secret").unwrap_err(),
+                UserConfigSaveError::InvalidExistingContent,
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        assert!(auth_temp_files(directory.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_writer_rejects_symlink_without_touching_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.json");
+        let link = directory.path().join("auth.json");
+        let original = br#"{"DEEPSEEK_API_KEY":"target-secret"}"#;
+        std::fs::write(&target, original).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            save_api_key_at(&link, "replacement-secret").unwrap_err(),
+            UserConfigSaveError::UnsafeExistingPath,
+        );
+        assert_eq!(std::fs::read(target).unwrap(), original);
+        assert!(
+            std::fs::symlink_metadata(link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(auth_temp_files(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn auth_writer_rejects_oversized_and_directory_paths() {
+        assert_eq!(MAX_AUTH_FILE_BYTES, 1024 * 1024);
+        let directory = tempfile::tempdir().unwrap();
+        let oversized = directory.path().join("oversized.json");
+        let original = vec![b'x'; MAX_AUTH_FILE_BYTES + 1];
+        std::fs::write(&oversized, &original).unwrap();
+        assert_eq!(
+            save_api_key_at(&oversized, "replacement-secret").unwrap_err(),
+            UserConfigSaveError::ExistingFileTooLarge,
+        );
+        assert_eq!(std::fs::read(oversized).unwrap(), original);
+
+        let missing = directory.path().join("missing.json");
+        assert_eq!(
+            save_api_key_at(&missing, &"x".repeat(MAX_AUTH_FILE_BYTES)).unwrap_err(),
+            UserConfigSaveError::ExistingFileTooLarge,
+        );
+        assert!(!missing.exists());
+
+        let invalid = directory.path().join("invalid.json");
+        let invalid_original = b"{invalid-auth-json";
+        std::fs::write(&invalid, invalid_original).unwrap();
+        assert_eq!(
+            save_api_key_at(&invalid, &"x".repeat(MAX_AUTH_FILE_BYTES + 1)).unwrap_err(),
+            UserConfigSaveError::ExistingFileTooLarge,
+        );
+        assert_eq!(std::fs::read(&invalid).unwrap(), invalid_original);
+
+        let nonregular = directory.path().join("auth-directory");
+        std::fs::create_dir(&nonregular).unwrap();
+        assert_eq!(
+            save_api_key_at(&nonregular, "replacement-secret").unwrap_err(),
+            UserConfigSaveError::UnsafeExistingPath,
+        );
+        assert!(nonregular.is_dir());
+        assert!(auth_temp_files(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn auth_writer_rejects_escaped_output_over_limit_without_replacing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let original = br#"{"other":"keep"}"#;
+        std::fs::write(&path, original).unwrap();
+        let escaped_key = "\\".repeat(MAX_AUTH_FILE_BYTES / 2 + 1);
+        assert!(escaped_key.len() <= MAX_AUTH_FILE_BYTES);
+
+        assert_eq!(
+            save_api_key_at(&path, &escaped_key).unwrap_err(),
+            UserConfigSaveError::ExistingFileTooLarge,
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(auth_temp_files(directory.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_writer_rejects_unix_socket() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let _listener = UnixListener::bind(&path).unwrap();
+
+        assert_eq!(
+            save_api_key_at(&path, "replacement-secret").unwrap_err(),
+            UserConfigSaveError::UnsafeExistingPath,
+        );
+        assert!(
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        assert!(auth_temp_files(directory.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_writer_creates_missing_file_with_secure_metadata_and_is_idempotent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "macos")]
+        set_inheritable_read_acl(directory.path());
+        let path = directory.path().join("auth.json");
+
+        save_api_key_at(&path, "created-secret").unwrap();
+        let first = std::fs::read(&path).unwrap();
+        save_api_key_at(&path, "created-secret").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        #[cfg(target_os = "macos")]
+        assert!(!has_extended_acl(&path));
+        assert!(auth_temp_files(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn auth_writer_rejects_concurrent_update_without_overwrite_or_temp_residual() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        std::fs::write(&path, r#"{"DEEPSEEK_API_KEY":"old"}"#).unwrap();
+        let concurrent = br#"{"DEEPSEEK_API_KEY":"concurrent","other":"keep"}"#;
+        let operations = ConcurrentMutationOps {
+            mutation: ConcurrentMutation::ReplaceContents(concurrent),
+        };
+
+        assert_eq!(
+            save_api_key_at_with_ops(&path, "replacement-secret", &operations).unwrap_err(),
+            UserConfigSaveError::ConcurrentModification,
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), concurrent);
+        assert!(auth_temp_files(directory.path()).is_empty());
+        assert!(acquire_user_config_lock(&path).is_ok());
+    }
+
+    #[test]
+    fn public_auth_entrypoint_uses_isolated_orca_home() {
+        if public_auth_save_child_mode() {
+            let result: Result<(), UserConfigSaveError> = save_api_key("isolated-secret");
+            result.unwrap();
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let status = public_auth_save_child_command(
+            directory.path(),
+            "config::file::tests::public_auth_entrypoint_uses_isolated_orca_home",
+        )
+        .status()
+        .unwrap();
+        assert!(status.success());
+        let saved = std::fs::read_to_string(directory.path().join("auth.json")).unwrap();
+        let map: std::collections::BTreeMap<String, String> = serde_json::from_str(&saved).unwrap();
+        assert_eq!(
+            map.get("DEEPSEEK_API_KEY").map(String::as_str),
+            Some("isolated-secret")
+        );
+    }
+
+    #[test]
+    fn public_auth_entrypoint_reports_typed_error_without_exposing_context() {
+        if public_auth_save_child_mode() {
+            assert_eq!(
+                save_api_key("isolated-error-secret").unwrap_err(),
+                UserConfigSaveError::InvalidExistingContent,
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let original = b"{invalid-auth-json";
+        std::fs::write(&path, original).unwrap();
+        let output = public_auth_save_child_command(
+            directory.path(),
+            "config::file::tests::public_auth_entrypoint_reports_typed_error_without_exposing_context",
+        )
+        .output()
+        .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let mut reported = output.stdout;
+        reported.extend_from_slice(&output.stderr);
+        let reported = String::from_utf8_lossy(&reported);
+        assert!(!reported.contains("isolated-error-secret"));
+        assert!(!reported.contains(path.to_string_lossy().as_ref()));
+        assert!(!reported.to_ascii_lowercase().contains("os error"));
     }
 
     #[test]
