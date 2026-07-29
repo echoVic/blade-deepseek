@@ -15,6 +15,12 @@ const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
 );
+const normalizeLineEndings = (source) => source.replace(/\r\n?/g, "\n");
+assert.equal(
+  normalizeLineEndings("pull_request:\r\n  push:\r\n"),
+  "pull_request:\n  push:\n",
+  "workflow contracts must be independent of checkout line endings",
+);
 const manifestPath = path.join(
   repoRoot,
   "docs/superpowers/specs/2026-07-28-native-windows-platform-foundation.manifest.json",
@@ -403,10 +409,10 @@ assert.ok(
 
 const workflowPath = path.join(repoRoot, ".github/workflows/windows-ci.yml");
 assert.ok(existsSync(workflowPath), "native Windows CI workflow must exist");
-const workflow = readFileSync(workflowPath, "utf8");
+const workflow = normalizeLineEndings(readFileSync(workflowPath, "utf8"));
 const releaseWorkflowPath = path.join(repoRoot, ".github/workflows/release.yml");
 assert.ok(existsSync(releaseWorkflowPath), "release workflow must exist");
-const releaseWorkflow = readFileSync(releaseWorkflowPath, "utf8");
+const releaseWorkflow = normalizeLineEndings(readFileSync(releaseWorkflowPath, "utf8"));
 const installerSource = readFileSync(path.join(repoRoot, "install.ps1"), "utf8");
 const pullRequest = workflow.match(/  pull_request:\n([\s\S]*?)\n  push:/);
 assert.ok(pullRequest, "Windows CI must validate pull requests before merge");
