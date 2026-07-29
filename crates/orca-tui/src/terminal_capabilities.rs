@@ -18,6 +18,16 @@ pub(crate) enum TerminalBackground {
     Unknown,
 }
 
+impl TerminalBackground {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TerminalColorLevel {
     TrueColor,
@@ -106,6 +116,15 @@ const fn color_level_from_facts(facts: Option<ColorSupportFacts>) -> TerminalCol
 }
 
 impl TerminalColorLevel {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::TrueColor => "truecolor",
+            Self::Ansi256 => "ansi256",
+            Self::Ansi16 => "ansi16",
+            Self::Monochrome => "monochrome",
+        }
+    }
+
     pub(crate) const fn revision(self) -> u64 {
         match self {
             Self::TrueColor => 0,

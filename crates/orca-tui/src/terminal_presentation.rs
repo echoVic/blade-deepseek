@@ -38,6 +38,14 @@ impl TerminalPresentationProfile {
             tmux_passthrough,
         }
     }
+
+    pub(crate) const fn osc9_supported(self) -> bool {
+        self.osc9_supported
+    }
+
+    pub(crate) const fn tmux_passthrough(self) -> bool {
+        self.tmux_passthrough
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
