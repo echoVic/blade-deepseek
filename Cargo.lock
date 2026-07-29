@@ -203,6 +203,7 @@ dependencies = [
  "orca-runtime",
  "orca-tools",
  "orca-tui",
+ "orca-windows-sandbox",
  "serde_json",
  "tempfile",
  "toml",

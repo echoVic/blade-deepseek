@@ -71,3 +71,6 @@ libc = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+orca-windows-sandbox = { path = "crates/orca-windows-sandbox" }

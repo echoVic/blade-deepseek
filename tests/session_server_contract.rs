@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -24,6 +24,8 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 struct OrcaCommand {
     command: Command,
     home: Option<TempDir>,
+    trust_config_dir: PathBuf,
+    trusted_folders: Vec<PathBuf>,
 }
 
 impl OrcaCommand {
@@ -32,7 +34,20 @@ impl OrcaCommand {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.command.args(args);
+        let args = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_os_string())
+            .collect::<Vec<OsString>>();
+        for pair in args.windows(2) {
+            if pair[0] == OsStr::new("--cwd") {
+                let folder = PathBuf::from(&pair[1]);
+                trust_test_folder(&folder, &self.trust_config_dir);
+                if !self.trusted_folders.contains(&folder) {
+                    self.trusted_folders.push(folder);
+                }
+            }
+        }
+        self.command.args(&args);
         self
     }
 
@@ -43,7 +58,11 @@ impl OrcaCommand {
     {
         if key.as_ref() == OsStr::new("ORCA_HOME") {
             self.home.take();
-            trust_all_test_folders(Path::new(value.as_ref()));
+            self.trust_config_dir = PathBuf::from(value.as_ref());
+            trust_all_test_folders(&self.trust_config_dir);
+            for folder in &self.trusted_folders {
+                trust_test_folder(folder, &self.trust_config_dir);
+            }
         }
         self.command.env(key, value);
         self
@@ -65,6 +84,17 @@ impl OrcaCommand {
     }
 
     fn spawn(&mut self) -> std::io::Result<ServerTestClient> {
+        #[cfg(windows)]
+        {
+            let capabilities = orca_windows_sandbox::CapabilityStore::new(
+                self.trust_config_dir.join("windows-capabilities"),
+            );
+            for folder in &self.trusted_folders {
+                capabilities
+                    .provision_setup(folder, orca_windows_sandbox::SETUP_HELPER_VERSION)
+                    .expect("provision Windows sandbox setup for server contract workspace");
+            }
+        }
         ServerTestClient::spawn(&mut self.command, self.home.take())
     }
 
@@ -81,15 +111,24 @@ fn orca_command() -> OrcaCommand {
         .expect("create isolated ORCA_HOME");
     trust_all_test_folders(home.path());
     command.env("ORCA_HOME", home.path());
+    let trust_config_dir = home.path().to_path_buf();
+    let current_dir = std::env::current_dir().expect("current test directory");
+    trust_test_folder(&current_dir, &trust_config_dir);
     OrcaCommand {
         command,
         home: Some(home),
+        trust_config_dir,
+        trusted_folders: vec![current_dir],
     }
 }
 
 fn trust_all_test_folders(home: &Path) {
+    trust_test_folder(Path::new("/"), home);
+}
+
+fn trust_test_folder(folder: &Path, home: &Path) {
     orca_core::config::folder_trust::set_trust_with_config_dir(
-        Path::new("/"),
+        folder,
         home,
         orca_core::config::folder_trust::TrustLevel::Trusted,
     )
@@ -476,7 +515,14 @@ fn server_mode_streams_unified_file_skill_and_plugin_mention_candidates() {
     .expect("plugin manifest");
 
     let mut child = orca_command()
-        .args(["--mode", "server", "--provider", "mock"])
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.path().to_str().unwrap(),
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2981,12 +3027,27 @@ fn server_mode_command_exec_honors_cwd_and_env_overrides() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf '%s|%s|%s|%s' \"$PWD\" \"$ORCA_COMMAND_EXEC_BASE\" \"$ORCA_COMMAND_EXEC_EXTRA\" \"${{ORCA_COMMAND_EXEC_REMOVE-unset}}\""],"cwd":"{}","env":{{"ORCA_COMMAND_EXEC_BASE":"request","ORCA_COMMAND_EXEC_EXTRA":"added","ORCA_COMMAND_EXEC_REMOVE":null}},"tty":false,"streamStdin":false,"streamStdoutStderr":false}}}}"#,
-            command_dir.display()
-        )
-        .expect("write command/exec");
+        let request = json!({
+            "id": "cmd",
+            "method": "command/exec",
+            "params": {
+                "command": [
+                    "sh",
+                    "-lc",
+                    "printf '%s|%s|%s|%s' \"$PWD\" \"$ORCA_COMMAND_EXEC_BASE\" \"$ORCA_COMMAND_EXEC_EXTRA\" \"${ORCA_COMMAND_EXEC_REMOVE-unset}\""
+                ],
+                "cwd": command_dir,
+                "env": {
+                    "ORCA_COMMAND_EXEC_BASE": "request",
+                    "ORCA_COMMAND_EXEC_EXTRA": "added",
+                    "ORCA_COMMAND_EXEC_REMOVE": null
+                },
+                "tty": false,
+                "streamStdin": false,
+                "streamStdoutStderr": false
+            }
+        });
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
 
@@ -3094,6 +3155,7 @@ fn server_mode_command_exec_uses_thread_additional_working_directories() {
     }
 }
 
+#[cfg(not(windows))]
 #[test]
 fn server_mode_command_exec_uses_session_network_domain_grants() {
     let home = tempdir().expect("orca home");
@@ -3236,6 +3298,7 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
     assert!(output.stderr.is_empty());
 }
 
+#[cfg(not(windows))]
 #[test]
 fn server_mode_session_network_deny_overrides_permission_profile_allow() {
     let home = tempdir().expect("orca home");
@@ -4389,6 +4452,12 @@ fn server_mode_command_exec_configured_permission_profile_enforces_network_domai
         assert_eq!(events.len(), 1, "expected one command event: {events:?}");
         assert_eq!(events[0]["id"], "cmd");
         assert_eq!(events[0]["event"], "error");
+        #[cfg(windows)]
+        assert_eq!(
+            events[0]["message"],
+            "Windows domain-restricted network sandbox is unavailable; refusing to run without an OS-enforced network boundary"
+        );
+        #[cfg(not(windows))]
         assert_eq!(
             events[0]["message"],
             "command/exec network access to blocked.orca.invalid was denied by configured network policy"
@@ -4396,6 +4465,7 @@ fn server_mode_command_exec_configured_permission_profile_enforces_network_domai
     });
 }
 
+#[cfg(not(windows))]
 #[test]
 fn server_mode_bash_inherits_thread_active_permission_profile_network_policy() {
     with_orca_home(|home| {
@@ -4483,6 +4553,7 @@ fn server_mode_bash_inherits_thread_active_permission_profile_network_policy() {
     });
 }
 
+#[cfg(not(windows))]
 #[test]
 fn server_mode_bash_network_permission_allow_retries_with_grant() {
     with_orca_home(|home| {
@@ -5036,11 +5107,25 @@ fn server_mode_command_exec_with_process_id_can_be_terminated() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf started; : > \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done; printf done","sh","{started_marker_arg}","{release_marker_arg}"],"processId":"sleep-1","tty":false,"streamStdin":false,"streamStdoutStderr":false}}}}"#
-        )
-        .expect("write command/exec");
+        let request = json!({
+            "id": "cmd",
+            "method": "command/exec",
+            "params": {
+                "command": [
+                    "sh",
+                    "-lc",
+                    "printf started; : > \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done; printf done",
+                    "sh",
+                    started_marker_arg,
+                    release_marker_arg
+                ],
+                "processId": "sleep-1",
+                "tty": false,
+                "streamStdin": false,
+                "streamStdoutStderr": false
+            }
+        });
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
     let started = child.expect_event("cmd", "command_exec_started");
@@ -5105,11 +5190,24 @@ fn server_mode_command_exec_stops_active_processes_when_input_closes() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf started; : > \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done; printf leaked > \"$3\"","sh","{started_marker_arg}","{release_marker_arg}","{leaked_marker_arg}"],"processId":"eof-cleanup-1","streamStdoutStderr":true}}}}"#
-        )
-        .expect("write command/exec");
+        let request = json!({
+            "id": "cmd",
+            "method": "command/exec",
+            "params": {
+                "command": [
+                    "sh",
+                    "-lc",
+                    "printf started; : > \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done; printf leaked > \"$3\"",
+                    "sh",
+                    started_marker_arg,
+                    release_marker_arg,
+                    leaked_marker_arg
+                ],
+                "processId": "eof-cleanup-1",
+                "streamStdoutStderr": true
+            }
+        });
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
     let started = child.expect_event("cmd", "command_exec_started");
@@ -5228,11 +5326,15 @@ fn server_mode_command_exec_rejects_duplicate_active_process_id() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd-2","method":"command/exec","params":{{"command":["sh","-lc","printf leaked > \"$1\"","sh","{duplicate_marker_arg}"],"processId":"dup-1"}}}}"#
-        )
-        .expect("write duplicate command/exec");
+        let request = json!({
+            "id": "cmd-2",
+            "method": "command/exec",
+            "params": {
+                "command": ["sh", "-lc", "printf leaked > \"$1\"", "sh", duplicate_marker_arg],
+                "processId": "dup-1"
+            }
+        });
+        writeln!(stdin, "{request}").expect("write duplicate command/exec");
         stdin.flush().expect("flush duplicate command/exec");
     }
 
@@ -5623,11 +5725,22 @@ fn server_mode_command_exec_read_drains_streaming_output() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","while [ ! -e \"$1\" ]; do sleep 0.05; done; printf 'read-out'; printf 'read-err' >&2; sleep 30","sh","{release_marker_arg}"],"processId":"read-1","streamStdoutStderr":true}}}}"#
-        )
-        .expect("write command/exec");
+        let request = json!({
+            "id": "cmd",
+            "method": "command/exec",
+            "params": {
+                "command": [
+                    "sh",
+                    "-lc",
+                    "while [ ! -e \"$1\" ]; do sleep 0.05; done; printf 'read-out'; printf 'read-err' >&2; sleep 30",
+                    "sh",
+                    release_marker_arg
+                ],
+                "processId": "read-1",
+                "streamStdoutStderr": true
+            }
+        });
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
     let started = child.expect_event("cmd", "command_exec_started");
@@ -5706,11 +5819,22 @@ fn server_mode_command_exec_read_caps_streaming_output() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","while [ ! -e \"$1\" ]; do sleep 0.05; done; printf 'abcdef'; sleep 30","sh","{release_marker_arg}"],"processId":"read-cap-1","streamStdoutStderr":true}}}}"#
-        )
-        .expect("write command/exec");
+        let request = json!({
+            "id": "cmd",
+            "method": "command/exec",
+            "params": {
+                "command": [
+                    "sh",
+                    "-lc",
+                    "while [ ! -e \"$1\" ]; do sleep 0.05; done; printf 'abcdef'; sleep 30",
+                    "sh",
+                    release_marker_arg
+                ],
+                "processId": "read-cap-1",
+                "streamStdoutStderr": true
+            }
+        });
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
     let started = child.expect_event("cmd", "command_exec_started");
@@ -5801,11 +5925,23 @@ fn server_mode_command_exec_streaming_respects_output_cap() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'abcdefghij'; : > \"$1\"; sleep 30","sh","{started_marker_arg}"],"processId":"stream-cap-1","streamStdoutStderr":true,"outputBytesCap":5}}}}"#
-        )
-        .expect("write command/exec");
+        let request = json!({
+            "id": "cmd",
+            "method": "command/exec",
+            "params": {
+                "command": [
+                    "sh",
+                    "-lc",
+                    "printf 'abcdefghij'; : > \"$1\"; sleep 30",
+                    "sh",
+                    started_marker_arg
+                ],
+                "processId": "stream-cap-1",
+                "streamStdoutStderr": true,
+                "outputBytesCap": 5
+            }
+        });
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
     let started = child.expect_event("cmd", "command_exec_started");
@@ -5878,11 +6014,23 @@ fn server_mode_command_exec_caps_streaming_output_by_bytes() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'ééé'; : > \"$1\"; sleep 30","sh","{started_marker_arg}"],"processId":"stream-byte-cap-1","streamStdoutStderr":true,"outputBytesCap":5}}}}"#
-        )
-        .expect("write command/exec");
+        let request = json!({
+            "id": "cmd",
+            "method": "command/exec",
+            "params": {
+                "command": [
+                    "sh",
+                    "-lc",
+                    "printf 'ééé'; : > \"$1\"; sleep 30",
+                    "sh",
+                    started_marker_arg
+                ],
+                "processId": "stream-byte-cap-1",
+                "streamStdoutStderr": true,
+                "outputBytesCap": 5
+            }
+        });
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
     let started = child.expect_event("cmd", "command_exec_started");
@@ -7725,14 +7873,24 @@ fn server_mode_turn_start_applies_package3_permission_updates() {
 
         {
             let stdin = child.stdin_mut();
-            writeln!(
-                stdin,
-                r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","activePermissionProfile":{{"id":"locked-down","extends":":workspace"}},"permissionUpdates":[{{"type":"setMode","mode":"bypassPermissions","destination":"session"}},{{"type":"removeRules","behavior":"allow","destination":"session","rules":[{{"toolName":"Bash","ruleContent":"cargo *"}}]}},{{"type":"addRules","behavior":"allow","destination":"session","rules":[{{"toolName":"Bash","ruleContent":"cargo test *"}}]}},{{"type":"replaceRules","behavior":"ask","destination":"session","rules":[{{"toolName":"Write","ruleContent":"/workspace/**"}}]}},{{"type":"addDirectories","destination":"session","directories":["{}"]}},{{"type":"removeDirectories","destination":"session","directories":["{}"]}}],"input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
-                thread_id,
-                extra_dir.display(),
-                removed_dir.display(),
-            )
-            .expect("write turn/start request");
+            let request = json!({
+                "id": "turn",
+                "method": "turn/start",
+                "params": {
+                    "threadId": thread_id,
+                    "activePermissionProfile": {"id": "locked-down", "extends": ":workspace"},
+                    "permissionUpdates": [
+                        {"type": "setMode", "mode": "bypassPermissions", "destination": "session"},
+                        {"type": "removeRules", "behavior": "allow", "destination": "session", "rules": [{"toolName": "Bash", "ruleContent": "cargo *"}]},
+                        {"type": "addRules", "behavior": "allow", "destination": "session", "rules": [{"toolName": "Bash", "ruleContent": "cargo test *"}]},
+                        {"type": "replaceRules", "behavior": "ask", "destination": "session", "rules": [{"toolName": "Write", "ruleContent": "/workspace/**"}]},
+                        {"type": "addDirectories", "destination": "session", "directories": [extra_dir]},
+                        {"type": "removeDirectories", "destination": "session", "directories": [removed_dir]}
+                    ],
+                    "input": [{"type": "text", "text": "mock_history_echo"}]
+                }
+            });
+            writeln!(stdin, "{request}").expect("write turn/start request");
             stdin.flush().expect("flush turn/start request");
         }
         let _turn_completed = child.expect_event("turn", "turn_completed");
@@ -7853,14 +8011,19 @@ fn server_mode_permission_updates_remove_directories_by_destination() {
 
         {
             let stdin = child.stdin_mut();
-            writeln!(
-                stdin,
-                r#"{{"id":"turn-add","method":"turn/start","params":{{"threadId":"{}","permissionUpdates":[{{"type":"addDirectories","destination":"projectSettings","directories":["{}"]}},{{"type":"addDirectories","destination":"session","directories":["{}"]}}],"input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
-                thread_id,
-                shared_dir.display(),
-                shared_dir.display(),
-            )
-            .expect("write add directories turn");
+            let request = json!({
+                "id": "turn-add",
+                "method": "turn/start",
+                "params": {
+                    "threadId": thread_id,
+                    "permissionUpdates": [
+                        {"type": "addDirectories", "destination": "projectSettings", "directories": [shared_dir]},
+                        {"type": "addDirectories", "destination": "session", "directories": [shared_dir]}
+                    ],
+                    "input": [{"type": "text", "text": "mock_history_echo"}]
+                }
+            });
+            writeln!(stdin, "{request}").expect("write add directories turn");
             stdin.flush().expect("flush add directories turn");
         }
         child.expect_event("turn-add", "turn_completed");
@@ -7888,13 +8051,20 @@ fn server_mode_permission_updates_remove_directories_by_destination() {
 
         {
             let stdin = child.stdin_mut();
-            writeln!(
-                stdin,
-                r#"{{"id":"turn-remove","method":"turn/start","params":{{"threadId":"{}","permissionUpdates":[{{"type":"removeDirectories","destination":"projectSettings","directories":["{}"]}}],"input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
-                thread_id,
-                shared_dir.display(),
-            )
-            .expect("write remove directories turn");
+            let request = json!({
+                "id": "turn-remove",
+                "method": "turn/start",
+                "params": {
+                    "threadId": thread_id,
+                    "permissionUpdates": [{
+                        "type": "removeDirectories",
+                        "destination": "projectSettings",
+                        "directories": [shared_dir]
+                    }],
+                    "input": [{"type": "text", "text": "mock_history_echo"}]
+                }
+            });
+            writeln!(stdin, "{request}").expect("write remove directories turn");
             stdin.flush().expect("flush remove directories turn");
         }
         child.expect_event("turn-remove", "turn_completed");
@@ -7984,14 +8154,17 @@ fn server_mode_request_permissions_waits_for_permission_response() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: printf granted > {}"}}]}}}}"#,
-            thread_id,
+        let prompt = format!(
+            "request_permissions_then_bash {} :: printf granted > {}",
             extra.display(),
-            output_file.display(),
-        )
-        .expect("write turn/start");
+            output_file.display()
+        );
+        let request = json!({
+            "id": "turn",
+            "method": "turn/start",
+            "params": {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]}
+        });
+        writeln!(stdin, "{request}").expect("write turn/start");
         stdin.flush().expect("flush turn/start");
     }
 
@@ -8008,13 +8181,17 @@ fn server_mode_request_permissions_waits_for_permission_response() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"turn","permissions":{{"fileSystem":{{"write":["{}"],"read":null}},"network":null}}}}}}"#,
-            request_id,
-            extra.display(),
-        )
-        .expect("write permission/respond");
+        let request = json!({
+            "id": "permission-response",
+            "method": "permission/respond",
+            "params": {
+                "requestId": request_id,
+                "decision": "allow",
+                "scope": "turn",
+                "permissions": {"fileSystem": {"write": [extra], "read": null}, "network": null}
+            }
+        });
+        writeln!(stdin, "{request}").expect("write permission/respond");
         stdin.flush().expect("flush permission/respond");
     }
 
@@ -8072,13 +8249,13 @@ fn server_mode_input_eof_cancels_pending_permission_request() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: true"}}]}}}}"#,
-            thread_id,
-            extra.display(),
-        )
-        .expect("write turn/start");
+        let prompt = format!("request_permissions_then_bash {} :: true", extra.display());
+        let request = json!({
+            "id": "turn",
+            "method": "turn/start",
+            "params": {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]}
+        });
+        writeln!(stdin, "{request}").expect("write turn/start");
         stdin.flush().expect("flush turn/start");
     }
     child.expect_event("turn", "permission_request");
@@ -8180,14 +8357,17 @@ fn server_mode_request_permissions_propagates_strict_auto_review() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: printf granted > {}"}}]}}}}"#,
-            thread_id,
+        let prompt = format!(
+            "request_permissions_then_bash {} :: printf granted > {}",
             extra.display(),
-            output_file.display(),
-        )
-        .expect("write turn/start");
+            output_file.display()
+        );
+        let request = json!({
+            "id": "turn",
+            "method": "turn/start",
+            "params": {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]}
+        });
+        writeln!(stdin, "{request}").expect("write turn/start");
         stdin.flush().expect("flush turn/start");
     }
     let permission_request = child.expect_event("turn", "permission_request");
@@ -8198,13 +8378,18 @@ fn server_mode_request_permissions_propagates_strict_auto_review() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"turn","strictAutoReview":true,"permissions":{{"fileSystem":{{"write":["{}"],"read":null}},"network":null}}}}}}"#,
-            request_id,
-            extra.display(),
-        )
-        .expect("write permission/respond");
+        let request = json!({
+            "id": "permission-response",
+            "method": "permission/respond",
+            "params": {
+                "requestId": request_id,
+                "decision": "allow",
+                "scope": "turn",
+                "strictAutoReview": true,
+                "permissions": {"fileSystem": {"write": [extra], "read": null}, "network": null}
+            }
+        });
+        writeln!(stdin, "{request}").expect("write permission/respond");
         stdin.flush().expect("flush permission/respond");
     }
 
@@ -8280,14 +8465,17 @@ fn server_mode_request_permissions_strict_auto_review_prompts_subsequent_command
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: printf blocked > {}"}}]}}}}"#,
-            thread_id,
+        let prompt = format!(
+            "request_permissions_then_bash {} :: printf blocked > {}",
             extra.display(),
-            output_file.display(),
-        )
-        .expect("write turn/start");
+            output_file.display()
+        );
+        let request = json!({
+            "id": "turn",
+            "method": "turn/start",
+            "params": {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]}
+        });
+        writeln!(stdin, "{request}").expect("write turn/start");
         stdin.flush().expect("flush turn/start");
     }
     let permission_request = child.expect_event("turn", "permission_request");
@@ -8298,13 +8486,18 @@ fn server_mode_request_permissions_strict_auto_review_prompts_subsequent_command
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"turn","strictAutoReview":true,"permissions":{{"fileSystem":{{"write":["{}"],"read":null}},"network":null}}}}}}"#,
-            request_id,
-            extra.display(),
-        )
-        .expect("write permission/respond");
+        let request = json!({
+            "id": "permission-response",
+            "method": "permission/respond",
+            "params": {
+                "requestId": request_id,
+                "decision": "allow",
+                "scope": "turn",
+                "strictAutoReview": true,
+                "permissions": {"fileSystem": {"write": [extra], "read": null}, "network": null}
+            }
+        });
+        writeln!(stdin, "{request}").expect("write permission/respond");
         stdin.flush().expect("flush permission/respond");
     }
 
@@ -8520,14 +8713,17 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"turn-1","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: printf first > {}"}}]}}}}"#,
-            thread_id,
+        let prompt = format!(
+            "request_permissions_then_bash {} :: printf first > {}",
             extra.display(),
-            first_output.display(),
-        )
-        .expect("write first turn");
+            first_output.display()
+        );
+        let request = json!({
+            "id": "turn-1",
+            "method": "turn/start",
+            "params": {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]}
+        });
+        writeln!(stdin, "{request}").expect("write first turn");
         stdin.flush().expect("flush first turn");
     }
     let permission_request = child.expect_event("turn-1", "permission_request");
@@ -8538,13 +8734,17 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"session","permissions":{{"fileSystem":{{"write":["{}"],"read":null}},"network":null}}}}}}"#,
-            request_id,
-            extra.display(),
-        )
-        .expect("write session permission/respond");
+        let request = json!({
+            "id": "permission-response",
+            "method": "permission/respond",
+            "params": {
+                "requestId": request_id,
+                "decision": "allow",
+                "scope": "session",
+                "permissions": {"fileSystem": {"write": [extra], "read": null}, "network": null}
+            }
+        });
+        writeln!(stdin, "{request}").expect("write session permission/respond");
         stdin.flush().expect("flush session permission/respond");
     }
     let _resolved = child.expect_event("permission-response", "permission_resolved");
@@ -8643,14 +8843,17 @@ fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"turn-1","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: printf first > {}"}}]}}}}"#,
-            thread_id,
+        let prompt = format!(
+            "request_permissions_then_bash {} :: printf first > {}",
             extra.display(),
-            first_output.display(),
-        )
-        .expect("write first turn");
+            first_output.display()
+        );
+        let request = json!({
+            "id": "turn-1",
+            "method": "turn/start",
+            "params": {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]}
+        });
+        writeln!(stdin, "{request}").expect("write first turn");
         stdin.flush().expect("flush first turn");
     }
     let permission_request = child.expect_event("turn-1", "permission_request");
@@ -8661,13 +8864,24 @@ fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"session","permissions":{{"fileSystem":{{"read":null,"write":null,"entries":[{{"path":"{}","access":"write"}}]}},"network":null}}}}}}"#,
-            request_id,
-            extra.display(),
-        )
-        .expect("write session permission/respond with entries");
+        let request = json!({
+            "id": "permission-response",
+            "method": "permission/respond",
+            "params": {
+                "requestId": request_id,
+                "decision": "allow",
+                "scope": "session",
+                "permissions": {
+                    "fileSystem": {
+                        "read": null,
+                        "write": null,
+                        "entries": [{"path": extra, "access": "write"}]
+                    },
+                    "network": null
+                }
+            }
+        });
+        writeln!(stdin, "{request}").expect("write session permission/respond with entries");
         stdin
             .flush()
             .expect("flush session permission/respond with entries");
@@ -8761,14 +8975,17 @@ fn server_mode_request_permissions_session_scope_accepts_workspace_roots_entries
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"turn-1","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: printf first > {}"}}]}}}}"#,
-            thread_id,
+        let prompt = format!(
+            "request_permissions_then_bash {} :: printf first > {}",
             docs.display(),
-            first_output.display(),
-        )
-        .expect("write first turn");
+            first_output.display()
+        );
+        let request = json!({
+            "id": "turn-1",
+            "method": "turn/start",
+            "params": {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]}
+        });
+        writeln!(stdin, "{request}").expect("write first turn");
         stdin.flush().expect("flush first turn");
     }
     let permission_request = child.expect_event("turn-1", "permission_request");
@@ -8866,12 +9083,12 @@ fn server_mode_turn_start_rebinds_runtime_workspace_roots_for_permission_grants(
         .expect("spawn orca server");
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"thread-req","method":"thread/start","params":{{"runtimeWorkspaceRoots":["{}"]}}}}"#,
-            old_root.display(),
-        )
-        .expect("write thread/start request");
+        let request = json!({
+            "id": "thread-req",
+            "method": "thread/start",
+            "params": {"runtimeWorkspaceRoots": [old_root]}
+        });
+        writeln!(stdin, "{request}").expect("write thread/start request");
         stdin.flush().expect("flush thread/start request");
     }
     let thread_started = child.expect_event("thread-req", "thread_started");
@@ -8882,15 +9099,21 @@ fn server_mode_turn_start_rebinds_runtime_workspace_roots_for_permission_grants(
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"turn-1","method":"turn/start","params":{{"threadId":"{}","runtimeWorkspaceRoots":["{}"],"input":[{{"type":"text","text":"request_permissions_then_bash {} :: printf first > {}"}}]}}}}"#,
-            thread_id,
-            new_root.display(),
+        let prompt = format!(
+            "request_permissions_then_bash {} :: printf first > {}",
             docs.display(),
-            first_output.display(),
-        )
-        .expect("write first turn");
+            first_output.display()
+        );
+        let request = json!({
+            "id": "turn-1",
+            "method": "turn/start",
+            "params": {
+                "threadId": thread_id,
+                "runtimeWorkspaceRoots": [new_root],
+                "input": [{"type": "text", "text": prompt}]
+            }
+        });
+        writeln!(stdin, "{request}").expect("write first turn");
         stdin.flush().expect("flush first turn");
     }
     let permission_request = child.expect_event("turn-1", "permission_request");
@@ -9160,12 +9383,17 @@ fn server_mode_filters_thread_list_by_codex_metadata_fields() {
 
         {
             let stdin = child.stdin_mut();
-            writeln!(
-            stdin,
-            r#"{{"id":"filter-cwd","method":"thread/list","params":{{"cwd":"{}","limit":10,"sortKey":"createdAt","sortDirection":"asc"}}}}"#,
-            alpha_cwd.display()
-        )
-        .expect("write cwd filter");
+            let request = json!({
+                "id": "filter-cwd",
+                "method": "thread/list",
+                "params": {
+                    "cwd": alpha_cwd,
+                    "limit": 10,
+                    "sortKey": "createdAt",
+                    "sortDirection": "asc"
+                }
+            });
+            writeln!(stdin, "{request}").expect("write cwd filter");
             stdin.flush().expect("flush cwd filter");
         }
         let filtered_cwd = child.expect_event("filter-cwd", "thread_list");
