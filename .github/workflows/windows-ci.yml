@@ -15,6 +15,7 @@ on:
       - "scripts/release/**"
       - "scripts/validate-windows-platform-boundaries.mjs"
       - "scripts/test-validate-windows-platform-boundaries.mjs"
+      - ".gitattributes"
       - ".github/workflows/release.yml"
       - ".github/workflows/windows-ci.yml"
   push:
@@ -30,6 +31,7 @@ on:
       - "scripts/release/**"
       - "scripts/validate-windows-platform-boundaries.mjs"
       - "scripts/test-validate-windows-platform-boundaries.mjs"
+      - ".gitattributes"
       - ".github/workflows/release.yml"
       - ".github/workflows/windows-ci.yml"
 
