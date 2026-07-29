@@ -231,15 +231,25 @@ command = "printf '%s' '{\"action\":\"injcet\",\"context\":\"typo should fail\"}
 fn exec_post_model_hook_observes_usage_environment() {
     let home = TempDir::new().expect("temp home");
     let usage_path = home.path().join("usage.txt");
+    #[cfg(unix)]
+    let hook_command = format!(
+        "printf '%s %s %s' \"$ORCA_USAGE_INPUT_TOKENS\" \"$ORCA_USAGE_OUTPUT_TOKENS\" \"$ORCA_USAGE_CACHE_TOKENS\" > {}",
+        shell_escape(&usage_path)
+    );
+    #[cfg(windows)]
+    let hook_command = format!(
+        "Set-Content -LiteralPath '{}' -Value \"$env:ORCA_USAGE_INPUT_TOKENS $env:ORCA_USAGE_OUTPUT_TOKENS $env:ORCA_USAGE_CACHE_TOKENS\" -NoNewline",
+        usage_path.display().to_string().replace('\'', "''")
+    );
     std::fs::write(
         home.path().join("config.toml"),
         format!(
             r#"
 [[hooks]]
 event = "post_model_call"
-command = "printf '%s %s %s' \"$ORCA_USAGE_INPUT_TOKENS\" \"$ORCA_USAGE_OUTPUT_TOKENS\" \"$ORCA_USAGE_CACHE_TOKENS\" > {}"
+command = {}
 "#,
-            shell_escape(&usage_path)
+            toml::Value::String(hook_command)
         ),
     )
     .unwrap();
@@ -466,6 +476,7 @@ fn run_exec_with_stdin(args: &[&str], stdin: &str) -> std::process::Output {
     child.wait_with_output().expect("wait for orca")
 }
 
+#[cfg(unix)]
 fn shell_escape(path: &std::path::Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }

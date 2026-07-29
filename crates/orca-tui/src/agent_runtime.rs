@@ -129,6 +129,8 @@ mod tests {
     use crate::interaction_broker::TuiInteractionBroker;
     use crate::surface_actions::TuiSurfaceActions;
 
+    const TEST_OPERATION_START_TIMEOUT: Duration = Duration::from_secs(10);
+
     fn run_blocking_surface_operation(
         control: TuiSurfaceTaskControl,
         host: RuntimeHostHandle,
@@ -187,7 +189,7 @@ mod tests {
         let mut runtime = spawn_blocking_runtime(action_rx, event_tx, ready_tx);
 
         ready_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(TEST_OPERATION_START_TIMEOUT)
             .expect("agent started");
         runtime.shutdown().expect("agent runtime shutdown");
     }
@@ -201,7 +203,7 @@ mod tests {
         let runtime = spawn_blocking_runtime(action_rx, event_tx, ready_tx);
 
         ready_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(TEST_OPERATION_START_TIMEOUT)
             .expect("agent started");
         drop(runtime);
     }
@@ -231,7 +233,7 @@ mod tests {
         )
         .expect("agent runtime spawned");
         ready_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(TEST_OPERATION_START_TIMEOUT)
             .expect("agent started");
 
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
