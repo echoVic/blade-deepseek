@@ -175,9 +175,10 @@ It is `None` when Vim is disabled and mirrors `VimState.mode` otherwise.
 Production synchronizes it centrally in `app.rs`:
 
 - immediately after `VimState` construction;
-- immediately before routing every input event;
-- immediately after the input event completes;
-- after setup/session replacement creates a new textarea/Vim ownership state.
+- immediately before routing every input event in a batch;
+- immediately after `run_event_loop_iteration` completes, before rendering;
+- after setup/session replacement creates a new textarea/Vim ownership state
+  outside the normal iteration boundary.
 
 Because slash commands execute inside one routed key event, the pre-routing
 projection is current when `/doctor` formats its report. Individual command,
