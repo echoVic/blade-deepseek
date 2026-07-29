@@ -3386,7 +3386,11 @@ mod tests {
             });
 
             action_tx
-                .send(UserAction::Submit("mock_stream_delay_ms 250".to_string()))
+                // Keep the first provider turn alive long enough for the
+                // background handoff and the next persisted turn admission on
+                // slower release-gate hosts. The ordering assertion below is
+                // still what proves the handoff released foreground ownership.
+                .send(UserAction::Submit("mock_stream_delay_ms 3000".to_string()))
                 .unwrap();
 
             loop {
