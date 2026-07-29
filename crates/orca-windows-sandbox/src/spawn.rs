@@ -249,9 +249,16 @@ impl SandboxedPtyInput {
     }
 
     pub fn close(&mut self) {
-        // Closing the ConPTY input pipe can deliver an interrupt-like terminal
-        // status to a still-running child. Stop accepting writes here and keep
-        // the pipe alive until terminal cleanup after the child exits.
+        // ConPTY treats a closed input pipe like a terminal disconnect, which
+        // can turn a normal exit into STATUS_CONTROL_C_EXIT. Send the Windows
+        // console EOF sequence instead, then retain the pipe and pseudoconsole
+        // so callers can still resize while the child drains and exits.
+        if !self.closed
+            && let Some(writer) = self.writer.as_mut()
+        {
+            let _ = writer.write_all(b"\x1a\r\n");
+            let _ = writer.flush();
+        }
         self.closed = true;
     }
 }

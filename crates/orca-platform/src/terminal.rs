@@ -124,8 +124,15 @@ mod windows {
 
         pub fn close(&mut self) {
             // Closing the input pipe while the child is active can turn a
-            // normal ConPTY exit into an interrupt status. Retain the native
-            // handle until terminal cleanup while rejecting further writes.
+            // normal ConPTY exit into an interrupt status. Send the Windows
+            // console EOF sequence, then retain the pipe and pseudoconsole so
+            // resize remains available while the child drains and exits.
+            if !self.closed
+                && let Some(writer) = self.writer.as_mut()
+            {
+                let _ = writer.write_all(b"\x1a\r\n");
+                let _ = writer.flush();
+            }
             self.closed = true;
         }
 
