@@ -18,8 +18,8 @@ use windows_sys::Win32::Security::{
     ACL, AdjustTokenPrivileges, CreateRestrictedToken, CreateWellKnownSid,
     DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, LUA_TOKEN, LookupPrivilegeValueW,
     SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY, TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES,
-    TOKEN_QUERY, TokenDefaultDacl, WRITE_RESTRICTED,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+    TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenDefaultDacl, WRITE_RESTRICTED,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -356,8 +356,12 @@ fn create_restricted_token(sids: &[*mut c_void]) -> Result<OwnedHandle, WindowsS
 }
 
 fn open_current_token() -> Result<OwnedHandle, WindowsSandboxError> {
-    let desired =
-        TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_PRIVILEGES;
+    let desired = TOKEN_DUPLICATE
+        | TOKEN_QUERY
+        | TOKEN_ASSIGN_PRIMARY
+        | TOKEN_ADJUST_DEFAULT
+        | TOKEN_ADJUST_SESSIONID
+        | TOKEN_ADJUST_PRIVILEGES;
     let mut token: HANDLE = std::ptr::null_mut();
     let ok = unsafe { OpenProcessToken(GetCurrentProcess(), desired, &mut token) };
     if ok == 0 {
