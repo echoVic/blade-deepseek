@@ -3051,7 +3051,7 @@ fn server_mode_controls_runtime_shell_session() {
         .expect("shell_completed event");
     assert_eq!(completed["shellId"], shell_id);
     assert_eq!(completed["status"], "completed");
-    assert_eq!(completed["exitCode"], 0);
+    assert_eq!(completed["exitCode"], 0, "{completed:?}");
     assert_eq!(
         completed["stdout"],
         platform_shell_script("server:from-server\n", "server:from-server\r\n")
