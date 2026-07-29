@@ -16,7 +16,7 @@ use windows_sys::Win32::Security::Isolation::{
 };
 use windows_sys::Win32::Security::{
     ACL, AdjustTokenPrivileges, CreateRestrictedToken, CreateWellKnownSid,
-    DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, LUA_TOKEN, LookupPrivilegeValueW,
+    DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, FreeSid, LUA_TOKEN, LookupPrivilegeValueW,
     SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT,
     TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
     TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenDefaultDacl, WRITE_RESTRICTED,
@@ -198,13 +198,9 @@ fn apply_plan_acls(
 
 fn appcontainer_sid() -> Result<LocalSid, WindowsSandboxError> {
     const PROFILE_NAME: &str = "Orca.WindowsSandbox.v1";
+    const ERROR_ALREADY_EXISTS_HRESULT: i32 = 0x8007_00b7_u32 as i32;
     let name = wide(PROFILE_NAME);
     let mut sid = std::ptr::null_mut();
-    let derived = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
-    if derived >= 0 && !sid.is_null() {
-        return Ok(LocalSid::from_raw(sid));
-    }
-
     let created = unsafe {
         CreateAppContainerProfile(
             name.as_ptr(),
@@ -216,16 +212,27 @@ fn appcontainer_sid() -> Result<LocalSid, WindowsSandboxError> {
         )
     };
     if created >= 0 && !sid.is_null() {
-        return Ok(LocalSid::from_raw(sid));
+        return Ok(LocalSid::from_appcontainer(sid));
+    }
+    if created != ERROR_ALREADY_EXISTS_HRESULT {
+        if !sid.is_null() {
+            unsafe { FreeSid(sid) };
+        }
+        return Err(WindowsSandboxError::Io(io::Error::other(format!(
+            "CreateAppContainerProfile failed with HRESULT {created:#x}"
+        ))));
     }
 
+    if !sid.is_null() {
+        unsafe { FreeSid(sid) };
+    }
     sid = std::ptr::null_mut();
-    let retried = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
-    if retried >= 0 && !sid.is_null() {
-        Ok(LocalSid::from_raw(sid))
+    let derived = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
+    if derived >= 0 && !sid.is_null() {
+        Ok(LocalSid::from_appcontainer(sid))
     } else {
         Err(WindowsSandboxError::Io(io::Error::other(format!(
-            "CreateAppContainerProfile failed with HRESULT {created:#x}"
+            "DeriveAppContainerSidFromAppContainerName failed with HRESULT {derived:#x}"
         ))))
     }
 }
@@ -482,6 +489,12 @@ fn enable_change_notify(token: HANDLE) -> Result<(), WindowsSandboxError> {
 
 struct LocalSid {
     raw: *mut c_void,
+    allocator: SidAllocator,
+}
+
+enum SidAllocator {
+    Local,
+    AppContainer,
 }
 
 impl LocalSid {
@@ -500,11 +513,17 @@ impl LocalSid {
         if ok == 0 || sid.is_null() {
             return Err(win32("ConvertStringSidToSidW", unsafe { GetLastError() }));
         }
-        Ok(Self { raw: sid })
+        Ok(Self {
+            raw: sid,
+            allocator: SidAllocator::Local,
+        })
     }
 
-    fn from_raw(raw: *mut c_void) -> Self {
-        Self { raw }
+    fn from_appcontainer(raw: *mut c_void) -> Self {
+        Self {
+            raw,
+            allocator: SidAllocator::AppContainer,
+        }
     }
 
     fn as_ptr(&self) -> *mut c_void {
@@ -514,7 +533,13 @@ impl LocalSid {
 
 impl Drop for LocalSid {
     fn drop(&mut self) {
-        free_local(self.raw);
+        match self.allocator {
+            SidAllocator::Local => free_local(self.raw),
+            SidAllocator::AppContainer if !self.raw.is_null() => unsafe {
+                FreeSid(self.raw);
+            },
+            SidAllocator::AppContainer => {}
+        }
     }
 }
 
