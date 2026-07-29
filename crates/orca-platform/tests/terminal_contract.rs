@@ -2,9 +2,12 @@
 mod windows {
     use std::io::Read;
     use std::process::Command;
+    use std::time::{Duration, Instant};
 
     use orca_platform::process::ProcessJob;
-    use orca_platform::terminal::{spawn_windows_pty, spawn_windows_pty_named};
+    use orca_platform::terminal::{
+        PtyExitStatus, WindowsPtyChild, spawn_windows_pty, spawn_windows_pty_named,
+    };
 
     #[test]
     fn conpty_runs_native_command_and_supports_resize() {
@@ -13,8 +16,8 @@ mod windows {
 
         let mut process = spawn_windows_pty(&command, Some(100), Some(30)).unwrap();
         process.input.resize(120, 40).unwrap();
-        let status = process.child.wait().unwrap();
         process.input.close();
+        let status = wait_for_exit(&mut process.child, "native ConPTY command");
 
         let mut output = String::new();
         process.reader.read_to_string(&mut output).unwrap();
@@ -39,8 +42,8 @@ mod windows {
 
         let mut process = spawn_windows_pty_named(&command, Some(100), Some(30), &job_name)
             .expect("spawn ConPTY child atomically inside named Job Object");
-        let status = process.child.wait().expect("wait for ConPTY helper");
         process.input.close();
+        let status = wait_for_exit(&mut process.child, "ConPTY membership helper");
 
         assert!(
             status.success(),
@@ -65,5 +68,20 @@ mod windows {
             .unwrap_or(false);
         std::fs::write(result_path, if owned { "owned" } else { "escaped" })
             .expect("write membership result");
+    }
+
+    fn wait_for_exit(child: &mut WindowsPtyChild, label: &str) -> PtyExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().expect("inspect ConPTY child") {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{label} did not exit after ConPTY input reached EOF");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
