@@ -994,6 +994,7 @@ impl ShellSession {
             self.child.wait()
         } else {
             let status = self.child.wait()?;
+            self.drain_windows_terminal_output();
             self.stop_and_join_readers();
             Ok(status)
         }
@@ -1048,6 +1049,27 @@ impl ShellSession {
 
     fn output_size(&self) -> usize {
         self.output_store.size(&self.task_id)
+    }
+
+    fn drain_windows_terminal_output(&self) {
+        #[cfg(windows)]
+        if self.effective_terminal.is_pty() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut observed = self.output_size();
+            let mut quiet_since = Instant::now();
+            loop {
+                thread::sleep(Duration::from_millis(10));
+                let current = self.output_size();
+                if current != observed {
+                    observed = current;
+                    quiet_since = Instant::now();
+                }
+                if quiet_since.elapsed() >= Duration::from_millis(200) || Instant::now() >= deadline
+                {
+                    break;
+                }
+            }
+        }
     }
 
     fn terminate_child_tree(&mut self) {

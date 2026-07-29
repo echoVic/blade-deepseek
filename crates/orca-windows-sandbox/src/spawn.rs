@@ -898,6 +898,9 @@ mod tests {
     use super::*;
     use crate::{SandboxFilesystemMode, WindowsSandboxPolicyInput};
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn windows_argument_quoting_preserves_backslashes() {
@@ -947,15 +950,12 @@ mod tests {
             Some(30),
         )
         .expect("restricted ConPTY child");
-        let (mut input, mut output) = child.take_pty().expect("pty transport");
-        let reader = std::thread::spawn(move || {
-            let mut text = String::new();
-            output.read_to_string(&mut text).expect("pty output");
-            text
-        });
+        let (mut input, output) = child.take_pty().expect("pty transport");
+        let (output_bytes, reader) = output_reader(output);
         input.close();
         input.resize(120, 40).expect("resize after closing stdin");
         let status = child.wait().expect("wait");
+        wait_for_output_quiet(&output_bytes, "restricted ConPTY child");
         input.close_terminal();
         let text = reader.join().expect("join ConPTY output reader");
         assert!(status.success(), "{text}");
@@ -1007,15 +1007,12 @@ mod tests {
             Some(30),
         )
         .expect("AppContainer ConPTY child");
-        let (mut input, mut output) = child.take_pty().expect("pty transport");
-        let reader = std::thread::spawn(move || {
-            let mut text = String::new();
-            output.read_to_string(&mut text).expect("pty output");
-            text
-        });
+        let (mut input, output) = child.take_pty().expect("pty transport");
+        let (output_bytes, reader) = output_reader(output);
         input.close();
         input.resize(120, 40).expect("resize after closing stdin");
         let status = child.wait().expect("wait");
+        wait_for_output_quiet(&output_bytes, "AppContainer ConPTY child");
         input.close_terminal();
         let text = reader.join().expect("join ConPTY output reader");
         assert!(status.success(), "{text}");
@@ -1190,5 +1187,50 @@ mod tests {
             .join("WindowsPowerShell")
             .join("v1.0")
             .join("powershell.exe")
+    }
+
+    fn output_reader(
+        mut output: Box<dyn Read + Send>,
+    ) -> (Arc<AtomicUsize>, std::thread::JoinHandle<String>) {
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&bytes_read);
+        let handle = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                match output.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        bytes.extend_from_slice(&buffer[..count]);
+                        observed.fetch_add(count, Ordering::Release);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("read sandbox ConPTY output: {error}"),
+                }
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        });
+        (bytes_read, handle)
+    }
+
+    fn wait_for_output_quiet(bytes_read: &AtomicUsize, label: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut observed = 0;
+        let mut quiet_since = Instant::now();
+        loop {
+            let current = bytes_read.load(Ordering::Acquire);
+            if current != observed {
+                observed = current;
+                quiet_since = Instant::now();
+            }
+            if observed > 0 && quiet_since.elapsed() >= Duration::from_millis(200) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{label} produced no ConPTY output before the drain deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
