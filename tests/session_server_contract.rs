@@ -196,6 +196,27 @@ fn platform_fixture_command(unix: &str, windows_node: &str) -> Vec<String> {
     }
 }
 
+fn platform_fixture_command_with_args(
+    unix: &str,
+    windows_node: &str,
+    unix_args: &[&str],
+) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let _ = unix_args;
+        platform_fixture_command(unix, windows_node)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = windows_node;
+        platform_command_with_args(unix, "", unix_args)
+    }
+}
+
+fn javascript_path(path: &Path) -> String {
+    serde_json::to_string(&path.to_string_lossy()).expect("serialize JavaScript fixture path")
+}
+
 fn platform_command_with_args(unix: &str, windows: &str, unix_args: &[&str]) -> Vec<String> {
     #[cfg(windows)]
     {
@@ -5348,9 +5369,9 @@ fn server_mode_command_exec_with_process_id_can_be_terminated() {
     let started_marker_arg = started_marker.to_str().expect("marker path");
     let release_marker_arg = release_marker.to_str().expect("release marker path");
     let windows_command = format!(
-        "Write-Host -NoNewline 'started'; New-Item -ItemType File -Force -LiteralPath {} | Out-Null; while (!(Test-Path -LiteralPath {})) {{ Start-Sleep -Milliseconds 50 }}; Write-Host -NoNewline 'done'",
-        powershell_path(&started_marker),
-        powershell_path(&release_marker)
+        "const fs = require('fs'); process.stdout.write('started'); fs.writeFileSync({}, ''); const poll = setInterval(() => {{ if (fs.existsSync({})) {{ clearInterval(poll); process.stdout.write('done'); }} }}, 50);",
+        javascript_path(&started_marker),
+        javascript_path(&release_marker)
     );
     let mut child = orca_command()
         .args([
@@ -5373,7 +5394,7 @@ fn server_mode_command_exec_with_process_id_can_be_terminated() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": platform_command_with_args(
+                "command": platform_fixture_command_with_args(
                     "printf started; : > \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done; printf done",
                     &windows_command,
                     &[started_marker_arg, release_marker_arg]
@@ -5433,10 +5454,10 @@ fn server_mode_command_exec_stops_active_processes_when_input_closes() {
     let release_marker_arg = release_marker.to_str().expect("release marker path");
     let leaked_marker_arg = leaked_marker.to_str().expect("marker path");
     let windows_command = format!(
-        "Write-Host -NoNewline 'started'; New-Item -ItemType File -Force -LiteralPath {} | Out-Null; while (!(Test-Path -LiteralPath {})) {{ Start-Sleep -Milliseconds 50 }}; Set-Content -NoNewline -LiteralPath {} -Value 'leaked'",
-        powershell_path(&started_marker),
-        powershell_path(&release_marker),
-        powershell_path(&leaked_marker)
+        "const fs = require('fs'); process.stdout.write('started'); fs.writeFileSync({}, ''); const poll = setInterval(() => {{ if (fs.existsSync({})) {{ clearInterval(poll); fs.writeFileSync({}, 'leaked'); }} }}, 50);",
+        javascript_path(&started_marker),
+        javascript_path(&release_marker),
+        javascript_path(&leaked_marker)
     );
     let mut child = orca_command()
         .args([
@@ -5459,7 +5480,7 @@ fn server_mode_command_exec_stops_active_processes_when_input_closes() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": platform_command_with_args(
+                "command": platform_fixture_command_with_args(
                     "printf started; : > \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done; printf leaked > \"$3\"",
                     &windows_command,
                     &[started_marker_arg, release_marker_arg, leaked_marker_arg]
@@ -5643,12 +5664,12 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
     let completed_marker_arg = completed_marker.to_str().expect("completed marker path");
     let command = "printf listed; touch $1; while test ! -e $2; do sleep 0.05; done; touch $3";
     let windows_command = format!(
-        "Write-Host -NoNewline 'listed'; New-Item -ItemType File -Force -LiteralPath {} | Out-Null; while (!(Test-Path -LiteralPath {})) {{ Start-Sleep -Milliseconds 50 }}; New-Item -ItemType File -Force -LiteralPath {} | Out-Null",
-        powershell_path(&started_marker),
-        powershell_path(&release_marker),
-        powershell_path(&completed_marker)
+        "const fs = require('fs'); process.stdout.write('listed'); fs.writeFileSync({}, ''); const poll = setInterval(() => {{ if (fs.existsSync({})) {{ clearInterval(poll); fs.writeFileSync({}, ''); }} }}, 50);",
+        javascript_path(&started_marker),
+        javascript_path(&release_marker),
+        javascript_path(&completed_marker)
     );
-    let command_args = platform_command_with_args(
+    let command_args = platform_fixture_command_with_args(
         command,
         &windows_command,
         &[started_marker_arg, release_marker_arg, completed_marker_arg],
@@ -6190,8 +6211,8 @@ fn server_mode_command_exec_streaming_respects_output_cap() {
     let started_marker = workspace.path().join("stream-cap-started");
     let started_marker_arg = started_marker.to_str().expect("started marker path");
     let windows_command = format!(
-        "Write-Host -NoNewline 'abcdefghij'; New-Item -ItemType File -Force -LiteralPath {} | Out-Null; Start-Sleep -Seconds 30",
-        powershell_path(&started_marker)
+        "const fs = require('fs'); process.stdout.write('abcdefghij'); fs.writeFileSync({}, ''); setTimeout(() => {{}}, 30_000);",
+        javascript_path(&started_marker)
     );
     let mut child = orca_command()
         .args([
@@ -6214,7 +6235,7 @@ fn server_mode_command_exec_streaming_respects_output_cap() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": platform_command_with_args(
+                "command": platform_fixture_command_with_args(
                     "printf 'abcdefghij'; : > \"$1\"; sleep 30",
                     &windows_command,
                     &[started_marker_arg]
@@ -6281,8 +6302,8 @@ fn server_mode_command_exec_caps_streaming_output_by_bytes() {
     let started_marker = workspace.path().join("stream-byte-cap-started");
     let started_marker_arg = started_marker.to_str().expect("started marker path");
     let windows_command = format!(
-        "Write-Host -NoNewline 'ééé'; New-Item -ItemType File -Force -LiteralPath {} | Out-Null; Start-Sleep -Seconds 30",
-        powershell_path(&started_marker)
+        "const fs = require('fs'); process.stdout.write('ééé'); fs.writeFileSync({}, ''); setTimeout(() => {{}}, 30_000);",
+        javascript_path(&started_marker)
     );
     let mut child = orca_command()
         .args([
@@ -6305,7 +6326,7 @@ fn server_mode_command_exec_caps_streaming_output_by_bytes() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": platform_command_with_args(
+                "command": platform_fixture_command_with_args(
                     "printf 'ééé'; : > \"$1\"; sleep 30",
                     &windows_command,
                     &[started_marker_arg]
@@ -6520,7 +6541,7 @@ fn server_mode_kills_runtime_shell_session() {
         let stdin = child.stdin_mut();
         let command = platform_shell_script(
             "printf started; sleep 30; printf done",
-            "Write-Output 'started'; Start-Sleep -Seconds 30; Write-Output 'done'",
+            "Write-Host -NoNewline 'started'; Start-Sleep -Seconds 30; Write-Host -NoNewline 'done'",
         );
         let request = json!({
             "id": "shell-start",
@@ -6534,6 +6555,28 @@ fn server_mode_kills_runtime_shell_session() {
     let shell_id = started["shellId"].as_str().expect("shell id").to_string();
     assert_eq!(started["requestedTerminalMode"], "pipe");
     assert_eq!(started["effectiveTerminalMode"], "pipe");
+
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            r#"{{"id":"shell-read","method":"shell/read","params":{{"shellId":"{}","timeoutMs":5000}}}}"#,
+            shell_id
+        )
+        .expect("write shell/read");
+        stdin.flush().expect("flush shell/read");
+    }
+    let read_events = child.drain_events_until_event("shell-read", "shell_updated");
+    assert!(
+        read_events.iter().any(|event| {
+            event["event"] == "shell_output_delta"
+                && event["stream"] == "stdout"
+                && event["delta"]
+                    .as_str()
+                    .is_some_and(|delta| delta.contains("started"))
+        }),
+        "shell must publish startup output before the kill contract is exercised: {read_events:?}"
+    );
 
     {
         let stdin = child.stdin_mut();
@@ -6693,7 +6736,7 @@ fn server_mode_reads_runtime_shell_session_incrementally() {
         let stdin = child.stdin_mut();
         let command = platform_shell_script(
             "printf ready; sleep 30; printf done",
-            "Write-Output 'ready'; Start-Sleep -Seconds 30; Write-Output 'done'",
+            "Write-Host -NoNewline 'ready'; Start-Sleep -Seconds 30; Write-Host -NoNewline 'done'",
         );
         let request = json!({
             "id": "shell-start",
