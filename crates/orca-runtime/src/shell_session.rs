@@ -1832,7 +1832,8 @@ mod tests {
         let mut sessions = RuntimeShellSessionManager::new(tasks);
         let handle = sessions
             .spawn(ShellSessionCommand {
-                command: "Start-Sleep -Milliseconds 300".to_string(),
+                command: "Write-Output restricted-conpty-ready; Start-Sleep -Milliseconds 300"
+                    .to_string(),
                 cwd: temp.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
                 additional_working_directories: Vec::new(),
@@ -1852,6 +1853,21 @@ mod tests {
             handle.effective_terminal,
             ShellTerminalMode::pty(Some(100), Some(30))
         );
+        let ready_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let output = sessions
+                .read(&handle.id, Duration::from_millis(50))
+                .expect("read restricted ConPTY startup");
+            if output.stdout.contains("restricted-conpty-ready") {
+                break;
+            }
+            assert_eq!(output.status, TaskStatus::Running, "{output:?}");
+            assert!(
+                Instant::now() < ready_deadline,
+                "restricted ConPTY did not enter the user script: {output:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         sessions
             .close_stdin(&handle.id)
             .expect("close ConPTY stdin without closing the terminal");
