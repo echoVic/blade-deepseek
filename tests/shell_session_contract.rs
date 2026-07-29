@@ -1,3 +1,8 @@
+#[cfg(windows)]
+use std::ffi::OsString;
+use std::path::Path;
+#[cfg(windows)]
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use orca_core::task_types::{TaskStatus, TaskType};
@@ -7,15 +12,98 @@ use orca_runtime::shell_session::{
 };
 use orca_runtime::tasks::TaskRegistry;
 
+#[cfg(windows)]
+static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(windows)]
+struct WindowsSandboxTestHome {
+    previous_home: Option<OsString>,
+    _home: tempfile::TempDir,
+    _lock: MutexGuard<'static, ()>,
+}
+
+#[cfg(windows)]
+impl WindowsSandboxTestHome {
+    fn new(workspace: &Path) -> Self {
+        let lock = ORCA_HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::Builder::new()
+            .prefix("orca-shell-session-contract-")
+            .tempdir()
+            .expect("create isolated ORCA_HOME");
+        let previous_home = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        orca_windows_sandbox::CapabilityStore::new(home.path().join("windows-capabilities"))
+            .provision_setup(workspace, orca_windows_sandbox::SETUP_HELPER_VERSION)
+            .expect("provision Windows sandbox setup for shell session workspace");
+        Self {
+            previous_home,
+            _home: home,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsSandboxTestHome {
+    fn drop(&mut self) {
+        match self.previous_home.take() {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+}
+
+#[cfg(windows)]
+fn prepare_windows_sandbox(workspace: &Path) -> WindowsSandboxTestHome {
+    WindowsSandboxTestHome::new(workspace)
+}
+
+#[cfg(not(windows))]
+fn prepare_windows_sandbox(_workspace: &Path) {}
+
+fn platform_shell_script(unix: &str, windows: &str) -> String {
+    if cfg!(windows) {
+        windows.to_string()
+    } else {
+        unix.to_string()
+    }
+}
+
+fn powershell_literal(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "''"))
+}
+
+fn marker_wait_script(started: &Path, release: &Path) -> String {
+    let unix_started = started.display();
+    let unix_release = release.display();
+    let windows_started = powershell_literal(started);
+    let windows_release = powershell_literal(release);
+    platform_shell_script(
+        &format!(
+            "printf started; : > {unix_started:?}; while [ ! -e {unix_release:?} ]; do sleep 0.05; done; printf done"
+        ),
+        &format!(
+            "Write-Host -NoNewline 'started'; [System.IO.File]::WriteAllText({windows_started}, ''); while (!(Test-Path -LiteralPath {windows_release})) {{ Start-Sleep -Milliseconds 50 }}; Write-Host -NoNewline 'done'"
+        ),
+    )
+}
+
 #[test]
 fn shell_session_runs_interactive_stdin_and_records_task_result() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let tasks = TaskRegistry::new("session-shell".to_string());
     let mut sessions = RuntimeShellSessionManager::new(tasks.clone());
+    let command = platform_shell_script(
+        "read line; printf 'reply:%s\\n' \"$line\"",
+        "$line = [Console]::In.ReadLine(); Write-Output \"reply:$line\"",
+    );
 
     let handle = sessions
         .spawn(ShellSessionCommand {
-            command: "read line; printf 'reply:%s\\n' \"$line\"".to_string(),
+            command: command.clone(),
             argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
@@ -45,24 +133,27 @@ fn shell_session_runs_interactive_stdin_and_records_task_result() {
     let task = tasks.get(&handle.task_id).expect("shell task");
     assert_eq!(task.task_type, TaskType::Shell);
     assert_eq!(task.status, TaskStatus::Completed);
-    assert_eq!(task.result.as_deref(), Some("reply:hello-runtime\n"));
-    assert_eq!(task.error, None);
     assert_eq!(
-        tasks.list()[0].command.as_deref(),
-        Some("read line; printf 'reply:%s\\n' \"$line\"")
+        task.result.as_deref().map(str::trim),
+        Some("reply:hello-runtime")
     );
+    assert_eq!(task.error, None);
+    assert_eq!(tasks.list()[0].command.as_deref(), Some(command.as_str()));
 }
 
 #[test]
 fn shell_session_applies_environment_overrides_and_unsets() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let tasks = TaskRegistry::new("session-shell".to_string());
     let mut sessions = RuntimeShellSessionManager::new(tasks);
 
     let handle = sessions
         .spawn(ShellSessionCommand {
-            command: "printf '%s|%s' \"$ORCA_SHELL_ENV_ADDED\" \"${ORCA_SHELL_ENV_REMOVED-unset}\""
-                .to_string(),
+            command: platform_shell_script(
+                "printf '%s|%s' \"$ORCA_SHELL_ENV_ADDED\" \"${ORCA_SHELL_ENV_REMOVED-unset}\"",
+                "if ($null -eq $env:ORCA_SHELL_ENV_REMOVED) { $removed = 'unset' } else { $removed = $env:ORCA_SHELL_ENV_REMOVED }; Write-Host -NoNewline \"$env:ORCA_SHELL_ENV_ADDED|$removed\"",
+            ),
             argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
@@ -128,18 +219,15 @@ fn sandboxed_shell_session_cannot_override_seatbelt_marker() {
 #[test]
 fn shell_session_kill_stops_running_task_and_collects_partial_output() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let started_marker = temp.path().join("shell-kill-started");
     let release_marker = temp.path().join("shell-kill-release");
-    let started_marker_arg = started_marker.to_str().expect("started marker path");
-    let release_marker_arg = release_marker.to_str().expect("release marker path");
     let tasks = TaskRegistry::new("session-shell".to_string());
     let mut sessions = RuntimeShellSessionManager::new(tasks.clone());
 
     let handle = sessions
         .spawn(ShellSessionCommand {
-            command: format!(
-                "printf started; : > {started_marker_arg:?}; while [ ! -e {release_marker_arg:?} ]; do sleep 0.05; done; printf done"
-            ),
+            command: marker_wait_script(&started_marker, &release_marker),
             argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
@@ -166,11 +254,12 @@ fn shell_session_kill_stops_running_task_and_collects_partial_output() {
 #[test]
 fn shell_session_kill_preserves_already_exited_terminal_with_buffered_output() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let tasks = TaskRegistry::new("session-shell".to_string());
     let mut sessions = RuntimeShellSessionManager::new(tasks.clone());
     let handle = sessions
         .spawn(ShellSessionCommand {
-            command: "printf completed".to_string(),
+            command: platform_shell_script("printf completed", "Write-Host -NoNewline 'completed'"),
             argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
@@ -222,18 +311,15 @@ fn shell_session_kill_preserves_already_exited_terminal_with_buffered_output() {
 #[test]
 fn shell_session_reaps_task_stop_requests() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let started_marker = temp.path().join("shell-started");
     let release_marker = temp.path().join("shell-release");
-    let started_marker_arg = started_marker.to_str().expect("started marker path");
-    let release_marker_arg = release_marker.to_str().expect("release marker path");
     let tasks = TaskRegistry::new("session-shell".to_string());
     let mut sessions = RuntimeShellSessionManager::new(tasks.clone());
 
     let handle = sessions
         .spawn(ShellSessionCommand {
-            command: format!(
-                "printf started; : > {started_marker_arg:?}; while [ ! -e {release_marker_arg:?} ]; do sleep 0.05; done; printf done"
-            ),
+            command: marker_wait_script(&started_marker, &release_marker),
             argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
@@ -284,12 +370,16 @@ fn wait_for_path(path: &std::path::Path) {
 #[test]
 fn shell_session_read_returns_incremental_output_without_waiting_for_exit() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let tasks = TaskRegistry::new("session-shell".to_string());
     let mut sessions = RuntimeShellSessionManager::new(tasks.clone());
 
     let handle = sessions
         .spawn(ShellSessionCommand {
-            command: "printf ready; sleep 30; printf done".to_string(),
+            command: platform_shell_script(
+                "printf ready; sleep 30; printf done",
+                "Write-Host -NoNewline 'ready'; Start-Sleep -Seconds 30; Write-Host -NoNewline 'done'",
+            ),
             argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
@@ -324,12 +414,17 @@ fn shell_session_read_returns_incremental_output_without_waiting_for_exit() {
 #[test]
 fn shell_session_list_returns_running_shell_snapshots() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let tasks = TaskRegistry::new("session-shell".to_string());
     let mut sessions = RuntimeShellSessionManager::new(tasks.clone());
+    let command = platform_shell_script(
+        "printf ready; sleep 30",
+        "Write-Host -NoNewline 'ready'; Start-Sleep -Seconds 30",
+    );
 
     let handle = sessions
         .spawn(ShellSessionCommand {
-            command: "printf ready; sleep 30".to_string(),
+            command: command.clone(),
             argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
@@ -348,7 +443,7 @@ fn shell_session_list_returns_running_shell_snapshots() {
     assert_eq!(snapshots.len(), 1);
     assert_eq!(snapshots[0].id, handle.id);
     assert_eq!(snapshots[0].task_id, handle.task_id);
-    assert_eq!(snapshots[0].command, "printf ready; sleep 30");
+    assert_eq!(snapshots[0].command, command);
     assert_eq!(snapshots[0].description, "listed shell");
     assert_eq!(snapshots[0].status, TaskStatus::Running);
     assert_eq!(snapshots[0].requested_terminal, ShellTerminalMode::pipe());
@@ -360,12 +455,13 @@ fn shell_session_list_returns_running_shell_snapshots() {
 #[test]
 fn shell_session_updates_description_for_list_snapshots() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let tasks = TaskRegistry::new("session-shell".to_string());
     let mut sessions = RuntimeShellSessionManager::new(tasks);
 
     let handle = sessions
         .spawn(ShellSessionCommand {
-            command: "sleep 30".to_string(),
+            command: platform_shell_script("sleep 30", "Start-Sleep -Seconds 30"),
             argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
@@ -394,11 +490,12 @@ fn shell_session_updates_description_for_list_snapshots() {
 #[test]
 fn shell_session_terminate_all_preserves_natural_completion() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let tasks = TaskRegistry::new("session-shell".to_string());
     let mut sessions = RuntimeShellSessionManager::new(tasks.clone());
     let handle = sessions
         .spawn(ShellSessionCommand {
-            command: "printf completed".to_string(),
+            command: platform_shell_script("printf completed", "Write-Host -NoNewline 'completed'"),
             argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
