@@ -76,6 +76,25 @@ fn platform_shell_script(unix: &str, windows: &str) -> String {
     }
 }
 
+fn platform_interactive_command(unix: &str, windows_node: &str) -> (String, Option<Vec<String>>) {
+    #[cfg(windows)]
+    {
+        (
+            windows_node.to_string(),
+            Some(vec![
+                "node".to_string(),
+                "-e".to_string(),
+                windows_node.to_string(),
+            ]),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = windows_node;
+        (unix.to_string(), None)
+    }
+}
+
 fn powershell_literal(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "''"))
 }
@@ -90,7 +109,7 @@ fn marker_wait_script(started: &Path, release: &Path) -> String {
             "printf started; : > {unix_started:?}; while [ ! -e {unix_release:?} ]; do sleep 0.05; done; printf done"
         ),
         &format!(
-            "Write-Host -NoNewline 'started'; [System.IO.File]::WriteAllText({windows_started}, ''); while (!(Test-Path -LiteralPath {windows_release})) {{ Start-Sleep -Milliseconds 50 }}; Write-Host -NoNewline 'done'"
+            "Write-Host -NoNewline 'started'; Set-Content -NoNewline -LiteralPath {windows_started} -Value ''; while (!(Test-Path -LiteralPath {windows_release})) {{ Start-Sleep -Milliseconds 50 }}; Write-Host -NoNewline 'done'"
         ),
     )
 }
@@ -101,15 +120,15 @@ fn shell_session_runs_interactive_stdin_and_records_task_result() {
     let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let tasks = TaskRegistry::new("session-shell".to_string());
     let mut sessions = RuntimeShellSessionManager::new(tasks.clone());
-    let command = platform_shell_script(
+    let (command, argv) = platform_interactive_command(
         "read line; printf 'reply:%s\\n' \"$line\"",
-        "$line = [Console]::In.ReadLine(); Write-Output \"reply:$line\"",
+        "let input = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', chunk => input += chunk); process.stdin.on('end', () => process.stdout.write(`reply:${input.trimEnd()}`));",
     );
 
     let handle = sessions
         .spawn(ShellSessionCommand {
             command: command.clone(),
-            argv: None,
+            argv,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
