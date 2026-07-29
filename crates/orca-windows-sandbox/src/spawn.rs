@@ -967,7 +967,7 @@ mod tests {
         let (mut input, output) = child.take_pty().expect("pty transport");
         let (output_bytes, reader) = output_reader(output);
         input.resize(120, 40).expect("resize live ConPTY");
-        let status = child.wait().expect("wait");
+        let status = wait_for_pty_child(&mut child, "restricted ConPTY child");
         wait_for_output_quiet(&output_bytes, "restricted ConPTY child");
         input.close_terminal();
         let text = reader.join().expect("join ConPTY output reader");
@@ -1023,7 +1023,7 @@ mod tests {
         let (mut input, output) = child.take_pty().expect("pty transport");
         let (output_bytes, reader) = output_reader(output);
         input.resize(120, 40).expect("resize live ConPTY");
-        let status = child.wait().expect("wait");
+        let status = wait_for_pty_child(&mut child, "AppContainer ConPTY child");
         wait_for_output_quiet(&output_bytes, "AppContainer ConPTY child");
         input.close_terminal();
         let text = reader.join().expect("join ConPTY output reader");
@@ -1070,12 +1070,13 @@ mod tests {
             capabilities: &capabilities,
         })
         .expect("AppContainer child");
-        let (_stdin, mut stdout, mut stderr) = child.take_stdio().expect("stdio");
-        let mut output = String::new();
-        stdout.read_to_string(&mut output).expect("stdout");
-        let mut error = String::new();
-        stderr.read_to_string(&mut error).expect("stderr");
-        let status = child.wait().expect("wait");
+        let (stdin, stdout, stderr) = child.take_stdio().expect("stdio");
+        drop(stdin);
+        let output_reader = text_reader(stdout, "stdout");
+        let error_reader = text_reader(stderr, "stderr");
+        let status = wait_for_pipe_child(&mut child, "network-disabled AppContainer child");
+        let output = output_reader.join().expect("join stdout reader");
+        let error = error_reader.join().expect("join stderr reader");
         assert!(
             !status.success(),
             "network-disabled AppContainer reached loopback: stdout={output:?}, stderr={error:?}"
@@ -1124,12 +1125,13 @@ mod tests {
             capabilities: &capabilities,
         })
         .expect("AppContainer child");
-        let (_stdin, mut stdout, mut stderr) = child.take_stdio().expect("stdio");
-        let mut output = String::new();
-        stdout.read_to_string(&mut output).expect("stdout");
-        let mut error = String::new();
-        stderr.read_to_string(&mut error).expect("stderr");
-        let status = child.wait().expect("wait");
+        let (stdin, stdout, stderr) = child.take_stdio().expect("stdio");
+        drop(stdin);
+        let output_reader = text_reader(stdout, "stdout");
+        let error_reader = text_reader(stderr, "stderr");
+        let status = wait_for_pipe_child(&mut child, "strict-read AppContainer child");
+        let output = output_reader.join().expect("join stdout reader");
+        let error = error_reader.join().expect("join stderr reader");
         assert!(
             !status.success(),
             "strict-read AppContainer accessed an ungranted file: stdout={output:?}, stderr={error:?}"
@@ -1175,12 +1177,13 @@ mod tests {
             capabilities: &capabilities,
         })
         .expect("restricted child");
-        let (_stdin, mut stdout, mut stderr) = child.take_stdio().expect("stdio");
-        let mut output = String::new();
-        stdout.read_to_string(&mut output).expect("stdout");
-        let mut error = String::new();
-        stderr.read_to_string(&mut error).expect("stderr");
-        let status = child.wait().expect("wait");
+        let (stdin, stdout, stderr) = child.take_stdio().expect("stdio");
+        drop(stdin);
+        let output_reader = text_reader(stdout, "stdout");
+        let error_reader = text_reader(stderr, "stderr");
+        let status = wait_for_pipe_child(&mut child, "sandbox pipe child");
+        let output = output_reader.join().expect("join stdout reader");
+        let error = error_reader.join().expect("join stderr reader");
         assert!(status.success(), "{error}");
         assert!(output.contains("sandbox-ok"), "{output:?}");
         if allow_global_read {
@@ -1223,6 +1226,49 @@ mod tests {
             String::from_utf8_lossy(&bytes).into_owned()
         });
         (bytes_read, handle)
+    }
+
+    fn text_reader(
+        mut output: Box<dyn Read + Send>,
+        label: &'static str,
+    ) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            output
+                .read_to_string(&mut text)
+                .unwrap_or_else(|error| panic!("read sandbox {label}: {error}"));
+            text
+        })
+    }
+
+    fn wait_for_pipe_child(child: &mut SandboxedChild, label: &str) -> ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll sandbox pipe child") {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{label} did not exit before the 10-second deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_pty_child(child: &mut SandboxedPty, label: &str) -> ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll sandbox ConPTY child") {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{label} did not exit before the 10-second deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn wait_for_output_quiet(bytes_read: &AtomicUsize, label: &str) {
