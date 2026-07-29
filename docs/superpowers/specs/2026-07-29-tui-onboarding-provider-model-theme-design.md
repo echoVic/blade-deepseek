@@ -296,6 +296,7 @@ pub enum UserConfigSaveError {
     InvalidExistingContent,
     CreateDirectoryFailed,
     CreateTemporaryFileFailed,
+    ReadFailed,
     WriteFailed,
     ReplaceFailed,
 }
