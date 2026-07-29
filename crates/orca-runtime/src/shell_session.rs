@@ -1832,7 +1832,7 @@ mod tests {
         let mut sessions = RuntimeShellSessionManager::new(tasks);
         let handle = sessions
             .spawn(ShellSessionCommand {
-                command: "ping -n 2 127.0.0.1".to_string(),
+                command: "Start-Sleep -Milliseconds 300".to_string(),
                 cwd: temp.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
                 additional_working_directories: Vec::new(),
@@ -1861,7 +1861,7 @@ mod tests {
         let output = sessions
             .wait(&handle.id, Duration::from_secs(5))
             .expect("wait for restricted ConPTY session");
-        assert_eq!(output.status, TaskStatus::Completed);
+        assert_eq!(output.status, TaskStatus::Completed, "{output:?}");
         assert_eq!(
             output.effective_terminal,
             ShellTerminalMode::pty(Some(100), Some(30))

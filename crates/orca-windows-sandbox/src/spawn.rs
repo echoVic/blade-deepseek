@@ -709,7 +709,11 @@ impl ProcessAttributeList {
             .collect();
         self.security_capabilities = Some(Box::new(SECURITY_CAPABILITIES {
             AppContainerSid: app_sid,
-            Capabilities: self.capabilities.as_mut_ptr(),
+            Capabilities: if self.capabilities.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                self.capabilities.as_mut_ptr()
+            },
             CapabilityCount: self.capabilities.len() as u32,
             Reserved: 0,
         }));
