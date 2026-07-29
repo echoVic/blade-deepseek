@@ -161,9 +161,9 @@ pub(crate) enum KeybindingsLocation {
 }
 ```
 
-The report renders `~/.orca/keybindings.json`,
-`$ORCA_HOME/keybindings.json`, or `unavailable`; it never expands either
-template to an absolute path.
+The report renders the stable labels `default-home`, `orca-home`, or
+`unavailable`; it never emits a filesystem path or expands either home
+location to an absolute path.
 
 The current Vim mode comes from a small `AppState` projection:
 
