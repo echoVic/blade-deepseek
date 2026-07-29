@@ -1,6 +1,8 @@
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
 use toml::Value;
@@ -15,6 +17,145 @@ use crate::config::{
 use crate::subagent_config::SubagentConfig;
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
+pub const MAX_USER_CONFIG_BYTES: usize = 1024 * 1024;
+
+static USER_FILE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(target_os = "macos")]
+const MACOS_ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+#[cfg(all(target_os = "macos", test))]
+const MACOS_ACL_FIRST_ENTRY: libc::c_int = 0;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn acl_init(count: libc::c_int) -> *mut libc::c_void;
+    fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+    fn acl_set_fd_np(fd: libc::c_int, acl: *mut libc::c_void, acl_type: libc::c_int)
+    -> libc::c_int;
+}
+
+#[cfg(all(target_os = "macos", test))]
+unsafe extern "C" {
+    fn acl_from_text(text: *const libc::c_char) -> *mut libc::c_void;
+    fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+    fn acl_get_entry(
+        acl: *mut libc::c_void,
+        entry_id: libc::c_int,
+        entry: *mut *mut libc::c_void,
+    ) -> libc::c_int;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserPreferenceValidationError {
+    UnsupportedProvider,
+    UnsupportedModel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserConfigSaveError {
+    ConfigDirectoryUnavailable,
+    UnsafeExistingPath,
+    ExistingFileTooLarge,
+    InvalidExistingContent,
+    ConcurrentModification,
+    CreateDirectoryFailed,
+    CreateTemporaryFileFailed,
+    ReadFailed,
+    WriteFailed,
+    ReplaceFailed,
+    RollbackFailed,
+}
+
+#[cfg(test)]
+const USER_CONFIG_SAVE_ERROR_LABELS: [(UserConfigSaveError, &str); 11] = [
+    (
+        UserConfigSaveError::ConfigDirectoryUnavailable,
+        "config directory unavailable",
+    ),
+    (
+        UserConfigSaveError::UnsafeExistingPath,
+        "unsafe existing config path",
+    ),
+    (
+        UserConfigSaveError::ExistingFileTooLarge,
+        "existing config is too large",
+    ),
+    (
+        UserConfigSaveError::InvalidExistingContent,
+        "invalid existing config",
+    ),
+    (
+        UserConfigSaveError::ConcurrentModification,
+        "config changed during save",
+    ),
+    (
+        UserConfigSaveError::CreateDirectoryFailed,
+        "could not create config directory",
+    ),
+    (
+        UserConfigSaveError::CreateTemporaryFileFailed,
+        "could not create temporary config",
+    ),
+    (
+        UserConfigSaveError::ReadFailed,
+        "could not read existing config",
+    ),
+    (UserConfigSaveError::WriteFailed, "could not write config"),
+    (
+        UserConfigSaveError::ReplaceFailed,
+        "could not replace config",
+    ),
+    (
+        UserConfigSaveError::RollbackFailed,
+        "could not restore concurrent config",
+    ),
+];
+
+impl UserConfigSaveError {
+    pub const fn safe_label(self) -> &'static str {
+        match self {
+            Self::ConfigDirectoryUnavailable => "config directory unavailable",
+            Self::UnsafeExistingPath => "unsafe existing config path",
+            Self::ExistingFileTooLarge => "existing config is too large",
+            Self::InvalidExistingContent => "invalid existing config",
+            Self::ConcurrentModification => "config changed during save",
+            Self::CreateDirectoryFailed => "could not create config directory",
+            Self::CreateTemporaryFileFailed => "could not create temporary config",
+            Self::ReadFailed => "could not read existing config",
+            Self::WriteFailed => "could not write config",
+            Self::ReplaceFailed => "could not replace config",
+            Self::RollbackFailed => "could not restore concurrent config",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct UserPreferencePatch {
+    provider: ProviderKind,
+    model: String,
+    theme: ThemeName,
+}
+
+impl UserPreferencePatch {
+    pub fn new(
+        provider: ProviderKind,
+        model: impl Into<String>,
+        theme: ThemeName,
+    ) -> Result<Self, UserPreferenceValidationError> {
+        if provider != ProviderKind::DeepSeek {
+            return Err(UserPreferenceValidationError::UnsupportedProvider);
+        }
+        let model = model.into();
+        if !crate::model::allowed_models().contains(&model.as_str()) {
+            return Err(UserPreferenceValidationError::UnsupportedModel);
+        }
+        Ok(Self {
+            provider,
+            model,
+            theme,
+        })
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(from = "RawFileConfig")]
@@ -277,6 +418,634 @@ fn config_dir() -> Option<PathBuf> {
         .or_else(|| dirs::home_dir().map(|h| h.join(".orca")))
 }
 
+fn patch_user_preferences(
+    source: &str,
+    patch: &UserPreferencePatch,
+) -> Result<String, UserConfigSaveError> {
+    use toml_edit::DocumentMut;
+
+    let mut document = if source.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        source
+            .parse::<DocumentMut>()
+            .map_err(|_| UserConfigSaveError::InvalidExistingContent)?
+    };
+    debug_assert_eq!(patch.provider, ProviderKind::DeepSeek);
+    patch_document_string(&mut document, "provider", "deep-seek");
+    patch_document_string(&mut document, "model", patch.model.as_str());
+    patch_document_string(&mut document, "theme", patch.theme.as_str());
+    Ok(document.to_string())
+}
+
+fn patch_document_string(document: &mut toml_edit::DocumentMut, key: &str, replacement: &str) {
+    let decor = document
+        .get(key)
+        .and_then(toml_edit::Item::as_value)
+        .map(|value| value.decor().clone());
+    let mut value = toml_edit::Value::from(replacement);
+    if let Some(decor) = decor {
+        *value.decor_mut() = decor;
+    }
+    document[key] = toml_edit::Item::Value(value);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UserFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    len: u64,
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+}
+
+impl UserFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(not(unix))]
+            len: metadata.len(),
+            #[cfg(not(unix))]
+            modified: metadata.modified().ok(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExistingUserFile {
+    bytes: Vec<u8>,
+    identity: UserFileIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExpectedUserFile {
+    Missing,
+    Existing(ExistingUserFile),
+}
+
+fn read_optional_regular_file(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Option<ExistingUserFile>, UserConfigSaveError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(UserConfigSaveError::ReadFailed),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(UserConfigSaveError::UnsafeExistingPath);
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Err(UserConfigSaveError::ExistingFileTooLarge);
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| UserConfigSaveError::ReadFailed)?;
+    let opened = file
+        .metadata()
+        .map_err(|_| UserConfigSaveError::ReadFailed)?;
+    if !opened.is_file() {
+        return Err(UserConfigSaveError::UnsafeExistingPath);
+    }
+    let mut bytes = Vec::with_capacity(opened.len().min(max_bytes as u64) as usize);
+    file.take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| UserConfigSaveError::ReadFailed)?;
+    if bytes.len() > max_bytes {
+        return Err(UserConfigSaveError::ExistingFileTooLarge);
+    }
+    Ok(Some(ExistingUserFile {
+        bytes,
+        identity: UserFileIdentity::from_metadata(&opened),
+    }))
+}
+
+fn user_config_lock_path(path: &Path) -> Result<PathBuf, UserConfigSaveError> {
+    let parent = path
+        .parent()
+        .ok_or(UserConfigSaveError::CreateDirectoryFailed)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(UserConfigSaveError::CreateTemporaryFileFailed)?;
+    Ok(parent.join(format!(".{name}.lock")))
+}
+
+fn open_user_config_lock(path: &Path) -> Result<File, UserConfigSaveError> {
+    let lock_path = user_config_lock_path(path)?;
+    if fs::symlink_metadata(&lock_path)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(UserConfigSaveError::UnsafeExistingPath);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock = options
+        .open(lock_path)
+        .map_err(|_| UserConfigSaveError::CreateTemporaryFileFailed)?;
+    let metadata = lock
+        .metadata()
+        .map_err(|_| UserConfigSaveError::ReadFailed)?;
+    if !metadata.is_file() {
+        return Err(UserConfigSaveError::UnsafeExistingPath);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(UserConfigSaveError::UnsafeExistingPath);
+        }
+    }
+    apply_secure_user_file_metadata(&lock).map_err(|_| UserConfigSaveError::WriteFailed)?;
+    Ok(lock)
+}
+
+fn acquire_user_config_lock(path: &Path) -> Result<File, UserConfigSaveError> {
+    let lock = open_user_config_lock(path)?;
+    lock.lock()
+        .map_err(|_| UserConfigSaveError::CreateTemporaryFileFailed)?;
+    Ok(lock)
+}
+
+#[cfg(test)]
+fn try_acquire_user_config_lock(path: &Path) -> Result<File, UserConfigSaveError> {
+    let lock = open_user_config_lock(path)?;
+    lock.try_lock()
+        .map_err(|_| UserConfigSaveError::ConcurrentModification)?;
+    Ok(lock)
+}
+
+fn open_unique_user_temp(path: &Path) -> Result<(PathBuf, File), UserConfigSaveError> {
+    let parent = path
+        .parent()
+        .ok_or(UserConfigSaveError::CreateDirectoryFailed)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(UserConfigSaveError::CreateTemporaryFileFailed)?;
+    for _ in 0..64 {
+        let counter = USER_FILE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(".{name}.tmp-{}-{counter}", std::process::id(),));
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp_path) {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(UserConfigSaveError::CreateTemporaryFileFailed),
+        }
+    }
+    Err(UserConfigSaveError::CreateTemporaryFileFailed)
+}
+
+struct UserTempGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl UserTempGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UserTempGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn apply_secure_user_file_metadata(file: &File) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    clear_user_file_acl(file)
+}
+
+#[cfg(not(unix))]
+fn apply_secure_user_file_metadata(_file: &File) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_user_file_acl(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    unsafe {
+        let acl = acl_init(0);
+        if acl.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let result = acl_set_fd_np(file.as_raw_fd(), acl, MACOS_ACL_TYPE_EXTENDED);
+        let set_error = (result != 0).then(std::io::Error::last_os_error);
+        let free_result = acl_free(acl);
+        if let Some(error) = set_error {
+            return Err(error);
+        }
+        if free_result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn clear_user_file_acl(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let name = c"system.posix_acl_access";
+    let result = unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(()),
+        _ => Err(error),
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn clear_user_file_acl(_file: &File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure ACL reset is unsupported",
+    ))
+}
+
+trait AtomicUserFileOps {
+    fn write_and_sync(&self, file: &mut File, bytes: &[u8]) -> std::io::Result<()>;
+    fn after_prevalidation(&self, _path: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn matches_expected(
+        &self,
+        path: &Path,
+        expected: &ExpectedUserFile,
+    ) -> Result<bool, UserConfigSaveError> {
+        user_file_matches_expected(path, expected)
+    }
+    fn reread_temp(&self, path: &Path) -> Result<Option<ExistingUserFile>, UserConfigSaveError> {
+        read_optional_regular_file(path, MAX_USER_CONFIG_BYTES)
+    }
+    fn exchange(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        platform_exchange_user_file(from, to)
+    }
+    fn install_missing(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        platform_install_missing_user_file(from, to)
+    }
+    fn after_missing_install(&self, _from: &Path, _to: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn sync_parent(&self, _parent: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn remove_temp(&self, path: &Path) -> std::io::Result<()> {
+        fs::remove_file(path)
+    }
+}
+
+struct RealAtomicUserFileOps;
+
+impl AtomicUserFileOps for RealAtomicUserFileOps {
+    fn write_and_sync(&self, file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+
+    fn sync_parent(&self, parent: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            return File::open(parent)?.sync_all();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = parent;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_exchange_user_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_SWAP) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn platform_exchange_user_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_install_missing_user_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn platform_install_missing_user_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn platform_exchange_user_file(_from: &Path, _to: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic exchange is unsupported",
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn platform_install_missing_user_file(_from: &Path, _to: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace move is unsupported",
+    ))
+}
+
+fn atomic_replace_user_file_with_ops(
+    path: &Path,
+    bytes: &[u8],
+    expected: &ExpectedUserFile,
+    operations: &impl AtomicUserFileOps,
+) -> Result<(), UserConfigSaveError> {
+    let parent = path
+        .parent()
+        .ok_or(UserConfigSaveError::CreateDirectoryFailed)?;
+    fs::create_dir_all(parent).map_err(|_| UserConfigSaveError::CreateDirectoryFailed)?;
+    let (temp_path, mut temp) = open_unique_user_temp(path)?;
+    let mut temp_guard = UserTempGuard::new(temp_path);
+    let write_result = (|| {
+        apply_secure_user_file_metadata(&temp).map_err(|_| UserConfigSaveError::WriteFailed)?;
+        operations
+            .write_and_sync(&mut temp, bytes)
+            .map_err(|_| UserConfigSaveError::WriteFailed)?;
+        Ok(())
+    })();
+    drop(temp);
+    if let Err(error) = write_result {
+        return Err(error);
+    }
+    match operations.matches_expected(path, expected) {
+        Ok(true) => {}
+        Ok(false) => return Err(UserConfigSaveError::ConcurrentModification),
+        Err(error) => return Err(error),
+    }
+    if operations.after_prevalidation(path).is_err() {
+        return Err(UserConfigSaveError::ReplaceFailed);
+    }
+    match expected {
+        ExpectedUserFile::Missing => {
+            if let Err(error) = operations.install_missing(temp_guard.path(), path) {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    return Err(UserConfigSaveError::ConcurrentModification);
+                }
+                return Err(UserConfigSaveError::ReplaceFailed);
+            }
+            temp_guard.disarm();
+            if operations
+                .after_missing_install(temp_guard.path(), path)
+                .is_err()
+            {
+                let _ = operations.sync_parent(parent);
+                return Err(UserConfigSaveError::ReplaceFailed);
+            }
+        }
+        ExpectedUserFile::Existing(_) => {
+            let ours = match operations.reread_temp(temp_guard.path()) {
+                Ok(Some(ours)) => ExpectedUserFile::Existing(ours),
+                Ok(None) => return Err(UserConfigSaveError::ReplaceFailed),
+                Err(error) => return Err(error),
+            };
+            if operations.exchange(temp_guard.path(), path).is_err() {
+                return Err(UserConfigSaveError::ReplaceFailed);
+            }
+            match operations.matches_expected(temp_guard.path(), expected) {
+                Ok(true) => {
+                    if operations.remove_temp(temp_guard.path()).is_err() {
+                        temp_guard.disarm();
+                        let _ = operations.sync_parent(parent);
+                        return Err(UserConfigSaveError::ReplaceFailed);
+                    }
+                    temp_guard.disarm();
+                }
+                Ok(false) => {
+                    if operations.exchange(temp_guard.path(), path).is_err() {
+                        temp_guard.disarm();
+                        let _ = operations.sync_parent(parent);
+                        return Err(UserConfigSaveError::RollbackFailed);
+                    }
+                    if !matches!(
+                        user_file_matches_expected(temp_guard.path(), &ours),
+                        Ok(true)
+                    ) {
+                        temp_guard.disarm();
+                        let _ = operations.sync_parent(parent);
+                        return Err(UserConfigSaveError::RollbackFailed);
+                    }
+                    if operations.remove_temp(temp_guard.path()).is_err() {
+                        temp_guard.disarm();
+                        let _ = operations.sync_parent(parent);
+                        return Err(UserConfigSaveError::ReplaceFailed);
+                    }
+                    temp_guard.disarm();
+                    operations
+                        .sync_parent(parent)
+                        .map_err(|_| UserConfigSaveError::ReplaceFailed)?;
+                    return Err(UserConfigSaveError::ConcurrentModification);
+                }
+                Err(error) => {
+                    if operations.exchange(temp_guard.path(), path).is_err() {
+                        temp_guard.disarm();
+                        let _ = operations.sync_parent(parent);
+                        return Err(UserConfigSaveError::RollbackFailed);
+                    }
+                    if !matches!(
+                        user_file_matches_expected(temp_guard.path(), &ours),
+                        Ok(true)
+                    ) {
+                        temp_guard.disarm();
+                        let _ = operations.sync_parent(parent);
+                        return Err(UserConfigSaveError::RollbackFailed);
+                    }
+                    if operations.remove_temp(temp_guard.path()).is_err() {
+                        temp_guard.disarm();
+                        let _ = operations.sync_parent(parent);
+                        return Err(UserConfigSaveError::ReplaceFailed);
+                    }
+                    temp_guard.disarm();
+                    operations
+                        .sync_parent(parent)
+                        .map_err(|_| UserConfigSaveError::ReplaceFailed)?;
+                    return Err(error);
+                }
+            }
+        }
+    }
+    operations
+        .sync_parent(parent)
+        .map_err(|_| UserConfigSaveError::ReplaceFailed)?;
+    Ok(())
+}
+
+fn user_file_matches_expected(
+    path: &Path,
+    expected: &ExpectedUserFile,
+) -> Result<bool, UserConfigSaveError> {
+    match read_optional_regular_file(path, MAX_USER_CONFIG_BYTES) {
+        Ok(None) => Ok(matches!(expected, ExpectedUserFile::Missing)),
+        Ok(Some(current)) => Ok(matches!(
+            expected,
+            ExpectedUserFile::Existing(previous) if previous == &current
+        )),
+        Err(UserConfigSaveError::UnsafeExistingPath)
+        | Err(UserConfigSaveError::ExistingFileTooLarge) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn save_user_preferences_at(
+    path: &Path,
+    patch: &UserPreferencePatch,
+) -> Result<(), UserConfigSaveError> {
+    save_user_preferences_at_with_ops(path, patch, &RealAtomicUserFileOps)
+}
+
+fn save_user_preferences_at_with_ops(
+    path: &Path,
+    patch: &UserPreferencePatch,
+    operations: &impl AtomicUserFileOps,
+) -> Result<(), UserConfigSaveError> {
+    let parent = path
+        .parent()
+        .ok_or(UserConfigSaveError::CreateDirectoryFailed)?;
+    fs::create_dir_all(parent).map_err(|_| UserConfigSaveError::CreateDirectoryFailed)?;
+    let _lock = acquire_user_config_lock(path)?;
+    let existing = read_optional_regular_file(path, MAX_USER_CONFIG_BYTES)?;
+    let (source, expected) = match existing {
+        Some(existing) => {
+            let source = String::from_utf8(existing.bytes.clone())
+                .map_err(|_| UserConfigSaveError::InvalidExistingContent)?;
+            (source, ExpectedUserFile::Existing(existing))
+        }
+        None => (String::new(), ExpectedUserFile::Missing),
+    };
+    let output = patch_user_preferences(&source, patch)?;
+    atomic_replace_user_file_with_ops(path, output.as_bytes(), &expected, operations)
+}
+
+fn save_user_preferences_in_dir(
+    directory: &Path,
+    patch: &UserPreferencePatch,
+) -> Result<(), UserConfigSaveError> {
+    save_user_preferences_at(&directory.join("config.toml"), patch)
+}
+
+pub fn save_user_preferences(patch: &UserPreferencePatch) -> Result<(), UserConfigSaveError> {
+    let directory = config_dir().ok_or(UserConfigSaveError::ConfigDirectoryUnavailable)?;
+    save_user_preferences_in_dir(&directory, patch)
+}
+
 pub fn load_layered_config(cwd: &Path) -> FileConfig {
     let Some(dir) = config_dir() else {
         return load_layered_config_from_optional_paths(None, cwd);
@@ -465,6 +1234,1067 @@ pub fn save_api_key(api_key: &str) {
 mod tests {
     use super::*;
     use crate::config::ProviderKind;
+
+    const PUBLIC_PREFERENCE_SAVE_CHILD_ENV: &str = "ORCA_TEST_PUBLIC_PREFERENCE_SAVE_CHILD";
+    const USER_CONFIG_LOCK_CHILD_ENV: &str = "ORCA_TEST_USER_CONFIG_LOCK_CHILD";
+
+    fn public_preference_save_child_mode() -> bool {
+        std::env::var_os(PUBLIC_PREFERENCE_SAVE_CHILD_ENV).is_some()
+    }
+
+    fn public_preference_save_child_command(directory: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("config::file::tests::public_preference_entrypoint_uses_isolated_orca_home")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(PUBLIC_PREFERENCE_SAVE_CHILD_ENV, "1")
+            .env(ORCA_HOME_ENV, directory);
+        command
+    }
+
+    #[test]
+    fn user_config_lock_coordinates_across_processes() {
+        if std::env::var_os(USER_CONFIG_LOCK_CHILD_ENV).is_some() {
+            let path = PathBuf::from(std::env::var_os(ORCA_HOME_ENV).unwrap()).join("config.toml");
+            let _lock = acquire_user_config_lock(&path).unwrap();
+            println!("LOCKED");
+            std::io::stdout().flush().unwrap();
+            let mut release = [0_u8; 1];
+            std::io::stdin().read_exact(&mut release).unwrap();
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("config::file::tests::user_config_lock_coordinates_across_processes")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(USER_CONFIG_LOCK_CHILD_ENV, "1")
+            .env(ORCA_HOME_ENV, directory.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            std::io::BufRead::read_line(&mut stdout, &mut line).unwrap();
+            assert!(!line.is_empty());
+            if line.trim() == "LOCKED" {
+                break;
+            }
+        }
+
+        assert_eq!(
+            try_acquire_user_config_lock(&path).unwrap_err(),
+            UserConfigSaveError::ConcurrentModification,
+        );
+        child.stdin.take().unwrap().write_all(b"x").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(try_acquire_user_config_lock(&path).is_ok());
+    }
+
+    struct FailingAtomicUserFileOps {
+        fail_write: bool,
+        fail_rename: bool,
+        fail_parent_sync: bool,
+        parent_sync_calls: std::cell::Cell<usize>,
+    }
+
+    impl AtomicUserFileOps for FailingAtomicUserFileOps {
+        fn write_and_sync(&self, file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+            if self.fail_write {
+                file.write_all(b"partial")?;
+                return Err(std::io::Error::other("injected write failure"));
+            }
+            file.write_all(bytes)?;
+            file.sync_all()
+        }
+
+        fn exchange(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if self.fail_rename {
+                return Err(std::io::Error::other("injected exchange failure"));
+            }
+            platform_exchange_user_file(from, to)
+        }
+
+        fn sync_parent(&self, parent: &Path) -> std::io::Result<()> {
+            self.parent_sync_calls.set(self.parent_sync_calls.get() + 1);
+            if self.fail_parent_sync {
+                return Err(std::io::Error::other("injected parent sync failure"));
+            }
+            File::open(parent)?.sync_all()
+        }
+    }
+
+    enum ConcurrentMutation {
+        ReplaceContents(&'static [u8]),
+        CreateMissing(&'static [u8]),
+        RevalidationError,
+        #[cfg(unix)]
+        ReplaceWithSocket,
+    }
+
+    struct ConcurrentMutationOps {
+        mutation: ConcurrentMutation,
+    }
+
+    impl AtomicUserFileOps for ConcurrentMutationOps {
+        fn write_and_sync(&self, file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()
+        }
+
+        fn after_prevalidation(&self, path: &Path) -> std::io::Result<()> {
+            match self.mutation {
+                ConcurrentMutation::ReplaceContents(bytes) => std::fs::write(path, bytes),
+                ConcurrentMutation::CreateMissing(bytes) => std::fs::write(path, bytes),
+                ConcurrentMutation::RevalidationError => Ok(()),
+                #[cfg(unix)]
+                ConcurrentMutation::ReplaceWithSocket => {
+                    use std::os::unix::net::UnixListener;
+
+                    std::fs::remove_file(path)?;
+                    let _listener = UnixListener::bind(path)?;
+                    Ok(())
+                }
+            }
+        }
+
+        fn matches_expected(
+            &self,
+            path: &Path,
+            expected: &ExpectedUserFile,
+        ) -> Result<bool, UserConfigSaveError> {
+            if matches!(self.mutation, ConcurrentMutation::RevalidationError) {
+                return Err(UserConfigSaveError::ReadFailed);
+            }
+            user_file_matches_expected(path, expected)
+        }
+    }
+
+    struct RollbackFailureOps {
+        exchange_calls: std::cell::Cell<usize>,
+    }
+
+    impl AtomicUserFileOps for RollbackFailureOps {
+        fn write_and_sync(&self, file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()
+        }
+
+        fn after_prevalidation(&self, path: &Path) -> std::io::Result<()> {
+            std::fs::write(path, b"theme = \"catppuccin\"\n")
+        }
+
+        fn exchange(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            let call = self.exchange_calls.get();
+            self.exchange_calls.set(call + 1);
+            if call == 1 {
+                return Err(std::io::Error::other("injected rollback failure"));
+            }
+            platform_exchange_user_file(from, to)
+        }
+    }
+
+    struct CleanupFailureOps;
+
+    impl AtomicUserFileOps for CleanupFailureOps {
+        fn write_and_sync(&self, file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()
+        }
+
+        fn remove_temp(&self, _path: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected cleanup failure"))
+        }
+    }
+
+    struct PostExchangeMutationOps {
+        exchange_calls: std::cell::Cell<usize>,
+    }
+
+    impl AtomicUserFileOps for PostExchangeMutationOps {
+        fn write_and_sync(&self, file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()
+        }
+
+        fn after_prevalidation(&self, path: &Path) -> std::io::Result<()> {
+            std::fs::write(path, b"theme = \"catppuccin\"\n")
+        }
+
+        fn exchange(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            platform_exchange_user_file(from, to)?;
+            let call = self.exchange_calls.get();
+            self.exchange_calls.set(call + 1);
+            if call == 0 {
+                std::fs::write(to, b"theme = \"post-exchange\"\n")?;
+            }
+            Ok(())
+        }
+    }
+
+    struct MissingInstallObservationOps {
+        temp_exists_after_install: std::cell::Cell<bool>,
+        target_link_count_after_install: std::cell::Cell<u64>,
+    }
+
+    impl AtomicUserFileOps for MissingInstallObservationOps {
+        fn write_and_sync(&self, file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()
+        }
+
+        fn after_missing_install(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.temp_exists_after_install.set(from.exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                self.target_link_count_after_install
+                    .set(std::fs::metadata(to)?.nlink());
+            }
+            Ok(())
+        }
+    }
+
+    struct MissingTempRereadOps;
+
+    impl AtomicUserFileOps for MissingTempRereadOps {
+        fn write_and_sync(&self, file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()
+        }
+
+        fn reread_temp(
+            &self,
+            _path: &Path,
+        ) -> Result<Option<ExistingUserFile>, UserConfigSaveError> {
+            Ok(None)
+        }
+    }
+
+    fn user_temp_files(directory: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".config.toml.tmp-"))
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_inheritable_read_acl(directory: &Path) {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+
+        let directory = File::open(directory).unwrap();
+        let text = CString::new(
+            "!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C:everyone:12:allow,file_inherit:read\n",
+        )
+        .unwrap();
+        unsafe {
+            let acl = acl_from_text(text.as_ptr());
+            assert!(!acl.is_null());
+            assert_eq!(
+                acl_set_fd_np(directory.as_raw_fd(), acl, MACOS_ACL_TYPE_EXTENDED),
+                0,
+            );
+            assert_eq!(acl_free(acl), 0);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn has_extended_acl(path: &Path) -> bool {
+        use std::os::fd::AsRawFd;
+
+        let file = File::open(path).unwrap();
+        unsafe {
+            let acl = acl_get_fd_np(file.as_raw_fd(), MACOS_ACL_TYPE_EXTENDED);
+            if acl.is_null() {
+                return false;
+            }
+            let mut entry = std::ptr::null_mut();
+            let has_entry = acl_get_entry(acl, MACOS_ACL_FIRST_ENTRY, &mut entry) == 0;
+            assert_eq!(acl_free(acl), 0);
+            has_entry
+        }
+    }
+
+    #[test]
+    fn atomic_writer_creates_unique_temp_in_target_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.toml");
+        let (temp_path, temp) = open_unique_user_temp(&target).unwrap();
+
+        assert_eq!(temp_path.parent(), Some(directory.path()));
+        assert!(
+            temp_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".config.toml.tmp-")
+        );
+        assert_eq!(
+            OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp_path)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists,
+        );
+
+        drop(temp);
+        std::fs::remove_file(temp_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_writer_creates_new_config_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+
+        save_user_preferences_at(&path, &patch).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_writer_restricts_existing_permissions_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "theme = \"light\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+
+        save_user_preferences_at(&path, &patch).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn atomic_writer_removes_inherited_extended_acl() {
+        let directory = tempfile::tempdir().unwrap();
+        set_inheritable_read_acl(directory.path());
+        let path = directory.path().join("config.toml");
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+
+        save_user_preferences_at(&path, &patch).unwrap();
+
+        assert!(!has_extended_acl(&path));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn user_config_lock_removes_inherited_extended_acl() {
+        let directory = tempfile::tempdir().unwrap();
+        set_inheritable_read_acl(directory.path());
+        let path = directory.path().join("config.toml");
+
+        drop(acquire_user_config_lock(&path).unwrap());
+
+        assert!(!has_extended_acl(&user_config_lock_path(&path).unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_config_lock_rejects_hard_link() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let victim = directory.path().join("victim");
+        std::fs::write(&victim, b"do not chmod").unwrap();
+        let lock_path = user_config_lock_path(&path).unwrap();
+        std::fs::hard_link(&victim, &lock_path).unwrap();
+
+        assert_eq!(
+            acquire_user_config_lock(&path).unwrap_err(),
+            UserConfigSaveError::UnsafeExistingPath,
+        );
+        assert_eq!(std::fs::read(victim).unwrap(), b"do not chmod");
+    }
+
+    #[test]
+    fn atomic_writer_cleans_temp_after_write_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = b"theme = \"light\"\n";
+        std::fs::write(&path, original).unwrap();
+        let expected = ExpectedUserFile::Existing(
+            read_optional_regular_file(&path, MAX_USER_CONFIG_BYTES)
+                .unwrap()
+                .unwrap(),
+        );
+        let operations = FailingAtomicUserFileOps {
+            fail_write: true,
+            fail_rename: false,
+            fail_parent_sync: false,
+            parent_sync_calls: std::cell::Cell::new(0),
+        };
+
+        assert_eq!(
+            atomic_replace_user_file_with_ops(
+                &path,
+                b"model = \"auto\"\n",
+                &expected,
+                &operations,
+            )
+            .unwrap_err(),
+            UserConfigSaveError::WriteFailed,
+        );
+        assert!(user_temp_files(directory.path()).is_empty());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn atomic_writer_cleans_temp_after_rename_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = b"theme = \"light\"\n";
+        std::fs::write(&path, original).unwrap();
+        let expected = ExpectedUserFile::Existing(
+            read_optional_regular_file(&path, MAX_USER_CONFIG_BYTES)
+                .unwrap()
+                .unwrap(),
+        );
+        let operations = FailingAtomicUserFileOps {
+            fail_write: false,
+            fail_rename: true,
+            fail_parent_sync: false,
+            parent_sync_calls: std::cell::Cell::new(0),
+        };
+
+        assert_eq!(
+            atomic_replace_user_file_with_ops(
+                &path,
+                b"model = \"auto\"\n",
+                &expected,
+                &operations,
+            )
+            .unwrap_err(),
+            UserConfigSaveError::ReplaceFailed,
+        );
+        assert!(user_temp_files(directory.path()).is_empty());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_writer_syncs_parent_directory_after_replace() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "theme = \"light\"\n").unwrap();
+        let expected = ExpectedUserFile::Existing(
+            read_optional_regular_file(&path, MAX_USER_CONFIG_BYTES)
+                .unwrap()
+                .unwrap(),
+        );
+        let operations = FailingAtomicUserFileOps {
+            fail_write: false,
+            fail_rename: false,
+            fail_parent_sync: false,
+            parent_sync_calls: std::cell::Cell::new(0),
+        };
+
+        atomic_replace_user_file_with_ops(&path, b"theme = \"dark\"\n", &expected, &operations)
+            .unwrap();
+
+        assert_eq!(operations.parent_sync_calls.get(), 1);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "theme = \"dark\"\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_writer_parent_sync_failure_keeps_visible_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "theme = \"light\"\n").unwrap();
+        let expected = ExpectedUserFile::Existing(
+            read_optional_regular_file(&path, MAX_USER_CONFIG_BYTES)
+                .unwrap()
+                .unwrap(),
+        );
+        let operations = FailingAtomicUserFileOps {
+            fail_write: false,
+            fail_rename: false,
+            fail_parent_sync: true,
+            parent_sync_calls: std::cell::Cell::new(0),
+        };
+
+        assert_eq!(
+            atomic_replace_user_file_with_ops(
+                &path,
+                b"theme = \"dark\"\n",
+                &expected,
+                &operations,
+            )
+            .unwrap_err(),
+            UserConfigSaveError::ReplaceFailed,
+        );
+        assert_eq!(operations.parent_sync_calls.get(), 1);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "theme = \"dark\"\n");
+        assert!(user_temp_files(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn preference_writer_rejects_concurrent_modification_without_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "theme = \"light\"\n").unwrap();
+        let concurrent = b"theme = \"catppuccin\"\n";
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+        let operations = ConcurrentMutationOps {
+            mutation: ConcurrentMutation::ReplaceContents(concurrent),
+        };
+
+        assert_eq!(
+            save_user_preferences_at_with_ops(&path, &patch, &operations).unwrap_err(),
+            UserConfigSaveError::ConcurrentModification,
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), concurrent);
+        assert!(user_temp_files(directory.path()).is_empty());
+        assert!(acquire_user_config_lock(&path).is_ok());
+    }
+
+    #[test]
+    fn preference_writer_rejects_concurrent_creation_of_missing_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let concurrent = b"unknown = \"created concurrently\"\n";
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+        let operations = ConcurrentMutationOps {
+            mutation: ConcurrentMutation::CreateMissing(concurrent),
+        };
+
+        assert_eq!(
+            save_user_preferences_at_with_ops(&path, &patch, &operations).unwrap_err(),
+            UserConfigSaveError::ConcurrentModification,
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), concurrent);
+        assert!(user_temp_files(directory.path()).is_empty());
+        assert!(acquire_user_config_lock(&path).is_ok());
+    }
+
+    #[test]
+    fn preference_writer_cleans_temp_when_revalidation_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "theme = \"light\"\n").unwrap();
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+        let operations = ConcurrentMutationOps {
+            mutation: ConcurrentMutation::RevalidationError,
+        };
+
+        assert_eq!(
+            save_user_preferences_at_with_ops(&path, &patch, &operations).unwrap_err(),
+            UserConfigSaveError::ReadFailed,
+        );
+        assert!(user_temp_files(directory.path()).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "theme = \"light\"\n"
+        );
+        assert!(acquire_user_config_lock(&path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preference_writer_rejects_concurrent_special_file_replacement() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "theme = \"light\"\n").unwrap();
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+        let operations = ConcurrentMutationOps {
+            mutation: ConcurrentMutation::ReplaceWithSocket,
+        };
+
+        assert_eq!(
+            save_user_preferences_at_with_ops(&path, &patch, &operations).unwrap_err(),
+            UserConfigSaveError::ConcurrentModification,
+        );
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        assert!(user_temp_files(directory.path()).is_empty());
+        assert!(acquire_user_config_lock(&path).is_ok());
+    }
+
+    #[test]
+    fn preference_writer_rollback_failure_keeps_recoverable_old_target_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "theme = \"light\"\n").unwrap();
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+        let operations = RollbackFailureOps {
+            exchange_calls: std::cell::Cell::new(0),
+        };
+
+        assert_eq!(
+            save_user_preferences_at_with_ops(&path, &patch, &operations).unwrap_err(),
+            UserConfigSaveError::RollbackFailed,
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("theme = \"dark\"")
+        );
+        let artifacts = user_temp_files(directory.path());
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&artifacts[0]).unwrap(),
+            "theme = \"catppuccin\"\n"
+        );
+        assert!(acquire_user_config_lock(&path).is_ok());
+    }
+
+    #[test]
+    fn atomic_exchange_cleanup_failure_is_not_reported_as_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = "theme = \"light\"\n";
+        std::fs::write(&path, original).unwrap();
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+
+        assert_eq!(
+            save_user_preferences_at_with_ops(&path, &patch, &CleanupFailureOps).unwrap_err(),
+            UserConfigSaveError::ReplaceFailed,
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("theme = \"dark\"")
+        );
+        let artifacts = user_temp_files(directory.path());
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(std::fs::read_to_string(&artifacts[0]).unwrap(), original);
+    }
+
+    #[test]
+    fn rollback_preserves_post_exchange_concurrent_content_as_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "theme = \"light\"\n").unwrap();
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+        let operations = PostExchangeMutationOps {
+            exchange_calls: std::cell::Cell::new(0),
+        };
+
+        assert_eq!(
+            save_user_preferences_at_with_ops(&path, &patch, &operations).unwrap_err(),
+            UserConfigSaveError::RollbackFailed,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "theme = \"catppuccin\"\n"
+        );
+        let artifacts = user_temp_files(directory.path());
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&artifacts[0]).unwrap(),
+            "theme = \"post-exchange\"\n"
+        );
+    }
+
+    #[test]
+    fn atomic_missing_install_moves_temp_without_residual_link() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+
+        save_user_preferences_at(&path, &patch).unwrap();
+
+        assert!(path.is_file());
+        assert!(user_temp_files(directory.path()).is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(path).unwrap().nlink(), 1);
+        }
+    }
+
+    #[test]
+    fn atomic_missing_install_has_no_transient_second_link_after_move() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+        let operations = MissingInstallObservationOps {
+            temp_exists_after_install: std::cell::Cell::new(true),
+            target_link_count_after_install: std::cell::Cell::new(0),
+        };
+
+        save_user_preferences_at_with_ops(&path, &patch, &operations).unwrap();
+
+        assert!(!operations.temp_exists_after_install.get());
+        #[cfg(unix)]
+        assert_eq!(operations.target_link_count_after_install.get(), 1);
+    }
+
+    #[test]
+    fn preference_patch_accepts_only_production_provider_and_known_models() {
+        assert!(UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark,).is_ok());
+        assert_eq!(
+            UserPreferencePatch::new(ProviderKind::Mock, "auto", ThemeName::Dark,).unwrap_err(),
+            UserPreferenceValidationError::UnsupportedProvider,
+        );
+        assert_eq!(
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "unknown", ThemeName::Dark,)
+                .unwrap_err(),
+            UserPreferenceValidationError::UnsupportedModel,
+        );
+    }
+
+    #[test]
+    fn preference_patch_preserves_comments_unknown_keys_and_nested_tables() {
+        let source = "\
+# keep me
+unknown = \"value\"
+model = \"deepseek-v4-flash\"
+
+[tools]
+max_read_parallel = 7
+";
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Solarized).unwrap();
+        let output = patch_user_preferences(source, &patch).unwrap();
+
+        assert!(output.contains("# keep me"));
+        assert!(output.contains("unknown = \"value\""));
+        assert!(output.contains("[tools]"));
+        assert!(output.contains("max_read_parallel = 7"));
+        assert!(output.contains("provider = \"deep-seek\""));
+        assert!(output.contains("model = \"auto\""));
+        assert!(output.contains("theme = \"solarized\""));
+        assert!(!output.contains("api_key"));
+    }
+
+    #[test]
+    fn preference_patch_preserves_preference_value_decorations_and_is_idempotent() {
+        let source = "provider=   \"mock\"   # provider note\nmodel =\t\"deepseek-v4-flash\"\t# model note\ntheme    =    \"light\"      # theme note\n";
+        let patch = UserPreferencePatch::new(
+            ProviderKind::DeepSeek,
+            "deepseek-v4-pro",
+            ThemeName::Solarized,
+        )
+        .unwrap();
+
+        let once = patch_user_preferences(source, &patch).unwrap();
+        let twice = patch_user_preferences(&once, &patch).unwrap();
+
+        assert!(once.contains("provider=   \"deep-seek\"   # provider note"));
+        assert!(once.contains("model =\t\"deepseek-v4-pro\"\t# model note"));
+        assert!(once.contains("theme    =    \"solarized\"      # theme note"));
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn invalid_existing_config_is_not_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = b"this is not [valid toml {{{";
+        std::fs::write(&path, original).unwrap();
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+
+        assert_eq!(
+            save_user_preferences_at(&path, &patch).unwrap_err(),
+            UserConfigSaveError::InvalidExistingContent,
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn preference_writer_rejects_unsafe_and_oversized_existing_paths() {
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let dir_path = directory.path().join("directory");
+        std::fs::create_dir(&dir_path).unwrap();
+        assert_eq!(
+            save_user_preferences_at(&dir_path, &patch).unwrap_err(),
+            UserConfigSaveError::UnsafeExistingPath,
+        );
+
+        let oversized = directory.path().join("oversized.toml");
+        std::fs::write(&oversized, vec![b'x'; MAX_USER_CONFIG_BYTES + 1]).unwrap();
+        assert_eq!(
+            save_user_preferences_at(&oversized, &patch).unwrap_err(),
+            UserConfigSaveError::ExistingFileTooLarge,
+        );
+
+        #[cfg(unix)]
+        {
+            let target = directory.path().join("target.toml");
+            std::fs::write(&target, "theme = \"dark\"").unwrap();
+            let link = directory.path().join("link.toml");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert_eq!(
+                save_user_preferences_at(&link, &patch).unwrap_err(),
+                UserConfigSaveError::UnsafeExistingPath,
+            );
+            assert_eq!(std::fs::read_to_string(target).unwrap(), "theme = \"dark\"");
+        }
+    }
+
+    #[test]
+    fn preference_writer_cleans_temp_when_patched_output_exceeds_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let prefix = "api_key = \"legacy-secret\"\npadding = \"";
+        let suffix = "\"\n";
+        let padding = "x".repeat(MAX_USER_CONFIG_BYTES - prefix.len() - suffix.len());
+        let original = format!("{prefix}{padding}{suffix}");
+        assert_eq!(original.len(), MAX_USER_CONFIG_BYTES);
+        std::fs::write(&path, original.as_bytes()).unwrap();
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+
+        assert_eq!(
+            save_user_preferences_at(&path, &patch).unwrap_err(),
+            UserConfigSaveError::ExistingFileTooLarge,
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        assert!(user_temp_files(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn preference_writer_cleans_temp_when_temp_reread_returns_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = b"theme = \"light\"\n";
+        std::fs::write(&path, original).unwrap();
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+
+        assert_eq!(
+            save_user_preferences_at_with_ops(&path, &patch, &MissingTempRereadOps).unwrap_err(),
+            UserConfigSaveError::ReplaceFailed,
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(user_temp_files(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn preference_persistence_invalid_utf8_is_byte_identical() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = b"theme = \"dark\"\n\xff\xfe";
+        std::fs::write(&path, original).unwrap();
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+
+        assert_eq!(
+            save_user_preferences_at(&path, &patch).unwrap_err(),
+            UserConfigSaveError::InvalidExistingContent,
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn preference_persistence_creates_missing_config_without_api_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let patch = UserPreferencePatch::new(
+            ProviderKind::DeepSeek,
+            "deepseek-v4-pro",
+            ThemeName::Catppuccin,
+        )
+        .unwrap();
+
+        save_user_preferences_in_dir(directory.path(), &patch).unwrap();
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(content.contains("provider = \"deep-seek\""));
+        assert!(content.contains("model = \"deepseek-v4-pro\""));
+        assert!(content.contains("theme = \"catppuccin\""));
+        assert!(!content.contains("api_key"));
+    }
+
+    #[test]
+    fn preference_persistence_updates_only_root_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "provider = \"mock\"\nmodel = \"deepseek-v4-flash\"\ntheme = \"light\"\nunknown = \"keep\"\n\n[tools]\nmax_read_parallel = 7\n",
+        )
+        .unwrap();
+        let patch = UserPreferencePatch::new(
+            ProviderKind::DeepSeek,
+            "deepseek-v4-pro",
+            ThemeName::Solarized,
+        )
+        .unwrap();
+
+        save_user_preferences_in_dir(directory.path(), &patch).unwrap();
+
+        let document = std::fs::read_to_string(path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(document["provider"].as_str(), Some("deep-seek"));
+        assert_eq!(document["model"].as_str(), Some("deepseek-v4-pro"));
+        assert_eq!(document["theme"].as_str(), Some("solarized"));
+        assert_eq!(document["unknown"].as_str(), Some("keep"));
+        assert_eq!(document["tools"]["max_read_parallel"].as_integer(), Some(7));
+    }
+
+    #[test]
+    fn preference_persistence_repeated_save_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "# retained\ntheme = \"light\"\n").unwrap();
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+
+        save_user_preferences_in_dir(directory.path(), &patch).unwrap();
+        let first = std::fs::read(&path).unwrap();
+        save_user_preferences_in_dir(directory.path(), &patch).unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), first);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preference_persistence_rejects_unix_socket_existing_path() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let _listener = UnixListener::bind(&path).unwrap();
+        let patch =
+            UserPreferencePatch::new(ProviderKind::DeepSeek, "auto", ThemeName::Dark).unwrap();
+
+        assert_eq!(
+            save_user_preferences_in_dir(directory.path(), &patch).unwrap_err(),
+            UserConfigSaveError::UnsafeExistingPath,
+        );
+        assert!(
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+    }
+
+    #[test]
+    fn user_config_save_error_safe_labels_are_stable_and_complete() {
+        assert_eq!(
+            USER_CONFIG_SAVE_ERROR_LABELS,
+            [
+                (
+                    UserConfigSaveError::ConfigDirectoryUnavailable,
+                    "config directory unavailable",
+                ),
+                (
+                    UserConfigSaveError::UnsafeExistingPath,
+                    "unsafe existing config path",
+                ),
+                (
+                    UserConfigSaveError::ExistingFileTooLarge,
+                    "existing config is too large",
+                ),
+                (
+                    UserConfigSaveError::InvalidExistingContent,
+                    "invalid existing config",
+                ),
+                (
+                    UserConfigSaveError::ConcurrentModification,
+                    "config changed during save",
+                ),
+                (
+                    UserConfigSaveError::CreateDirectoryFailed,
+                    "could not create config directory",
+                ),
+                (
+                    UserConfigSaveError::CreateTemporaryFileFailed,
+                    "could not create temporary config",
+                ),
+                (
+                    UserConfigSaveError::ReadFailed,
+                    "could not read existing config",
+                ),
+                (UserConfigSaveError::WriteFailed, "could not write config",),
+                (
+                    UserConfigSaveError::ReplaceFailed,
+                    "could not replace config",
+                ),
+                (
+                    UserConfigSaveError::RollbackFailed,
+                    "could not restore concurrent config",
+                ),
+            ],
+        );
+        for (error, expected) in USER_CONFIG_SAVE_ERROR_LABELS {
+            assert_eq!(error.safe_label(), expected);
+            assert!(!expected.contains('/'));
+            assert!(!expected.contains('\\'));
+        }
+    }
+
+    #[test]
+    fn public_preference_entrypoint_uses_isolated_orca_home() {
+        if public_preference_save_child_mode() {
+            let patch = UserPreferencePatch::new(
+                ProviderKind::DeepSeek,
+                "deepseek-v4-flash",
+                ThemeName::Solarized,
+            )
+            .unwrap();
+            save_user_preferences(&patch).unwrap();
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let status = public_preference_save_child_command(directory.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let content = std::fs::read_to_string(directory.path().join("config.toml")).unwrap();
+        assert!(content.contains("provider = \"deep-seek\""));
+        assert!(content.contains("model = \"deepseek-v4-flash\""));
+        assert!(content.contains("theme = \"solarized\""));
+        assert!(!content.contains("api_key"));
+    }
 
     #[test]
     fn provider_defaults_to_deepseek_and_parses_explicit_values() {
