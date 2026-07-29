@@ -1028,6 +1028,12 @@ impl AppState {
         self.applied_diff_highlights.clear();
     }
 
+    pub(crate) fn apply_theme_projection(&mut self, theme: &crate::theme::Theme) {
+        self.syntax_theme = theme.syntax_theme;
+        self.syntax_color_level = theme.color_level;
+        self.applied_diff_highlights.clear();
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn edit_highlight_needs_tick(&self) -> bool {
         self.edit_highlight_runtime
@@ -3347,6 +3353,50 @@ mod tests {
         );
         assert_eq!(config.model.display_name(), orca_core::model::FLASH_MODEL);
         assert_eq!(config.theme, orca_core::config::ThemeName::Catppuccin);
+    }
+
+    #[test]
+    fn theme_projection_updates_syntax_revision_and_clears_only_applied_highlights() {
+        let (_directory, mut state, job) = state_with_submitted_edit_job();
+        let revision = state.message_revisions[job.message_index];
+        state.applied_diff_highlights.insert(
+            revision,
+            AppliedDiffHighlight {
+                tool_id: job.tool_id.clone(),
+                display_path: job.display_path.clone(),
+                styles: Arc::new(Default::default()),
+            },
+        );
+        let pending_before = state.pending_edit_highlight_count_for_test();
+        let runtime_started_before = state.edit_highlight_runtime_started_for_test();
+        let theme = crate::theme::Theme::resolve(
+            ThemeName::Light,
+            crate::terminal_capabilities::TerminalProfile {
+                background: crate::terminal_capabilities::TerminalBackground::Dark,
+                color_level: TerminalColorLevel::Ansi256,
+            },
+        );
+
+        state.apply_theme_projection(&theme);
+
+        assert_eq!(state.syntax_theme_for_test(), theme.syntax_theme);
+        assert_eq!(state.syntax_color_level_for_test(), theme.color_level);
+        assert_eq!(
+            syntax_style_revision(
+                state.syntax_theme_for_test(),
+                state.syntax_color_level_for_test(),
+            ),
+            theme.syntax_theme_revision,
+        );
+        assert!(state.applied_diff_highlights.is_empty());
+        assert_eq!(
+            state.pending_edit_highlight_count_for_test(),
+            pending_before,
+        );
+        assert_eq!(
+            state.edit_highlight_runtime_started_for_test(),
+            runtime_started_before,
+        );
     }
 
     fn prepare_transcript_cache(state: &mut AppState, width: usize) {

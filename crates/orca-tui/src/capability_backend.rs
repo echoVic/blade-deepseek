@@ -26,6 +26,11 @@ impl<B> CapabilityBackend<B> {
     pub(crate) fn inner_mut(&mut self) -> &mut B {
         &mut self.inner
     }
+
+    #[cfg(test)]
+    pub(crate) const fn color_level_for_test(&self) -> TerminalColorLevel {
+        self.color_level
+    }
 }
 
 impl<B: Backend> Backend for CapabilityBackend<B> {
@@ -380,6 +385,14 @@ mod tests {
             assert!(drawn.2.skip);
             assert!(cell_colors_fit(level, &drawn.2));
         }
+    }
+
+    #[test]
+    fn theme_preview_never_changes_capability_backend_color_level() {
+        let backend =
+            CapabilityBackend::new(RecordingBackend::default(), TerminalColorLevel::Ansi16);
+
+        assert_eq!(backend.color_level_for_test(), TerminalColorLevel::Ansi16,);
     }
 
     #[test]

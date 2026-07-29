@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use crossterm::event::{Event, KeyEvent};
 use tui_textarea::TextArea;
 
-use orca_core::config::RunConfig;
+use orca_core::config::{RunConfig, ThemeName};
 use orca_runtime::history::SessionTranscript;
 
 use crate::approval_dialog_actions::{
@@ -31,6 +31,7 @@ use crate::vim::{VimState, VimTranscriptSearchIntent};
 
 pub(crate) enum StatusKeyFlow {
     Continue,
+    PreviewTheme(ThemeName),
     Exit(i32),
 }
 
@@ -67,7 +68,8 @@ where
             theme,
             initial_prompt,
         )? {
-            SetupFlow::Continue | SetupFlow::PreviewTheme(_) => Ok(StatusKeyFlow::Continue),
+            SetupFlow::Continue => Ok(StatusKeyFlow::Continue),
+            SetupFlow::PreviewTheme(theme) => Ok(StatusKeyFlow::PreviewTheme(theme)),
             SetupFlow::Exit(code) => Ok(StatusKeyFlow::Exit(code)),
         };
     }
@@ -334,6 +336,48 @@ mod tests {
     use orca_file_search::{MatchKind, SearchMatch, SearchPhase};
     use orca_runtime::mentions::MentionCandidate;
     use std::path::PathBuf;
+
+    #[test]
+    fn normal_setup_status_route_propagates_preview_theme() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = AppStatus::Setup;
+        state
+            .onboarding
+            .set_step_for_test(crate::onboarding::OnboardingStep::Theme);
+        let mut config = config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let operation = TestOperationInterrupt::default();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut textarea = TextArea::default();
+        let mut vim = VimState::new(false);
+        let key = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let preloaded = Arc::new(Mutex::new(None));
+
+        let flow = handle_status_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &operation,
+            &preloaded,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(matches!(flow, StatusKeyFlow::PreviewTheme(ThemeName::Dark)));
+    }
 
     fn config() -> RunConfig {
         RunConfig {

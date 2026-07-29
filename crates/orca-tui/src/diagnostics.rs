@@ -107,6 +107,11 @@ impl DiagnosticSnapshot {
         }
     }
 
+    pub(crate) fn set_theme_projection(&mut self, requested: ThemeName, resolved: ThemeName) {
+        self.requested_theme = requested;
+        self.resolved_theme = resolved;
+    }
+
     #[cfg(test)]
     pub(crate) fn terminal_program(&self) -> &str {
         &self.terminal_program
@@ -575,6 +580,16 @@ mod tests {
         KeybindingsDiagnostic, KeybindingsLocation, KeybindingsReload, SnapshotInput,
         bounded_diagnostic_text, format_doctor_report,
     };
+
+    #[test]
+    fn theme_projection_updates_requested_and_resolved_values() {
+        let mut snapshot = DiagnosticSnapshot::default();
+
+        snapshot.set_theme_projection(ThemeName::Auto, ThemeName::Light);
+
+        assert_eq!(snapshot.requested_theme(), ThemeName::Auto);
+        assert_eq!(snapshot.resolved_theme(), ThemeName::Light);
+    }
 
     fn known_snapshot() -> DiagnosticSnapshot {
         let identity = qwertty::caps::identity_from_env(None, |key| match key {

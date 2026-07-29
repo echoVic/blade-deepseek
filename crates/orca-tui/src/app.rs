@@ -76,6 +76,34 @@ enum PendingInsertEscapeRouting {
     Consumed,
 }
 
+fn apply_onboarding_theme_preview(
+    requested: orca_core::config::ThemeName,
+    terminal_profile: TerminalProfile,
+    theme: &mut Theme,
+    state: &mut AppState,
+) {
+    let resolved = resolve_base_theme(requested, terminal_profile.background);
+    *theme = Theme::resolve(requested, terminal_profile);
+    state.apply_theme_projection(theme);
+    state.diagnostics.set_theme_projection(requested, resolved);
+}
+
+fn apply_status_key_flow(
+    flow: StatusKeyFlow,
+    terminal_profile: TerminalProfile,
+    theme: &mut Theme,
+    state: &mut AppState,
+) -> Option<i32> {
+    match flow {
+        StatusKeyFlow::Continue => None,
+        StatusKeyFlow::PreviewTheme(requested) => {
+            apply_onboarding_theme_preview(requested, terminal_profile, theme, state);
+            None
+        }
+        StatusKeyFlow::Exit(code) => Some(code),
+    }
+}
+
 pub(crate) fn input_owner_fingerprint(
     state: &AppState,
     vim_state: &VimState,
@@ -205,7 +233,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let terminal_identity = qwertty::caps::identity_from_env(None, qwertty::caps::std_env_source);
     let terminal_profile = pending_input_runtime.profile();
     let presentation_profile = TerminalPresentationProfile::from_identity(&terminal_identity);
-    let theme = Theme::resolve(config.theme, terminal_profile);
+    let mut theme = Theme::resolve(config.theme, terminal_profile);
     let input_rx = pending_input_runtime.events().clone();
     let focus_rx = pending_input_runtime.focus_events().clone();
     let input_control_rx = pending_input_runtime.controls().clone();
@@ -633,27 +661,31 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
                                             let enter_event = Event::Key(enter_key);
                                             let owner = input_owner_fingerprint(&state, &vim_state);
-                                            if let StatusKeyFlow::Exit(code) =
-                                                handle_status_key_dynamic(
-                                                    &enter_event,
-                                                    &enter_key,
-                                                    Instant::now(),
-                                                    owner,
-                                                    &mut keymap_runtime,
-                                                    None,
-                                                    &mut state,
-                                                    &mut config,
-                                                    &shared_config,
-                                                    &action_tx,
-                                                    agent_runtime.controller(),
-                                                    &preloaded_transcript,
-                                                    &mut textarea,
-                                                    &mut vim_state,
-                                                    &theme,
-                                                    initial_prompt.clone(),
-                                                    || clear_terminal_scrollback(terminal),
-                                                )?
-                                            {
+                                            let status_flow = handle_status_key_dynamic(
+                                                &enter_event,
+                                                &enter_key,
+                                                Instant::now(),
+                                                owner,
+                                                &mut keymap_runtime,
+                                                None,
+                                                &mut state,
+                                                &mut config,
+                                                &shared_config,
+                                                &action_tx,
+                                                agent_runtime.controller(),
+                                                &preloaded_transcript,
+                                                &mut textarea,
+                                                &mut vim_state,
+                                                &theme,
+                                                initial_prompt.clone(),
+                                                || clear_terminal_scrollback(terminal),
+                                            )?;
+                                            if let Some(code) = apply_status_key_flow(
+                                                status_flow,
+                                                terminal_profile,
+                                                &mut theme,
+                                                &mut state,
+                                            ) {
                                                 return Ok(Some(code));
                                             }
                                             return Ok(None);
@@ -688,7 +720,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                     }
 
                                     let owner = input_owner_fingerprint(&state, &vim_state);
-                                    if let StatusKeyFlow::Exit(code) = handle_status_key_dynamic(
+                                    let status_flow = handle_status_key_dynamic(
                                         &ev,
                                         key,
                                         Instant::now(),
@@ -706,9 +738,16 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                         &theme,
                                         initial_prompt.clone(),
                                         || clear_terminal_scrollback(terminal),
-                                    )? {
+                                    )?;
+                                    if let Some(code) = apply_status_key_flow(
+                                        status_flow,
+                                        terminal_profile,
+                                        &mut theme,
+                                        &mut state,
+                                    ) {
                                         return Ok(Some(code));
                                     }
+                                    return Ok(None);
                                 }
                             },
                             IterationEvent::Runtime(tui_event) => match tui_event {
@@ -1254,6 +1293,240 @@ mod tests {
         assert_eq!(production.matches("InputRuntime::start").count(), 1);
         assert!(!production.contains("probe_capabilities("));
         assert!(!production.contains("probe_background("));
+    }
+
+    #[test]
+    fn onboarding_theme_preview_reuses_captured_profile_without_reprobe() {
+        let source = production_app_source();
+        let helper = source
+            .find("fn apply_onboarding_theme_preview(")
+            .expect("preview helper");
+        let body = &source[helper
+            ..source[helper + 1..]
+                .find("\nfn ")
+                .map(|offset| helper + 1 + offset)
+                .unwrap_or(source.len())];
+
+        assert!(body.contains("Theme::resolve(requested, terminal_profile)"));
+        assert!(!body.contains("InputRuntime::start"));
+        assert!(!body.contains("identity_from_env"));
+        assert!(!body.contains("system_color_level"));
+        assert!(!body.contains("probe_"));
+        assert!(!body.contains("CapabilityBackend::new"));
+    }
+
+    #[test]
+    fn preview_updates_theme_syntax_revision_and_doctor_projection_together() {
+        use crate::syntax_highlight::SyntaxTheme;
+        use crate::terminal_capabilities::{
+            TerminalBackground, TerminalColorLevel, TerminalProfile, syntax_style_revision,
+        };
+
+        let profile = TerminalProfile {
+            background: TerminalBackground::Light,
+            color_level: TerminalColorLevel::Ansi256,
+        };
+        let (tx, _rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            tx,
+            "test".to_string(),
+            "auto".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut theme = Theme::resolve(ThemeName::Dark, profile);
+
+        apply_onboarding_theme_preview(ThemeName::Auto, profile, &mut theme, &mut state);
+
+        assert_eq!(theme.color_level, TerminalColorLevel::Ansi256);
+        assert_eq!(theme.syntax_theme, SyntaxTheme::OneHalfLight);
+        assert_eq!(state.syntax_theme_for_test(), SyntaxTheme::OneHalfLight);
+        assert_eq!(
+            syntax_style_revision(
+                state.syntax_theme_for_test(),
+                state.syntax_color_level_for_test(),
+            ),
+            theme.syntax_theme_revision,
+        );
+        assert_eq!(state.diagnostics.requested_theme(), ThemeName::Auto);
+        assert_eq!(state.diagnostics.resolved_theme(), ThemeName::Light);
+    }
+
+    #[test]
+    fn preview_preserves_each_captured_color_level_and_auto_background() {
+        use crate::terminal_capabilities::{
+            TerminalBackground, TerminalColorLevel, TerminalProfile,
+        };
+
+        for color_level in [
+            TerminalColorLevel::TrueColor,
+            TerminalColorLevel::Ansi256,
+            TerminalColorLevel::Ansi16,
+            TerminalColorLevel::Monochrome,
+        ] {
+            for (background, resolved) in [
+                (TerminalBackground::Light, ThemeName::Light),
+                (TerminalBackground::Dark, ThemeName::Dark),
+                (TerminalBackground::Unknown, ThemeName::Dark),
+            ] {
+                let profile = TerminalProfile {
+                    background,
+                    color_level,
+                };
+                let (tx, _rx) = mpsc::unbounded();
+                let mut state = AppState::new(
+                    tx,
+                    "test".to_string(),
+                    "auto".to_string(),
+                    "/tmp".to_string(),
+                );
+                let mut theme = Theme::resolve(ThemeName::Catppuccin, profile);
+
+                apply_onboarding_theme_preview(ThemeName::Auto, profile, &mut theme, &mut state);
+
+                assert_eq!(theme.color_level, color_level);
+                assert_eq!(state.syntax_color_level_for_test(), color_level);
+                assert_eq!(state.diagnostics.requested_theme(), ThemeName::Auto);
+                assert_eq!(state.diagnostics.resolved_theme(), resolved);
+            }
+        }
+    }
+
+    #[test]
+    fn complete_enter_builds_main_textarea_from_current_previewed_theme() {
+        use crate::onboarding::OnboardingStep;
+        use crate::terminal_capabilities::{
+            TerminalBackground, TerminalColorLevel, TerminalProfile,
+        };
+
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "auto".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = AppStatus::Setup;
+        state.onboarding.set_step_for_test(OnboardingStep::Complete);
+        let mut config = test_config(HistoryMode::Disabled);
+        config.theme = ThemeName::Dark;
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let operation = crate::test_support::TestOperationInterrupt::default();
+        let preloaded = Arc::new(Mutex::new(None));
+        let previewed = Theme::resolve(
+            ThemeName::Light,
+            TerminalProfile {
+                background: TerminalBackground::Dark,
+                color_level: TerminalColorLevel::Ansi256,
+            },
+        );
+        let startup = Theme::resolve(
+            ThemeName::Dark,
+            TerminalProfile {
+                background: TerminalBackground::Dark,
+                color_level: TerminalColorLevel::Ansi256,
+            },
+        );
+        let mut textarea = make_setup_textarea(&startup);
+        let mut vim = VimState::new(false);
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        let flow = handle_status_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &operation,
+            &preloaded,
+            &mut textarea,
+            &mut vim,
+            &previewed,
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(matches!(flow, StatusKeyFlow::Continue));
+        assert_eq!(state.status, AppStatus::Idle);
+        assert_eq!(
+            textarea.cursor_style(),
+            make_textarea(&vim, &previewed).cursor_style(),
+        );
+        assert_ne!(
+            textarea.cursor_style(),
+            make_textarea(&vim, &startup).cursor_style(),
+        );
+    }
+
+    fn status_flow_harness() -> (TerminalProfile, Theme, AppState) {
+        use crate::terminal_capabilities::{
+            TerminalBackground, TerminalColorLevel, TerminalProfile,
+        };
+
+        let profile = TerminalProfile {
+            background: TerminalBackground::Light,
+            color_level: TerminalColorLevel::Ansi16,
+        };
+        let (tx, _rx) = mpsc::unbounded();
+        let state = AppState::new(
+            tx,
+            "test".to_string(),
+            "auto".to_string(),
+            "/tmp".to_string(),
+        );
+        let theme = Theme::resolve(ThemeName::Dark, profile);
+        (profile, theme, state)
+    }
+
+    #[test]
+    fn status_key_flow_continue_preserves_theme_projection() {
+        let (profile, mut theme, mut state) = status_flow_harness();
+        let syntax_theme = theme.syntax_theme;
+        let syntax_color_level = state.syntax_color_level_for_test();
+
+        let exit = apply_status_key_flow(StatusKeyFlow::Continue, profile, &mut theme, &mut state);
+
+        assert_eq!(exit, None);
+        assert_eq!(theme.syntax_theme, syntax_theme);
+        assert_eq!(state.syntax_color_level_for_test(), syntax_color_level);
+        assert_eq!(state.diagnostics.requested_theme(), ThemeName::Auto);
+        assert_eq!(state.diagnostics.resolved_theme(), ThemeName::Dark);
+    }
+
+    #[test]
+    fn status_key_flow_preview_updates_theme_and_projections_without_exit() {
+        let (profile, mut theme, mut state) = status_flow_harness();
+
+        let exit = apply_status_key_flow(
+            StatusKeyFlow::PreviewTheme(ThemeName::Auto),
+            profile,
+            &mut theme,
+            &mut state,
+        );
+
+        assert_eq!(exit, None);
+        assert_eq!(
+            theme.syntax_theme,
+            crate::syntax_highlight::SyntaxTheme::OneHalfLight
+        );
+        assert_eq!(state.diagnostics.requested_theme(), ThemeName::Auto);
+        assert_eq!(state.diagnostics.resolved_theme(), ThemeName::Light);
+    }
+
+    #[test]
+    fn status_key_flow_exit_returns_code_without_mutating_projection() {
+        let (profile, mut theme, mut state) = status_flow_harness();
+        let syntax_theme = theme.syntax_theme;
+        let syntax_color_level = state.syntax_color_level_for_test();
+
+        let exit = apply_status_key_flow(StatusKeyFlow::Exit(23), profile, &mut theme, &mut state);
+
+        assert_eq!(exit, Some(23));
+        assert_eq!(theme.syntax_theme, syntax_theme);
+        assert_eq!(state.syntax_color_level_for_test(), syntax_color_level);
+        assert_eq!(state.diagnostics.requested_theme(), ThemeName::Auto);
+        assert_eq!(state.diagnostics.resolved_theme(), ThemeName::Dark);
     }
 
     #[test]
@@ -2336,11 +2609,8 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_enter_uses_dynamic_status_routing() {
-        let production = include_str!("app.rs")
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("production app source");
+    fn synthetic_enter_branch_reduces_dynamic_status_flow_before_immediate_return() {
+        let production = production_app_source();
         let branch_start = production
             .find("MouseFlow::SyntheticEnter =>")
             .expect("synthetic enter branch");
@@ -2349,8 +2619,53 @@ mod tests {
             .map(|offset| branch_start + offset)
             .expect("synthetic enter branch end")];
 
-        assert!(branch.contains("handle_status_key_dynamic("));
+        assert_status_flow_branch_contract(branch);
         assert!(!branch.contains("handle_status_key("));
+    }
+
+    #[test]
+    fn direct_key_branch_reduces_dynamic_status_flow_before_immediate_return() {
+        let production = production_app_source();
+        let branch_start = production
+            .find("let Event::Key(key) = &ev else")
+            .expect("direct key branch");
+        let branch = &production[branch_start
+            ..production[branch_start..]
+                .find("\n                                }\n                            },")
+                .map(|offset| branch_start + offset)
+                .expect("direct key branch end")];
+
+        assert_status_flow_branch_contract(branch);
+    }
+
+    fn assert_status_flow_branch_contract(branch: &str) {
+        let routed = branch
+            .find("let status_flow = handle_status_key_dynamic(")
+            .expect("dynamic status flow");
+        let reduced = branch
+            .find("apply_status_key_flow(")
+            .expect("single status flow reducer");
+        let exit = branch.find("return Ok(Some(code));").expect("exit return");
+        let no_exit = branch.rfind("return Ok(None);").expect("non-exit return");
+
+        assert!(routed < reduced && reduced < exit && exit < no_exit);
+        assert!(!branch[reduced..].contains("handle_status_key_dynamic("));
+        assert!(!branch.contains("scheduler.mark_dirty"));
+        assert!(
+            branch[no_exit + "return Ok(None);".len()..]
+                .trim()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn production_uses_one_status_flow_reducer_without_route_wrappers() {
+        let production = production_app_source();
+
+        assert_eq!(production.matches("fn apply_status_key_flow(").count(), 1);
+        assert_eq!(production.matches("apply_status_key_flow(").count(), 3);
+        assert!(!production.contains("apply_direct_status_key_flow"));
+        assert!(!production.contains("apply_synthetic_enter_status_key_flow"));
     }
 
     #[test]
