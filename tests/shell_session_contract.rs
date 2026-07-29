@@ -16,6 +16,7 @@ fn shell_session_runs_interactive_stdin_and_records_task_result() {
     let handle = sessions
         .spawn(ShellSessionCommand {
             command: "read line; printf 'reply:%s\\n' \"$line\"".to_string(),
+            argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -62,6 +63,7 @@ fn shell_session_applies_environment_overrides_and_unsets() {
         .spawn(ShellSessionCommand {
             command: "printf '%s|%s' \"$ORCA_SHELL_ENV_ADDED\" \"${ORCA_SHELL_ENV_REMOVED-unset}\""
                 .to_string(),
+            argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -99,6 +101,7 @@ fn sandboxed_shell_session_cannot_override_seatbelt_marker() {
     let handle = sessions
         .spawn(ShellSessionCommand {
             command: "printf %s \"$ORCA_SANDBOX\"".to_string(),
+            argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -137,6 +140,7 @@ fn shell_session_kill_stops_running_task_and_collects_partial_output() {
             command: format!(
                 "printf started; : > {started_marker_arg:?}; while [ ! -e {release_marker_arg:?} ]; do sleep 0.05; done; printf done"
             ),
+            argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -167,6 +171,7 @@ fn shell_session_kill_preserves_already_exited_terminal_with_buffered_output() {
     let handle = sessions
         .spawn(ShellSessionCommand {
             command: "printf completed".to_string(),
+            argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -229,6 +234,7 @@ fn shell_session_reaps_task_stop_requests() {
             command: format!(
                 "printf started; : > {started_marker_arg:?}; while [ ! -e {release_marker_arg:?} ]; do sleep 0.05; done; printf done"
             ),
+            argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -284,6 +290,7 @@ fn shell_session_read_returns_incremental_output_without_waiting_for_exit() {
     let handle = sessions
         .spawn(ShellSessionCommand {
             command: "printf ready; sleep 30; printf done".to_string(),
+            argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -323,6 +330,7 @@ fn shell_session_list_returns_running_shell_snapshots() {
     let handle = sessions
         .spawn(ShellSessionCommand {
             command: "printf ready; sleep 30".to_string(),
+            argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -358,6 +366,7 @@ fn shell_session_updates_description_for_list_snapshots() {
     let handle = sessions
         .spawn(ShellSessionCommand {
             command: "sleep 30".to_string(),
+            argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -390,6 +399,7 @@ fn shell_session_terminate_all_preserves_natural_completion() {
     let handle = sessions
         .spawn(ShellSessionCommand {
             command: "printf completed".to_string(),
+            argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -431,6 +441,7 @@ fn shell_session_pty_exposes_terminal_to_child_process() {
     let handle = sessions
         .spawn(ShellSessionCommand {
             command: "if test -t 0 && test -t 1; then printf tty; else printf pipe; fi".to_string(),
+            argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -469,6 +480,7 @@ fn shell_session_pty_starts_with_configured_window_size() {
     let handle = sessions
         .spawn(ShellSessionCommand {
             command: "python3 -c 'import fcntl,termios,struct,sys; data=fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, struct.pack(\"HHHH\",0,0,0,0)); rows,cols,_,_=struct.unpack(\"HHHH\", data); print(f\"{rows} {cols}\")'".to_string(),
+            argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),

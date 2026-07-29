@@ -565,6 +565,7 @@ fn execute_bash_once(context: RuntimeBashOnceContext<'_, '_>) -> BashShellOutput
     let handle = match manager.spawn_with_metadata_roots(
         ShellSessionCommand {
             command: command.to_string(),
+            argv: None,
             cwd: cwd.to_path_buf(),
             additional_readable_directories,
             additional_working_directories,

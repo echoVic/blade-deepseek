@@ -164,10 +164,11 @@ fn platform_command(unix: &str, windows: &str) -> Vec<String> {
     {
         let _ = unix;
         vec![
-            "powershell.exe".to_string(),
-            "-NoLogo".to_string(),
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
+            "/D".to_string(),
+            "/V:ON".to_string(),
+            "/S".to_string(),
+            "/C".to_string(),
             windows.to_string(),
         ]
     }
@@ -193,8 +194,13 @@ fn platform_command_with_args(unix: &str, windows: &str, unix_args: &[&str]) -> 
     }
 }
 
+#[cfg(windows)]
 fn powershell_path(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "''"))
+}
+
+fn cmd_path(path: &Path) -> String {
+    format!("\"{}\"", path.to_string_lossy().replace('"', "\"\""))
 }
 
 fn unix_shell_path(path: &Path) -> String {
@@ -1996,7 +2002,7 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait_and_accepts_next_turn() {
     {
         let command = platform_shell_script(
             "touch bash-invocation-started; sleep 5; printf after",
-            "New-Item -ItemType File -Force -Path 'bash-invocation-started' | Out-Null; Start-Sleep -Seconds 5; [Console]::Out.Write('after')",
+            "New-Item -ItemType File -Force -Path 'bash-invocation-started' | Out-Null; Start-Sleep -Seconds 5; Write-Host -NoNewline 'after'",
         );
         let request = json!({
             "id": "turn-bash",
@@ -2950,7 +2956,7 @@ fn server_mode_controls_runtime_shell_session() {
         let stdin = child.stdin_mut();
         let command = platform_shell_script(
             r#"read line; printf 'server:%s\n' "$line""#,
-            "$line = [Console]::In.ReadLine(); [Console]::Out.Write(\"server:$line`n\")",
+            "$line = Read-Host; Write-Output \"server:$line\"",
         );
         let request = json!({
             "id": "shell-start",
@@ -2970,7 +2976,7 @@ fn server_mode_controls_runtime_shell_session() {
         started["command"],
         platform_shell_script(
             r#"read line; printf 'server:%s\n' "$line""#,
-            "$line = [Console]::In.ReadLine(); [Console]::Out.Write(\"server:$line`n\")"
+            "$line = Read-Host; Write-Output \"server:$line\""
         )
     );
     assert!(started["taskId"].as_str().is_some_and(|id| !id.is_empty()));
@@ -3084,7 +3090,7 @@ fn server_mode_command_exec_returns_buffered_output() {
             "params": {
                 "command": platform_command(
                     "printf 'legacy-out'; printf 'legacy-err' >&2",
-                    "[Console]::Out.Write('legacy-out'); [Console]::Error.Write('legacy-err')"
+                    "<nul set /p =legacy-out & <nul set /p =legacy-err 1>&2"
                 ),
                 "tty": false,
                 "streamStdin": false,
@@ -3143,7 +3149,7 @@ fn server_mode_command_exec_honors_cwd_and_env_overrides() {
             "params": {
                 "command": platform_command(
                     "printf '%s|%s|%s|%s' \"$PWD\" \"$ORCA_COMMAND_EXEC_BASE\" \"$ORCA_COMMAND_EXEC_EXTRA\" \"${ORCA_COMMAND_EXEC_REMOVE-unset}\"",
-                    "[Console]::Out.Write(\"$($PWD.Path)|$env:ORCA_COMMAND_EXEC_BASE|$env:ORCA_COMMAND_EXEC_EXTRA|$(if ([string]::IsNullOrEmpty($env:ORCA_COMMAND_EXEC_REMOVE)) { 'unset' } else { $env:ORCA_COMMAND_EXEC_REMOVE })\")"
+                    "if defined ORCA_COMMAND_EXEC_REMOVE (set _orca_removed=!ORCA_COMMAND_EXEC_REMOVE!) else (set _orca_removed=unset) & <nul set /p =!CD!^|!ORCA_COMMAND_EXEC_BASE!^|!ORCA_COMMAND_EXEC_EXTRA!^|!_orca_removed!"
                 ),
                 "cwd": command_dir,
                 "env": {
@@ -5092,7 +5098,7 @@ fn server_mode_command_exec_respects_buffered_output_cap() {
             "params": {
                 "command": platform_command(
                     "printf 'abcdef'; printf 'uvwxyz' >&2",
-                    "[Console]::Out.Write('abcdef'); [Console]::Error.Write('uvwxyz')"
+                    "<nul set /p =abcdef & <nul set /p =uvwxyz 1>&2"
                 ),
                 "outputBytesCap": 5
             }
@@ -5142,7 +5148,7 @@ fn server_mode_command_exec_caps_buffered_output_by_bytes() {
             "params": {
                 "command": platform_command(
                     "printf 'ééé'; printf 'ééé' >&2",
-                    "$encoding = [Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = $encoding; [Console]::Out.Write('ééé'); [Console]::Error.Write('ééé')"
+                    "chcp 65001 >nul & <nul set /p =ééé & <nul set /p =ééé 1>&2"
                 ),
                 "outputBytesCap": 5
             }
@@ -5214,9 +5220,9 @@ fn server_mode_command_exec_with_process_id_can_be_terminated() {
     let started_marker_arg = started_marker.to_str().expect("marker path");
     let release_marker_arg = release_marker.to_str().expect("release marker path");
     let windows_command = format!(
-        "[Console]::Out.Write('started'); New-Item -ItemType File -Force -Path {} | Out-Null; while (!(Test-Path {})) {{ Start-Sleep -Milliseconds 50 }}; [Console]::Out.Write('done')",
-        powershell_path(&started_marker),
-        powershell_path(&release_marker)
+        "<nul set /p =started & type nul > {} & for /L %i in (1,1,600) do @if not exist {} >nul ping -w 50 -n 1 192.0.2.1 & <nul set /p =done",
+        cmd_path(&started_marker),
+        cmd_path(&release_marker)
     );
     let mut child = orca_command()
         .args([
@@ -5299,10 +5305,10 @@ fn server_mode_command_exec_stops_active_processes_when_input_closes() {
     let release_marker_arg = release_marker.to_str().expect("release marker path");
     let leaked_marker_arg = leaked_marker.to_str().expect("marker path");
     let windows_command = format!(
-        "[Console]::Out.Write('started'); New-Item -ItemType File -Force -Path {} | Out-Null; while (!(Test-Path {})) {{ Start-Sleep -Milliseconds 50 }}; Set-Content -NoNewline -Path {} -Value 'leaked'",
-        powershell_path(&started_marker),
-        powershell_path(&release_marker),
-        powershell_path(&leaked_marker)
+        "<nul set /p =started & type nul > {} & for /L %i in (1,1,600) do @if not exist {} >nul ping -w 50 -n 1 192.0.2.1 & <nul set /p =leaked > {}",
+        cmd_path(&started_marker),
+        cmd_path(&release_marker),
+        cmd_path(&leaked_marker)
     );
     let mut child = orca_command()
         .args([
@@ -5445,7 +5451,7 @@ fn server_mode_command_exec_rejects_duplicate_active_process_id() {
             "id": "cmd-1",
             "method": "command/exec",
             "params": {
-                "command": platform_command("sleep 30", "Start-Sleep -Seconds 30"),
+                "command": platform_command("sleep 30", "ping -n 31 127.0.0.1 >nul"),
                 "processId": "dup-1"
             }
         });
@@ -5509,10 +5515,10 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
     let completed_marker_arg = completed_marker.to_str().expect("completed marker path");
     let command = "printf listed; touch $1; while test ! -e $2; do sleep 0.05; done; touch $3";
     let windows_command = format!(
-        "[Console]::Out.Write('listed'); New-Item -ItemType File -Force -Path {} | Out-Null; while (!(Test-Path {})) {{ Start-Sleep -Milliseconds 50 }}; New-Item -ItemType File -Force -Path {} | Out-Null",
-        powershell_path(&started_marker),
-        powershell_path(&release_marker),
-        powershell_path(&completed_marker)
+        "<nul set /p =listed & type nul > {} & for /L %i in (1,1,600) do @if not exist {} >nul ping -w 50 -n 1 192.0.2.1 & type nul > {}",
+        cmd_path(&started_marker),
+        cmd_path(&release_marker),
+        cmd_path(&completed_marker)
     );
     let command_args = platform_command_with_args(
         command,
@@ -5655,7 +5661,7 @@ fn server_mode_command_exec_write_requires_input_or_close() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": platform_command("cat", "$null = [Console]::In.ReadToEnd()"),
+                "command": platform_command("cat", "more >nul"),
                 "processId": "write-empty-1",
                 "streamStdin": true
             }
@@ -5725,7 +5731,7 @@ fn server_mode_command_exec_resize_rejects_zero_dimensions() {
             "id": "cmd",
             "method": "command/exec",
             "params": {
-                "command": platform_command("cat", "$null = [Console]::In.ReadToEnd()"),
+                "command": platform_command("cat", "more >nul"),
                 "processId": "resize-zero-1",
                 "tty": true,
                 "size": {"rows": 24, "cols": 80}
@@ -5798,7 +5804,7 @@ fn server_mode_command_exec_streams_output_and_accepts_write() {
             "params": {
                 "command": platform_command(
                     "printf 'out-start\n'; printf 'err-start\n' >&2; IFS= read line; printf 'out:%s\n' \"$line\"; printf 'err:%s\n' \"$line\" >&2",
-                    "[Console]::Out.Write(\"out-start`n\"); [Console]::Error.Write(\"err-start`n\"); $line = [Console]::In.ReadLine(); [Console]::Out.Write(\"out:$line`n\"); [Console]::Error.Write(\"err:$line`n\")"
+                    "echo out-start & <nul set /p =err-start 1>&2 & set /p line= & echo out:!line! & echo err:!line! 1>&2"
                 ),
                 "processId": "pipe-1",
                 "streamStdin": true,
@@ -5828,10 +5834,10 @@ fn server_mode_command_exec_streams_output_and_accepts_write() {
         .expect("command_exec_written event");
     assert_eq!(write_ack["processId"], "pipe-1");
     completion_events.extend(child.drain_events_until_event("cmd", "command_exec_completed"));
-    assert_command_exec_delta_seen(&completion_events, "stdout", "out-start\n");
-    assert_command_exec_delta_seen(&completion_events, "stderr", "err-start\n");
-    assert_command_exec_delta_seen(&completion_events, "stdout", "out:hello\n");
-    assert_command_exec_delta_seen(&completion_events, "stderr", "err:hello\n");
+    assert_command_exec_delta_seen(&completion_events, "stdout", "out-start");
+    assert_command_exec_delta_seen(&completion_events, "stderr", "err-start");
+    assert_command_exec_delta_seen(&completion_events, "stdout", "out:hello");
+    assert_command_exec_delta_seen(&completion_events, "stderr", "err:hello");
     let completed = completion_events
         .iter()
         .find(|event| event["event"] == "command_exec_completed")
@@ -5852,8 +5858,8 @@ fn server_mode_command_exec_read_drains_streaming_output() {
     let release_marker = workspace.path().join("command-release");
     let release_marker_arg = release_marker.to_str().expect("release marker path");
     let windows_command = format!(
-        "while (!(Test-Path {})) {{ Start-Sleep -Milliseconds 50 }}; [Console]::Out.Write('read-out'); [Console]::Error.Write('read-err'); Start-Sleep -Seconds 30",
-        powershell_path(&release_marker)
+        "for /L %i in (1,1,600) do @if not exist {} >nul ping -w 50 -n 1 192.0.2.1 & <nul set /p =read-out & <nul set /p =read-err 1>&2 & ping -n 31 127.0.0.1 >nul",
+        cmd_path(&release_marker)
     );
     let mut child = orca_command()
         .args([
@@ -5948,8 +5954,8 @@ fn server_mode_command_exec_read_caps_streaming_output() {
     let release_marker = workspace.path().join("command-cap-release");
     let release_marker_arg = release_marker.to_str().expect("release marker path");
     let windows_command = format!(
-        "while (!(Test-Path {})) {{ Start-Sleep -Milliseconds 50 }}; [Console]::Out.Write('abcdef'); Start-Sleep -Seconds 30",
-        powershell_path(&release_marker)
+        "for /L %i in (1,1,600) do @if not exist {} >nul ping -w 50 -n 1 192.0.2.1 & <nul set /p =abcdef & ping -n 31 127.0.0.1 >nul",
+        cmd_path(&release_marker)
     );
     let mut child = orca_command()
         .args([
@@ -6056,8 +6062,8 @@ fn server_mode_command_exec_streaming_respects_output_cap() {
     let started_marker = workspace.path().join("stream-cap-started");
     let started_marker_arg = started_marker.to_str().expect("started marker path");
     let windows_command = format!(
-        "[Console]::Out.Write('abcdefghij'); New-Item -ItemType File -Force -Path {} | Out-Null; Start-Sleep -Seconds 30",
-        powershell_path(&started_marker)
+        "<nul set /p =abcdefghij & type nul > {} & ping -n 31 127.0.0.1 >nul",
+        cmd_path(&started_marker)
     );
     let mut child = orca_command()
         .args([
@@ -6147,8 +6153,8 @@ fn server_mode_command_exec_caps_streaming_output_by_bytes() {
     let started_marker = workspace.path().join("stream-byte-cap-started");
     let started_marker_arg = started_marker.to_str().expect("started marker path");
     let windows_command = format!(
-        "$encoding = [Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = $encoding; [Console]::Out.Write('ééé'); New-Item -ItemType File -Force -Path {} | Out-Null; Start-Sleep -Seconds 30",
-        powershell_path(&started_marker)
+        "chcp 65001 >nul & <nul set /p =ééé & type nul > {} & ping -n 31 127.0.0.1 >nul",
+        cmd_path(&started_marker)
     );
     let mut child = orca_command()
         .args([
@@ -6386,7 +6392,7 @@ fn server_mode_kills_runtime_shell_session() {
         let stdin = child.stdin_mut();
         let command = platform_shell_script(
             "printf started; sleep 30; printf done",
-            "[Console]::Out.Write('started'); Start-Sleep -Seconds 30; [Console]::Out.Write('done')",
+            "Write-Host -NoNewline 'started'; Start-Sleep -Seconds 30; Write-Host -NoNewline 'done'",
         );
         let request = json!({
             "id": "shell-start",
@@ -6464,7 +6470,7 @@ fn server_mode_task_stop_reaps_runtime_shell_session() {
         let stdin = child.stdin_mut();
         let command = platform_shell_script(
             "printf started; sleep 30; printf done",
-            "[Console]::Out.Write('started'); Start-Sleep -Seconds 30; [Console]::Out.Write('done')",
+            "Write-Host -NoNewline 'started'; Start-Sleep -Seconds 30; Write-Host -NoNewline 'done'",
         );
         let request = json!({
             "id": "shell-start",
@@ -6559,7 +6565,7 @@ fn server_mode_reads_runtime_shell_session_incrementally() {
         let stdin = child.stdin_mut();
         let command = platform_shell_script(
             "printf ready; sleep 30; printf done",
-            "[Console]::Out.Write('ready'); Start-Sleep -Seconds 30; [Console]::Out.Write('done')",
+            "Write-Host -NoNewline 'ready'; Start-Sleep -Seconds 30; Write-Host -NoNewline 'done'",
         );
         let request = json!({
             "id": "shell-start",
@@ -6667,7 +6673,7 @@ fn server_mode_shell_read_honors_output_byte_cap() {
         let stdin = child.stdin_mut();
         let command = platform_shell_script(
             "printf ready-long-output; sleep 30",
-            "[Console]::Out.Write('ready-long-output'); Start-Sleep -Seconds 30",
+            "Write-Host -NoNewline 'ready-long-output'; Start-Sleep -Seconds 30",
         );
         let request = json!({
             "id": "shell-start",
@@ -6735,7 +6741,7 @@ fn server_mode_lists_runtime_shell_sessions() {
     let workspace = tempdir().expect("workspace");
     let command = platform_shell_script(
         "printf ready; sleep 30",
-        "[Console]::Out.Write('ready'); Start-Sleep -Seconds 30",
+        "Write-Host -NoNewline 'ready'; Start-Sleep -Seconds 30",
     );
     let mut child = orca_command()
         .args([

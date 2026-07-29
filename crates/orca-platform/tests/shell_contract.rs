@@ -114,6 +114,7 @@ fn windows_shell_commands_preserve_the_active_dialect() {
     assert_eq!(command.args[3], "-Command");
     let script = command.args[4].to_string_lossy();
     assert!(script.contains("OutputEncoding"));
+    assert!(script.contains("LanguageMode -eq 'FullLanguage'"));
     assert!(script.ends_with("Write-Output 'orca-test'"));
     assert!(pwsh.prompt_dialect().contains("PowerShell 7"));
 

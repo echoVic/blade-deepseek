@@ -78,6 +78,7 @@ pub(super) struct JsonlCommandExecPermissionRequest {
     pub(super) thread_id: String,
     pub(super) runtime_workspace_roots: Vec<PathBuf>,
     pub(super) command: Vec<String>,
+    pub(super) command_is_argv: bool,
     pub(super) process_id: Option<String>,
     pub(super) cwd: Option<PathBuf>,
     pub(super) env: crate::protocol::CommandEnvOverrides,

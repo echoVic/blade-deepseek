@@ -180,6 +180,7 @@ fn shell_session_writes_process_output_to_task_output_store() {
     let handle = manager
         .spawn(ShellSessionCommand {
             command: "printf stdout; printf stderr >&2; read -r _ || true".to_string(),
+            argv: None,
             cwd: cwd.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -235,6 +236,7 @@ fn shell_session_evicts_completed_process_output_from_task_output_store() {
     let handle = manager
         .spawn(ShellSessionCommand {
             command: "printf done".to_string(),
+            argv: None,
             cwd: cwd.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -264,6 +266,7 @@ fn shell_session_evicts_completed_process_output_when_read_observes_exit() {
     let handle = manager
         .spawn(ShellSessionCommand {
             command: "printf done".to_string(),
+            argv: None,
             cwd: cwd.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -294,6 +297,7 @@ fn shell_session_reap_completed_removes_process_output_from_task_output_store() 
     let handle = manager
         .spawn(ShellSessionCommand {
             command: "printf listed".to_string(),
+            argv: None,
             cwd: cwd.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -327,6 +331,7 @@ fn shell_session_evicts_stopped_process_output_from_task_output_store() {
     let handle = manager
         .spawn(ShellSessionCommand {
             command: "printf running; sleep 5".to_string(),
+            argv: None,
             cwd: cwd.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -356,6 +361,7 @@ fn shell_session_reports_when_retained_output_omits_prefix() {
     let handle = manager
         .spawn(ShellSessionCommand {
             command: "printf 'first\\nlast\\n'".to_string(),
+            argv: None,
             cwd: cwd.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),

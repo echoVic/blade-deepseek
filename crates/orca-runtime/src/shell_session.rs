@@ -39,6 +39,7 @@ use std::os::unix::process::ExitStatusExt;
 #[derive(Clone, Debug)]
 pub struct ShellSessionCommand {
     pub command: String,
+    pub argv: Option<Vec<String>>,
     pub cwd: PathBuf,
     pub additional_readable_directories: Vec<PathBuf>,
     pub additional_working_directories: Vec<PathBuf>,
@@ -412,9 +413,7 @@ impl RuntimeShellSessionManager {
                     allowed_unix_socket_roots: &command.allowed_unix_socket_roots,
                 },
             ),
-            ShellSandboxMode::DangerFullAccess => {
-                shell_command(&shell, &command.command, &command.cwd)
-            }
+            ShellSandboxMode::DangerFullAccess => session_command(&shell, &command),
         };
         process.env_remove("ORCA_API_KEY");
         for (key, value) in &command.env {
@@ -916,7 +915,7 @@ fn spawn_windows_sandbox(
     capabilities
         .verify_setup_for_workspace(&command.cwd, orca_windows_sandbox::SETUP_HELPER_VERSION)
         .map_err(io::Error::other)?;
-    let spec = shell.command(&command.command);
+    let spec = session_command_spec(shell, command)?;
     let request = || SandboxSpawnRequest {
         program: &spec.program,
         args: &spec.args,
@@ -959,6 +958,52 @@ fn shell_command(shell: &ShellSpec, script: &str, cwd: &std::path::Path) -> std:
     process.args(command.args).current_dir(cwd);
     orca_tools::process::prepare_non_interactive_command(&mut process);
     process
+}
+
+fn session_command(shell: &ShellSpec, command: &ShellSessionCommand) -> std::process::Command {
+    #[cfg(windows)]
+    if let Some(argv) = command.argv.as_ref() {
+        let mut process = direct_command(argv, &command.cwd);
+        orca_tools::process::prepare_non_interactive_command(&mut process);
+        return process;
+    }
+    shell_command(shell, &command.command, &command.cwd)
+}
+
+#[cfg(windows)]
+fn session_command_spec(
+    shell: &ShellSpec,
+    command: &ShellSessionCommand,
+) -> io::Result<orca_platform::shell::CommandSpec> {
+    use std::ffi::OsString;
+
+    let Some(argv) = command.argv.as_ref() else {
+        return Ok(shell.command(&command.command));
+    };
+    let (program, args) = argv.split_first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "command argv must not be empty",
+        )
+    })?;
+    let program =
+        orca_platform::shell::resolve_program(program).unwrap_or_else(|| PathBuf::from(program));
+    Ok(orca_platform::shell::CommandSpec {
+        program,
+        args: args.iter().map(OsString::from).collect(),
+    })
+}
+
+#[cfg(windows)]
+fn direct_command(argv: &[String], cwd: &std::path::Path) -> std::process::Command {
+    let (program, args) = argv
+        .split_first()
+        .expect("validated command/exec argv must not be empty");
+    let program =
+        orca_platform::shell::resolve_program(program).unwrap_or_else(|| PathBuf::from(program));
+    let mut command = std::process::Command::new(program);
+    command.args(args).current_dir(cwd);
+    command
 }
 impl Drop for RuntimeShellSessionManager {
     fn drop(&mut self) {
@@ -1834,6 +1879,7 @@ mod tests {
             .spawn(ShellSessionCommand {
                 command: "Write-Output restricted-conpty-ready; Start-Sleep -Milliseconds 300"
                     .to_string(),
+                argv: None,
                 cwd: temp.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
                 additional_working_directories: Vec::new(),
@@ -1984,6 +2030,7 @@ mod tests {
         let handle = sessions
             .spawn(ShellSessionCommand {
                 command: "\"$ORCA_SHELL_ESCAPE_HELPER\" --exact shell_session::tests::escaped_shell_pipe_holder_helper --nocapture & printf parent-done".to_string(),
+                argv: None,
                 cwd: temp.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
                 additional_working_directories: Vec::new(),

@@ -82,9 +82,11 @@ impl ShellSpec {
                 OsString::from("-NonInteractive"),
                 OsString::from("-Command"),
                 OsString::from(format!(
-                    "[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); \
-                     [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); \
-                     $OutputEncoding = [Console]::OutputEncoding; {script}"
+                    "if ($ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage') {{ \
+                         [Console]::InputEncoding = [Text.UTF8Encoding]::new($false); \
+                         [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); \
+                         $OutputEncoding = [Console]::OutputEncoding \
+                     }}; {script}"
                 )),
             ],
             ShellKind::PowerShell(PowerShellEdition::Windows) => vec![
@@ -93,10 +95,12 @@ impl ShellSpec {
                 OsString::from("-NonInteractive"),
                 OsString::from("-Command"),
                 OsString::from(format!(
-                    "$orcaUtf8 = New-Object System.Text.UTF8Encoding $false; \
-                     [Console]::InputEncoding = $orcaUtf8; \
-                     [Console]::OutputEncoding = $orcaUtf8; \
-                     $OutputEncoding = $orcaUtf8; {script}"
+                    "if ($ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage') {{ \
+                         $orcaUtf8 = New-Object System.Text.UTF8Encoding $false; \
+                         [Console]::InputEncoding = $orcaUtf8; \
+                         [Console]::OutputEncoding = $orcaUtf8; \
+                         $OutputEncoding = $orcaUtf8 \
+                     }}; {script}"
                 )),
             ],
             ShellKind::Cmd => vec![

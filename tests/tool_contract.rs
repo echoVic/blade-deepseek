@@ -710,7 +710,7 @@ fn external_tool_descriptor_runs_from_orca_tools_dir() {
             .replace('`', "``")
             .replace('"', "`\"");
         format!(
-            "$input = [Console]::In.ReadToEnd(); Set-Content -LiteralPath \"{output_path}\" -Value $input -NoNewline; Write-Output \"deploy ok\""
+            "$input | Set-Content -LiteralPath \"{output_path}\" -NoNewline; Write-Output \"deploy ok\""
         )
     };
     fs::write(

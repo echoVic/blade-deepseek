@@ -61,6 +61,10 @@ pub(super) fn command_args_from_wire(command: Option<&WireCommandParam>) -> Opti
     }
 }
 
+pub(super) fn command_is_argv_from_wire(command: Option<&WireCommandParam>) -> bool {
+    matches!(command, Some(WireCommandParam::Args(_)))
+}
+
 pub(super) fn command_cwd_from_wire(cwd: Option<&CwdOrModelFilter>) -> Option<PathBuf> {
     match cwd {
         Some(CwdOrModelFilter::One(value)) if !value.is_empty() => Some(PathBuf::from(value)),

@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
 use orca_platform::process::ProcessJob;
@@ -348,8 +348,8 @@ fn spawn_with_security(
     use_pseudo_console: bool,
     job: ProcessJob,
 ) -> Result<SandboxedProcess, WindowsSandboxError> {
-    let application_name = wide_path(request.program);
-    let mut command_line = command_line(request.program, request.args);
+    let (application, mut command_line) = launch_command(request.program, request.args)?;
+    let application_name = wide_path(&application);
     let mut environment = environment_block(request.env);
     let cwd = wide_path(request.cwd);
     let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -852,6 +852,30 @@ fn environment_block(overrides: &BTreeMap<String, Option<String>>) -> Vec<u16> {
     block
 }
 
+fn launch_command(program: &Path, args: &[OsString]) -> io::Result<(PathBuf, Vec<u16>)> {
+    if is_batch_file(program) {
+        return Ok((command_processor(), batch_command_line(program, args)?));
+    }
+    Ok((program.to_path_buf(), command_line(program, args)))
+}
+
+fn is_batch_file(program: &Path) -> bool {
+    program.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+    })
+}
+
+fn command_processor() -> PathBuf {
+    std::env::var_os("COMSPEC")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("SystemRoot")
+                .map(PathBuf::from)
+                .map(|root| root.join("System32").join("cmd.exe"))
+        })
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"))
+}
+
 fn command_line(program: &Path, args: &[OsString]) -> Vec<u16> {
     let mut line = quote_windows_arg(&program.to_string_lossy());
     for arg in args {
@@ -859,6 +883,67 @@ fn command_line(program: &Path, args: &[OsString]) -> Vec<u16> {
         line.push_str(&quote_windows_arg(&arg.to_string_lossy()));
     }
     line.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn batch_command_line(program: &Path, args: &[OsString]) -> io::Result<Vec<u16>> {
+    let program = program.to_string_lossy();
+    if program.contains('"') || program.ends_with('\\') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows batch paths may not contain quotes or end with a backslash",
+        ));
+    }
+    let mut line = String::from("cmd.exe /E:ON /V:OFF /D /S /C \"\"");
+    line.push_str(&program);
+    line.push('"');
+    for arg in args {
+        line.push(' ');
+        append_batch_arg(&mut line, &arg.to_string_lossy())?;
+    }
+    line.push('"');
+    Ok(line.encode_utf16().chain(std::iter::once(0)).collect())
+}
+
+fn append_batch_arg(line: &mut String, arg: &str) -> io::Result<()> {
+    if arg.chars().any(|ch| matches!(ch, '\r' | '\n')) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows batch arguments may not contain newlines",
+        ));
+    }
+    let safe_punctuation = "#$*+-./:?@\\_";
+    let quote = arg.is_empty()
+        || arg.ends_with('\\')
+        || arg.chars().any(|ch| {
+            (ch.is_ascii() && !(ch.is_ascii_alphanumeric() || safe_punctuation.contains(ch)))
+                || ch.is_control()
+        });
+    if quote {
+        line.push('"');
+    }
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if ch == '"' {
+            line.push_str(&"\\".repeat(backslashes * 2));
+            line.push('"');
+        } else {
+            line.push_str(&"\\".repeat(backslashes));
+            if ch == '%' {
+                line.push_str("%%cd:~,%");
+            }
+        }
+        line.push(ch);
+        backslashes = 0;
+    }
+    line.push_str(&"\\".repeat(backslashes * if quote { 2 } else { 1 }));
+    if quote {
+        line.push('"');
+    }
+    Ok(())
 }
 
 fn quote_windows_arg(value: &str) -> String {
@@ -947,6 +1032,66 @@ mod tests {
             r#""C:\Program Files\orca""#
         );
         assert_eq!(quote_windows_arg("a\"b"), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn batch_launch_routes_through_cmd_with_hardened_arguments() {
+        let (application, command_line) = launch_command(
+            Path::new(r"C:\Tools\npx.cmd"),
+            &[
+                OsString::from("plain"),
+                OsString::from("two words"),
+                OsString::from("100%"),
+            ],
+        )
+        .expect("batch launch");
+        let command_line = String::from_utf16_lossy(
+            command_line
+                .strip_suffix(&[0])
+                .expect("nul-terminated command line"),
+        );
+
+        assert!(application.ends_with("cmd.exe"), "{application:?}");
+        assert!(command_line.starts_with("cmd.exe /E:ON /V:OFF /D /S /C \"\"C:\\Tools\\npx.cmd\""));
+        assert!(command_line.contains("\"two words\""));
+        assert!(command_line.contains("100%%cd:~,%%"));
+    }
+
+    #[test]
+    fn restricted_pipe_child_executes_batch_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("echo-args.cmd");
+        std::fs::write(&script, "@echo batch:%~1").expect("write batch fixture");
+        let plan = WindowsSandboxPlan::build(WindowsSandboxPolicyInput {
+            mode: SandboxFilesystemMode::WorkspaceWrite,
+            cwd: temp.path().to_path_buf(),
+            readable_roots: Vec::new(),
+            writable_roots: Vec::new(),
+            denied_roots: Vec::new(),
+            network_access: true,
+        })
+        .expect("sandbox plan");
+        let capabilities = CapabilityStore::new(temp.path().join("capabilities"));
+        let args = vec![OsString::from("two words")];
+        let mut child = SandboxedChild::spawn(SandboxSpawnRequest {
+            program: &script,
+            args: &args,
+            cwd: temp.path(),
+            env: &BTreeMap::new(),
+            plan: &plan,
+            capabilities: &capabilities,
+        })
+        .expect("restricted batch child");
+        let (stdin, stdout, stderr) = child.take_stdio().expect("stdio");
+        drop(stdin);
+        let output_reader = text_reader(stdout, "stdout");
+        let error_reader = text_reader(stderr, "stderr");
+        let status = wait_for_pipe_child(&mut child, "sandbox batch child");
+        let output = output_reader.join().expect("join stdout reader");
+        let error = error_reader.join().expect("join stderr reader");
+
+        assert!(status.success(), "{error}");
+        assert!(output.contains("batch:two words"), "{output:?}");
     }
 
     #[test]

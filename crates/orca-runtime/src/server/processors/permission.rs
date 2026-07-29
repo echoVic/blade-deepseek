@@ -276,6 +276,7 @@ fn run_permission_respond<W: Write>(
                 state,
                 Some(&request.thread_id),
                 &request.command,
+                request.command_is_argv,
                 request.process_id.as_deref(),
                 request.cwd.as_ref(),
                 &request.env,

@@ -12,7 +12,7 @@ use crate::thread_store::{SortDirection, ThreadListFilters, ThreadSortKey, TurnI
 
 use super::command_exec::{
     CommandEnvOverrides, CommandExecOptions, command_args_from_wire, command_cwd_from_wire,
-    command_exec_options_from_params, command_text_from_wire,
+    command_exec_options_from_params, command_is_argv_from_wire, command_text_from_wire,
 };
 use super::permissions::{
     PermissionGrantScope, PermissionResponseDecision, RequestPermissionProfile,
@@ -157,6 +157,7 @@ pub enum ClientOp {
     CommandExec {
         thread_id: Option<String>,
         command: Vec<String>,
+        command_is_argv: bool,
         process_id: Option<String>,
         cwd: Option<PathBuf>,
         env: CommandEnvOverrides,
@@ -896,6 +897,10 @@ impl Submission {
                         .as_ref()
                         .and_then(|params| command_args_from_wire(params.command.as_ref()))
                         .unwrap_or_default(),
+                    command_is_argv: wire
+                        .params
+                        .as_ref()
+                        .is_some_and(|params| command_is_argv_from_wire(params.command.as_ref())),
                     process_id: wire
                         .params
                         .as_ref()
@@ -2423,6 +2428,7 @@ mod tests {
             ClientOp::CommandExec {
                 thread_id: Some("thread-1".to_string()),
                 command: vec!["sh".to_string(), "-lc".to_string(), "printf ok".to_string()],
+                command_is_argv: true,
                 process_id: Some("process-1".to_string()),
                 cwd: Some(PathBuf::from("/tmp/orca-command")),
                 env: BTreeMap::from([
@@ -2449,6 +2455,26 @@ mod tests {
     }
 
     #[test]
+    fn submission_preserves_legacy_command_exec_script_shape() {
+        let submission = Submission::decode(
+            r#"{"id":"cmd","method":"command/exec","params":{"command":"printf ok"}}"#,
+        )
+        .expect("legacy command/exec submission");
+
+        match submission.op {
+            ClientOp::CommandExec {
+                command,
+                command_is_argv,
+                ..
+            } => {
+                assert_eq!(command, ["printf ok"]);
+                assert!(!command_is_argv);
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+    }
+
+    #[test]
     fn submission_decodes_command_exec_list_wire_shape() {
         let list =
             Submission::decode(r#"{"id":"cmd-list","method":"command/exec/list","params":{}}"#)
@@ -2470,6 +2496,7 @@ mod tests {
             ClientOp::CommandExec {
                 thread_id: None,
                 command: vec!["sh".to_string()],
+                command_is_argv: true,
                 process_id: None,
                 cwd: None,
                 env: BTreeMap::new(),

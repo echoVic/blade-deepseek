@@ -836,6 +836,7 @@ fn run_shell_start<W: Write>(
     let command_text = command.to_string();
     let command = ShellSessionCommand {
         command: command_text.clone(),
+        argv: None,
         cwd: cwd.clone(),
         additional_readable_directories: Vec::new(),
         additional_working_directories: Vec::new(),
@@ -1135,6 +1136,7 @@ fn run_command_exec<W: Write>(
     state: &mut ServerState,
     thread_id: Option<&str>,
     command: &[String],
+    command_is_argv: bool,
     process_id: Option<&str>,
     cwd: Option<&PathBuf>,
     env: &protocol::CommandEnvOverrides,
@@ -1328,6 +1330,7 @@ fn run_command_exec<W: Write>(
         thread_id: thread_id.to_string(),
         runtime_workspace_roots: runtime_workspace_roots.clone(),
         command: command.to_vec(),
+        command_is_argv,
         process_id: process_id.map(ToString::to_string),
         cwd: Some(cwd.clone()),
         env: env.clone(),
@@ -1407,6 +1410,7 @@ fn run_command_exec<W: Write>(
         &cwd,
         ShellSessionCommand {
             command: command_text.clone(),
+            argv: command_is_argv.then(|| command.to_vec()),
             cwd: cwd.clone(),
             additional_readable_directories: effective_sandbox.additional_readable_roots,
             additional_working_directories,
@@ -3078,6 +3082,7 @@ mod tests {
                 cwd.path(),
                 ShellSessionCommand {
                     command: "printf command-owned".to_string(),
+                    argv: None,
                     cwd: cwd.path().to_path_buf(),
                     additional_readable_directories: Vec::new(),
                     additional_working_directories: Vec::new(),

@@ -27,6 +27,7 @@ pub(in crate::server::router) fn dispatch_command_exec_operation<W: Write>(
         ClientOp::CommandExec {
             thread_id,
             command,
+            command_is_argv,
             process_id,
             cwd,
             env,
@@ -37,6 +38,7 @@ pub(in crate::server::router) fn dispatch_command_exec_operation<W: Write>(
             state,
             thread_id.as_deref(),
             command,
+            *command_is_argv,
             process_id.as_deref(),
             cwd.as_ref(),
             env,

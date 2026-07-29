@@ -929,6 +929,7 @@ mod tests {
         let handle = shell_sessions
             .spawn(ShellSessionCommand {
                 command: "printf first; sleep 0.2; printf later; sleep 0.2".to_string(),
+                argv: None,
                 cwd: cwd.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
                 additional_working_directories: Vec::new(),
@@ -1010,6 +1011,7 @@ mod tests {
         let handle = shell_sessions
             .spawn(ShellSessionCommand {
                 command: "printf ab; sleep 0.2; printf cd; sleep 0.2".to_string(),
+                argv: None,
                 cwd: cwd.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
                 additional_working_directories: Vec::new(),
@@ -1099,6 +1101,7 @@ mod tests {
         let handle = shell_sessions
             .spawn(ShellSessionCommand {
                 command: "printf abcdef; sleep 0.2".to_string(),
+                argv: None,
                 cwd: cwd.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
                 additional_working_directories: Vec::new(),
@@ -1164,6 +1167,7 @@ mod tests {
         let handle = shell_sessions
             .spawn(ShellSessionCommand {
                 command: "printf abcdef >&2; sleep 0.2".to_string(),
+                argv: None,
                 cwd: cwd.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
                 additional_working_directories: Vec::new(),
@@ -1233,6 +1237,7 @@ mod tests {
         let handle = shell_sessions
             .spawn(ShellSessionCommand {
                 command: "printf abcdef; sleep 0.2".to_string(),
+                argv: None,
                 cwd: cwd.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
                 additional_working_directories: Vec::new(),
@@ -1301,6 +1306,7 @@ mod tests {
         let handle = shell_sessions
             .spawn(ShellSessionCommand {
                 command: "printf denied".to_string(),
+                argv: None,
                 cwd: cwd.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
                 additional_working_directories: Vec::new(),
@@ -1370,6 +1376,7 @@ mod tests {
         let handle = shell_sessions
             .spawn(ShellSessionCommand {
                 command: "printf listed-complete".to_string(),
+                argv: None,
                 cwd: cwd.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
                 additional_working_directories: Vec::new(),
