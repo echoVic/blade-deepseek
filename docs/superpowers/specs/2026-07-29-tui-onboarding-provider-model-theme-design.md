@@ -423,10 +423,11 @@ user config provider
 DeepSeek default
 ```
 
-The hidden provider arguments on user-facing entry points become
-`Option<ProviderKind>` rather than having a clap default. The workflow-worker
-provider remains required because its parent process passes an already
-resolved value. Every normal `RunConfig` construction resolves:
+The hidden provider arguments on `Cli`, `ExecArgs`, and `WorkflowRunArgs`
+become `Option<ProviderKind>` rather than having a clap default.
+`WorkflowWorkerArgs`, `SubagentWorkerArgs`, and `WorkflowCliLaunchRecord`
+retain a required provider because their parent process passes or persists an
+already resolved value. Every user-facing `RunConfig` construction resolves:
 
 ```rust
 cli_provider
@@ -612,8 +613,9 @@ No secret or absolute path is rendered.
   error; this should only be reachable through corrupted state.
 - Auth save failure: continue with the current-session key.
 - Preference save failure: continue with current-session provider/model/theme.
-- Shared config lock poison: remain on Review; do not update local config,
-  current UI projections, or disk.
+- Shared config lock poison: remain on Review; keep the already visible theme
+  preview, but do not update local/shared config, committed app projections,
+  or disk.
 - Invalid existing config TOML: do not overwrite it; report current-session
   preferences only.
 - Symlink/special/oversized config: do not follow or overwrite it.
