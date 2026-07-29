@@ -28,6 +28,11 @@ use crate::transcript_view::{TranscriptRenderContext, viewport_paragraph};
 use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, CopyNotice, PanelMode};
 use crate::workspace_status::{GitIdentity, compact_cwd};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HardwareCursorProjection {
+    position: Position,
+}
+
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
     // Recomputed below when the widgets are actually shown; cleared here so
     // panel/status switches never leave stale mouse hit targets behind.
@@ -36,11 +41,13 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     state.input_area = None;
     state.search_area = None;
     if state.status == AppStatus::Setup {
-        render_setup(frame, state, textarea, theme);
+        let hardware_cursor = render_setup(frame, state, textarea, theme);
+        finish_frame(frame, hardware_cursor);
         return;
     }
     if state.status == AppStatus::SessionPicker {
         render_session_picker(frame, state, theme);
+        finish_frame(frame, None);
         return;
     }
 
@@ -98,21 +105,24 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     if queue_preview_height > 0 {
         frame.render_widget(Paragraph::new(queue_preview_lines), chunks[4]);
     }
+    let mut hardware_cursor = None;
     if search_height > 0 {
         state.search_area = Some(chunks[5]);
-        render_search_bar(frame, chunks[5], state, theme);
+        hardware_cursor = render_search_bar(frame, chunks[5], state, theme);
     }
     if composer_visible(state) {
         state.input_area = Some(chunks[6]);
-        render_input(
-            frame,
-            chunks[6],
-            textarea,
-            composer_layout.as_ref().expect("visible composer layout"),
-            state,
-            theme,
-            show_composer_hardware_cursor,
-        );
+        hardware_cursor = hardware_cursor.or_else(|| {
+            render_input(
+                frame,
+                chunks[6],
+                textarea,
+                composer_layout.as_ref().expect("visible composer layout"),
+                state,
+                theme,
+                show_composer_hardware_cursor,
+            )
+        });
     }
     render_status(frame, chunks[7], state, theme);
 
@@ -132,6 +142,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     if state.show_shortcuts {
         render_shortcuts(frame, state, theme);
     }
+    finish_frame(frame, hardware_cursor);
 }
 
 fn main_layout(
@@ -2027,7 +2038,7 @@ fn render_input(
     state: &AppState,
     theme: &Theme,
     show_hardware_cursor: bool,
-) {
+) -> Option<HardwareCursorProjection> {
     render_textarea_surface(
         frame,
         area,
@@ -2036,12 +2047,17 @@ fn render_input(
         state.copy_notice_at(std::time::Instant::now()),
         theme,
         show_hardware_cursor,
-    );
+    )
 }
 
-fn render_search_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+fn render_search_bar(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+) -> Option<HardwareCursorProjection> {
     if area.is_empty() {
-        return;
+        return None;
     }
     let count = format!(
         " {}/{} ",
@@ -2070,7 +2086,7 @@ fn render_search_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         );
     }
     if query_width == 0 {
-        return;
+        return None;
     }
 
     let mut textarea = TextArea::from([state.transcript_search.query()]);
@@ -2093,7 +2109,7 @@ fn render_search_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         None,
         theme,
         !state.show_shortcuts && state.status != AppStatus::WaitingApproval,
-    );
+    )
 }
 
 fn render_textarea_surface(
@@ -2104,10 +2120,10 @@ fn render_textarea_surface(
     notice: Option<CopyNotice>,
     theme: &Theme,
     show_hardware_cursor: bool,
-) {
+) -> Option<HardwareCursorProjection> {
     let inner = render_textarea_block_and_notice(frame, area, textarea, notice, theme);
     if inner.is_empty() {
-        return;
+        return None;
     }
 
     let computed_layout;
@@ -2130,9 +2146,10 @@ fn render_textarea_surface(
         .alignment(layout.alignment);
     frame.render_widget(paragraph, inner);
 
-    if show_hardware_cursor && let Some(position) = visible_textarea_cursor(layout, inner) {
-        frame.set_cursor_position(position);
-    }
+    show_hardware_cursor
+        .then(|| visible_textarea_cursor(layout, inner))
+        .flatten()
+        .map(|position| HardwareCursorProjection { position })
 }
 
 fn render_textarea_block_and_notice(
@@ -3599,7 +3616,12 @@ pub(crate) fn composer_click_target(
     ))
 }
 
-fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme: &Theme) {
+fn render_setup(
+    frame: &mut Frame,
+    state: &AppState,
+    textarea: &TextArea,
+    theme: &Theme,
+) -> Option<HardwareCursorProjection> {
     let area = frame.area();
 
     match state.setup_step {
@@ -3655,6 +3677,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
 
             let paragraph = Paragraph::new(content).block(block);
             frame.render_widget(paragraph, popup_area);
+            None
         }
         1 => {
             let width = 60u16.min(area.width.saturating_sub(4));
@@ -3701,7 +3724,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
 
             let paragraph = Paragraph::new(content).block(block);
             frame.render_widget(paragraph, popup_area);
-            render_textarea_surface(frame, inner[1], textarea, None, None, theme, true);
+            render_textarea_surface(frame, inner[1], textarea, None, None, theme, true)
         }
         2 => {
             let width = 60u16.min(area.width.saturating_sub(4));
@@ -3741,8 +3764,9 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
 
             let paragraph = Paragraph::new(content).block(block);
             frame.render_widget(paragraph, popup_area);
+            None
         }
-        _ => {}
+        _ => None,
     }
 }
 
@@ -4220,6 +4244,12 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
     }
 }
 
+fn finish_frame(frame: &mut Frame, hardware_cursor: Option<HardwareCursorProjection>) {
+    if let Some(cursor) = hardware_cursor {
+        frame.set_cursor_position(cursor.position);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4234,6 +4264,19 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn top_level_render_is_the_only_frame_cursor_owner() {
+        let production = include_str!("ui.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+        assert_eq!(production.matches("frame.set_cursor_position(").count(), 1);
+        let render_start = production.find("pub fn render(").unwrap();
+        let cursor = production.find("frame.set_cursor_position(").unwrap();
+        assert!(cursor > render_start);
+        assert!(!production[cursor..].contains("frame.render_widget("));
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum CursorEvent {
@@ -7737,7 +7780,16 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                render_textarea_surface(frame, frame.area(), &visible, None, None, &theme, true);
+                let hardware_cursor = render_textarea_surface(
+                    frame,
+                    frame.area(),
+                    &visible,
+                    None,
+                    None,
+                    &theme,
+                    true,
+                );
+                finish_frame(frame, hardware_cursor);
             })
             .unwrap();
         assert_eq!(
@@ -7747,7 +7799,7 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                render_textarea_surface(
+                let hardware_cursor = render_textarea_surface(
                     frame,
                     frame.area(),
                     &unrenderable,
@@ -7756,6 +7808,7 @@ mod tests {
                     &theme,
                     true,
                 );
+                finish_frame(frame, hardware_cursor);
             })
             .unwrap();
 
@@ -7782,7 +7835,16 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                render_textarea_surface(frame, frame.area(), &textarea, None, None, &theme, true);
+                let hardware_cursor = render_textarea_surface(
+                    frame,
+                    frame.area(),
+                    &textarea,
+                    None,
+                    None,
+                    &theme,
+                    true,
+                );
+                finish_frame(frame, hardware_cursor);
             })
             .unwrap();
 
@@ -8419,7 +8481,16 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                render_textarea_surface(frame, frame.area(), &textarea, None, None, &theme, false);
+                let hardware_cursor = render_textarea_surface(
+                    frame,
+                    frame.area(),
+                    &textarea,
+                    None,
+                    None,
+                    &theme,
+                    false,
+                );
+                finish_frame(frame, hardware_cursor);
             })
             .expect("draw");
 
