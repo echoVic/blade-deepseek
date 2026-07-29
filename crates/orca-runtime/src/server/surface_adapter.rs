@@ -898,6 +898,9 @@ impl JsonlSurfaceAdapter {
                     requested,
                 ) {
                     if orca_tools::sandbox::is_protected_metadata_root(&path) {
+                        if !orca_tools::sandbox::is_safe_metadata_writable_root(&path) {
+                            continue;
+                        }
                         if !metadata_writable_directories.contains(&path) {
                             metadata_writable_directories.push(path);
                         }
@@ -3045,6 +3048,100 @@ mod tests {
         adapter
             .shutdown()
             .expect("shutdown stateless permission runtime host");
+    }
+
+    #[test]
+    fn recorded_session_metadata_grant_stays_in_the_dedicated_authority_channel() {
+        let _guard = crate::history::lock_test_env();
+        let home = tempdir().expect("recorded permission home");
+        let previous_home = std::env::var_os(crate::thread_store::ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(crate::thread_store::ORCA_HOME_ENV, home.path());
+        }
+        let host = RuntimeHost::start().expect("start recorded permission runtime host");
+        let surface_host = host.surface_handle().bind_new_connection();
+        let mut adapter = JsonlSurfaceAdapter {
+            host: Some(host),
+            surface_host,
+            threads: HashMap::new(),
+            ephemeral_threads: Arc::new(Mutex::new(HashMap::new())),
+            transport_turns: Vec::new(),
+        };
+        let cwd = tempdir().expect("recorded permission cwd");
+        let metadata = cwd.path().join(".git");
+        std::fs::create_dir(&metadata).expect("metadata directory");
+        let config = test_run_config(cwd.path().to_path_buf());
+        let thread_id = adapter
+            .start_thread(&config)
+            .expect("start recorded thread");
+        let prepared = adapter
+            .prepare_turn(
+                &config,
+                &thread_id,
+                "request protected metadata access",
+                PermissionProfileOverride::default(),
+                &serde_json::json!("recorded-permission"),
+            )
+            .expect("prepare recorded permission turn");
+        let permissions = crate::protocol::RequestPermissionProfile {
+            file_system: Some(crate::protocol::RequestFileSystemPermissions {
+                write: Some(vec![metadata.clone()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        adapter
+            .persist_session_permission_grant(
+                &thread_id,
+                &prepared.client,
+                &[cwd.path().to_path_buf()],
+                &permissions,
+            )
+            .expect("persist recorded metadata grant");
+
+        let attachment = match prepared.surface.attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::new(),
+            role: SurfaceAttachmentRole::Jsonl,
+            requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
+            interaction_capabilities: BTreeSet::new(),
+        }) {
+            AttachResult::FreshAttached { attachment } => attachment,
+            _ => panic!("attach recorded metadata settings snapshot"),
+        };
+        let snapshot = attachment.baseline.snapshot;
+        assert!(
+            snapshot
+                .settings
+                .effective
+                .additional_working_directories
+                .iter()
+                .all(|directory| directory.path.as_path() != metadata)
+        );
+        let stored = crate::thread_store::SessionStore::new()
+            .load_session(&thread_id)
+            .expect("load recorded metadata grant");
+        assert!(
+            stored
+                .meta
+                .additional_working_directories
+                .iter()
+                .all(|directory| directory.path != metadata)
+        );
+        assert_eq!(stored.meta.metadata_writable_directories, vec![metadata]);
+
+        drop(prepared);
+        adapter
+            .shutdown()
+            .expect("shutdown recorded permission runtime host");
+        unsafe {
+            match previous_home {
+                Some(previous_home) => {
+                    std::env::set_var(crate::thread_store::ORCA_HOME_ENV, previous_home)
+                }
+                None => std::env::remove_var(crate::thread_store::ORCA_HOME_ENV),
+            }
+        }
     }
 
     #[test]

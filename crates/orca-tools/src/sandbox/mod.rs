@@ -20,6 +20,16 @@ pub fn is_protected_metadata_root(path: &Path) -> bool {
         .is_some_and(|name| PROTECTED_METADATA_DIRS.contains(&name))
 }
 
+pub fn is_safe_metadata_writable_root(path: &Path) -> bool {
+    if !is_protected_metadata_root(path) {
+        return false;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => !metadata.file_type().is_symlink(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 /// Platform read roots a Linux shell runtime needs when the sandbox root is a
 /// fresh tmpfs. Exposed here so the pure `bwrap` argv builder (compiled on all
 /// platforms) can consult the same list the Linux backend uses.
@@ -263,7 +273,7 @@ mod platform {
             &context
                 .metadata_writable_roots
                 .iter()
-                .filter(|root| is_protected_metadata_root(root))
+                .filter(|root| is_safe_metadata_writable_root(root))
                 .cloned()
                 .collect::<Vec<_>>(),
         );
@@ -411,7 +421,7 @@ mod platform {
             &context
                 .metadata_writable_roots
                 .iter()
-                .filter(|root| is_protected_metadata_root(root))
+                .filter(|root| is_safe_metadata_writable_root(root))
                 .cloned()
                 .collect::<Vec<_>>(),
         );

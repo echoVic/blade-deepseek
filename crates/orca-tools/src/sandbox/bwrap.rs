@@ -60,6 +60,28 @@ pub struct LinuxSandboxPolicy {
     pub network_access: bool,
 }
 
+pub(crate) fn effective_read_only_roots(policy: &LinuxSandboxPolicy) -> Vec<PathBuf> {
+    let mut roots = policy.read_only_roots.clone();
+    for writable_root in &policy.writable_roots {
+        for name in crate::sandbox::PROTECTED_METADATA_DIRS {
+            let candidate = writable_root.join(name);
+            if !candidate.exists() {
+                continue;
+            }
+            let canonical = candidate
+                .canonicalize()
+                .unwrap_or_else(|_| candidate.clone());
+            let explicitly_writable = policy.writable_roots.iter().any(|root| {
+                root == &candidate && crate::sandbox::is_safe_metadata_writable_root(root)
+            });
+            if !explicitly_writable {
+                push_unique(&mut roots, canonical);
+            }
+        }
+    }
+    roots
+}
+
 /// Build the full `bwrap` argument vector (excluding the leading `bwrap`
 /// program name) for the given policy and shell command.
 ///
@@ -118,11 +140,11 @@ pub fn build_bwrap_argv(policy: &LinuxSandboxPolicy, command: &str) -> Vec<Strin
 
     // Re-assert read-only roots after writable binds so protected metadata
     // (e.g. `.git`) stays readable but not writable even under a writable root.
-    for root in &policy.read_only_roots {
+    for root in effective_read_only_roots(policy) {
         if root.exists() {
             argv.push("--ro-bind".to_string());
-            argv.push(path_arg(root));
-            argv.push(path_arg(root));
+            argv.push(path_arg(&root));
+            argv.push(path_arg(&root));
         }
     }
 
@@ -279,6 +301,59 @@ mod tests {
                 "read-only rebind must come after writable bind: {joined}"
             );
         }
+    }
+
+    #[test]
+    fn ordinary_external_writable_root_rebinds_its_metadata_read_only() {
+        let external = tempfile::tempdir().unwrap();
+        let metadata = external.path().join(".git");
+        std::fs::create_dir(&metadata).unwrap();
+        let mut policy = base_policy();
+        policy.writable_roots = vec![external.path().to_path_buf()];
+
+        let argv = build_bwrap_argv(&policy, "true");
+        let metadata = path_arg(&metadata.canonicalize().unwrap());
+        let read_only_position = argv
+            .windows(3)
+            .position(|args| args == ["--ro-bind", metadata.as_str(), metadata.as_str()]);
+
+        assert!(read_only_position.is_some());
+    }
+
+    #[test]
+    fn explicit_metadata_writable_root_is_not_rebound_read_only() {
+        let external = tempfile::tempdir().unwrap();
+        let metadata = external.path().join(".git");
+        std::fs::create_dir(&metadata).unwrap();
+        let mut policy = base_policy();
+        policy.writable_roots = vec![external.path().to_path_buf(), metadata.clone()];
+
+        let argv = build_bwrap_argv(&policy, "true");
+        let metadata = path_arg(&metadata);
+        let read_only_position = argv
+            .windows(3)
+            .position(|args| args == ["--ro-bind", metadata.as_str(), metadata.as_str()]);
+
+        assert!(read_only_position.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_metadata_does_not_treat_its_writable_target_as_an_explicit_grant() {
+        let external = tempfile::tempdir().unwrap();
+        let metadata = external.path().join(".git");
+        std::os::unix::fs::symlink(external.path(), &metadata).unwrap();
+        let mut policy = base_policy();
+        let target = external.path().canonicalize().unwrap();
+        policy.writable_roots = vec![target.clone()];
+
+        let argv = build_bwrap_argv(&policy, "true");
+        let target = path_arg(&target);
+        let read_only_position = argv
+            .windows(3)
+            .position(|args| args == ["--ro-bind", target.as_str(), target.as_str()]);
+
+        assert!(read_only_position.is_some());
     }
 
     #[test]

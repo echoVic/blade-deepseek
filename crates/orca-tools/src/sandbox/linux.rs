@@ -22,7 +22,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::sandbox::bwrap::{LinuxReadScope, LinuxSandboxPolicy, build_bwrap_argv};
+use crate::sandbox::bwrap::{
+    LinuxReadScope, LinuxSandboxPolicy, build_bwrap_argv, effective_read_only_roots,
+};
 
 /// Resolved, canonicalized sandbox request shared by both backends.
 pub(crate) struct LinuxSandboxRequest {
@@ -68,10 +70,10 @@ pub(crate) fn sandbox_command(request: LinuxSandboxRequest) -> Command {
 
     // No bwrap: try the in-process Landlock + seccomp fallback.
     // Some nested deny/read-only policies require namespace mounts that
-    // Landlock cannot express. Only strict restricted-read requests must fail
-    // closed when no enforcing backend is available; non-strict capability
-    // modes retain their established compatibility fallback.
-    let must_fail_closed = request.strict;
+    // Landlock cannot express. Restricted-read requests and policies that need
+    // bwrap-specific enforcement must fail closed when no backend is available;
+    // other non-strict capability modes retain their compatibility fallback.
+    let must_fail_closed = request.strict || policy_requires_bwrap(&request);
     match landlock_command(&request) {
         Ok(command) => command,
         Err(_) if must_fail_closed => {
@@ -86,8 +88,7 @@ fn policy_requires_bwrap(request: &LinuxSandboxRequest) -> bool {
     if !policy.network_access && !policy.allowed_unix_socket_roots.is_empty() {
         return true;
     }
-    let writable_overlap = policy
-        .read_only_roots
+    let writable_overlap = effective_read_only_roots(policy)
         .iter()
         .filter(|root| root.exists())
         .any(|read_only| {
@@ -556,6 +557,36 @@ mod tests {
         denied.policy.read_only_roots.clear();
         denied.policy.denied_roots = vec![workspace.path().join("secret")];
         assert!(policy_requires_bwrap(&denied));
+    }
+
+    #[test]
+    fn nested_read_only_policy_without_backend_fails_closed_when_non_strict() {
+        if bwrap_path(Path::new(".")).is_some() {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let metadata = workspace.path().join(".git");
+        let marker = workspace.path().join("must-not-run");
+        std::fs::create_dir(&metadata).unwrap();
+        let request = LinuxSandboxRequest {
+            command: format!("touch {}", marker.display()),
+            policy: LinuxSandboxPolicy {
+                cwd: workspace.path().to_path_buf(),
+                read_scope: LinuxReadScope::Global,
+                readable_roots: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                writable_roots: vec![workspace.path().to_path_buf()],
+                read_only_roots: vec![metadata],
+                denied_roots: Vec::new(),
+                network_access: true,
+            },
+            strict: false,
+        };
+
+        let output = sandbox_command(request).output().unwrap();
+
+        assert_eq!(output.status.code(), Some(126));
+        assert!(!marker.exists());
     }
 
     #[test]

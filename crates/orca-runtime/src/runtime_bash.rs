@@ -26,6 +26,7 @@ use crate::shell_session::{
     ShellTerminalMode,
 };
 use crate::tasks::TaskRegistry;
+use crate::thread_store::SessionStore;
 
 pub(crate) struct RuntimeBashInvocationContext<'a, 'output> {
     pub(crate) config: Option<&'a RunConfig>,
@@ -87,6 +88,24 @@ pub(crate) fn execute_bash_with_shell_session(
         Ok(sandbox) => sandbox,
         Err(error) => return ToolResult::failed(request, error, None),
     };
+    let mut ordinary_additional_roots = Vec::new();
+    for root in additional_roots {
+        // Protected metadata paths only gain write authority through the
+        // dedicated overlay/session channel below. Their presence in ordinary
+        // runtime settings must not mint an escalation by path shape alone.
+        if !orca_tools::sandbox::is_protected_metadata_root(root) {
+            push_unique_path(&mut ordinary_additional_roots, root.clone());
+        }
+    }
+    if let Ok(session) = SessionStore::new().load_session(task_registry.session_id())
+        && session.meta.session_id == task_registry.session_id()
+    {
+        for root in session.meta.metadata_writable_directories {
+            if orca_tools::sandbox::is_safe_metadata_writable_root(&root) {
+                push_unique_path(&mut sandbox.metadata_writable_roots, root);
+            }
+        }
+    }
     for (domain, access) in permission_overlay.network_domain_permissions() {
         match access {
             PermissionProfileNetworkAccess::Deny => {
@@ -111,7 +130,7 @@ pub(crate) fn execute_bash_with_shell_session(
     let result = execute_bash_with_sandbox(RuntimeBashSandboxContext {
         command,
         cwd,
-        additional_roots,
+        additional_roots: &ordinary_additional_roots,
         sandbox: &sandbox,
         shell_timeout_secs,
         task_registry,
@@ -148,7 +167,7 @@ pub(crate) fn execute_bash_with_shell_session(
         return execute_bash_with_sandbox(RuntimeBashSandboxContext {
             command,
             cwd,
-            additional_roots,
+            additional_roots: &ordinary_additional_roots,
             sandbox: &retry_sandbox,
             shell_timeout_secs,
             task_registry,
@@ -191,7 +210,7 @@ pub(crate) fn execute_bash_with_shell_session(
             return execute_bash_with_sandbox(RuntimeBashSandboxContext {
                 command,
                 cwd,
-                additional_roots,
+                additional_roots: &ordinary_additional_roots,
                 sandbox: &retry_sandbox,
                 shell_timeout_secs,
                 task_registry,
@@ -223,7 +242,7 @@ pub(crate) fn execute_bash_with_shell_session(
                 command,
                 cwd,
                 additional_readable_directories: Vec::new(),
-                additional_working_directories: additional_roots.to_vec(),
+                additional_working_directories: ordinary_additional_roots,
                 metadata_writable_directories: Vec::new(),
                 denied_working_directories: Vec::new(),
                 allowed_unix_socket_roots: Vec::new(),
