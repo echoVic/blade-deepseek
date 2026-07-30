@@ -710,7 +710,7 @@ fn external_tool_descriptor_runs_from_orca_tools_dir() {
             .replace('`', "``")
             .replace('"', "`\"");
         format!(
-            "$input | Set-Content -LiteralPath \"{output_path}\" -NoNewline; Write-Output \"deploy ok\""
+            "$input | Set-Content -LiteralPath \"{output_path}\" -NoNewline; Write-Host -NoNewline \"deploy ok\""
         )
     };
     fs::write(
@@ -772,7 +772,13 @@ fn find_event<'a>(events: &'a [Value], event_type: &str) -> &'a Value {
 }
 
 fn tool_cli_test_guard() -> MutexGuard<'static, ()> {
-    TOOL_CLI_TEST_LOCK.lock().expect("tool CLI test lock")
+    // Recover from a poisoned lock so a single failing test is reported on its
+    // own merits instead of cascading into every other test failing with
+    // `PoisonError`. The guard only serializes access; there is no shared state
+    // left inconsistent by a panicking test.
+    TOOL_CLI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
