@@ -123,23 +123,6 @@ fn run_permission_respond<W: Write>(
             permissions,
         )?;
         let allow = decision == protocol::PermissionResponseDecision::Allow;
-        if allow
-            && scope == protocol::PermissionGrantScope::Session
-            && let Err(error) = state.threads.persist_session_permission_grant(
-                &thread_id,
-                &client,
-                &runtime_workspace_roots,
-                &permissions,
-            )
-        {
-            return protocol::write_server_event(
-                writer,
-                &id,
-                ServerEvent::error(format!(
-                    "session permission settings did not commit: {error}"
-                )),
-            );
-        }
         let answer = match &target {
             crate::unstable_surface::SurfaceInteractionKind::ToolApproval => {
                 crate::unstable_surface::SurfaceClientInteractionAnswer::ToolApproval {

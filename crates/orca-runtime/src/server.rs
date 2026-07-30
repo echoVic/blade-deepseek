@@ -261,12 +261,21 @@ fn apply_permission_updates(config: &mut RunConfig, updates: Vec<PermissionUpdat
             }),
             PermissionUpdate::AddDirectories { directories } => {
                 for directory in directories {
+                    if directory.source
+                        == crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+                    {
+                        continue;
+                    }
                     if let Some(existing) = config
                         .additional_working_directories
                         .iter_mut()
                         .find(|existing| existing.path == directory.path)
                     {
-                        existing.source = directory.source;
+                        if existing.source
+                            != crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+                        {
+                            existing.source = directory.source;
+                        }
                     } else {
                         config.additional_working_directories.push(directory);
                     }
@@ -276,7 +285,8 @@ fn apply_permission_updates(config: &mut RunConfig, updates: Vec<PermissionUpdat
                 destination,
                 directories,
             } => config.additional_working_directories.retain(|directory| {
-                directory.source != destination
+                directory.source == crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+                    || directory.source != destination
                     || !directories.iter().any(|remove| remove == &directory.path)
             }),
         }

@@ -9162,6 +9162,113 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
     assert!(output.stderr.is_empty());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn server_mode_session_metadata_grant_is_committed_before_later_agent_turn_uses_it() {
+    let parent = sandbox_test_parent("orca-request-permissions-session-metadata-");
+    let workspace = parent.path().join("workspace");
+    let home = parent.path().join("home");
+    let metadata = workspace.join(".git");
+    std::fs::create_dir_all(&metadata).expect("create metadata");
+    std::fs::create_dir_all(&home).expect("create home");
+    std::fs::write(
+        home.join("config.toml"),
+        "mode = \"suggest\"\n[[permissions.rules]]\ntool = \"bash\"\npattern = \"**\"\ndecision = \"allow\"\n",
+    )
+    .expect("write config");
+    let first_output = metadata.join("first.lock");
+    let second_output = metadata.join("second.lock");
+
+    let mut child = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.to_str().unwrap(),
+        ])
+        .env("ORCA_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
+        )
+        .expect("write thread/start request");
+        stdin.flush().expect("flush thread/start request");
+    }
+    let thread_started = child.expect_event("thread-req", "thread_started");
+    let thread_id = thread_started["threadId"]
+        .as_str()
+        .expect("thread id")
+        .to_string();
+
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            r#"{{"id":"turn-1","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: printf first > {}"}}]}}}}"#,
+            thread_id,
+            metadata.display(),
+            first_output.display(),
+        )
+        .expect("write first turn");
+        stdin.flush().expect("flush first turn");
+    }
+    let permission_request = child.expect_event("turn-1", "permission_request");
+    let request_id = permission_request["requestId"]
+        .as_str()
+        .expect("permission request id")
+        .to_string();
+
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"session","permissions":{{"fileSystem":{{"write":["{}"],"read":null}},"network":null}}}}}}"#,
+            request_id,
+            metadata.display(),
+        )
+        .expect("write metadata session permission/respond");
+        stdin
+            .flush()
+            .expect("flush metadata session permission/respond");
+    }
+    let _resolved = child.expect_event("permission-response", "permission_resolved");
+    let first_completed = child.expect_event("turn-1", "turn_completed");
+    assert_eq!(first_completed["status"], "success");
+
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            r#"{{"id":"turn-2","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"force_bash printf second > {}"}}]}}}}"#,
+            thread_id,
+            second_output.display(),
+        )
+        .expect("write second turn");
+        stdin.flush().expect("flush second turn");
+    }
+    let second_tool =
+        child.expect_event_matching("turn-2", "tool_completed", |event| event["tool"] == "bash");
+    assert_eq!(second_tool["status"], "completed", "{second_tool:#}");
+    let second_completed = child.expect_event("turn-2", "turn_completed");
+    assert_eq!(second_completed["status"], "success");
+
+    child.close_stdin();
+    let output = child.wait_with_output().expect("wait for server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(std::fs::read_to_string(first_output).unwrap(), "first");
+    assert_eq!(std::fs::read_to_string(second_output).unwrap(), "second");
+}
+
 #[test]
 fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
     let parent = sandbox_test_parent("orca-request-permissions-entries-");

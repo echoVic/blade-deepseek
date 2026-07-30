@@ -846,183 +846,6 @@ impl JsonlSurfaceAdapter {
         );
         Ok(())
     }
-
-    pub(crate) fn persist_session_permission_grant(
-        &self,
-        thread_id: &str,
-        client: &RuntimeSurfaceClientHandle,
-        runtime_workspace_roots: &[std::path::PathBuf],
-        permissions: &crate::protocol::RequestPermissionProfile,
-    ) -> io::Result<()> {
-        let surface = self
-            .jsonl_surface(thread_id)
-            .ok_or_else(|| io::Error::other("JSONL runtime surface unavailable"))?;
-        let attachment = match surface.attach_fresh(FreshAttachRequest {
-            request_id: SurfaceRequestId::new(),
-            role: SurfaceAttachmentRole::Jsonl,
-            requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
-            interaction_capabilities: BTreeSet::new(),
-        }) {
-            AttachResult::FreshAttached { attachment } => attachment,
-            _ => {
-                return Err(io::Error::other(
-                    "JSONL permission settings snapshot unavailable",
-                ));
-            }
-        };
-        let settings = &attachment.baseline.snapshot.settings;
-        let cwd = settings
-            .effective
-            .cwd
-            .as_path()
-            .to_str()
-            .ok_or_else(|| io::Error::other("JSONL thread cwd is not valid UTF-8"))?;
-        let is_ephemeral = self.ephemeral_thread(thread_id).is_some();
-        let mut directories = settings.effective.additional_working_directories.clone();
-        let mut metadata_writable_directories = if is_ephemeral {
-            Vec::new()
-        } else {
-            self.read_session(thread_id, false, false)?
-                .metadata_writable_directories
-        };
-        if let Some(file_system) = permissions.file_system.as_ref() {
-            for requested in file_system
-                .write
-                .iter()
-                .flatten()
-                .filter(|path| !path.as_os_str().is_empty())
-            {
-                for path in super::materialize_workspace_roots_paths(
-                    cwd,
-                    runtime_workspace_roots,
-                    requested,
-                ) {
-                    if orca_tools::sandbox::is_protected_metadata_root(&path) {
-                        if !orca_tools::sandbox::is_safe_metadata_writable_root(&path) {
-                            continue;
-                        }
-                        if !metadata_writable_directories.contains(&path) {
-                            metadata_writable_directories.push(path);
-                        }
-                        continue;
-                    }
-                    let path = crate::unstable_surface::CanonicalPath::try_new(path)
-                        .map_err(|error| io::Error::other(error.to_string()))?;
-                    if !directories.iter().any(|directory| directory.path == path) {
-                        directories.push(
-                            crate::unstable_surface::SurfaceAdditionalWorkingDirectory {
-                                path,
-                                source: crate::unstable_surface::NonEmptyText::try_new("session")
-                                    .expect("session permission source is non-empty"),
-                            },
-                        );
-                    }
-                }
-            }
-        }
-        let mut network = settings.effective.network_permissions.clone();
-        if let Some(requested) = permissions.network.as_ref() {
-            if requested.enabled.is_some() {
-                network.enabled = requested.enabled;
-            }
-            for (domain, access) in &requested.domains {
-                let domain = crate::unstable_surface::CanonicalDomainName::try_new(domain.clone())
-                    .map_err(|error| io::Error::other(error.to_string()))?;
-                let access = match access {
-                    orca_core::config::PermissionProfileNetworkAccess::Allow => {
-                        crate::unstable_surface::SurfaceNetworkDomainAccess::Allow
-                    }
-                    orca_core::config::PermissionProfileNetworkAccess::Deny => {
-                        crate::unstable_surface::SurfaceNetworkDomainAccess::Deny
-                    }
-                };
-                if let Some(existing) = network
-                    .domains
-                    .iter_mut()
-                    .find(|permission| permission.domain == domain)
-                {
-                    existing.access = access;
-                } else {
-                    network
-                        .domains
-                        .push(crate::unstable_surface::SurfaceNetworkDomainPermission {
-                            domain,
-                            access,
-                        });
-                }
-            }
-            network
-                .domains
-                .sort_by(|left, right| left.domain.as_str().cmp(right.domain.as_str()));
-        }
-        let persisted_additional_working_directories = directories
-            .iter()
-            .map(|directory| orca_core::config::AdditionalWorkingDirectory {
-                path: directory.path.as_path().to_path_buf(),
-                source: directory.source.as_str().to_string(),
-            })
-            .collect();
-        let persisted_network_domain_permissions = network
-            .domains
-            .iter()
-            .map(|permission| {
-                (
-                    permission.domain.as_str().to_string(),
-                    match permission.access {
-                        crate::unstable_surface::SurfaceNetworkDomainAccess::Allow => {
-                            orca_core::config::PermissionProfileNetworkAccess::Allow
-                        }
-                        crate::unstable_surface::SurfaceNetworkDomainAccess::Deny => {
-                            orca_core::config::PermissionProfileNetworkAccess::Deny
-                        }
-                    },
-                )
-            })
-            .collect();
-        let mut patches = Vec::new();
-        if directories != settings.effective.additional_working_directories {
-            patches.push(RuntimeSettingsPatch::ReplaceAdditionalWorkingDirectories { directories });
-        }
-        if network != settings.effective.network_permissions {
-            patches.push(RuntimeSettingsPatch::ReplaceNetworkPermissions {
-                permissions: network,
-            });
-        }
-        let update_result = if let Ok(patches) = NonEmptyVec::try_new(patches) {
-            committed(
-                client.update_settings(SurfaceRequestId::new(), settings.thread_revision, patches),
-                "JSONL session permission settings update",
-            )
-            .map(|_| ())
-        } else {
-            Ok(())
-        };
-        let update_result = update_result.and_then(|_| {
-            if is_ephemeral {
-                return Ok(());
-            }
-            self.surface_host
-                .jsonl_update_session_metadata(
-                    thread_id,
-                    ThreadMetadataPatch {
-                        additional_working_directories: Some(
-                            persisted_additional_working_directories,
-                        ),
-                        metadata_writable_directories: Some(metadata_writable_directories),
-                        network_domain_permissions: Some(persisted_network_domain_permissions),
-                        ..ThreadMetadataPatch::default()
-                    },
-                )
-                .map(|_| ())
-        });
-        let _ = surface.detach(
-            &attachment.client,
-            DetachRequest {
-                request_id: SurfaceRequestId::new(),
-            },
-        );
-        update_result
-    }
 }
 
 fn apply_surface_settings_to_run_config(
@@ -1092,6 +915,15 @@ fn apply_surface_settings_to_run_config(
             source: directory.source.as_str().to_string(),
         })
         .collect();
+    config.additional_working_directories.extend(
+        settings
+            .metadata_writable_directories
+            .iter()
+            .map(|directory| orca_core::config::AdditionalWorkingDirectory {
+                path: directory.as_path().to_path_buf(),
+                source: crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE.to_string(),
+            }),
+    );
     config.reasoning_effort = match settings.reasoning_effort {
         crate::unstable_surface::SurfaceReasoningEffort::High => {
             orca_core::config::ReasoningEffort::High
@@ -2864,6 +2696,9 @@ fn settings_patches(
     let directories = config
         .additional_working_directories
         .iter()
+        .filter(|directory| {
+            directory.source != crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+        })
         .map(|directory| {
             Ok(crate::unstable_surface::SurfaceAdditionalWorkingDirectory {
                 path: crate::unstable_surface::CanonicalPath::try_new(directory.path.clone())?,
@@ -3004,145 +2839,6 @@ mod tests {
     }
 
     impl JsonlSurfaceOutput for BrokenProjectionWriter {}
-
-    #[test]
-    fn stateless_session_metadata_grant_does_not_require_a_persisted_thread() {
-        let host = RuntimeHost::start().expect("start stateless permission runtime host");
-        let surface_host = host.surface_handle().bind_new_connection();
-        let mut adapter = JsonlSurfaceAdapter {
-            host: Some(host),
-            surface_host,
-            threads: HashMap::new(),
-            ephemeral_threads: Arc::new(Mutex::new(HashMap::new())),
-            transport_turns: Vec::new(),
-        };
-        let cwd = tempdir().expect("stateless permission cwd");
-        let config = test_run_config(cwd.path().to_path_buf());
-        let prepared = adapter
-            .prepare_stateless_turn_with_interactions(
-                &config,
-                "request protected metadata access",
-                PermissionProfileOverride::default(),
-                &serde_json::json!("stateless-permission"),
-                test_interactions(),
-            )
-            .expect("prepare stateless permission turn");
-        let permissions = crate::protocol::RequestPermissionProfile {
-            file_system: Some(crate::protocol::RequestFileSystemPermissions {
-                write: Some(vec![cwd.path().join(".git")]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        adapter
-            .persist_session_permission_grant(
-                prepared.thread_id(),
-                &prepared.client,
-                &[cwd.path().to_path_buf()],
-                &permissions,
-            )
-            .expect("ephemeral session grant must stay runtime-only");
-
-        drop(prepared);
-        adapter
-            .shutdown()
-            .expect("shutdown stateless permission runtime host");
-    }
-
-    #[test]
-    fn recorded_session_metadata_grant_stays_in_the_dedicated_authority_channel() {
-        let _guard = crate::history::lock_test_env();
-        let home = tempdir().expect("recorded permission home");
-        let previous_home = std::env::var_os(crate::thread_store::ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(crate::thread_store::ORCA_HOME_ENV, home.path());
-        }
-        let host = RuntimeHost::start().expect("start recorded permission runtime host");
-        let surface_host = host.surface_handle().bind_new_connection();
-        let mut adapter = JsonlSurfaceAdapter {
-            host: Some(host),
-            surface_host,
-            threads: HashMap::new(),
-            ephemeral_threads: Arc::new(Mutex::new(HashMap::new())),
-            transport_turns: Vec::new(),
-        };
-        let cwd = tempdir().expect("recorded permission cwd");
-        let metadata = cwd.path().join(".git");
-        std::fs::create_dir(&metadata).expect("metadata directory");
-        let config = test_run_config(cwd.path().to_path_buf());
-        let thread_id = adapter
-            .start_thread(&config)
-            .expect("start recorded thread");
-        let prepared = adapter
-            .prepare_turn(
-                &config,
-                &thread_id,
-                "request protected metadata access",
-                PermissionProfileOverride::default(),
-                &serde_json::json!("recorded-permission"),
-            )
-            .expect("prepare recorded permission turn");
-        let permissions = crate::protocol::RequestPermissionProfile {
-            file_system: Some(crate::protocol::RequestFileSystemPermissions {
-                write: Some(vec![metadata.clone()]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        adapter
-            .persist_session_permission_grant(
-                &thread_id,
-                &prepared.client,
-                &[cwd.path().to_path_buf()],
-                &permissions,
-            )
-            .expect("persist recorded metadata grant");
-
-        let attachment = match prepared.surface.attach_fresh(FreshAttachRequest {
-            request_id: SurfaceRequestId::new(),
-            role: SurfaceAttachmentRole::Jsonl,
-            requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
-            interaction_capabilities: BTreeSet::new(),
-        }) {
-            AttachResult::FreshAttached { attachment } => attachment,
-            _ => panic!("attach recorded metadata settings snapshot"),
-        };
-        let snapshot = attachment.baseline.snapshot;
-        assert!(
-            snapshot
-                .settings
-                .effective
-                .additional_working_directories
-                .iter()
-                .all(|directory| directory.path.as_path() != metadata)
-        );
-        let stored = crate::thread_store::SessionStore::new()
-            .load_session(&thread_id)
-            .expect("load recorded metadata grant");
-        assert!(
-            stored
-                .meta
-                .additional_working_directories
-                .iter()
-                .all(|directory| directory.path != metadata)
-        );
-        assert_eq!(stored.meta.metadata_writable_directories, vec![metadata]);
-
-        drop(prepared);
-        adapter
-            .shutdown()
-            .expect("shutdown recorded permission runtime host");
-        unsafe {
-            match previous_home {
-                Some(previous_home) => {
-                    std::env::set_var(crate::thread_store::ORCA_HOME_ENV, previous_home)
-                }
-                None => std::env::remove_var(crate::thread_store::ORCA_HOME_ENV),
-            }
-        }
-    }
 
     #[test]
     fn projection_write_failure_is_returned_after_worker_and_ephemeral_actor_cleanup() {

@@ -2045,7 +2045,10 @@ pub struct RuntimeThreadStartRequest {
 }
 
 impl RuntimeThreadStartRequest {
-    pub fn new(config: RunConfig, title: impl Into<String>) -> Self {
+    pub fn new(mut config: RunConfig, title: impl Into<String>) -> Self {
+        config.additional_working_directories.retain(|directory| {
+            directory.source != crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+        });
         Self {
             config,
             title: title.into(),
@@ -7741,6 +7744,9 @@ fn initial_surface_snapshot(
     let additional_working_directories = config
         .additional_working_directories
         .iter()
+        .filter(|directory| {
+            directory.source != crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+        })
         .map(|directory| {
             Ok(surface::SurfaceAdditionalWorkingDirectory {
                 path: surface::CanonicalPath::try_new(directory.path.clone()).map_err(|error| {
@@ -7755,6 +7761,20 @@ fn initial_surface_snapshot(
                         ),
                     },
                 )?,
+            })
+        })
+        .collect::<Result<Vec<_>, RuntimeHostError>>()?;
+    let metadata_writable_directories = config
+        .additional_working_directories
+        .iter()
+        .filter(|directory| {
+            directory.source == crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+        })
+        .map(|directory| {
+            surface::CanonicalPath::try_new(directory.path.clone()).map_err(|error| {
+                RuntimeHostError::ThreadStartFailed {
+                    message: format!("invalid metadata writable directory: {error:?}"),
+                }
             })
         })
         .collect::<Result<Vec<_>, RuntimeHostError>>()?;
@@ -7847,6 +7867,7 @@ fn initial_surface_snapshot(
             digest: permission_rules_digest,
         },
         additional_working_directories,
+        metadata_writable_directories,
         network_permissions: surface::SurfaceNetworkPermissions {
             enabled: None,
             domains: Vec::new(),
@@ -8041,14 +8062,33 @@ fn apply_runtime_settings_patch(
             };
         }
         surface::RuntimeSettingsPatch::ReplaceAdditionalWorkingDirectories { directories } => {
+            config.additional_working_directories.retain(|directory| {
+                directory.source == crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+            });
             config.additional_working_directories = directories
                 .iter()
                 .map(|directory| orca_core::config::AdditionalWorkingDirectory {
                     path: directory.path.as_path().to_path_buf(),
                     source: directory.source.as_str().to_string(),
                 })
+                .chain(config.additional_working_directories.clone())
                 .collect();
             settings.additional_working_directories = directories.clone();
+        }
+        surface::RuntimeSettingsPatch::ReplaceMetadataWritableDirectories { directories } => {
+            config.additional_working_directories.retain(|directory| {
+                directory.source != crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+            });
+            config
+                .additional_working_directories
+                .extend(directories.iter().map(|directory| {
+                    orca_core::config::AdditionalWorkingDirectory {
+                        path: directory.as_path().to_path_buf(),
+                        source: crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+                            .to_string(),
+                    }
+                }));
+            settings.metadata_writable_directories = directories.clone();
         }
         surface::RuntimeSettingsPatch::ReplaceNetworkPermissions { permissions } => {
             settings.network_permissions = permissions.clone();
@@ -8069,6 +8109,7 @@ fn runtime_settings_patch_affects_policy(patch: &surface::RuntimeSettingsPatch) 
             | surface::RuntimeSettingsPatch::SetActivePermissionProfile { .. }
             | surface::RuntimeSettingsPatch::ReplacePermissionRules { .. }
             | surface::RuntimeSettingsPatch::ReplaceAdditionalWorkingDirectories { .. }
+            | surface::RuntimeSettingsPatch::ReplaceMetadataWritableDirectories { .. }
             | surface::RuntimeSettingsPatch::ReplaceNetworkPermissions { .. }
             | surface::RuntimeSettingsPatch::ApplyPermissionUpdate { .. }
     )
@@ -8133,6 +8174,13 @@ fn hydrate_run_config_from_surface_settings(
         &mut restored,
         &surface::RuntimeSettingsPatch::ReplaceAdditionalWorkingDirectories {
             directories: settings.additional_working_directories.clone(),
+        },
+    )?;
+    apply_runtime_settings_patch(
+        config,
+        &mut restored,
+        &surface::RuntimeSettingsPatch::ReplaceMetadataWritableDirectories {
+            directories: settings.metadata_writable_directories.clone(),
         },
     )?;
     Ok(())
@@ -8221,7 +8269,13 @@ fn persist_surface_settings_metadata(
                         })
                         .collect(),
                 ),
-                metadata_writable_directories: None,
+                metadata_writable_directories: Some(
+                    settings
+                        .metadata_writable_directories
+                        .iter()
+                        .map(|directory| directory.as_path().to_path_buf())
+                        .collect(),
+                ),
                 network_domain_permissions: Some(network_domain_permissions),
             },
         )
@@ -10210,56 +10264,121 @@ fn surface_permission_profile_is_subset(
     file_system_subset && network_subset && shell_subset
 }
 
-fn surface_session_permission_grant_is_applied(
-    settings: &surface::SurfaceRuntimeSettings,
+fn prepare_surface_session_permission_grant(
+    config: &RunConfig,
+    current: &surface::SurfaceSettingsSnapshot,
     permissions: &surface::SurfacePermissionProfile,
-) -> bool {
-    let paths_applied = permissions.file_system.as_ref().is_none_or(|file_system| {
-        file_system
-            .read
-            .iter()
-            .flatten()
-            .chain(file_system.write.iter().flatten())
-            .all(|path| {
-                surface::CanonicalPath::try_new(std::path::PathBuf::from(path.0.as_str()))
-                    .ok()
-                    .is_some_and(|path| {
-                        settings
-                            .additional_working_directories
-                            .iter()
-                            .any(|directory| directory.path == path)
-                    })
-            })
-    });
-    let network_applied = permissions.network.as_ref().is_none_or(|requested| {
-        let enabled = requested
-            .enabled
-            .is_none_or(|enabled| settings.network_permissions.enabled == Some(enabled));
-        enabled
-            && requested.domains.iter().all(|(domain, access)| {
-                settings
-                    .network_permissions
-                    .domains
-                    .iter()
-                    .any(|permission| {
-                        permission.domain.as_str() == domain.0.as_str()
-                            && permission.access
-                                == match access {
-                                    surface::SurfaceAllowDeny::Allow => {
-                                        surface::SurfaceNetworkDomainAccess::Allow
-                                    }
-                                    surface::SurfaceAllowDeny::Deny => {
-                                        surface::SurfaceNetworkDomainAccess::Deny
-                                    }
-                                }
-                    })
-            })
-    });
-    let shell_applied = permissions
+) -> Result<(surface::SurfaceSettingsSnapshot, RunConfig), &'static str> {
+    if permissions
         .shell
         .as_ref()
-        .is_none_or(|shell| !shell.unsandboxed);
-    paths_applied && network_applied && shell_applied
+        .is_some_and(|shell| shell.unsandboxed)
+    {
+        return Err("unsandboxed shell grants cannot persist for a session");
+    }
+    if permissions
+        .file_system
+        .as_ref()
+        .and_then(|file_system| file_system.read.as_ref())
+        .is_some_and(|paths| !paths.is_empty())
+    {
+        return Err("session read grants are not supported");
+    }
+
+    let mut directories = current.effective.additional_working_directories.clone();
+    let mut metadata_directories = current.effective.metadata_writable_directories.clone();
+    if let Some(file_system) = permissions.file_system.as_ref() {
+        for requested in file_system.write.iter().flatten() {
+            let path = std::path::PathBuf::from(requested.0.as_str());
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            let canonical = surface::CanonicalPath::try_new(path.clone())
+                .map_err(|_| "session permission path is not canonical")?;
+            if orca_tools::sandbox::is_protected_metadata_root(&path) {
+                if !orca_tools::sandbox::is_safe_metadata_writable_root(&path) {
+                    return Err(
+                        "session metadata grant must name a non-symlink metadata directory",
+                    );
+                }
+                if !metadata_directories.contains(&canonical) {
+                    metadata_directories.push(canonical);
+                }
+            } else if !directories
+                .iter()
+                .any(|directory| directory.path == canonical)
+            {
+                directories.push(surface::SurfaceAdditionalWorkingDirectory {
+                    path: canonical,
+                    source: surface::NonEmptyText::try_new("session")
+                        .expect("session permission source is non-empty"),
+                });
+            }
+        }
+    }
+
+    let mut network = current.effective.network_permissions.clone();
+    if let Some(requested) = permissions.network.as_ref() {
+        if requested.enabled.is_some() {
+            network.enabled = requested.enabled;
+        }
+        for (domain, access) in &requested.domains {
+            let domain = surface::CanonicalDomainName::try_new(domain.0.as_str().to_string())
+                .map_err(|_| "session network domain is invalid")?;
+            let access = match access {
+                surface::SurfaceAllowDeny::Allow => surface::SurfaceNetworkDomainAccess::Allow,
+                surface::SurfaceAllowDeny::Deny => surface::SurfaceNetworkDomainAccess::Deny,
+            };
+            if let Some(existing) = network
+                .domains
+                .iter_mut()
+                .find(|permission| permission.domain == domain)
+            {
+                existing.access = access;
+            } else {
+                network
+                    .domains
+                    .push(surface::SurfaceNetworkDomainPermission { domain, access });
+            }
+        }
+        network
+            .domains
+            .sort_by(|left, right| left.domain.as_str().cmp(right.domain.as_str()));
+    }
+
+    let mut next = current.clone();
+    let mut next_config = config.clone();
+    for patch in [
+        surface::RuntimeSettingsPatch::ReplaceAdditionalWorkingDirectories { directories },
+        surface::RuntimeSettingsPatch::ReplaceMetadataWritableDirectories {
+            directories: metadata_directories,
+        },
+        surface::RuntimeSettingsPatch::ReplaceNetworkPermissions {
+            permissions: network,
+        },
+    ] {
+        apply_runtime_settings_patch(&mut next_config, &mut next.effective, &patch)
+            .map_err(|_| "session permission settings could not be applied")?;
+    }
+    next.thread_revision = surface::SettingsRevision::try_new(
+        current
+            .thread_revision
+            .get()
+            .checked_add(1)
+            .ok_or("session settings revision exhausted")?,
+    )
+    .map_err(|_| "session settings revision is invalid")?;
+    next.effective.policy_epoch = surface::PolicyEpoch::try_new(
+        current
+            .effective
+            .policy_epoch
+            .get()
+            .checked_add(1)
+            .ok_or("session policy epoch exhausted")?,
+    )
+    .map_err(|_| "session policy epoch is invalid")?;
+    next.pending = None;
+    Ok((next, next_config))
 }
 
 fn surface_session_permission_settings_delta_authorized(
@@ -10284,6 +10403,13 @@ fn surface_session_permission_settings_delta_authorized(
     {
         return false;
     }
+    if current
+        .metadata_writable_directories
+        .iter()
+        .any(|directory| !next.metadata_writable_directories.contains(directory))
+    {
+        return false;
+    }
     let requested_paths = requested
         .file_system
         .iter()
@@ -10305,6 +10431,14 @@ fn surface_session_permission_settings_delta_authorized(
         .any(|directory| {
             directory.source.as_str() != "session" || !requested_paths.contains(&directory.path)
         })
+    {
+        return false;
+    }
+    if next
+        .metadata_writable_directories
+        .iter()
+        .filter(|directory| !current.metadata_writable_directories.contains(directory))
+        .any(|directory| !requested_paths.contains(directory))
     {
         return false;
     }
@@ -14565,7 +14699,11 @@ impl ThreadActor {
         batch: &surface::SurfaceCommitBatch,
         value: T,
     ) -> surface::MutationReply<T> {
-        let event = &batch.events.as_slice()[0];
+        let event = batch
+            .events
+            .as_slice()
+            .last()
+            .expect("interaction commit has an event");
         surface::MutationReply::Committed {
             mutation: surface::CommittedMutation {
                 request_id,
@@ -18583,7 +18721,7 @@ impl ThreadActor {
                 "interaction response authority does not match the persisted request",
             ));
         }
-        if let (
+        let attempted_session_permission_grant = if let (
             surface::SurfaceInteractionRequest::PermissionRequest {
                 permissions: requested,
                 ..
@@ -18594,27 +18732,9 @@ impl ThreadActor {
                         scope, permissions, ..
                     },
             },
-        ) = (&interaction.record.request, response.answer())
+        ) =
+            (&interaction.record.request, response.answer())
         {
-            if *scope == surface::PermissionGrantScope::Session
-                && !surface_session_permission_grant_is_applied(
-                    &self
-                        .resident_surface
-                        .coordinator
-                        .state()
-                        .snapshot()
-                        .settings
-                        .effective,
-                    permissions,
-                )
-            {
-                return Ok(Self::uncommitted_interaction_response(
-                    request_id,
-                    interaction,
-                    surface::SurfaceMutationErrorCode::InvalidInput,
-                    "session permission grants require runtime settings ownership",
-                ));
-            }
             if !surface_permission_profile_is_subset(permissions, requested) {
                 return Ok(Self::uncommitted_interaction_response(
                     request_id,
@@ -18623,7 +18743,29 @@ impl ThreadActor {
                     "permission response exceeds the persisted requested profile",
                 ));
             }
-        }
+            if *scope == surface::PermissionGrantScope::Session {
+                let snapshot = self.resident_surface.coordinator.state().snapshot();
+                match prepare_surface_session_permission_grant(
+                    &self.config,
+                    &snapshot.settings,
+                    permissions,
+                ) {
+                    Ok(grant) => Some(grant),
+                    Err(message) => {
+                        return Ok(Self::uncommitted_interaction_response(
+                            request_id,
+                            interaction,
+                            surface::SurfaceMutationErrorCode::InvalidInput,
+                            message,
+                        ));
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if !self
             .resident_surface
             .hub
@@ -18700,6 +18842,7 @@ impl ThreadActor {
             &interaction.record.response_token,
             response.answer(),
         );
+        let interaction_request = interaction.record.request.clone();
         let (receipt, winner_answer, attempted_private_winner) =
             match interaction.private_response.as_ref() {
                 Some(winner) => (
@@ -18745,6 +18888,32 @@ impl ThreadActor {
                     (receipt, response.answer().clone(), true)
                 }
             };
+        let session_permission_grant = if attempted_private_winner {
+            attempted_session_permission_grant
+        } else if let (
+            surface::SurfaceInteractionRequest::PermissionRequest { .. },
+            surface::SurfaceClientInteractionAnswer::PermissionRequest {
+                decision:
+                    surface::SurfacePermissionClientDecision::Allow {
+                        scope: surface::PermissionGrantScope::Session,
+                        permissions,
+                        ..
+                    },
+            },
+        ) = (&interaction_request, &winner_answer)
+        {
+            let snapshot = self.resident_surface.coordinator.state().snapshot();
+            Some(
+                prepare_surface_session_permission_grant(
+                    &self.config,
+                    &snapshot.settings,
+                    permissions,
+                )
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+            )
+        } else {
+            None
+        };
         let batch = if let Some(batch) = self
             .resident_surface
             .interactions
@@ -18754,26 +18923,40 @@ impl ThreadActor {
         {
             batch
         } else {
-            let scope = background_fence
-                .as_ref()
-                .map(|fence| surface::SurfaceScope::Background {
+            let interaction_scope = background_fence.as_ref().map_or_else(
+                || surface::SurfaceScope::Generation {
                     fence: fence.clone(),
-                })
-                .unwrap_or_else(|| surface::SurfaceScope::Generation {
+                },
+                |fence| surface::SurfaceScope::Background {
                     fence: fence.clone(),
-                });
-            let batch = self.surface_event_batch_with_commit_id(
-                vec![(
-                    scope,
-                    surface::SurfaceEvent::Interaction(surface::InteractionPatch::Resolved {
-                        interaction_id: interaction_id.clone(),
-                        expected_revision,
-                        next_revision,
-                        receipt: receipt.clone(),
-                    }),
-                )],
-                None,
+                },
             );
+            let mut events = Vec::new();
+            if let Some((next_settings, _)) = session_permission_grant.as_ref() {
+                events.push((
+                    surface::SurfaceScope::Thread,
+                    surface::SurfaceEvent::Settings(surface::SettingsPatch::Committed {
+                        previous_revision: self
+                            .resident_surface
+                            .coordinator
+                            .state()
+                            .snapshot()
+                            .settings
+                            .thread_revision,
+                        snapshot: next_settings.clone(),
+                    }),
+                ));
+            }
+            events.push((
+                interaction_scope,
+                surface::SurfaceEvent::Interaction(surface::InteractionPatch::Resolved {
+                    interaction_id: interaction_id.clone(),
+                    expected_revision,
+                    next_revision,
+                    receipt: receipt.clone(),
+                }),
+            ));
+            let batch = self.surface_event_batch_with_commit_id(events, None);
             self.resident_surface
                 .interactions
                 .get_mut(&interaction_id)
@@ -18793,6 +18976,10 @@ impl ThreadActor {
                         &batch,
                     )
             }
+            None if session_permission_grant.is_some() => self
+                .resident_surface
+                .coordinator
+                .commit_actor_generation_permission_resolution_batch(fence, &batch),
             None => self
                 .resident_surface
                 .coordinator
@@ -18808,6 +18995,14 @@ impl ThreadActor {
                 .retry_at =
                 Some(tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL);
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        if let Some((next_settings, next_config)) = session_permission_grant {
+            self.config = next_config;
+            if let Err(error) =
+                self.persist_surface_settings_metadata_if_recorded(&next_settings.effective)
+            {
+                eprintln!("orca: committed session permission metadata projection failed: {error}");
+            }
         }
         self.apply_surface_interaction_resolution(&interaction_id, &winner_answer);
         let output = surface::RespondInteractionOutput {
@@ -18848,7 +19043,11 @@ impl ThreadActor {
             let batch = private
                 .pending_batch
                 .expect("committed interaction retains its exact public batch");
-            let envelope = &batch.events.as_slice()[0];
+            let envelope = batch
+                .events
+                .as_slice()
+                .last()
+                .expect("interaction resolution batch has an event");
             interaction.revision =
                 surface::InteractionRevision::try_new(interaction.revision.get().saturating_add(1))
                     .expect("interaction revision did not exhaust");
@@ -23433,6 +23632,14 @@ impl ThreadActor {
         surface::SurfaceClientCommandError,
     > {
         if !self.admits_surface_client(client, surface::SurfaceCapability::ManageThreadSettings) {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        if patches.as_slice().iter().any(|patch| {
+            matches!(
+                patch,
+                surface::RuntimeSettingsPatch::ReplaceMetadataWritableDirectories { .. }
+            )
+        }) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
         if self.pending_manual_compaction_completion.is_some() {
@@ -41516,6 +41723,21 @@ mod tests {
         let surface = thread.surface();
         let attachment = fresh_surface_attachment(&surface);
         let previous_revision = attachment.baseline.snapshot.settings.thread_revision;
+        let metadata = cwd.path().join(".git");
+        std::fs::create_dir(&metadata).expect("create protected metadata directory");
+        assert!(matches!(
+            attachment.client.update_settings(
+                surface_request_id(),
+                previous_revision,
+                surface::NonEmptyVec::try_new(vec![
+                    surface::RuntimeSettingsPatch::ReplaceMetadataWritableDirectories {
+                        directories: vec![surface::CanonicalPath::try_new(metadata).unwrap()],
+                    },
+                ])
+                .unwrap(),
+            ),
+            Err(surface::SurfaceClientCommandError::Unauthorized)
+        ));
         let updated = committed_surface_value(
             attachment
                 .client

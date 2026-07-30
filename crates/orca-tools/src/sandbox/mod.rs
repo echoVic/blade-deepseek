@@ -24,9 +24,31 @@ pub fn is_safe_metadata_writable_root(path: &Path) -> bool {
     if !is_protected_metadata_root(path) {
         return false;
     }
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => !metadata.file_type().is_symlink(),
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    !metadata.file_type().is_symlink()
+        && path.canonicalize().is_ok_and(|canonical| canonical == path)
+}
+
+#[cfg(all(test, unix))]
+mod metadata_root_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_grant_rejects_symlinked_parent_components() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        let metadata = workspace.join(".git");
+        std::fs::create_dir_all(&metadata).unwrap();
+        let alias = parent.path().join("workspace-link");
+        std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+
+        assert!(is_safe_metadata_writable_root(
+            &metadata.canonicalize().unwrap()
+        ));
+        assert!(!is_safe_metadata_writable_root(&alias.join(".git")));
+        assert!(!is_safe_metadata_writable_root(&workspace.join(".agents")));
     }
 }
 
@@ -283,11 +305,7 @@ mod platform {
                 writable_roots.push(root.clone());
             }
         }
-        for root in &metadata_writable_roots {
-            if !writable_roots.contains(root) {
-                writable_roots.push(root.clone());
-            }
-        }
+        let metadata_protection_roots = writable_roots.clone();
         if !context.exclude_slash_tmp {
             writable_roots.push(PathBuf::from("/tmp"));
         }
@@ -328,6 +346,8 @@ mod platform {
                 readable_roots: canonicalize_all(context.readable_roots),
                 allowed_unix_socket_roots: canonicalize_all(context.allowed_unix_socket_roots),
                 writable_roots,
+                metadata_protection_roots,
+                metadata_writable_roots,
                 read_only_roots,
                 denied_roots,
                 network_access: context.network_access,
@@ -417,6 +437,7 @@ mod platform {
         // Additional roots are writable even in read-only mode (e.g. an
         // explicitly granted output directory), matching the Seatbelt profile.
         let mut writable_roots = canonicalize_all(context.additional_roots);
+        let metadata_protection_roots = writable_roots.clone();
         let metadata_writable_roots = canonicalize_all(
             &context
                 .metadata_writable_roots
@@ -425,11 +446,6 @@ mod platform {
                 .cloned()
                 .collect::<Vec<_>>(),
         );
-        for root in &metadata_writable_roots {
-            if !writable_roots.contains(root) {
-                writable_roots.push(root.clone());
-            }
-        }
 
         let mut read_only_roots = Vec::new();
         for name in PROTECTED_METADATA_DIRS {
@@ -463,6 +479,8 @@ mod platform {
                 readable_roots: canonicalize_all(context.readable_roots),
                 allowed_unix_socket_roots: canonicalize_all(context.allowed_unix_socket_roots),
                 writable_roots,
+                metadata_protection_roots,
+                metadata_writable_roots,
                 read_only_roots,
                 denied_roots,
                 network_access: context.network_access,

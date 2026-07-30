@@ -10,6 +10,8 @@ use crate::protocol::{
     PermissionGrantScope, PermissionResponseDecision, RequestFileSystemPermissions,
     RequestNetworkPermissions, RequestPermissionProfile, RequestShellPermissions,
 };
+
+pub(crate) const SESSION_METADATA_DIRECTORY_SOURCE: &str = "session-metadata";
 use crate::sandbox_denial::{
     SandboxDenialDiagnostic, should_request_filesystem_permission_with_denied_roots,
 };

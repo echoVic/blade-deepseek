@@ -998,6 +998,8 @@ pub struct SurfaceRuntimeSettings {
     pub active_permission_profile: Option<SurfaceActivePermissionProfile>,
     pub permission_rules: SurfacePermissionRuleSet,
     pub additional_working_directories: Vec<SurfaceAdditionalWorkingDirectory>,
+    #[serde(default)]
+    pub metadata_writable_directories: Vec<CanonicalPath>,
     pub network_permissions: SurfaceNetworkPermissions,
     pub policy_epoch: PolicyEpoch,
 }
@@ -1072,6 +1074,9 @@ pub enum RuntimeSettingsPatch {
     },
     ReplaceAdditionalWorkingDirectories {
         directories: Vec<SurfaceAdditionalWorkingDirectory>,
+    },
+    ReplaceMetadataWritableDirectories {
+        directories: Vec<CanonicalPath>,
     },
     ReplaceNetworkPermissions {
         permissions: SurfaceNetworkPermissions,

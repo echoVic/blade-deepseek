@@ -38,6 +38,7 @@ fn snapshot(next_seq: u64) -> SurfaceSnapshot {
             digest: Sha256Digest::new([1; 32]),
         },
         additional_working_directories: Vec::new(),
+        metadata_writable_directories: Vec::new(),
         network_permissions: SurfaceNetworkPermissions {
             enabled: Some(true),
             domains: Vec::new(),
