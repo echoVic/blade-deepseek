@@ -519,9 +519,13 @@ fn find_event<'a>(events: &'a [Value], event_type: &str) -> &'a Value {
 }
 
 fn subagent_cli_test_guard() -> MutexGuard<'static, ()> {
+    // Recover from a poisoned lock so that a single failing test is reported on
+    // its own merits instead of cascading into every other test failing with
+    // `PoisonError`. The guard only serializes access; there is no shared state
+    // to be left inconsistent by a panicking test.
     SUBAGENT_CLI_TEST_LOCK
         .lock()
-        .expect("subagent CLI test lock")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn run_git(cwd: &std::path::Path, args: &[&str]) {
@@ -640,9 +644,16 @@ fn poll_subagent_status(
 
 fn write_sleep_hook_config(home: &std::path::Path, seconds: f32) {
     std::fs::create_dir_all(home).expect("create ORCA_HOME");
+    // The resolved host shell differs per platform, so the delay command has to
+    // match its dialect. Unix runs the config through `sh -c`, while Windows
+    // resolves to PowerShell, where `sleep` is not a valid command.
+    #[cfg(unix)]
+    let sleep_command = format!("sleep {seconds}");
+    #[cfg(windows)]
+    let sleep_command = format!("Start-Sleep -Milliseconds {}", (seconds * 1000.0).round() as u64);
     std::fs::write(
         home.join("config.toml"),
-        format!("[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"sleep {seconds}\"\n"),
+        format!("[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"{sleep_command}\"\n"),
     )
     .expect("write hook config");
 }
