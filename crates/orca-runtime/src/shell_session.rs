@@ -1924,11 +1924,15 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let tasks = TaskRegistry::new("restricted-windows-conpty".to_string());
         let mut sessions = RuntimeShellSessionManager::new(tasks);
+        let script = "process.stdout.write('restricted-conpty-ready'); setTimeout(() => {}, 1500);";
         let handle = sessions
             .spawn(ShellSessionCommand {
-                command: "Write-Output restricted-conpty-ready; Start-Sleep -Milliseconds 300"
-                    .to_string(),
-                argv: None,
+                command: script.to_string(),
+                argv: Some(vec![
+                    "node".to_string(),
+                    "-e".to_string(),
+                    script.to_string(),
+                ]),
                 cwd: temp.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
                 additional_working_directories: Vec::new(),
