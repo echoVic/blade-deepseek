@@ -201,7 +201,7 @@ fn workflow_source_command_prints_saved_workflow_source() {
 fn workflow_run_returns_before_slow_workflow_completes() {
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");
-    let gate = write_gate_hook_config(&home);
+    write_hold_hook_config(&home);
     let script = temp.path().join("slow.js");
     fs::write(
         &script,
@@ -226,17 +226,11 @@ fn workflow_run_returns_before_slow_workflow_completes() {
     let launched: Value = serde_json::from_slice(&run.stdout).unwrap();
     let task_id = launched["taskId"].as_str().unwrap();
 
-    // The workflow is held inside the model-call hook until we release it, so
-    // it is guaranteed to still be active here regardless of CI scheduling.
-    gate.wait_until_started();
-    let show = workflow_show(temp.path(), Some(&home), task_id);
-    assert!(
-        show["status"] == "queued" || show["status"] == "running",
-        "workflow already left active state before release: {show}; hook log: {}",
-        gate.hook_log()
-    );
+    // The model call is held by the hook, so the run is observably active while
+    // the launching command has already returned. Poll for that state instead
+    // of assuming a fixed startup latency.
+    wait_until_active(temp.path(), Some(&home), task_id);
 
-    gate.release();
     wait_for_workflow_terminal_status(temp.path(), Some(&home), task_id);
     let completed = workflow_show(temp.path(), Some(&home), task_id);
     assert_eq!(completed["status"], "completed");
@@ -246,7 +240,7 @@ fn workflow_run_returns_before_slow_workflow_completes() {
 fn workflow_stop_requests_real_background_stop() {
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");
-    let gate = write_gate_hook_config(&home);
+    write_hold_hook_config(&home);
     let script = temp.path().join("stoppable.js");
     fs::write(
         &script,
@@ -272,9 +266,9 @@ fn workflow_stop_requests_real_background_stop() {
     let task_id = launched["taskId"].as_str().unwrap();
     let run_id = launched["runId"].as_str().unwrap();
 
-    // Wait until the first model call is blocked in the hook so the workflow is
-    // provably still active when we request the stop.
-    gate.wait_until_started();
+    // The first model call is held by the hook; poll until the run is active so
+    // the stop request provably lands on a live task.
+    wait_until_active(temp.path(), Some(&home), task_id);
 
     let stop = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
@@ -286,17 +280,15 @@ fn workflow_stop_requests_real_background_stop() {
     assert_eq!(
         stop.status.code(),
         Some(0),
-        "stop failed: stderr={} show={} hook log={}",
+        "stop failed: stderr={} show={}",
         String::from_utf8_lossy(&stop.stderr),
-        workflow_show(temp.path(), Some(&home), task_id),
-        gate.hook_log()
+        workflow_show(temp.path(), Some(&home), task_id)
     );
     let stop_value: Value = serde_json::from_slice(&stop.stdout).unwrap();
     assert_eq!(stop_value["status"], "stop_requested");
     assert_eq!(stop_value["taskId"], task_id);
     assert_eq!(stop_value["runId"], run_id);
 
-    gate.release();
     wait_for_workflow_terminal_status(temp.path(), Some(&home), task_id);
     let stopped = workflow_show(temp.path(), Some(&home), task_id);
     assert_eq!(stopped["status"], "stopped");
@@ -306,7 +298,7 @@ fn workflow_stop_requests_real_background_stop() {
 fn workflow_pause_resume_and_clone_control_persisted_run() {
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");
-    let gate = write_gate_hook_config(&home);
+    write_hold_hook_config(&home);
     let script = temp.path().join("pausable.js");
     fs::write(
         &script,
@@ -332,10 +324,10 @@ fn workflow_pause_resume_and_clone_control_persisted_run() {
     let task_id = launched["taskId"].as_str().unwrap();
     let run_id = launched["runId"].as_str().unwrap();
 
-    // The first model call is blocked in the hook, so the workflow is provably
-    // running when we request the pause. Releasing the gate lets the first
-    // agent finish and the runner observes the pause before the second agent.
-    gate.wait_until_started();
+    // The first model call is held by the hook; poll until the run is active,
+    // then request the pause. The runner observes the pause before the second
+    // agent, so the workflow settles into `paused`.
+    wait_until_active(temp.path(), Some(&home), task_id);
     let pause = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
         .env("ORCA_HOME", &home)
@@ -345,15 +337,13 @@ fn workflow_pause_resume_and_clone_control_persisted_run() {
     assert_eq!(
         pause.status.code(),
         Some(0),
-        "pause failed: stderr={} show={} hook log={}",
+        "pause failed: stderr={} show={}",
         String::from_utf8_lossy(&pause.stderr),
-        workflow_show(temp.path(), Some(&home), task_id),
-        gate.hook_log()
+        workflow_show(temp.path(), Some(&home), task_id)
     );
     let pause_value: Value = serde_json::from_slice(&pause.stdout).unwrap();
     assert_eq!(pause_value["status"], "pause_requested");
 
-    gate.release();
     wait_for_workflow_status(temp.path(), Some(&home), task_id, "paused");
 
     let list = Command::new(env!("CARGO_BIN_EXE_orca"))
@@ -574,102 +564,57 @@ fn wait_for_workflow_status(
     );
 }
 
-/// A deterministic `pre_model_call` gate. The hook records that a model call
-/// started and then blocks until the test releases it, so the workflow is
-/// guaranteed to still be mid-run when the test observes it. This replaces
-/// wall-clock sleeps, which raced against background-worker startup latency on
-/// loaded Windows CI runners and made pause/stop observe an already-terminal
-/// task.
-struct WorkflowGate {
-    started_marker: std::path::PathBuf,
-    release_marker: std::path::PathBuf,
-    log_marker: std::path::PathBuf,
-}
-
-impl WorkflowGate {
-    fn wait_until_started(&self) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !self.started_marker.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "workflow model-call hook did not start within 30s (hook log: {})",
-                self.hook_log()
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    fn hook_log(&self) -> String {
-        fs::read_to_string(&self.log_marker).unwrap_or_else(|_| "<no hook log>".to_string())
-    }
-
-    fn release(&self) {
-        fs::write(&self.release_marker, b"release").unwrap();
-    }
-}
-
-/// Write a `pre_model_call` hook that appends to `started_marker` and then
-/// polls for `release_marker`, using the host shell dialect. This mirrors the
-/// `shell_session_contract.rs` marker-wait pattern that is known to run on
-/// Windows CI. A bounded iteration cap keeps the hook inside the 30s timeout.
-fn write_gate_hook_config(home: &std::path::Path) -> WorkflowGate {
+/// Write a `pre_model_call` hook that holds each model call for a fixed
+/// duration. The workflow worker runs in a separate process, so tests poll for
+/// the active state (see `wait_until_active`) rather than assuming a fixed
+/// startup latency. The hold is comfortably shorter than the 30s hook timeout
+/// but long enough to observe the run and issue a control command against it.
+fn write_hold_hook_config(home: &std::path::Path) {
     fs::create_dir_all(home).unwrap();
-    let started_marker = home.join("model-call-started");
-    let release_marker = home.join("model-call-release");
-    let log_marker = home.join("model-call-hook.log");
-
+    // Windows CI runners can be slow to spawn the worker and reach the first
+    // model call, so hold long enough for the test's polling to catch the
+    // active state and act, while staying well under the 30s hook timeout.
+    let seconds = 8.0_f32;
     #[cfg(windows)]
-    let command = {
-        let started = powershell_literal(&started_marker);
-        let release = powershell_literal(&release_marker);
-        let log = powershell_literal(&log_marker);
-        format!(
-            "Add-Content -LiteralPath {log} -Value 'enter'; \
-             Set-Content -NoNewline -LiteralPath {started} -Value ''; \
-             $i = 0; \
-             while (!(Test-Path -LiteralPath {release}) -and $i -lt 500) {{ \
-                 Start-Sleep -Milliseconds 50; $i++ \
-             }}; \
-             Add-Content -LiteralPath {log} -Value \"exit i=$i released=$(Test-Path -LiteralPath {release})\""
-        )
-    };
+    let command = format!(
+        "Start-Sleep -Milliseconds {}",
+        (seconds * 1000.0).round() as u64
+    );
     #[cfg(not(windows))]
-    let command = {
-        let started = shell_single_quote(&started_marker);
-        let release = shell_single_quote(&release_marker);
-        let log = shell_single_quote(&log_marker);
-        format!(
-            "printf 'enter\\n' >> {log}; printf x >> {started}; i=0; while [ ! -e {release} ] && [ \"$i\" -lt 500 ]; do sleep 0.05; i=$((i+1)); done; printf 'exit i=%s\\n' \"$i\" >> {log}"
-        )
-    };
-
+    let command = format!("sleep {seconds}");
     fs::write(
         home.join("config.toml"),
-        format!(
-            "[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"{}\"\n",
-            escape_toml_command(&command)
-        ),
+        format!("[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"{command}\"\n"),
     )
     .unwrap();
+}
 
-    WorkflowGate {
-        started_marker,
-        release_marker,
-        log_marker,
+/// Poll `workflow show` until the task is observably active (`queued` or
+/// `running`), returning the status seen. Fails if the task reaches a terminal
+/// state or never becomes active within the deadline. This replaces fixed
+/// sleeps that raced the background worker's startup on loaded CI runners.
+fn wait_until_active(
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+    task_id: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = Value::Null;
+    loop {
+        let show = workflow_show(cwd, home, task_id);
+        let status = show["status"].as_str().unwrap_or_default();
+        if status == "queued" || status == "running" {
+            return show;
+        }
+        assert!(
+            !matches!(status, "completed" | "failed" | "stopped" | "cancelled"),
+            "workflow reached terminal state before it could be observed active: {show}"
+        );
+        last = show;
+        assert!(
+            Instant::now() < deadline,
+            "workflow task {task_id} never became active within 20s (last: {last})"
+        );
+        thread::sleep(Duration::from_millis(50));
     }
-}
-
-/// Escape a shell command for embedding inside a double-quoted TOML string.
-fn escape_toml_command(command: &str) -> String {
-    command.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-#[cfg(windows)]
-fn powershell_literal(path: &std::path::Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "''"))
-}
-
-#[cfg(not(windows))]
-fn shell_single_quote(path: &std::path::Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
