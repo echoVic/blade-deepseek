@@ -491,7 +491,6 @@ for (const [job, label] of [
 for (const relativePath of [
   "tests/session_server_contract.rs",
   "tests/subagent_contract.rs",
-  "tests/workflow_cli_contract.rs",
 ]) {
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   assert.ok(
@@ -499,6 +498,18 @@ for (const relativePath of [
     `${relativePath} must use the active Windows shell dialect for sleep hooks`,
   );
 }
+const workflowCliContract = readFileSync(
+  path.join(repoRoot, "tests/workflow_cli_contract.rs"),
+  "utf8",
+);
+assert.ok(
+  workflowCliContract.includes("mock_stream_delay_ms"),
+  "tests/workflow_cli_contract.rs must use the provider-native cross-platform delay",
+);
+assert.ok(
+  workflowCliContract.includes("wait_until_active"),
+  "tests/workflow_cli_contract.rs must wait for persisted active state instead of racing worker startup",
+);
 const nativeLockBehaviorTests = [
   "goal_runtime_lease_is_shared_in_process_and_exclusive_across_processes",
   "thread_and_policy_owner_leases_fail_closed_and_wall_rollback_has_no_authority",
