@@ -184,9 +184,14 @@ fn workflow_source_command_prints_saved_workflow_source() {
     assert_eq!(output.status.code(), Some(0));
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["name"], "audit");
+    // The CLI reports the path as resolved from the working directory, which is
+    // not run through `canonicalize`, so on Windows it lacks the `\\?\` verbatim
+    // prefix and long-name expansion. Canonicalize both sides to compare the
+    // same underlying file across platforms.
+    let reported_path = std::path::Path::new(value["path"].as_str().unwrap());
     assert_eq!(
-        value["path"],
-        script.canonicalize().unwrap().display().to_string()
+        reported_path.canonicalize().unwrap(),
+        script.canonicalize().unwrap()
     );
     assert_eq!(value["meta"]["description"], "Audit code");
     assert_eq!(value["script"], source);
@@ -196,7 +201,7 @@ fn workflow_source_command_prints_saved_workflow_source() {
 fn workflow_run_returns_before_slow_workflow_completes() {
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");
-    write_sleep_hook_config(&home, 1.5);
+    let gate = write_gate_hook_config(&home);
     let script = temp.path().join("slow.js");
     fs::write(
         &script,
@@ -220,9 +225,14 @@ fn workflow_run_returns_before_slow_workflow_completes() {
     assert_eq!(run.status.code(), Some(0));
     let launched: Value = serde_json::from_slice(&run.stdout).unwrap();
     let task_id = launched["taskId"].as_str().unwrap();
+
+    // The workflow is held inside the model-call hook until we release it, so
+    // it is guaranteed to still be active here regardless of CI scheduling.
+    gate.wait_until_started();
     let show = workflow_show(temp.path(), Some(&home), task_id);
     assert!(show["status"] == "queued" || show["status"] == "running");
 
+    gate.release();
     wait_for_workflow_terminal_status(temp.path(), Some(&home), task_id);
     let completed = workflow_show(temp.path(), Some(&home), task_id);
     assert_eq!(completed["status"], "completed");
@@ -232,7 +242,7 @@ fn workflow_run_returns_before_slow_workflow_completes() {
 fn workflow_stop_requests_real_background_stop() {
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");
-    write_sleep_hook_config(&home, 1.0);
+    let gate = write_gate_hook_config(&home);
     let script = temp.path().join("stoppable.js");
     fs::write(
         &script,
@@ -258,7 +268,9 @@ fn workflow_stop_requests_real_background_stop() {
     let task_id = launched["taskId"].as_str().unwrap();
     let run_id = launched["runId"].as_str().unwrap();
 
-    thread::sleep(Duration::from_millis(250));
+    // Wait until the first model call is blocked in the hook so the workflow is
+    // provably still active when we request the stop.
+    gate.wait_until_started();
 
     let stop = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
@@ -273,6 +285,7 @@ fn workflow_stop_requests_real_background_stop() {
     assert_eq!(stop_value["taskId"], task_id);
     assert_eq!(stop_value["runId"], run_id);
 
+    gate.release();
     wait_for_workflow_terminal_status(temp.path(), Some(&home), task_id);
     let stopped = workflow_show(temp.path(), Some(&home), task_id);
     assert_eq!(stopped["status"], "stopped");
@@ -282,7 +295,7 @@ fn workflow_stop_requests_real_background_stop() {
 fn workflow_pause_resume_and_clone_control_persisted_run() {
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");
-    write_sleep_hook_config(&home, 0.8);
+    let gate = write_gate_hook_config(&home);
     let script = temp.path().join("pausable.js");
     fs::write(
         &script,
@@ -308,7 +321,10 @@ fn workflow_pause_resume_and_clone_control_persisted_run() {
     let task_id = launched["taskId"].as_str().unwrap();
     let run_id = launched["runId"].as_str().unwrap();
 
-    thread::sleep(Duration::from_millis(150));
+    // The first model call is blocked in the hook, so the workflow is provably
+    // running when we request the pause. Releasing the gate lets the first
+    // agent finish and the runner observes the pause before the second agent.
+    gate.wait_until_started();
     let pause = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
         .env("ORCA_HOME", &home)
@@ -319,6 +335,7 @@ fn workflow_pause_resume_and_clone_control_persisted_run() {
     let pause_value: Value = serde_json::from_slice(&pause.stdout).unwrap();
     assert_eq!(pause_value["status"], "pause_requested");
 
+    gate.release();
     wait_for_workflow_status(temp.path(), Some(&home), task_id, "paused");
 
     let list = Command::new(env!("CARGO_BIN_EXE_orca"))
@@ -539,18 +556,89 @@ fn wait_for_workflow_status(
     );
 }
 
-fn write_sleep_hook_config(home: &std::path::Path, seconds: f32) {
+/// A deterministic `pre_model_call` gate. The hook records that a model call
+/// started and then blocks until the test releases it, so the workflow is
+/// guaranteed to still be mid-run when the test observes it. This replaces
+/// wall-clock sleeps, which raced against background-worker startup latency on
+/// loaded Windows CI runners and made pause/stop observe an already-terminal
+/// task.
+struct WorkflowGate {
+    started_marker: std::path::PathBuf,
+    release_marker: std::path::PathBuf,
+}
+
+impl WorkflowGate {
+    fn wait_until_started(&self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !self.started_marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "workflow model-call hook did not start within 30s"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn release(&self) {
+        fs::write(&self.release_marker, b"release").unwrap();
+    }
+}
+
+/// Write a `pre_model_call` hook that appends to `started_marker` and then
+/// polls for `release_marker`, using the host shell dialect. The hook must
+/// finish inside the 30s hook timeout, so it also stops waiting after ~25s.
+fn write_gate_hook_config(home: &std::path::Path) -> WorkflowGate {
     fs::create_dir_all(home).unwrap();
+    let started_marker = home.join("model-call-started");
+    let release_marker = home.join("model-call-release");
+
     #[cfg(windows)]
-    let command = format!(
-        "Start-Sleep -Milliseconds {}",
-        (seconds * 1000.0).round() as u64
-    );
+    let command = {
+        let started = powershell_literal(&started_marker);
+        let release = powershell_literal(&release_marker);
+        format!(
+            "Add-Content -LiteralPath {started} -Value 'x'; \
+             $deadline = (Get-Date).AddSeconds(25); \
+             while (-not (Test-Path -LiteralPath {release}) -and (Get-Date) -lt $deadline) {{ \
+                 Start-Sleep -Milliseconds 50 \
+             }}"
+        )
+    };
     #[cfg(not(windows))]
-    let command = format!("sleep {seconds}");
+    let command = {
+        let started = shell_single_quote(&started_marker);
+        let release = shell_single_quote(&release_marker);
+        format!(
+            "printf x >> {started}; i=0; while [ ! -e {release} ] && [ \"$i\" -lt 500 ]; do sleep 0.05; i=$((i+1)); done"
+        )
+    };
+
     fs::write(
         home.join("config.toml"),
-        format!("[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"{command}\"\n"),
+        format!(
+            "[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"{}\"\n",
+            escape_toml_command(&command)
+        ),
     )
     .unwrap();
+
+    WorkflowGate {
+        started_marker,
+        release_marker,
+    }
+}
+
+/// Escape a shell command for embedding inside a double-quoted TOML string.
+fn escape_toml_command(command: &str) -> String {
+    command.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(windows)]
+fn powershell_literal(path: &std::path::Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn shell_single_quote(path: &std::path::Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
