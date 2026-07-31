@@ -93,6 +93,9 @@ fn grep_emits_completed_tool_event_with_matches() {
     .expect("write grep fixture");
 
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        // The built-in grep must remain usable on a native Windows install
+        // without requiring ripgrep to be present on PATH.
+        .env("PATH", "")
         .args([
             "exec",
             "--output-format",

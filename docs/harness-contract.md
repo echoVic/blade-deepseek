@@ -180,7 +180,7 @@ Built-in tools:
 | `read_file` | read | Reads UTF-8 file content, truncated at 8KB |
 | `glob` | read | Finds files and directories by glob pattern or `mode: "fuzzy"` path query, sorted as workspace-relative paths; returns `(no matches)` when the path is missing or no entries match |
 | `list_files` | read | Compatibility alias for directory listing; returns sorted names and `(empty)` for missing directories |
-| `grep` | read | Regex search via `rg` with line numbers, `(no matches)` for empty results |
+| `grep` | read | Regex search with line numbers; uses `rg` when available and a native in-process fallback otherwise, `(no matches)` for empty results |
 | `git_status` | read | Runs `git status --short` |
 | `web_search` | network | Searches the web for current information |
 | `bash` | shell | Executes via `sh -c` under the active approval policy and sandbox |

@@ -1,7 +1,9 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use orca_platform::fs::{AtomicWritePolicy, atomic_write, atomic_write_with, open_nofollow};
+use orca_platform::fs::{
+    AtomicWritePolicy, atomic_write, atomic_write_with, open_nofollow, open_nofollow_nonblocking,
+};
 
 #[test]
 fn atomic_replace_never_leaves_a_partial_file_or_temp_artifact() {
@@ -135,6 +137,32 @@ fn no_follow_opens_a_regular_file() {
 
     let file = open_nofollow(&path).expect("open regular file");
     assert_eq!(file.metadata().expect("metadata").len(), 7);
+}
+
+#[cfg(unix)]
+#[test]
+fn no_follow_nonblocking_rejects_fifo_without_waiting_for_a_writer() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fifo = temp.path().join("named-pipe");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success());
+
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(open_nofollow_nonblocking(&fifo));
+    });
+
+    let file = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("nonblocking open must not wait for a FIFO writer")
+        .expect("open FIFO without following links");
+    assert!(!file.metadata().expect("FIFO metadata").is_file());
 }
 
 #[cfg(windows)]

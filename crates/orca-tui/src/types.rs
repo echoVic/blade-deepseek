@@ -5938,14 +5938,14 @@ mod tests {
             task_id: "task-main".to_string(),
         });
         state.update(TuiEvent::MessageDelta(
-            "missing foreground suffix".to_string(),
+            "missing foreground suffix\n".to_string(),
         ));
 
         assert!(!state.suppress_background_main_session_output);
         assert_eq!(state.panel_mode, PanelMode::Conversation);
         assert!(matches!(
             state.messages.last(),
-            Some(ChatMessage::Assistant(text)) if text == "missing foreground suffix"
+            Some(ChatMessage::Assistant(text)) if text == "missing foreground suffix\n"
         ));
     }
 

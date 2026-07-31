@@ -34,7 +34,7 @@ special dispatch 执行，不再通过普通工具 worker 或 thread-local callb
 | `read_file` | read | 已实现 | 读取 UTF-8 文件内容，输出按 8KB 截断 |
 | `glob` | read | 已实现 | 首选文件发现工具，支持 glob pattern 和 `mode: "fuzzy"` 路径查询，返回 workspace-relative 路径 |
 | `list_files` | read | 兼容 alias | 保留给旧 prompt 和历史会话，模型 prompt 不再优先推荐 |
-| `grep` | read | 已实现 | 使用 ripgrep 搜索，空结果返回 `(no matches)` |
+| `grep` | read | 已实现 | 优先使用 ripgrep，缺失时回退到进程内正则搜索，空结果返回 `(no matches)` |
 | `git_status` | read | 已实现 | `git status --short` |
 | `web_search` | network | 已实现 | 网络搜索，按 network 能力走审批策略 |
 | `bash` | shell | 已实现 | 通过 `sh -c` 执行命令，shell 能力需要对应审批 |

@@ -10091,9 +10091,17 @@ fn lock_env() -> std::sync::MutexGuard<'static, ()> {
 
 fn write_sleep_hook_config(home: &std::path::Path, seconds: f32) {
     std::fs::create_dir_all(home).expect("create ORCA_HOME");
+    let command = platform_shell_script(
+        &format!("sleep {seconds}"),
+        &format!(
+            "Start-Sleep -Milliseconds {}",
+            (seconds * 1000.0).round() as u64
+        ),
+    )
+    .to_string();
     std::fs::write(
         home.join("config.toml"),
-        format!("[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"sleep {seconds}\"\n"),
+        format!("[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"{command}\"\n"),
     )
     .expect("write hook config");
 }

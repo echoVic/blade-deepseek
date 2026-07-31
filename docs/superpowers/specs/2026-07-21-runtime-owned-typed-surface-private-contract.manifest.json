@@ -3861,6 +3861,30 @@
       "remove_pre_started_resource_expansion_and_writable_mcp_registry"
     ],
     [
+      "SubmitQueued",
+      "current",
+      [
+        "crates/orca-tui/src/types.rs:453",
+        "crates/orca-tui/src/app.rs:7389"
+      ],
+      "runtime_mutation",
+      "UserAction::SubmitQueued{id,prompt,bindings}",
+      "ReserveOperation(typed SurfaceInputBinding)+AdmitReserved",
+      "ReserveOperation(typed SurfaceInputBinding)+AdmitReserved",
+      [
+        "SubmitOperation",
+        "ControlBoundOperation",
+        "ReadCatalog"
+      ],
+      [
+        "CatalogRevision",
+        "SurfaceOperationFence"
+      ],
+      "MutationReply<AdmissionOutput>+OperationWaiter",
+      "queued lifecycle consumes typed admission and terminal by id",
+      "remove_tui_queued_admission_mirror"
+    ],
+    [
       "SubmitWorkflowNotification",
       "current",
       [

@@ -7,6 +7,10 @@ pub fn open_nofollow(path: &Path) -> Result<File, PlatformError> {
     platform::open(path)
 }
 
+pub fn open_nofollow_nonblocking(path: &Path) -> Result<File, PlatformError> {
+    platform::open_nonblocking(path)
+}
+
 #[cfg(unix)]
 mod platform {
     use std::os::unix::fs::OpenOptionsExt;
@@ -14,6 +18,14 @@ mod platform {
     use super::*;
 
     pub(super) fn open(path: &Path) -> Result<File, PlatformError> {
+        open_with_flags(path, libc::O_CLOEXEC | libc::O_NOFOLLOW)
+    }
+
+    pub(super) fn open_nonblocking(path: &Path) -> Result<File, PlatformError> {
+        open_with_flags(path, libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+    }
+
+    fn open_with_flags(path: &Path, flags: i32) -> Result<File, PlatformError> {
         if path
             .symlink_metadata()
             .is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -24,7 +36,7 @@ mod platform {
         }
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .custom_flags(flags)
             .open(path)
             .map_err(|error| PlatformError::io("open file without following links", error))
     }
@@ -59,5 +71,9 @@ mod platform {
             });
         }
         Ok(file)
+    }
+
+    pub(super) fn open_nonblocking(path: &Path) -> Result<File, PlatformError> {
+        open(path)
     }
 }

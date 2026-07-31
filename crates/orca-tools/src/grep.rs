@@ -1,9 +1,13 @@
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use ignore::WalkBuilder;
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
 use orca_platform::process::ProcessJob;
+use regex::Regex;
 use serde::Deserialize;
 
 const DEFAULT_GREP_HEAD_LIMIT: usize = 250;
@@ -102,8 +106,129 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
             let stderr = output.stderr_text().trim().to_string();
             ToolResult::failed(request, stderr, output.status.code())
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            execute_in_process(request, cwd, pattern, &search_path, max_bytes)
+        }
         Err(error) => ToolResult::failed(request, format!("failed to run rg: {error}"), None),
     }
+}
+
+fn execute_in_process(
+    request: &ToolRequest,
+    cwd: &Path,
+    pattern: &str,
+    search_path: &str,
+    max_bytes: usize,
+) -> ToolResult {
+    let regex = match Regex::new(pattern) {
+        Ok(regex) => regex,
+        Err(error) => return ToolResult::failed(request, error.to_string(), None),
+    };
+
+    let offset = parse_args(request).offset.unwrap_or(0);
+    let limit = normalized_head_limit(parse_args(request).head_limit);
+    let mut collector = GrepPageCollector::new(offset, limit, max_bytes.max(1));
+    let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_LINE_BYTES);
+    let search_root = cwd.join(search_path);
+    let mut walker = WalkBuilder::new(search_root);
+    walker
+        .hidden(true)
+        .follow_links(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true);
+
+    for entry in walker.build() {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+
+        let path = entry.path();
+        let Ok(file) = File::open(path) else {
+            continue;
+        };
+        let mut reader = BufReader::new(file);
+        let display_path = path
+            .strip_prefix(cwd)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut line_number = 1;
+        while let Some(line) = read_bounded_line(&mut reader, max_line_bytes) {
+            if regex.is_match(&String::from_utf8_lossy(&line.bytes)) {
+                let prefix = format!("{display_path}:{line_number}:");
+                let mut output_line = Vec::with_capacity(prefix.len() + line.bytes.len());
+                output_line.extend_from_slice(prefix.as_bytes());
+                output_line.extend_from_slice(&line.bytes);
+                collector.push(crate::process::BoundedLine {
+                    bytes: &output_line,
+                    observed_bytes: output_line.len().saturating_add(line.omitted_bytes),
+                    omitted_bytes: line.omitted_bytes,
+                });
+            }
+            line_number += 1;
+        }
+    }
+
+    let no_matches = collector.total_lines == 0;
+    let (output, page_truncated) = collector.render();
+    if no_matches {
+        return ToolResult::completed_kind(
+            request,
+            "(no matches)".to_string(),
+            false,
+            ToolResultKind::NoMatches,
+        );
+    }
+    let (output, truncated) = truncate_output(output, max_bytes);
+    ToolResult::completed(request, output, page_truncated || truncated)
+}
+
+struct BoundedInputLine {
+    bytes: Vec<u8>,
+    omitted_bytes: usize,
+}
+
+fn read_bounded_line(reader: &mut impl BufRead, max_bytes: usize) -> Option<BoundedInputLine> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let mut omitted_bytes: usize = 0;
+    let mut saw_bytes = false;
+
+    loop {
+        let buffer = reader.fill_buf().ok()?;
+        if buffer.is_empty() {
+            break;
+        }
+        saw_bytes = true;
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(buffer.len());
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        let retained_len = content_len.min(remaining);
+        bytes.extend_from_slice(&buffer[..retained_len]);
+        omitted_bytes = omitted_bytes.saturating_add(content_len - retained_len);
+        let consumed = newline.map_or(content_len, |index| index + 1);
+        reader.consume(consumed);
+        if newline.is_some() {
+            break;
+        }
+    }
+
+    if !saw_bytes {
+        return None;
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    Some(BoundedInputLine {
+        bytes,
+        omitted_bytes,
+    })
 }
 
 fn parse_args(request: &ToolRequest) -> GrepArgs {
@@ -399,6 +524,26 @@ mod tests {
         assert!(result.truncated);
         assert!(output.len() <= 1024 * 1024 + 128);
         assert!(output.contains("bytes of output omitted"));
+    }
+
+    #[test]
+    fn in_process_fallback_reports_no_matches_with_the_builtin_contract() {
+        let cwd = temp_dir("grep-fallback-no-matches");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::write(cwd.join("notes.txt"), "haystack\n").expect("write fixture");
+        let request = ToolRequest {
+            id: "grep-fallback-no-matches".to_string(),
+            name: ToolName::Grep,
+            action: ActionKind::Read,
+            target: Some("needle".to_string()),
+            raw_arguments: Some(r#"{"pattern":"needle","path":"notes.txt"}"#.to_string()),
+        };
+
+        let result = execute_in_process(&request, &cwd, "needle", "notes.txt", 4096);
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(result.kind, ToolResultKind::NoMatches);
+        assert_eq!(result.output.as_deref(), Some("(no matches)"));
     }
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {

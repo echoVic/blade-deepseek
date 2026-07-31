@@ -192,15 +192,8 @@ mod tests {
         assert!(action_rx.try_recv().is_err());
 
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        handle_key_event_preflight(
-            ctrl_c,
-            &mut state,
-            &config,
-            &action_tx,
-            &mut vim,
-            || Ok(()),
-        )
-        .unwrap();
+        handle_key_event_preflight(ctrl_c, &mut state, &config, &action_tx, &mut vim, || Ok(()))
+            .unwrap();
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
     }
 

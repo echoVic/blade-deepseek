@@ -564,6 +564,7 @@ pub fn run() -> i32 {
                 fork: cli.fork,
                 continue_latest: cli.continue_latest,
                 session_picker: cli.session_picker,
+                cwd: cli.cwd,
                 model: cli.model,
                 mode: cli.mode,
                 api_key: cli.api_key,

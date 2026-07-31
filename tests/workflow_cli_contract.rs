@@ -541,9 +541,16 @@ fn wait_for_workflow_status(
 
 fn write_sleep_hook_config(home: &std::path::Path, seconds: f32) {
     fs::create_dir_all(home).unwrap();
+    #[cfg(windows)]
+    let command = format!(
+        "Start-Sleep -Milliseconds {}",
+        (seconds * 1000.0).round() as u64
+    );
+    #[cfg(not(windows))]
+    let command = format!("sleep {seconds}");
     fs::write(
         home.join("config.toml"),
-        format!("[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"sleep {seconds}\"\n"),
+        format!("[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"{command}\"\n"),
     )
     .unwrap();
 }

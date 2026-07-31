@@ -277,6 +277,27 @@
       "windows-sandbox-plan"
     ],
     [
+      "tui-edit-highlight-unix-test-fixtures",
+      "crates/orca-tui/src/edit_highlight_worker.rs",
+      "unix_std_api",
+      3,
+      "windows-test-portability"
+    ],
+    [
+      "tui-edit-highlight-unix-test-flags",
+      "crates/orca-tui/src/edit_highlight_worker.rs",
+      "unix_libc_process",
+      1,
+      "windows-test-portability"
+    ],
+    [
+      "tui-types-unix-symlink-fixtures",
+      "crates/orca-tui/src/types.rs",
+      "unix_std_api",
+      5,
+      "windows-test-portability"
+    ],
+    [
       "session-server-unix-fixtures",
       "tests/session_server_contract.rs",
       "unix_std_api",

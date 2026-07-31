@@ -645,15 +645,18 @@ fn poll_subagent_status(
 fn write_sleep_hook_config(home: &std::path::Path, seconds: f32) {
     std::fs::create_dir_all(home).expect("create ORCA_HOME");
     // The resolved host shell differs per platform, so the delay command has to
-    // match its dialect. Unix runs the config through `sh -c`, while Windows
+    // match its dialect. Non-Windows hosts run the config through `sh -c`, while Windows
     // resolves to PowerShell, where `sleep` is not a valid command.
-    #[cfg(unix)]
-    let sleep_command = format!("sleep {seconds}");
     #[cfg(windows)]
-    let sleep_command = format!("Start-Sleep -Milliseconds {}", (seconds * 1000.0).round() as u64);
+    let command = format!(
+        "Start-Sleep -Milliseconds {}",
+        (seconds * 1000.0).round() as u64
+    );
+    #[cfg(not(windows))]
+    let command = format!("sleep {seconds}");
     std::fs::write(
         home.join("config.toml"),
-        format!("[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"{sleep_command}\"\n"),
+        format!("[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"{command}\"\n"),
     )
     .expect("write hook config");
 }

@@ -328,7 +328,7 @@ fn receive_until(
     failure: &str,
 ) {
     let deadline = Instant::now() + timeout;
-    while !String::from_utf8_lossy(output).contains(expected) {
+    while !contains_rendered_text(output, expected) {
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(
             !remaining.is_zero(),
@@ -339,6 +339,18 @@ fn receive_until(
             output.extend_from_slice(&chunk);
         }
     }
+}
+
+fn contains_rendered_text(output: &[u8], expected: &str) -> bool {
+    let rendered = String::from_utf8_lossy(output);
+    let mut cursor = 0;
+    for token in expected.split_whitespace() {
+        let Some(offset) = rendered[cursor..].find(token) else {
+            return false;
+        };
+        cursor += offset + token.len();
+    }
+    true
 }
 
 fn open_pty(columns: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {

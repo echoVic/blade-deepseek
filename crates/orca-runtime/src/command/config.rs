@@ -152,7 +152,10 @@ mod tests {
         assert_eq!(config.max_budget_usd, Some(2.5));
         assert!(!config.update_check);
         assert_eq!(
-            config.vim_insert_escape.as_ref().map(|value| value.as_str()),
+            config
+                .vim_insert_escape
+                .as_ref()
+                .map(|value| value.as_str()),
             Some("jj")
         );
         assert!(config.desktop_notifications);

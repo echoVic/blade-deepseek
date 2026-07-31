@@ -472,6 +472,33 @@ const windowsX64Job = workflow.match(/  native-x64:\n([\s\S]*?)\n  native-arm64:
 assert.ok(windowsX64Job, "Windows CI must define a native x64 job");
 const windowsArm64Job = workflow.match(/  native-arm64:\n([\s\S]*)$/);
 assert.ok(windowsArm64Job, "Windows CI must define a native ARM64 job");
+for (const [job, label] of [
+  [windowsX64Job[1], "x64"],
+  [windowsArm64Job[1], "ARM64"],
+]) {
+  const runnerBuild = "cargo build -p orca-windows-runner --locked";
+  const fullSuite = "cargo test --workspace --all-targets --locked";
+  assert.ok(
+    job.includes(runnerBuild),
+    `Windows ${label} CI must materialize the async-worker runner before integration tests`,
+  );
+  assert.ok(
+    job.indexOf(runnerBuild) < job.indexOf(fullSuite),
+    `Windows ${label} CI must build the runner before the full test suite`,
+  );
+}
+
+for (const relativePath of [
+  "tests/session_server_contract.rs",
+  "tests/subagent_contract.rs",
+  "tests/workflow_cli_contract.rs",
+]) {
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  assert.ok(
+    source.includes("Start-Sleep -Milliseconds"),
+    `${relativePath} must use the active Windows shell dialect for sleep hooks`,
+  );
+}
 const nativeLockBehaviorTests = [
   "goal_runtime_lease_is_shared_in_process_and_exclusive_across_processes",
   "thread_and_policy_owner_leases_fail_closed_and_wall_rollback_has_no_authority",

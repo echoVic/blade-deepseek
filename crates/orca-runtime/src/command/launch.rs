@@ -38,6 +38,7 @@ pub struct InteractiveLaunchRequest {
     pub fork: Option<String>,
     pub continue_latest: bool,
     pub session_picker: bool,
+    pub cwd: Option<PathBuf>,
     pub model: Option<String>,
     pub mode: Option<String>,
     pub api_key: Option<String>,
@@ -71,7 +72,10 @@ pub fn prepare_interactive(request: InteractiveLaunchRequest) -> Result<RunConfi
     if resume_like > 1 {
         return Err("--resume, --fork, and --continue are mutually exclusive".to_string());
     }
-    let cwd = std::env::current_dir().unwrap_or_default();
+    let cwd = request
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let mode = request
         .mode
         .as_deref()
@@ -83,7 +87,8 @@ pub fn prepare_interactive(request: InteractiveLaunchRequest) -> Result<RunConfi
         request.continue_latest,
         HistoryMode::Record,
     );
-    let mut config_request = RunConfigRequest::new(request.app_version, cwd);
+    let mut config_request = RunConfigRequest::new(request.app_version, cwd.clone());
+    config_request.runtime_cwd = Some(cwd);
     config_request.prompt = request.prompt.join(" ");
     config_request.output_format = OutputFormat::Text;
     config_request.provider = request.provider;
@@ -287,6 +292,7 @@ mod tests {
             fork: Some("two".to_string()),
             continue_latest: false,
             session_picker: false,
+            cwd: None,
             model: None,
             mode: None,
             api_key: None,
@@ -298,6 +304,28 @@ mod tests {
             prepare_interactive(request).unwrap_err(),
             "--resume, --fork, and --continue are mutually exclusive"
         );
+    }
+
+    #[test]
+    fn interactive_launch_preserves_requested_cwd() {
+        let cwd = tempfile::tempdir().expect("temporary workspace");
+        let request = InteractiveLaunchRequest {
+            app_version: "0.2.55".to_string(),
+            resume: None,
+            fork: None,
+            continue_latest: false,
+            session_picker: false,
+            cwd: Some(cwd.path().to_path_buf()),
+            model: None,
+            mode: None,
+            api_key: Some("test-key".to_string()),
+            base_url: None,
+            provider: ProviderKind::Mock,
+            prompt: vec!["hello".to_string()],
+        };
+
+        let config = prepare_interactive(request).expect("interactive config");
+        assert_eq!(config.cwd.as_deref(), Some(cwd.path()));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -99,18 +99,6 @@ fn read_capped_utf8_from(reader: impl Read, is_file: bool, metadata_len: u64) ->
     content_within_limits(&text).then_some(text)
 }
 
-fn open_highlight_file(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    }
-    options.open(path)
-}
-
 fn read_capped_utf8_with(
     path: &Path,
     open: impl FnOnce(&Path) -> io::Result<File>,
@@ -121,7 +109,9 @@ fn read_capped_utf8_with(
 }
 
 fn read_capped_utf8(path: &Path) -> Option<String> {
-    read_capped_utf8_with(path, open_highlight_file)
+    let file = orca_platform::fs::open_nofollow_nonblocking(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    read_capped_utf8_from(file, metadata.is_file(), metadata.len())
 }
 
 fn run_job(job: &EditHighlightJob) -> EditHighlightOutcome {
