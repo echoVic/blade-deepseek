@@ -201,11 +201,13 @@ fn workflow_source_command_prints_saved_workflow_source() {
 fn workflow_run_returns_before_slow_workflow_completes() {
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");
-    write_hold_hook_config(&home);
     let script = temp.path().join("slow.js");
+    // The mock provider honors a `mock_stream_delay_ms <n>` prompt with a real,
+    // cancellable in-provider delay, so the model call is deterministically slow
+    // on every platform without depending on shell hooks or wall-clock races.
     fs::write(
         &script,
-        "export const meta = { name: 'slow', description: 'Slow workflow', phases: [] };\nexport default await agent('inspect repo');",
+        "export const meta = { name: 'slow', description: 'Slow workflow', phases: [] };\nexport default await agent('mock_stream_delay_ms 6000');",
     )
     .unwrap();
 
@@ -226,9 +228,9 @@ fn workflow_run_returns_before_slow_workflow_completes() {
     let launched: Value = serde_json::from_slice(&run.stdout).unwrap();
     let task_id = launched["taskId"].as_str().unwrap();
 
-    // The model call is held by the hook, so the run is observably active while
-    // the launching command has already returned. Poll for that state instead
-    // of assuming a fixed startup latency.
+    // The launching command returns while the model call is still streaming, so
+    // the run is observably active. Poll for that state rather than assuming a
+    // fixed startup latency.
     wait_until_active(temp.path(), Some(&home), task_id);
 
     wait_for_workflow_terminal_status(temp.path(), Some(&home), task_id);
@@ -240,11 +242,12 @@ fn workflow_run_returns_before_slow_workflow_completes() {
 fn workflow_stop_requests_real_background_stop() {
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");
-    write_hold_hook_config(&home);
     let script = temp.path().join("stoppable.js");
+    // The first model call is deterministically slow via the mock provider's
+    // in-provider delay, so the run is reliably active when we request the stop.
     fs::write(
         &script,
-        "export const meta = { name: 'stoppable', description: 'Stoppable workflow', phases: [] };\nawait agent('first');\nexport default await agent('second');",
+        "export const meta = { name: 'stoppable', description: 'Stoppable workflow', phases: [] };\nawait agent('mock_stream_delay_ms 6000');\nexport default await agent('second');",
     )
     .unwrap();
 
@@ -266,8 +269,8 @@ fn workflow_stop_requests_real_background_stop() {
     let task_id = launched["taskId"].as_str().unwrap();
     let run_id = launched["runId"].as_str().unwrap();
 
-    // The first model call is held by the hook; poll until the run is active so
-    // the stop request provably lands on a live task.
+    // Poll until the run is active so the stop request provably lands on a live
+    // task while the first model call is still streaming.
     wait_until_active(temp.path(), Some(&home), task_id);
 
     let stop = Command::new(env!("CARGO_BIN_EXE_orca"))
@@ -298,11 +301,13 @@ fn workflow_stop_requests_real_background_stop() {
 fn workflow_pause_resume_and_clone_control_persisted_run() {
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");
-    write_hold_hook_config(&home);
     let script = temp.path().join("pausable.js");
+    // The first model call is deterministically slow via the mock provider's
+    // in-provider delay, so the run is reliably active when we request the
+    // pause; the runner then observes the pause before the second agent.
     fs::write(
         &script,
-        "export const meta = { name: 'pausable', description: 'Pausable workflow', phases: [] };\nawait agent('first');\nexport default await agent('second');",
+        "export const meta = { name: 'pausable', description: 'Pausable workflow', phases: [] };\nawait agent('mock_stream_delay_ms 6000');\nexport default await agent('second');",
     )
     .unwrap();
 
@@ -324,9 +329,8 @@ fn workflow_pause_resume_and_clone_control_persisted_run() {
     let task_id = launched["taskId"].as_str().unwrap();
     let run_id = launched["runId"].as_str().unwrap();
 
-    // The first model call is held by the hook; poll until the run is active,
-    // then request the pause. The runner observes the pause before the second
-    // agent, so the workflow settles into `paused`.
+    // Poll until the run is active, then request the pause. The runner observes
+    // the pause before the second agent, so the workflow settles into `paused`.
     wait_until_active(temp.path(), Some(&home), task_id);
     let pause = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
@@ -562,31 +566,6 @@ fn wait_for_workflow_status(
     panic!(
         "workflow task {task_id} did not reach status {expected} within 60s (last status: {last_status})"
     );
-}
-
-/// Write a `pre_model_call` hook that holds each model call for a fixed
-/// duration. The workflow worker runs in a separate process, so tests poll for
-/// the active state (see `wait_until_active`) rather than assuming a fixed
-/// startup latency. The hold is comfortably shorter than the 30s hook timeout
-/// but long enough to observe the run and issue a control command against it.
-fn write_hold_hook_config(home: &std::path::Path) {
-    fs::create_dir_all(home).unwrap();
-    // Windows CI runners can be slow to spawn the worker and reach the first
-    // model call, so hold long enough for the test's polling to catch the
-    // active state and act, while staying well under the 30s hook timeout.
-    let seconds = 8.0_f32;
-    #[cfg(windows)]
-    let command = format!(
-        "Start-Sleep -Milliseconds {}",
-        (seconds * 1000.0).round() as u64
-    );
-    #[cfg(not(windows))]
-    let command = format!("sleep {seconds}");
-    fs::write(
-        home.join("config.toml"),
-        format!("[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"{command}\"\n"),
-    )
-    .unwrap();
 }
 
 /// Poll `workflow show` until the task is observably active (`queued` or
