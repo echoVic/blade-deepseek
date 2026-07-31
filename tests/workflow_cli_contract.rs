@@ -211,6 +211,7 @@ fn workflow_run_returns_before_slow_workflow_completes() {
     )
     .unwrap();
 
+    let launch_started = Instant::now();
     let run = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
         .env("ORCA_HOME", &home)
@@ -223,8 +224,19 @@ fn workflow_run_returns_before_slow_workflow_completes() {
         ])
         .output()
         .expect("run workflow");
+    let launch_elapsed = launch_started.elapsed();
 
     assert_eq!(run.status.code(), Some(0));
+    // This is the contract the test is named for, and it was previously never
+    // asserted: `workflow run` must hand back the launch record while the model
+    // call is still streaming, not block until the worker finishes. Half the
+    // mock delay is a generous bound that still fails loudly if the launch path
+    // starts waiting on the run.
+    assert!(
+        launch_elapsed < Duration::from_millis(3000),
+        "workflow run blocked for {launch_elapsed:?}; it must return before the \
+         6s model call completes"
+    );
     let launched: Value = serde_json::from_slice(&run.stdout).unwrap();
     let task_id = launched["taskId"].as_str().unwrap();
 
@@ -578,21 +590,31 @@ fn wait_until_active(
     task_id: &str,
 ) -> Value {
     let deadline = Instant::now() + Duration::from_secs(20);
-    let mut last = Value::Null;
+    let mut seen: Vec<String> = Vec::new();
     loop {
         let show = workflow_show(cwd, home, task_id);
         let status = show["status"].as_str().unwrap_or_default();
-        if status == "queued" || status == "running" {
-            return show;
+        if seen.last().map(String::as_str) != Some(status) {
+            seen.push(status.to_string());
         }
         assert!(
             !matches!(status, "completed" | "failed" | "stopped" | "cancelled"),
-            "workflow reached terminal state before it could be observed active: {show}"
+            "workflow reached terminal state before it could be observed active \
+             (status sequence: {seen:?}): {show}"
         );
-        last = show;
+        // Classify by exclusion, not by allowlist. `WorkflowRunStatus` has nine
+        // variants; an allowlist of `queued`/`running` left the rest in a gap
+        // where the loop neither returned nor failed, so it spun for the whole
+        // run and only tripped once the run went terminal. Any non-terminal
+        // status means the run is live, which is all these tests need before
+        // issuing pause/stop. The status sequence is reported on failure so a
+        // future gap names itself instead of looking like a timing flake.
+        if !status.is_empty() {
+            return show;
+        }
         assert!(
             Instant::now() < deadline,
-            "workflow task {task_id} never became active within 20s (last: {last})"
+            "workflow task {task_id} never reported a status within 20s (last: {show})"
         );
         thread::sleep(Duration::from_millis(50));
     }
