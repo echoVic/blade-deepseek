@@ -230,7 +230,11 @@ fn workflow_run_returns_before_slow_workflow_completes() {
     // it is guaranteed to still be active here regardless of CI scheduling.
     gate.wait_until_started();
     let show = workflow_show(temp.path(), Some(&home), task_id);
-    assert!(show["status"] == "queued" || show["status"] == "running");
+    assert!(
+        show["status"] == "queued" || show["status"] == "running",
+        "workflow already left active state before release: {show}; hook log: {}",
+        gate.hook_log()
+    );
 
     gate.release();
     wait_for_workflow_terminal_status(temp.path(), Some(&home), task_id);
@@ -279,7 +283,14 @@ fn workflow_stop_requests_real_background_stop() {
         .output()
         .expect("stop workflow");
 
-    assert_eq!(stop.status.code(), Some(0));
+    assert_eq!(
+        stop.status.code(),
+        Some(0),
+        "stop failed: stderr={} show={} hook log={}",
+        String::from_utf8_lossy(&stop.stderr),
+        workflow_show(temp.path(), Some(&home), task_id),
+        gate.hook_log()
+    );
     let stop_value: Value = serde_json::from_slice(&stop.stdout).unwrap();
     assert_eq!(stop_value["status"], "stop_requested");
     assert_eq!(stop_value["taskId"], task_id);
@@ -331,7 +342,14 @@ fn workflow_pause_resume_and_clone_control_persisted_run() {
         .args(["workflow", "pause", task_id])
         .output()
         .expect("pause workflow");
-    assert_eq!(pause.status.code(), Some(0));
+    assert_eq!(
+        pause.status.code(),
+        Some(0),
+        "pause failed: stderr={} show={} hook log={}",
+        String::from_utf8_lossy(&pause.stderr),
+        workflow_show(temp.path(), Some(&home), task_id),
+        gate.hook_log()
+    );
     let pause_value: Value = serde_json::from_slice(&pause.stdout).unwrap();
     assert_eq!(pause_value["status"], "pause_requested");
 
@@ -565,6 +583,7 @@ fn wait_for_workflow_status(
 struct WorkflowGate {
     started_marker: std::path::PathBuf,
     release_marker: std::path::PathBuf,
+    log_marker: std::path::PathBuf,
 }
 
 impl WorkflowGate {
@@ -573,10 +592,15 @@ impl WorkflowGate {
         while !self.started_marker.exists() {
             assert!(
                 Instant::now() < deadline,
-                "workflow model-call hook did not start within 30s"
+                "workflow model-call hook did not start within 30s (hook log: {})",
+                self.hook_log()
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    fn hook_log(&self) -> String {
+        fs::read_to_string(&self.log_marker).unwrap_or_else(|_| "<no hook log>".to_string())
     }
 
     fn release(&self) {
@@ -585,31 +609,37 @@ impl WorkflowGate {
 }
 
 /// Write a `pre_model_call` hook that appends to `started_marker` and then
-/// polls for `release_marker`, using the host shell dialect. The hook must
-/// finish inside the 30s hook timeout, so it also stops waiting after ~25s.
+/// polls for `release_marker`, using the host shell dialect. This mirrors the
+/// `shell_session_contract.rs` marker-wait pattern that is known to run on
+/// Windows CI. A bounded iteration cap keeps the hook inside the 30s timeout.
 fn write_gate_hook_config(home: &std::path::Path) -> WorkflowGate {
     fs::create_dir_all(home).unwrap();
     let started_marker = home.join("model-call-started");
     let release_marker = home.join("model-call-release");
+    let log_marker = home.join("model-call-hook.log");
 
     #[cfg(windows)]
     let command = {
         let started = powershell_literal(&started_marker);
         let release = powershell_literal(&release_marker);
+        let log = powershell_literal(&log_marker);
         format!(
-            "Add-Content -LiteralPath {started} -Value 'x'; \
-             $deadline = (Get-Date).AddSeconds(25); \
-             while (-not (Test-Path -LiteralPath {release}) -and (Get-Date) -lt $deadline) {{ \
-                 Start-Sleep -Milliseconds 50 \
-             }}"
+            "Add-Content -LiteralPath {log} -Value 'enter'; \
+             Set-Content -NoNewline -LiteralPath {started} -Value ''; \
+             $i = 0; \
+             while (!(Test-Path -LiteralPath {release}) -and $i -lt 500) {{ \
+                 Start-Sleep -Milliseconds 50; $i++ \
+             }}; \
+             Add-Content -LiteralPath {log} -Value \"exit i=$i released=$(Test-Path -LiteralPath {release})\""
         )
     };
     #[cfg(not(windows))]
     let command = {
         let started = shell_single_quote(&started_marker);
         let release = shell_single_quote(&release_marker);
+        let log = shell_single_quote(&log_marker);
         format!(
-            "printf x >> {started}; i=0; while [ ! -e {release} ] && [ \"$i\" -lt 500 ]; do sleep 0.05; i=$((i+1)); done"
+            "printf 'enter\\n' >> {log}; printf x >> {started}; i=0; while [ ! -e {release} ] && [ \"$i\" -lt 500 ]; do sleep 0.05; i=$((i+1)); done; printf 'exit i=%s\\n' \"$i\" >> {log}"
         )
     };
 
@@ -625,6 +655,7 @@ fn write_gate_hook_config(home: &std::path::Path) -> WorkflowGate {
     WorkflowGate {
         started_marker,
         release_marker,
+        log_marker,
     }
 }
 
