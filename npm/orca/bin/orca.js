@@ -13,19 +13,33 @@ const require = createRequire(import.meta.url);
 const TARGETS = {
   "darwin:arm64": {
     packageName: "@blade-ai/orca-darwin-arm64",
-    targetTriple: "aarch64-apple-darwin"
+    targetTriple: "aarch64-apple-darwin",
+    binaryName: "orca"
   },
   "darwin:x64": {
     packageName: "@blade-ai/orca-darwin-x64",
-    targetTriple: "x86_64-apple-darwin"
+    targetTriple: "x86_64-apple-darwin",
+    binaryName: "orca"
   },
   "linux:arm64": {
     packageName: "@blade-ai/orca-linux-arm64",
-    targetTriple: "aarch64-unknown-linux-gnu"
+    targetTriple: "aarch64-unknown-linux-gnu",
+    binaryName: "orca"
   },
   "linux:x64": {
     packageName: "@blade-ai/orca-linux-x64",
-    targetTriple: "x86_64-unknown-linux-gnu"
+    targetTriple: "x86_64-unknown-linux-gnu",
+    binaryName: "orca"
+  },
+  "win32:arm64": {
+    packageName: "@blade-ai/orca-win32-arm64",
+    targetTriple: "aarch64-pc-windows-msvc",
+    binaryName: "orca.exe"
+  },
+  "win32:x64": {
+    packageName: "@blade-ai/orca-win32-x64",
+    targetTriple: "x86_64-pc-windows-msvc",
+    binaryName: "orca.exe"
   }
 };
 
@@ -43,7 +57,7 @@ function findExecutable() {
     vendorRoot = path.join(__dirname, "..", "vendor");
   }
 
-  const executable = path.join(vendorRoot, target.targetTriple, "bin", "orca");
+  const executable = path.join(vendorRoot, target.targetTriple, "bin", target.binaryName);
   if (existsSync(executable)) {
     return executable;
   }
@@ -71,7 +85,9 @@ child.on("error", (error) => {
   process.exit(1);
 });
 
-const handledSignals = ["SIGINT", "SIGTERM", "SIGHUP"];
+const handledSignals = process.platform === "win32"
+  ? ["SIGINT", "SIGTERM"]
+  : ["SIGINT", "SIGTERM", "SIGHUP"];
 const forwardSignal = (signal) => {
   if (!child.killed) {
     child.kill(signal);
