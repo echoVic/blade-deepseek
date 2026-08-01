@@ -4527,12 +4527,14 @@ async fn run_host_supervisor(
                                 Some((HostShutdownActorState::Settled, Some(error)))
                             }
                             Err(mpsc::TryRecvError::Empty) => None,
-                            Err(mpsc::TryRecvError::Disconnected) => Some((
-                                HostShutdownActorState::Settled,
-                                Some(RuntimeHostError::ResponseChannelClosed {
-                                    owner: "runtime thread",
-                                }),
-                            )),
+                            // The actor can finish after accepting an idempotent
+                            // second shutdown but before consuming its reply
+                            // sender. Re-enter dispatch so the next pass observes
+                            // the closed mailbox or finished join handle; the
+                            // final join still reports a real actor panic.
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                Some((HostShutdownActorState::NeedsDispatch, None))
+                            }
                         };
                         if let Some((state, error)) = transition {
                             shutdown_actor.state = state;

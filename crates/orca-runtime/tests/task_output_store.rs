@@ -8,6 +8,14 @@ use orca_runtime::{
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+fn platform_shell_script(unix: &str, windows: &str) -> String {
+    if cfg!(windows) {
+        windows.to_string()
+    } else {
+        unix.to_string()
+    }
+}
+
 #[test]
 fn task_output_store_reads_delta_and_tail_without_splitting_utf8() {
     let store = TaskOutputStore::new();
@@ -179,7 +187,10 @@ fn shell_session_writes_process_output_to_task_output_store() {
 
     let handle = manager
         .spawn(ShellSessionCommand {
-            command: "printf stdout; printf stderr >&2; read -r _ || true".to_string(),
+            command: platform_shell_script(
+                "printf stdout; printf stderr >&2; read -r _ || true",
+                "[Console]::Out.Write('stdout'); [Console]::Out.Flush(); [Console]::Error.Write('stderr'); [Console]::Error.Flush(); $null = [Console]::In.ReadLine()",
+            ),
             argv: None,
             cwd: cwd.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
@@ -193,7 +204,7 @@ fn shell_session_writes_process_output_to_task_output_store() {
         })
         .expect("spawn shell");
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(5);
     let running_output = loop {
         let output = manager
             .read(&handle.id, Duration::from_millis(50))
@@ -221,7 +232,7 @@ fn shell_session_writes_process_output_to_task_output_store() {
         .write_stdin(&handle.id, "\n")
         .expect("release running shell");
     let final_output = manager
-        .wait(&handle.id, Duration::from_secs(2))
+        .wait(&handle.id, Duration::from_secs(5))
         .expect("wait for shell");
     assert_eq!(final_output.stdout, "stdout");
     assert_eq!(final_output.stderr, "stderr");
@@ -235,7 +246,7 @@ fn shell_session_evicts_completed_process_output_from_task_output_store() {
 
     let handle = manager
         .spawn(ShellSessionCommand {
-            command: "printf done".to_string(),
+            command: platform_shell_script("printf done", "[Console]::Out.Write('done')"),
             argv: None,
             cwd: cwd.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
@@ -265,7 +276,7 @@ fn shell_session_evicts_completed_process_output_when_read_observes_exit() {
 
     let handle = manager
         .spawn(ShellSessionCommand {
-            command: "printf done".to_string(),
+            command: platform_shell_script("printf done", "[Console]::Out.Write('done')"),
             argv: None,
             cwd: cwd.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
@@ -279,10 +290,19 @@ fn shell_session_evicts_completed_process_output_when_read_observes_exit() {
         })
         .expect("spawn shell");
 
-    std::thread::sleep(Duration::from_millis(100));
-    let output = manager
-        .read(&handle.id, Duration::from_secs(1))
-        .expect("read completed shell");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let output = loop {
+        let output = manager
+            .read(&handle.id, Duration::from_millis(100))
+            .expect("read completed shell");
+        if output.status != orca_core::task_types::TaskStatus::Running {
+            break output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "shell did not complete before read deadline"
+        );
+    };
 
     assert_eq!(output.stdout, "done");
     assert_eq!(manager.output_store().size(&handle.task_id), 0);
@@ -296,7 +316,7 @@ fn shell_session_reap_completed_removes_process_output_from_task_output_store() 
 
     let handle = manager
         .spawn(ShellSessionCommand {
-            command: "printf listed".to_string(),
+            command: platform_shell_script("printf listed", "[Console]::Out.Write('listed')"),
             argv: None,
             cwd: cwd.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
@@ -310,8 +330,18 @@ fn shell_session_reap_completed_removes_process_output_from_task_output_store() 
         })
         .expect("spawn shell");
 
-    std::thread::sleep(Duration::from_millis(100));
-    let completed = manager.reap_completed().expect("reap completed shell");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let completed = loop {
+        let completed = manager.reap_completed().expect("reap completed shell");
+        if !completed.is_empty() {
+            break completed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "shell did not complete before reap deadline"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
 
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].id, handle.id);
@@ -330,7 +360,10 @@ fn shell_session_evicts_stopped_process_output_from_task_output_store() {
 
     let handle = manager
         .spawn(ShellSessionCommand {
-            command: "printf running; sleep 5".to_string(),
+            command: platform_shell_script(
+                "printf running; sleep 5",
+                "[Console]::Out.Write('running'); [Console]::Out.Flush(); Start-Sleep -Seconds 5",
+            ),
             argv: None,
             cwd: cwd.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
@@ -344,6 +377,21 @@ fn shell_session_evicts_stopped_process_output_from_task_output_store() {
         })
         .expect("spawn shell");
 
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let stored = manager
+            .output_store()
+            .read_delta(&handle.task_id, 0, 64)
+            .expect("read running output");
+        if stored.stdout.contains("running") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "shell did not publish output before kill"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let output = manager.kill(&handle.id).expect("kill shell");
 
     assert_eq!(output.status, orca_core::task_types::TaskStatus::Stopped);
@@ -360,7 +408,10 @@ fn shell_session_reports_when_retained_output_omits_prefix() {
 
     let handle = manager
         .spawn(ShellSessionCommand {
-            command: "printf 'first\\nlast\\n'".to_string(),
+            command: platform_shell_script(
+                "printf 'first\\nlast\\n'",
+                "[Console]::Out.Write(\"first`nlast`n\")",
+            ),
             argv: None,
             cwd: cwd.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
@@ -375,7 +426,7 @@ fn shell_session_reports_when_retained_output_omits_prefix() {
         .expect("spawn shell");
 
     let output = manager
-        .wait(&handle.id, Duration::from_secs(2))
+        .wait(&handle.id, Duration::from_secs(5))
         .expect("wait for shell");
 
     assert_eq!(output.stdout, "[6 bytes of earlier output omitted]\nlast\n");

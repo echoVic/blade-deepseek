@@ -2624,6 +2624,14 @@ mod tests {
         }
     }
 
+    fn test_shell_script(unix: &str, windows: &str) -> String {
+        if cfg!(windows) {
+            windows.to_string()
+        } else {
+            unix.to_string()
+        }
+    }
+
     struct DelayedTerminalWriter {
         output: SharedVecWriter,
         delay_started: Arc<std::sync::atomic::AtomicBool>,
@@ -3097,7 +3105,10 @@ mod tests {
             .spawn(
                 cwd.path(),
                 ShellSessionCommand {
-                    command: "printf command-owned".to_string(),
+                    command: test_shell_script(
+                        "printf command-owned",
+                        "[Console]::Out.Write('command-owned')",
+                    ),
                     argv: None,
                     cwd: cwd.path().to_path_buf(),
                     additional_readable_directories: Vec::new(),
@@ -3135,16 +3146,10 @@ mod tests {
                 },
             )
             .expect("insert command exec process");
-        std::thread::sleep(Duration::from_millis(100));
-
         let mut output = Vec::new();
         run_shell_list(&mut state, Value::from("shell-list"), &mut output).expect("shell/list");
-        drain_command_exec_processes_with_timeout(
-            &mut state,
-            &mut output,
-            Duration::from_millis(50),
-        )
-        .expect("drain command exec");
+        drain_command_exec_processes_with_timeout(&mut state, &mut output, Duration::from_secs(4))
+            .expect("drain command exec");
         let events = parse_jsonl(&output);
 
         assert!(

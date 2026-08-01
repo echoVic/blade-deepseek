@@ -161,10 +161,31 @@ mod tests {
     use crate::runtime_state::RuntimeTurnReducer;
     use crate::thread_store::{SessionStore, ThreadStore};
     use orca_core::config::PermissionProfileNetworkAccess;
+    use std::borrow::Cow;
     use std::collections::HashMap;
     use std::io;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+
+    fn normalized_source(source: &str) -> Cow<'_, str> {
+        if source.contains('\r') {
+            Cow::Owned(source.replace("\r\n", "\n").replace('\r', "\n"))
+        } else {
+            Cow::Borrowed(source)
+        }
+    }
+
+    #[test]
+    fn source_contracts_use_one_line_ending_on_every_host() {
+        assert_eq!(
+            normalized_source("first\r\nsecond\rthird"),
+            "first\nsecond\nthird"
+        );
+        assert!(matches!(
+            normalized_source("first\nsecond"),
+            Cow::Borrowed(_)
+        ));
+    }
 
     #[test]
     fn thread_store_module_exports_session_store_boundary() {
@@ -449,7 +470,7 @@ mod tests {
 
     #[test]
     fn tool_execution_context_groups_extension_store_refs() {
-        let tool_execution_source = include_str!("tool_execution.rs");
+        let tool_execution_source = normalized_source(include_str!("tool_execution.rs"));
 
         assert!(
             tool_execution_source.contains("extension_stores: Option<RuntimeExtensionStores"),
@@ -921,8 +942,8 @@ mod tests {
 
     #[test]
     fn runtime_turn_kernel_owns_sampling_request_state_and_reducer() {
-        let kernel_source = include_str!("runtime_turn_kernel.rs");
-        let provider_turn_source = include_str!("provider_turn.rs");
+        let kernel_source = normalized_source(include_str!("runtime_turn_kernel.rs"));
+        let provider_turn_source = normalized_source(include_str!("provider_turn.rs"));
         let provider_turn_runtime_source = provider_turn_source
             .split("\n#[cfg(test)]\nmod tests")
             .next()
@@ -964,8 +985,8 @@ mod tests {
 
     #[test]
     fn runtime_turn_kernel_binds_provider_step_context_extensions() {
-        let kernel_source = include_str!("runtime_turn_kernel.rs");
-        let provider_turn_source = include_str!("provider_turn.rs");
+        let kernel_source = normalized_source(include_str!("runtime_turn_kernel.rs"));
+        let provider_turn_source = normalized_source(include_str!("provider_turn.rs"));
         let provider_turn_runtime_source = provider_turn_source
             .split("\n#[cfg(test)]\nmod tests")
             .next()
@@ -1030,8 +1051,8 @@ mod tests {
 
     #[test]
     fn runtime_provider_response_input_groups_io_refs_contract() {
-        let kernel_source = include_str!("runtime_turn_kernel.rs");
-        let provider_turn_source = include_str!("provider_turn.rs");
+        let kernel_source = normalized_source(include_str!("runtime_turn_kernel.rs"));
+        let provider_turn_source = normalized_source(include_str!("provider_turn.rs"));
         let provider_turn_runtime_source = provider_turn_source
             .split("\n#[cfg(test)]\nmod tests")
             .next()
@@ -1094,7 +1115,7 @@ mod tests {
 
     #[test]
     fn runtime_provider_turn_input_groups_io_refs_contract() {
-        let provider_turn_source = include_str!("provider_turn.rs");
+        let provider_turn_source = normalized_source(include_str!("provider_turn.rs"));
         let provider_turn_runtime_source = provider_turn_source
             .split("\n#[cfg(test)]\nmod tests")
             .next()
@@ -1154,8 +1175,8 @@ mod tests {
 
     #[test]
     fn runtime_turn_kernel_assembles_turn_loop_state() {
-        let kernel_source = include_str!("runtime_turn_kernel.rs");
-        let lifecycle_source = include_str!("lifecycle.rs");
+        let kernel_source = normalized_source(include_str!("runtime_turn_kernel.rs"));
+        let lifecycle_source = normalized_source(include_str!("lifecycle.rs"));
         let lifecycle_runtime_source = lifecycle_source
             .split("\n#[cfg(test)]")
             .next()

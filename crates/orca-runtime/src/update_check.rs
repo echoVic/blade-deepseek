@@ -451,7 +451,7 @@ mod tests {
         );
 
         assert_eq!(
-            action.command().display,
+            action.command_for_os(OperatingSystem::Linux).display,
             "curl -fsSL https://orcaagent.dev/install.sh -o <tmp> && ORCA_NON_INTERACTIVE=1 INSTALL_DIR=/custom/bin sh <tmp>"
         );
     }
@@ -462,7 +462,7 @@ mod tests {
             |_| None,
             Some(std::path::Path::new("/custom/bin/orca")),
         );
-        let command = action.command();
+        let command = action.command_for_os(OperatingSystem::Linux);
 
         assert_eq!(command.program, "sh");
         assert!(command.args.iter().any(|arg| arg.contains("mktemp")));

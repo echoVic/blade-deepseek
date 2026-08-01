@@ -192,10 +192,11 @@ pub fn call_streaming(
     cancel: &CancelToken,
     on_step: &mut dyn FnMut(&ProviderStep),
 ) -> ProviderResponse {
+    const STREAM_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
     let mut stream = start_streaming(kind, conversation, config, cancel.clone());
     let callback_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         loop {
-            match stream.recv_timeout(Duration::from_secs(1)) {
+            match stream.recv_timeout(STREAM_EVENT_POLL_INTERVAL) {
                 Ok(ProviderStreamEvent::Step(delivery)) => on_step(delivery.step()),
                 Ok(ProviderStreamEvent::Completed(response)) => return response,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,

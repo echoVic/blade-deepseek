@@ -355,7 +355,7 @@ mod tests {
     fn verifier_command_timeout_kills_descendant_processes() {
         let start = Instant::now();
         let command = platform_verifier_script(
-            "printf before; trap 'exit 143' TERM; sleep 10; printf after",
+            "printf before; sleep 10 && printf after",
             "[Console]::Out.Write('before'); [Console]::Out.Flush(); & \"$env:WINDIR\\System32\\ping.exe\" -n 11 127.0.0.1 > $null; [Console]::Out.Write('after')",
         );
 

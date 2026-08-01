@@ -25,7 +25,7 @@ use orca_core::thread_identity::TurnId;
 use orca_core::thread_item_projection::ModelResponseIdentity;
 use orca_core::tool_types::ToolRequest;
 use orca_core::workflow_types::WorkflowInput;
-use orca_platform::fs::{AtomicWritePolicy, atomic_write};
+use orca_platform::fs::{AtomicWritePolicy, ExclusiveFileLock, atomic_write};
 use orca_platform::process::ProcessJob;
 use serde::{Deserialize, Serialize};
 
@@ -1547,6 +1547,8 @@ impl TaskPersistence {
 
     fn write_current_session(&self, tasks: &HashMap<String, TaskRecord>) -> io::Result<()> {
         self.write_session_records(&self.session_id, tasks)?;
+        let _index_lock =
+            ExclusiveFileLock::acquire(&self.index_lock_path()).map_err(io::Error::other)?;
         let mut index = self.load_index()?;
         for id in tasks.keys() {
             index.insert(id.clone(), self.session_id.clone());
@@ -1676,6 +1678,10 @@ impl TaskPersistence {
 
     fn index_path(&self) -> PathBuf {
         self.root.join("task-index.json")
+    }
+
+    fn index_lock_path(&self) -> PathBuf {
+        self.root.join("task-index.lock")
     }
 }
 
@@ -2086,7 +2092,25 @@ fn subagent_worker_command_matches(command_line: &str, agent_id: &str) -> bool {
             .any(|pair| pair[0] == "--agent-id" && pair[1] == agent_id)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn verify_recovered_worker(pid: u32, agent_id: &str) -> Result<RecoveredWorkerState, String> {
+    match ProcessJob::open_named(&async_worker_job_name(agent_id)) {
+        Ok(job) => job
+            .contains_process(pid)
+            .map(|matches| {
+                if matches {
+                    RecoveredWorkerState::Matches
+                } else {
+                    RecoveredWorkerState::Replaced
+                }
+            })
+            .map_err(|error| format!("failed to inspect async subagent worker job: {error}")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(RecoveredWorkerState::Missing),
+        Err(error) => Err(format!("failed to open async subagent worker job: {error}")),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn verify_recovered_worker(_pid: u32, _agent_id: &str) -> Result<RecoveredWorkerState, String> {
     Err("cannot safely verify a recovered async subagent worker on this platform".to_string())
 }
@@ -2157,7 +2181,26 @@ fn process_group_has_live_members(pgid: i32) -> Result<bool, String> {
     }))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn terminate_recovered_worker(pid: u32, agent_id: &str) -> Result<(), String> {
+    let job = match ProcessJob::open_named(&async_worker_job_name(agent_id)) {
+        Ok(job) => job,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!("failed to open async subagent worker job: {error}"));
+        }
+    };
+    if !job
+        .contains_process(pid)
+        .map_err(|error| format!("failed to inspect async subagent worker job: {error}"))?
+    {
+        return Ok(());
+    }
+    job.terminate(137)
+        .map_err(|error| format!("failed to terminate async subagent worker job: {error}"))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn terminate_recovered_worker(_pid: u32, _agent_id: &str) -> Result<(), String> {
     Err("cannot safely stop a recovered async subagent worker on this platform".to_string())
 }
@@ -2304,6 +2347,8 @@ fn migrate_legacy_task_sessions(legacy_root: &Path, target_root: &Path) -> io::R
         return Ok(());
     }
 
+    let _index_lock =
+        ExclusiveFileLock::acquire(&target.index_lock_path()).map_err(io::Error::other)?;
     let mut target_index = target.load_index()?;
     let mut changed_index = false;
     let session_ids = legacy_index.values().cloned().collect::<HashSet<_>>();
@@ -2342,6 +2387,44 @@ mod tests {
 
     fn runtime_response(response: ProviderResponse) -> RuntimeModelResponse {
         RuntimeModelResponse::new(response, TurnId::new())
+    }
+
+    #[test]
+    fn concurrent_persistent_sessions_merge_task_index_updates() {
+        let root = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let barrier = Arc::clone(&barrier);
+                let root = root.path().to_path_buf();
+                scope.spawn(move || {
+                    let registry =
+                        TaskRegistry::new_persistent(format!("concurrent-session-{worker}"), root)
+                            .unwrap();
+                    barrier.wait();
+                    registry.create_main_session(format!("concurrent task {worker}"));
+                });
+            }
+            barrier.wait();
+        });
+
+        let index = TaskPersistence::new(root.path().to_path_buf(), String::new())
+            .load_index()
+            .unwrap();
+        assert_eq!(
+            index.len(),
+            4,
+            "concurrent task index lost updates: {index:?}"
+        );
+        for worker in 0..4 {
+            assert!(
+                index
+                    .values()
+                    .any(|session| session == &format!("concurrent-session-{worker}")),
+                "missing concurrent session {worker}: {index:?}"
+            );
+        }
     }
 
     #[test]

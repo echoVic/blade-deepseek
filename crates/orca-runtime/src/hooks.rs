@@ -386,6 +386,10 @@ mod tests {
         }
     }
 
+    fn platform_test_delay(unix_ms: u64, windows_ms: u64) -> Duration {
+        Duration::from_millis(if cfg!(windows) { windows_ms } else { unix_ms })
+    }
+
     fn hook_stdout_script(stdout: &str) -> String {
         platform_hook_script(
             &format!("printf '%s' '{}'", stdout.replace('\'', "'\\''")),
@@ -491,16 +495,16 @@ mod tests {
                     after_messages: None,
                     usage: None,
                 },
-                Duration::from_millis(200),
+                platform_test_delay(200, 1_500),
             )
             .unwrap_err();
 
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(4),
             "hook should not wait for descendant processes"
         );
         assert!(
-            err.contains("timed out after 0s: before"),
+            err.contains("timed out after") && err.contains("before"),
             "unexpected error: {err}"
         );
     }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -56,9 +57,18 @@ fn boundary_scan_ignores_only_the_trailing_test_module() {
 }
 
 #[test]
+fn boundary_scan_is_independent_of_checkout_line_endings() {
+    let source = normalized_source(
+        "production\r\n#[cfg(test)]\r\nmod tests {\r\nHostedTurnRequest\r\n}\r\n",
+    );
+    assert_eq!(production_source(&source), "production");
+}
+
+#[test]
 fn prompt_cancel_keeps_only_transport_binding_in_acp() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/acp/agent.rs");
     let source = fs::read_to_string(&path).expect("read ACP agent source");
+    let source = normalized_source(&source);
     let production = production_source(&source);
     let binding = between(
         production,
@@ -90,6 +100,14 @@ fn production_source(source: &str) -> &str {
         .map_or(source, |(production, _)| production)
 }
 
+fn normalized_source(source: &str) -> Cow<'_, str> {
+    if source.contains('\r') {
+        Cow::Owned(source.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(source)
+    }
+}
+
 fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
         .split_once(start)
@@ -113,7 +131,7 @@ fn scan_rs_files(root: &Path, visit: &mut impl FnMut(&Path, &str)) {
         } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
             let source = fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-            visit(&path, &source);
+            visit(&path, &normalized_source(&source));
         }
     }
 }

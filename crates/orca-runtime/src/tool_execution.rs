@@ -1240,6 +1240,14 @@ mod tests {
     use crate::runtime_surface::RuntimeProviderResponseIngress;
     use crate::tasks::TaskRegistry;
 
+    fn platform_hook_script(unix: impl Into<String>, windows: impl Into<String>) -> String {
+        if cfg!(windows) {
+            windows.into()
+        } else {
+            unix.into()
+        }
+    }
+
     #[derive(Debug)]
     struct RecordingSemanticIngress {
         committed: Arc<AtomicBool>,
@@ -1812,7 +1820,13 @@ mod tests {
         .to_string();
         let hooks = HookRunner::new(vec![HookConfig {
             event: HookEvent::PreToolUse,
-            command: format!("printf '%s' '{}'", hook_output),
+            command: platform_hook_script(
+                format!("printf '%s' '{}'", hook_output),
+                format!(
+                    "[Console]::Out.Write('{}')",
+                    hook_output.replace('\'', "''")
+                ),
+            ),
             tool: Some("bash".to_string()),
         }]);
         let policy = policy_for_tool_execution(&config);

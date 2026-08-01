@@ -996,6 +996,15 @@ impl ServerTestClient {
         {
             first_error = Some(error);
         }
+        if let Some(status) = self.status {
+            self.process_group_id.take();
+            self.process_job.take();
+            return if let Some(error) = first_error {
+                Err(error)
+            } else {
+                Ok(status)
+            };
+        }
 
         let child = self
             .child

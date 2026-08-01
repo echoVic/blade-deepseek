@@ -637,6 +637,22 @@ mod tests {
 
     use crate::tool_turn::ToolTurnOutcome;
 
+    fn platform_hook_script(unix: &str, windows: &str) -> String {
+        if cfg!(windows) {
+            windows.to_string()
+        } else {
+            unix.to_string()
+        }
+    }
+
+    fn platform_test_deadline(unix_secs: u64, windows_secs: u64) -> Duration {
+        Duration::from_secs(if cfg!(windows) {
+            windows_secs
+        } else {
+            unix_secs
+        })
+    }
+
     fn config(subagents: SubagentConfig) -> RunConfig {
         RunConfig {
             app_version: "0.0.0-test".to_string(),
@@ -1072,8 +1088,10 @@ mod tests {
         let mcp_registry = McpRegistry::default();
         let hooks = HookRunner::new(vec![HookConfig {
             event: HookEvent::PreToolUse,
-            command: r#"if [ "$ORCA_TOOL_TARGET" = "inspect second" ]; then sleep 5; fi"#
-                .to_string(),
+            command: platform_hook_script(
+                r#"if [ "$ORCA_TOOL_TARGET" = "inspect second" ]; then sleep 5; fi"#,
+                "if ($env:ORCA_TOOL_TARGET -eq 'inspect second') { Start-Sleep -Seconds 5 }",
+            ),
             tool: Some("subagent".to_string()),
         }]);
         let mut cost_tracker = CostTracker::new(None);
@@ -1111,7 +1129,7 @@ mod tests {
             })
             .expect("cancel subagent batch");
 
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < platform_test_deadline(2, 4));
         assert!(matches!(
             outcome,
             ToolTurnOutcome::Return {

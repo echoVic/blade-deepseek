@@ -4306,20 +4306,35 @@ mod tests {
                 )
                 .await;
             }
-            assert_eq!(cleanups[0].0, "terminal/kill");
-            assert_eq!(cleanups[1].0, "terminal/kill");
-            assert_ne!(cleanups[0].1, cleanups[1].1);
-            assert_eq!(cleanups[2].0, "terminal/release");
+            let killed_terminals = cleanups
+                .iter()
+                .filter(|(method, _)| method == "terminal/kill")
+                .map(|(_, terminal_id)| terminal_id.as_str())
+                .collect::<BTreeSet<_>>();
+            let released_terminals = cleanups
+                .iter()
+                .filter(|(method, _)| method == "terminal/release")
+                .map(|(_, terminal_id)| terminal_id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                killed_terminals,
+                BTreeSet::from(["terminal-a", "terminal-b"]),
+                "both exact terminal identities must be killed: {cleanups:?}"
+            );
+            assert_eq!(
+                released_terminals.len(),
+                1,
+                "exactly one terminal release must complete: {cleanups:?}"
+            );
+            let released_terminal = released_terminals[0];
             assert!(
-                cleanups[..2]
-                    .iter()
-                    .any(|(_, terminal_id)| terminal_id == &cleanups[2].1),
+                killed_terminals.contains(released_terminal),
                 "release must preserve one of the exact killed terminal identities: {cleanups:?}"
             );
-            let unresolved_terminal = cleanups[..2]
+            let unresolved_terminal = killed_terminals
                 .iter()
-                .find_map(|(_, terminal_id)| {
-                    (terminal_id != &cleanups[2].1).then_some(terminal_id.clone())
+                .find_map(|terminal_id| {
+                    (*terminal_id != released_terminal).then_some((*terminal_id).to_string())
                 })
                 .expect("one killed terminal remains unreleased");
             assert_eq!(

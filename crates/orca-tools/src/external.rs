@@ -278,6 +278,18 @@ mod tests {
     use orca_core::tool_types::{ToolName, ToolStatus};
     use std::time::Instant;
 
+    fn platform_script(unix: impl Into<String>, windows: impl Into<String>) -> String {
+        if cfg!(windows) {
+            windows.into()
+        } else {
+            unix.into()
+        }
+    }
+
+    fn platform_delay(unix_ms: u64, windows_ms: u64) -> Duration {
+        Duration::from_millis(if cfg!(windows) { windows_ms } else { unix_ms })
+    }
+
     #[test]
     fn external_tool_timeout_kills_descendant_processes() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -285,8 +297,10 @@ mod tests {
             name: "slow_tool".to_string(),
             description: "slow tool".to_string(),
             action_kind: ActionKind::Shell,
-            command: "printf stdout-before; printf stderr-before >&2; sleep 5; printf after"
-                .to_string(),
+            command: platform_script(
+                "printf stdout-before; printf stderr-before >&2; sleep 5; printf after",
+                "[Console]::Out.Write('stdout-before'); [Console]::Out.Flush(); [Console]::Error.Write('stderr-before'); [Console]::Error.Flush(); Start-Sleep -Seconds 5; [Console]::Out.Write('after')",
+            ),
             schema: serde_json::json!({}),
         };
         let request = ToolRequest {
@@ -303,11 +317,11 @@ mod tests {
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
-            Duration::from_millis(200),
+            platform_delay(200, 1_500),
         );
 
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(4),
             "external tool should not wait for descendant processes"
         );
         let error = result.error.as_deref().unwrap_or_default();
@@ -372,7 +386,14 @@ mod tests {
             name: "failing_tool".to_string(),
             description: "failing tool".to_string(),
             action_kind: ActionKind::Shell,
-            command: format!("printf {stdout:?}; printf {stderr:?} >&2; exit 7"),
+            command: platform_script(
+                format!("printf {stdout:?}; printf {stderr:?} >&2; exit 7"),
+                format!(
+                    "[Console]::Out.Write('{}'); [Console]::Error.Write('{}'); exit 7",
+                    stdout.replace('\'', "''"),
+                    stderr.replace('\'', "''"),
+                ),
+            ),
             schema: serde_json::json!({}),
         };
         let request = ToolRequest {
@@ -417,7 +438,10 @@ mod tests {
             name: "slow_tool".to_string(),
             description: "slow tool".to_string(),
             action_kind: ActionKind::Shell,
-            command: "printf before; sleep 5; printf after".to_string(),
+            command: platform_script(
+                "printf before; sleep 5; printf after",
+                "[Console]::Out.Write('before'); [Console]::Out.Flush(); Start-Sleep -Seconds 5; [Console]::Out.Write('after')",
+            ),
             schema: serde_json::json!({}),
         };
         let request = ToolRequest {
@@ -435,11 +459,11 @@ mod tests {
             dir.path(),
             ToolOutputTruncation::bytes(1024),
             Duration::from_secs(30),
-            || start.elapsed() >= Duration::from_millis(100),
+            || start.elapsed() >= platform_delay(100, 1_500),
         );
 
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(4),
             "cancelled external tool should not wait for the shell timeout"
         );
         assert_eq!(result.status, ToolStatus::Cancelled);

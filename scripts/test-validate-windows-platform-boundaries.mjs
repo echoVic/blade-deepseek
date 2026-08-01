@@ -554,12 +554,59 @@ for (const marker of [
   "capability_mark_rails",
   "older_incomplete_background_completion",
   "external_tool_timeout_",
+  "in_flight_summary_request_stops_waiting_for_headers_when_cancelled",
+  "workflow_pause_resume_and_clone_control_persisted_run",
+  "server_mode_input_eof_cancels_pending_permission_request",
+  "production_connection_enforces_terminal_wait_canonical_result_limit",
+  "cancelling_prompt_terminalizes_outstanding_read_text_file_call",
+  "concurrent_terminals_from_one_tool_keep_cleanup_identity_exact",
+  "hook_timeout_kills_descendant_processes",
+  "subagent_batch_cancellation_stops_blocked_hook_and_unstarted_sibling",
+  "bash_commands_receive_eof_on_stdin_instead_of_inheriting_terminal",
+  "binary(=task_output_store)",
+  "verifier_command_timeout_kills_descendant_processes",
 ]) {
   assert.ok(
     nextestConfig.includes(marker),
     `nextest CI profile must contain ${marker}`,
   );
 }
+const taskRegistrySource = readFileSync(
+  path.join(repoRoot, "crates/orca-runtime/src/tasks.rs"),
+  "utf8",
+);
+for (const marker of [
+  "ExclusiveFileLock::acquire(&self.index_lock_path())",
+  "ExclusiveFileLock::acquire(&target.index_lock_path())",
+  "ProcessJob::open_named(&async_worker_job_name(agent_id))",
+  ".contains_process(pid)",
+  "job.terminate(137)",
+]) {
+  assert.ok(
+    taskRegistrySource.includes(marker),
+    `task persistence and recovered workers must contain ${marker}`,
+  );
+}
+const providerSource = readFileSync(
+  path.join(repoRoot, "crates/orca-provider/src/lib.rs"),
+  "utf8",
+);
+const runtimeHostSource = readFileSync(
+  path.join(repoRoot, "crates/orca-runtime/src/runtime_host.rs"),
+  "utf8",
+);
+assert.ok(
+  runtimeHostSource.includes(
+    "Err(mpsc::TryRecvError::Disconnected) => {\n                                Some((HostShutdownActorState::NeedsDispatch, None))",
+  ),
+  "host shutdown must recheck an actor that exits after accepting idempotent shutdown",
+);
+assert.ok(
+  providerSource.includes(
+    "const STREAM_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50)",
+  ),
+  "synchronous provider cancellation must not wait on a one-second receive poll",
+);
 assert.ok(
   pullRequest[1].includes('".config/nextest.toml"') &&
     push[1].includes('".config/nextest.toml"'),

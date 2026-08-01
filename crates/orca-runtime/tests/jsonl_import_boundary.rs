@@ -1,5 +1,24 @@
+use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+fn normalized_source(source: &str) -> Cow<'_, str> {
+    if source.contains('\r') {
+        Cow::Owned(source.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(source)
+    }
+}
+
+#[test]
+fn production_source_scan_is_independent_of_checkout_line_endings() {
+    assert_eq!(
+        normalized_source("production\r\n#[cfg(test)]\r\nmod tests {}\r\n")
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production),
+        Some("production")
+    );
+}
 
 #[test]
 fn jsonl_runtime_and_thread_bound_waiter_owner_modules_are_deleted() {
@@ -57,7 +76,9 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
 fn read_production(path: &Path) -> String {
     let source =
         fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-    source
-        .split_once("\n#[cfg(test)]\nmod tests")
-        .map_or(source.clone(), |(production, _)| production.to_string())
+    let source = normalized_source(&source);
+    match source.split_once("\n#[cfg(test)]\nmod tests") {
+        Some((production, _)) => production.to_string(),
+        None => source.into_owned(),
+    }
 }

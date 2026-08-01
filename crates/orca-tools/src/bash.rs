@@ -629,10 +629,34 @@ mod tests {
         }
     }
 
+    fn platform_script(unix: impl Into<String>, windows: impl Into<String>) -> String {
+        if cfg!(windows) {
+            windows.into()
+        } else {
+            unix.into()
+        }
+    }
+
+    fn platform_delay(unix_ms: u64, windows_ms: u64) -> Duration {
+        Duration::from_millis(if cfg!(windows) { windows_ms } else { unix_ms })
+    }
+
+    fn platform_test_deadline(unix_secs: u64, windows_secs: u64) -> Duration {
+        Duration::from_secs(if cfg!(windows) {
+            windows_secs
+        } else {
+            unix_secs
+        })
+    }
+
     #[test]
     fn streaming_reports_output_chunks_and_final_result() {
         let dir = tempfile::TempDir::new().unwrap();
-        let request = bash_request("printf 'one\\ntwo\\n'");
+        let command = platform_script(
+            "printf 'one\\ntwo\\n'",
+            "[Console]::Out.Write(\"one`ntwo`n\"); [Console]::Out.Flush()",
+        );
+        let request = bash_request(&command);
         let mut chunks = Vec::new();
 
         let result = execute_streaming(&request, dir.path(), 1024, &mut |chunk| {
@@ -650,10 +674,17 @@ mod tests {
     fn streaming_large_unterminated_output_is_bounded_before_result_truncation() {
         let dir = tempfile::TempDir::new().unwrap();
         let logical_bytes = process::DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM * 2;
-        let request = bash_request(&format!(
-            "printf HEAD; yes x | tr -d '\\n' | head -c {}; printf TAIL",
-            logical_bytes - 8
-        ));
+        let command = platform_script(
+            format!(
+                "printf HEAD; yes x | tr -d '\\n' | head -c {}; printf TAIL",
+                logical_bytes - 8
+            ),
+            format!(
+                "[Console]::Out.Write('HEAD'); [Console]::Out.Write('x' * {}); [Console]::Out.Write('TAIL'); [Console]::Out.Flush()",
+                logical_bytes - 8
+            ),
+        );
+        let request = bash_request(&command);
         let mut streamed_bytes = 0usize;
 
         let result = execute_streaming_with_policy(
@@ -685,18 +716,22 @@ mod tests {
     #[test]
     fn bash_commands_receive_eof_on_stdin_instead_of_inheriting_terminal() {
         let dir = tempfile::TempDir::new().unwrap();
-        let request = bash_request("read line; printf done");
+        let command = platform_script(
+            "read line; printf done",
+            "$null = [Console]::In.ReadLine(); [Console]::Out.Write('done')",
+        );
+        let request = bash_request(&command);
         let start = Instant::now();
 
         let result = execute_with_policy(
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
-            Duration::from_secs(2),
+            platform_test_deadline(2, 5),
         );
 
         assert!(
-            start.elapsed() < Duration::from_millis(500),
+            start.elapsed() < platform_test_deadline(1, 4),
             "stdin should be closed without waiting for timeout"
         );
         assert_eq!(result.status, ToolStatus::Completed);
@@ -706,7 +741,11 @@ mod tests {
     #[test]
     fn streaming_respects_shell_timeout_and_returns_partial_output() {
         let dir = tempfile::TempDir::new().unwrap();
-        let request = bash_request("printf before; sleep 5; printf after");
+        let command = platform_script(
+            "printf before; sleep 5; printf after",
+            "[Console]::Out.Write('before'); [Console]::Out.Flush(); Start-Sleep -Seconds 5; [Console]::Out.Write('after')",
+        );
+        let request = bash_request(&command);
         let mut chunks = Vec::new();
         let start = Instant::now();
 
@@ -714,12 +753,12 @@ mod tests {
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
-            Duration::from_millis(200),
+            platform_delay(200, 1_500),
             &mut |chunk| chunks.push(chunk.to_string()),
         );
 
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(4),
             "streaming command should not wait for the child to finish"
         );
         assert_eq!(result.status, ToolStatus::Failed);
@@ -741,7 +780,11 @@ mod tests {
     #[test]
     fn noisy_streaming_timeout_does_not_deadlock_reader_shutdown() {
         let dir = tempfile::TempDir::new().unwrap();
-        let request = bash_request("while :; do printf 1234567890; done");
+        let command = platform_script(
+            "while :; do printf 1234567890; done",
+            "while ($true) { [Console]::Out.Write('1234567890') }",
+        );
+        let request = bash_request(&command);
         let start = Instant::now();
         let mut delayed_callback = false;
 
@@ -749,7 +792,7 @@ mod tests {
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
-            Duration::from_millis(100),
+            platform_delay(100, 1_500),
             &mut |_| {
                 if !delayed_callback {
                     delayed_callback = true;
@@ -759,7 +802,7 @@ mod tests {
         );
 
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(4),
             "noisy streaming timeout deadlocked reader shutdown: {:?}",
             start.elapsed()
         );
@@ -830,7 +873,11 @@ mod tests {
     #[test]
     fn bash_wait_observes_cancel_callback() {
         let dir = tempfile::TempDir::new().unwrap();
-        let request = bash_request("printf before; sleep 5; printf after");
+        let command = platform_script(
+            "printf before; sleep 5; printf after",
+            "[Console]::Out.Write('before'); [Console]::Out.Flush(); Start-Sleep -Seconds 5; [Console]::Out.Write('after')",
+        );
+        let request = bash_request(&command);
         let start = Instant::now();
 
         let result = execute_with_policy_or_cancel(
@@ -838,11 +885,11 @@ mod tests {
             dir.path(),
             ToolOutputTruncation::bytes(1024),
             Duration::from_secs(30),
-            || start.elapsed() >= Duration::from_millis(100),
+            || start.elapsed() >= platform_delay(100, 1_500),
         );
 
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(4),
             "cancelled command should not wait for the shell timeout"
         );
         assert_eq!(result.status, ToolStatus::Cancelled);
@@ -865,7 +912,11 @@ mod tests {
     fn bash_wait_preserves_one_shot_cancel_observation() {
         let dir = tempfile::TempDir::new().unwrap();
         let cancel_ready = dir.path().join("cancel-ready");
-        let request = bash_request("printf before; : > cancel-ready; sleep 5; printf after");
+        let command = platform_script(
+            "printf before; : > cancel-ready; sleep 5; printf after",
+            "[Console]::Out.Write('before'); [Console]::Out.Flush(); New-Item -ItemType File -Force -Path 'cancel-ready' | Out-Null; Start-Sleep -Seconds 5; [Console]::Out.Write('after')",
+        );
+        let request = bash_request(&command);
         let cancellation_delivered = std::cell::Cell::new(false);
 
         let result = execute_with_policy_or_cancel(
@@ -889,7 +940,11 @@ mod tests {
     #[test]
     fn streaming_bash_wait_observes_cancel_callback() {
         let dir = tempfile::TempDir::new().unwrap();
-        let request = bash_request("printf 'before\\n'; sleep 5; printf after");
+        let command = platform_script(
+            "printf 'before\\n'; sleep 5; printf after",
+            "[Console]::Out.Write(\"before`n\"); [Console]::Out.Flush(); Start-Sleep -Seconds 5; [Console]::Out.Write('after')",
+        );
+        let request = bash_request(&command);
         let mut chunks = Vec::new();
         let start = Instant::now();
         let saw_output = Arc::new(AtomicBool::new(false));
@@ -909,13 +964,13 @@ mod tests {
             },
             || {
                 (saw_output_for_cancel.load(Ordering::SeqCst)
-                    && start.elapsed() >= Duration::from_millis(100))
-                    || start.elapsed() >= Duration::from_secs(1)
+                    && start.elapsed() >= platform_delay(100, 1_500))
+                    || start.elapsed() >= platform_delay(1_000, 3_000)
             },
         );
 
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(4),
             "cancelled streaming command should not wait for the shell timeout"
         );
         assert_eq!(result.status, ToolStatus::Cancelled);
@@ -1004,7 +1059,11 @@ mod tests {
     #[test]
     fn noisy_streaming_cancel_does_not_deadlock_reader_shutdown() {
         let dir = tempfile::TempDir::new().unwrap();
-        let request = bash_request("while :; do printf 1234567890; done");
+        let command = platform_script(
+            "while :; do printf 1234567890; done",
+            "while ($true) { [Console]::Out.Write('1234567890') }",
+        );
+        let request = bash_request(&command);
         let start = Instant::now();
         let mut delayed_callback = false;
 
@@ -1019,11 +1078,11 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(250));
                 }
             },
-            || start.elapsed() >= Duration::from_millis(100),
+            || start.elapsed() >= platform_delay(100, 1_500),
         );
 
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(4),
             "noisy streaming cancel deadlocked reader shutdown: {:?}",
             start.elapsed()
         );
