@@ -751,6 +751,14 @@ mod tests {
     use crate::tasks::TaskRegistry;
     use serde_json::Value;
 
+    fn platform_shell_script(unix: &str, windows: &str) -> String {
+        if cfg!(windows) {
+            windows.to_string()
+        } else {
+            unix.to_string()
+        }
+    }
+
     #[test]
     fn command_exec_permission_policy_requests_pathless_sandbox_retry() {
         let diagnostic = SandboxDenialDiagnostic {
@@ -928,7 +936,10 @@ mod tests {
             RuntimeShellSessionManager::with_output_store(task_registry, output_store);
         let handle = shell_sessions
             .spawn(ShellSessionCommand {
-                command: "printf first; sleep 0.2; printf later; sleep 0.2".to_string(),
+                command: platform_shell_script(
+                    "printf first; sleep 0.2; printf later; sleep 0.2",
+                    "[Console]::Out.Write('first'); Start-Sleep -Milliseconds 200; [Console]::Out.Write('later'); Start-Sleep -Milliseconds 200",
+                ),
                 argv: None,
                 cwd: cwd.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
@@ -1010,7 +1021,10 @@ mod tests {
         let mut shell_sessions = RuntimeShellSessionManager::new(task_registry);
         let handle = shell_sessions
             .spawn(ShellSessionCommand {
-                command: "printf ab; sleep 0.2; printf cd; sleep 0.2".to_string(),
+                command: platform_shell_script(
+                    "printf ab; sleep 0.2; printf cd; sleep 0.2",
+                    "[Console]::Out.Write('ab'); Start-Sleep -Milliseconds 200; [Console]::Out.Write('cd'); Start-Sleep -Milliseconds 200",
+                ),
                 argv: None,
                 cwd: cwd.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
@@ -1100,7 +1114,10 @@ mod tests {
             RuntimeShellSessionManager::with_output_store(task_registry, output_store);
         let handle = shell_sessions
             .spawn(ShellSessionCommand {
-                command: "printf abcdef; sleep 0.2".to_string(),
+                command: platform_shell_script(
+                    "printf abcdef; sleep 0.2",
+                    "[Console]::Out.Write('abcdef'); Start-Sleep -Milliseconds 200",
+                ),
                 argv: None,
                 cwd: cwd.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
@@ -1166,7 +1183,10 @@ mod tests {
             RuntimeShellSessionManager::with_output_store(task_registry, output_store);
         let handle = shell_sessions
             .spawn(ShellSessionCommand {
-                command: "printf abcdef >&2; sleep 0.2".to_string(),
+                command: platform_shell_script(
+                    "printf abcdef >&2; sleep 0.2",
+                    "[Console]::Error.Write('abcdef'); Start-Sleep -Milliseconds 200",
+                ),
                 argv: None,
                 cwd: cwd.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
@@ -1236,7 +1256,10 @@ mod tests {
             RuntimeShellSessionManager::with_output_store(task_registry, output_store);
         let handle = shell_sessions
             .spawn(ShellSessionCommand {
-                command: "printf abcdef; sleep 0.2".to_string(),
+                command: platform_shell_script(
+                    "printf abcdef; sleep 0.2",
+                    "[Console]::Out.Write('abcdef'); Start-Sleep -Milliseconds 200",
+                ),
                 argv: None,
                 cwd: cwd.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
@@ -1305,7 +1328,7 @@ mod tests {
         let mut shell_sessions = RuntimeShellSessionManager::new(task_registry);
         let handle = shell_sessions
             .spawn(ShellSessionCommand {
-                command: "printf denied".to_string(),
+                command: platform_shell_script("printf denied", "[Console]::Out.Write('denied')"),
                 argv: None,
                 cwd: cwd.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),
@@ -1375,7 +1398,10 @@ mod tests {
         let mut shell_sessions = RuntimeShellSessionManager::new(task_registry);
         let handle = shell_sessions
             .spawn(ShellSessionCommand {
-                command: "printf listed-complete".to_string(),
+                command: platform_shell_script(
+                    "printf listed-complete",
+                    "[Console]::Out.Write('listed-complete')",
+                ),
                 argv: None,
                 cwd: cwd.path().to_path_buf(),
                 additional_readable_directories: Vec::new(),

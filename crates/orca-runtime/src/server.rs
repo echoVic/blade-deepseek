@@ -3445,6 +3445,7 @@ enabled = true
         assert_eq!(completed["exitCode"], 0);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn command_exec_permission_profile_allowlist_miss_requests_permission_and_retries() {
         with_orca_home(|home| {
@@ -4219,6 +4220,7 @@ enabled = true
         });
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn command_exec_permission_profile_denylist_block_reports_policy_denial() {
         with_orca_home(|home| {
@@ -4280,6 +4282,7 @@ enabled = true
         });
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn command_exec_permission_profile_domain_policy_allows_http_request() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
@@ -4334,6 +4337,7 @@ enabled = true
         assert_eq!(completed["exitCode"], 0);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn command_exec_permission_profile_domain_policy_blocks_unallowlisted_local_request() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
@@ -4380,6 +4384,7 @@ enabled = true
         assert_eq!(completed["exitCode"], 0);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn command_exec_permission_profile_domain_policy_blocks_localhost_resolution() {
         let mut config = test_run_config();
@@ -4419,6 +4424,49 @@ enabled = true
             "stdout should include resolved localhost policy block: {completed:?}"
         );
         assert_eq!(completed["exitCode"], 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_exec_permission_profile_domain_policy_fails_closed() {
+        let mut config = test_run_config();
+        let file_config: orca_core::config::file::FileConfig = toml::from_str(
+            r#"
+[permission_profiles.limited-network]
+extends = ":workspace"
+
+[permission_profiles.limited-network.network]
+enabled = true
+
+[permission_profiles.limited-network.network.domains]
+"127.0.0.1" = "allow"
+"blocked.orca.invalid" = "deny"
+"#,
+        )
+        .expect("domain policy config");
+        config.permission_profiles = file_config.permission_profiles;
+        let cwd = tempdir().expect("cwd");
+        config.cwd = Some(cwd.path().to_path_buf());
+        let input = Cursor::new(
+            br#"{"id":"cmd-domain-policy","method":"command/exec","params":{"command":["powershell.exe","-NoProfile","-Command","exit 0"],"permissionProfile":"limited-network","timeoutMs":5000}}"#
+                .to_vec(),
+        );
+        let output = SharedVecWriter::default();
+
+        run_with_io(ServerConfig { run_config: config }, input, output.clone())
+            .expect("server run");
+
+        let events = parse_jsonl(&output.bytes());
+        assert_eq!(
+            events.len(),
+            1,
+            "expected one fail-closed event: {events:?}"
+        );
+        assert_eq!(events[0]["event"], "error");
+        assert_eq!(
+            events[0]["message"],
+            "Windows domain-restricted network sandbox is unavailable; refusing to run without an OS-enforced network boundary"
+        );
     }
 
     #[test]

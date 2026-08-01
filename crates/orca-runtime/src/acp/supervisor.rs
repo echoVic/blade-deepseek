@@ -2448,6 +2448,10 @@ mod tests {
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+    fn test_absolute_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
     struct WaitForCancelExecutor;
 
     struct CompleteWithMessageExecutor;
@@ -2618,14 +2622,13 @@ mod tests {
             _writer: &mut (dyn io::Write + Send),
             cancel: &CancelToken,
         ) -> io::Result<ThreadOperationOutcome> {
+            let path = test_absolute_path("orca-acp-notes.txt");
             let tool = ToolRequest {
                 id: "read-capability-1".to_string(),
                 name: ToolName::ReadFile,
                 action: orca_core::approval_types::ActionKind::Read,
-                target: Some("/workspace/notes.txt".to_string()),
-                raw_arguments: Some(
-                    r#"{"path":"/workspace/notes.txt","line":2,"limit":3}"#.to_string(),
-                ),
+                target: Some(path.display().to_string()),
+                raw_arguments: Some(json!({ "path": path, "line": 2, "limit": 3 }).to_string()),
             };
             let turn_request = request.thread_turn_request(generation);
             let ingress = turn_request
@@ -2645,16 +2648,12 @@ mod tests {
                 },
                 request.turn_id().clone(),
             ))?;
-            let content = match generation.read_text_file_from_acp_client(
-                &tool,
-                PathBuf::from("/workspace/notes.txt"),
-                Some(2),
-                Some(3),
-            ) {
-                Ok(content) => content,
-                Err(_) if cancel.is_cancelled() => return Ok(RunStatus::Cancelled.into()),
-                Err(error) => return Err(error),
-            };
+            let content =
+                match generation.read_text_file_from_acp_client(&tool, path, Some(2), Some(3)) {
+                    Ok(content) => content,
+                    Err(_) if cancel.is_cancelled() => return Ok(RunStatus::Cancelled.into()),
+                    Err(error) => return Err(error),
+                };
             self.content_tx.send(content).unwrap();
             ingress.commit_tool_result(&ToolResult::completed(
                 &tool,
@@ -2676,13 +2675,14 @@ mod tests {
             _writer: &mut (dyn io::Write + Send),
             _cancel: &CancelToken,
         ) -> io::Result<ThreadOperationOutcome> {
+            let path = test_absolute_path("orca-acp-output.txt");
             let tool = ToolRequest {
                 id: "write-capability-1".to_string(),
                 name: ToolName::WriteFile,
                 action: orca_core::approval_types::ActionKind::Write,
-                target: Some("/workspace/output.txt".to_string()),
+                target: Some(path.display().to_string()),
                 raw_arguments: Some(
-                    r#"{"path":"/workspace/output.txt","content":"written by Orca\n"}"#.to_string(),
+                    json!({ "path": path, "content": "written by Orca\n" }).to_string(),
                 ),
             };
             let turn_request = request.thread_turn_request(generation);
@@ -2705,7 +2705,7 @@ mod tests {
             ))?;
             let outcome = generation.write_text_file_to_acp_client(
                 &tool,
-                PathBuf::from("/workspace/output.txt"),
+                path,
                 "written by Orca\n".to_string(),
             );
             self.outcome_tx
@@ -2991,7 +2991,9 @@ mod tests {
                                     permissions: RequestPermissionProfile {
                                         file_system: Some(RequestFileSystemPermissions {
                                             read: None,
-                                            write: Some(vec![PathBuf::from("/workspace/output")]),
+                                            write: Some(vec![test_absolute_path(
+                                                "orca-acp-output",
+                                            )]),
                                             entries: None,
                                         }),
                                         network: None,
@@ -3076,7 +3078,7 @@ mod tests {
                 "sleep".to_string(),
                 vec!["30".to_string()],
                 Vec::new(),
-                Some(PathBuf::from("/workspace")),
+                Some(test_absolute_path("orca-acp-workspace")),
                 Some(4096),
             )?;
             match terminal.output() {
@@ -3129,7 +3131,7 @@ mod tests {
                 "printf".to_string(),
                 vec!["first".to_string()],
                 Vec::new(),
-                Some(PathBuf::from("/workspace")),
+                Some(test_absolute_path("orca-acp-workspace")),
                 Some(4096),
             )?;
             let second = generation.create_terminal_on_acp_client(
@@ -3137,7 +3139,7 @@ mod tests {
                 "printf".to_string(),
                 vec!["second".to_string()],
                 Vec::new(),
-                Some(PathBuf::from("/workspace")),
+                Some(test_absolute_path("orca-acp-workspace")),
                 Some(4096),
             )?;
             let terminal_ids = vec![
@@ -3586,7 +3588,12 @@ mod tests {
                 }
             };
             assert_eq!(read_request["params"]["sessionId"], session_id);
-            assert_eq!(read_request["params"]["path"], "/workspace/notes.txt");
+            assert_eq!(
+                read_request["params"]["path"],
+                test_absolute_path("orca-acp-notes.txt")
+                    .display()
+                    .to_string()
+            );
             assert_eq!(read_request["params"]["line"], 2);
             assert_eq!(read_request["params"]["limit"], 3);
             let written_before_response = persisted_capability_is_written(
@@ -3691,7 +3698,12 @@ mod tests {
                 }
             };
             assert_eq!(write_request["params"]["sessionId"], session_id);
-            assert_eq!(write_request["params"]["path"], "/workspace/output.txt");
+            assert_eq!(
+                write_request["params"]["path"],
+                test_absolute_path("orca-acp-output.txt")
+                    .display()
+                    .to_string()
+            );
             assert_eq!(write_request["params"]["content"], "written by Orca\n");
             assert!(
                 outcome_rx.try_recv().is_err(),

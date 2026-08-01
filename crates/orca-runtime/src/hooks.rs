@@ -378,11 +378,33 @@ mod tests {
     use orca_core::tool_types::{ToolName, ToolRequest};
     use std::time::Instant;
 
+    fn platform_hook_script(unix: &str, windows: &str) -> String {
+        if cfg!(windows) {
+            windows.to_string()
+        } else {
+            unix.to_string()
+        }
+    }
+
+    fn hook_stdout_script(stdout: &str) -> String {
+        platform_hook_script(
+            &format!("printf '%s' '{}'", stdout.replace('\'', "'\\''")),
+            &format!("[Console]::Out.Write('{}')", stdout.replace('\'', "''")),
+        )
+    }
+
+    fn blocking_hook_script() -> String {
+        platform_hook_script(
+            "echo blocked >&2; exit 7",
+            "[Console]::Error.Write('blocked'); exit 7",
+        )
+    }
+
     #[test]
     fn pre_tool_hook_can_block() {
         let runner = HookRunner::new(vec![HookConfig {
             event: HookEvent::PreToolUse,
-            command: "echo blocked >&2; exit 7".to_string(),
+            command: blocking_hook_script(),
             tool: Some("bash".to_string()),
         }]);
         let request = ToolRequest {
@@ -413,7 +435,7 @@ mod tests {
     fn typed_hook_failure_is_not_relabelled_by_late_cancellation() {
         let runner = HookRunner::new(vec![HookConfig {
             event: HookEvent::PreToolUse,
-            command: "echo blocked >&2; exit 7".to_string(),
+            command: blocking_hook_script(),
             tool: Some("bash".to_string()),
         }]);
         let request = ToolRequest {
@@ -449,7 +471,10 @@ mod tests {
     fn hook_timeout_kills_descendant_processes() {
         let runner = HookRunner::new(vec![HookConfig {
             event: HookEvent::PreModelCall,
-            command: "printf before; sleep 5; printf after".to_string(),
+            command: platform_hook_script(
+                "printf before; sleep 5; printf after",
+                "[Console]::Out.Write('before'); Start-Sleep -Seconds 5; [Console]::Out.Write('after')",
+            ),
             tool: None,
         }]);
         let start = Instant::now();
@@ -524,7 +549,7 @@ command = "true"
     fn hook_json_deny_blocks_with_reason_even_when_exit_succeeds() {
         let runner = HookRunner::new(vec![HookConfig {
             event: HookEvent::PreToolUse,
-            command: r#"printf '%s' '{"action":"deny","reason":"violates policy X"}'"#.to_string(),
+            command: hook_stdout_script(r#"{"action":"deny","reason":"violates policy X"}"#),
             tool: Some("bash".to_string()),
         }]);
         let request = ToolRequest {
@@ -557,8 +582,9 @@ command = "true"
     fn hook_json_modify_returns_modified_target() {
         let runner = HookRunner::new(vec![HookConfig {
             event: HookEvent::PreToolUse,
-            command: r#"printf '%s' '{"action":"modify","modified_target":"ls -la (sanitized)"}'"#
-                .to_string(),
+            command: hook_stdout_script(
+                r#"{"action":"modify","modified_target":"ls -la (sanitized)"}"#,
+            ),
             tool: Some("bash".to_string()),
         }]);
         let request = ToolRequest {
@@ -594,8 +620,7 @@ command = "true"
     fn hook_json_rejects_unknown_action_instead_of_injecting_it() {
         let runner = HookRunner::new(vec![HookConfig {
             event: HookEvent::PreModelCall,
-            command: r#"printf '%s' '{"action":"injcet","context":"typo should fail"}'"#
-                .to_string(),
+            command: hook_stdout_script(r#"{"action":"injcet","context":"typo should fail"}"#),
             tool: None,
         }]);
 
@@ -624,7 +649,7 @@ command = "true"
     fn hook_json_rejects_inject_without_string_context() {
         let runner = HookRunner::new(vec![HookConfig {
             event: HookEvent::PreModelCall,
-            command: r#"printf '%s' '{"action":"inject","context":123}'"#.to_string(),
+            command: hook_stdout_script(r#"{"action":"inject","context":123}"#),
             tool: None,
         }]);
 
@@ -653,7 +678,7 @@ command = "true"
     fn hook_json_rejects_modify_without_string_target() {
         let runner = HookRunner::new(vec![HookConfig {
             event: HookEvent::PreToolUse,
-            command: r#"printf '%s' '{"action":"modify","modified_target":123}'"#.to_string(),
+            command: hook_stdout_script(r#"{"action":"modify","modified_target":123}"#),
             tool: Some("bash".to_string()),
         }]);
         let request = ToolRequest {
@@ -690,12 +715,12 @@ command = "true"
         let runner = HookRunner::new(vec![
             HookConfig {
                 event: HookEvent::PreModelCall,
-                command: r#"printf '%s' '{"action":"inject","context":"policy hint"}'"#.to_string(),
+                command: hook_stdout_script(r#"{"action":"inject","context":"policy hint"}"#),
                 tool: None,
             },
             HookConfig {
                 event: HookEvent::PreModelCall,
-                command: "printf '%s' 'legacy hint'".to_string(),
+                command: hook_stdout_script("legacy hint"),
                 tool: None,
             },
         ]);
@@ -722,12 +747,18 @@ command = "true"
     fn post_model_call_hook_receives_usage_environment() {
         let runner = HookRunner::new(vec![HookConfig {
             event: HookEvent::PostModelCall,
-            command: concat!(
-                r#"test "$ORCA_USAGE_INPUT_TOKENS" = "120" && "#,
-                r#"test "$ORCA_USAGE_OUTPUT_TOKENS" = "30" && "#,
-                r#"test "$ORCA_USAGE_CACHE_TOKENS" = "10""#,
-            )
-            .to_string(),
+            command: platform_hook_script(
+                concat!(
+                    r#"test "$ORCA_USAGE_INPUT_TOKENS" = "120" && "#,
+                    r#"test "$ORCA_USAGE_OUTPUT_TOKENS" = "30" && "#,
+                    r#"test "$ORCA_USAGE_CACHE_TOKENS" = "10""#,
+                ),
+                concat!(
+                    "if ($env:ORCA_USAGE_INPUT_TOKENS -ne '120' -or ",
+                    "$env:ORCA_USAGE_OUTPUT_TOKENS -ne '30' -or ",
+                    "$env:ORCA_USAGE_CACHE_TOKENS -ne '10') { exit 7 }",
+                ),
+            ),
             tool: None,
         }]);
         let usage = Usage {

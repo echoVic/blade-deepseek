@@ -2283,6 +2283,10 @@ mod tests {
     use orca_core::subagent_config::SubagentConfig;
     use orca_core::thread_identity::TurnId;
 
+    fn test_absolute_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
     struct CompleteImmediatelyExecutor;
 
     impl ThreadOperationExecutor for CompleteImmediatelyExecutor {
@@ -2402,13 +2406,14 @@ mod tests {
         base.mcp_servers.clear();
         base.additional_working_directories.clear();
         base.runtime_workspace_roots = None;
+        let stdio_command = test_absolute_path("example-mcp-server");
 
         let config = build_acp_session_config(
             base,
             cwd.path().to_path_buf(),
             vec![
                 McpServer::Stdio(
-                    McpServerStdio::new("stdio", "/usr/bin/example")
+                    McpServerStdio::new("stdio", stdio_command.clone())
                         .args(vec!["--stdio".to_string()])
                         .env(vec![EnvVariable::new("TOKEN", "secret")]),
                 ),
@@ -2432,7 +2437,7 @@ mod tests {
         assert_eq!(config.mcp_servers[0].name, "stdio");
         assert_eq!(
             config.mcp_servers[0].command.as_deref(),
-            Some("/usr/bin/example")
+            stdio_command.to_str()
         );
         assert_eq!(
             config.mcp_servers[0].env.get("TOKEN").map(String::as_str),
@@ -2456,6 +2461,7 @@ mod tests {
     fn acp_session_declarations_reject_unsupported_or_ambiguous_scope() {
         let cwd = tempfile::tempdir().expect("cwd");
         let relative = PathBuf::from("relative-root");
+        let absolute_command = test_absolute_path("mcp-server");
         let base = test_run_config(cwd.path().to_path_buf());
         assert!(
             build_acp_session_config(
@@ -2498,8 +2504,8 @@ mod tests {
                 base.clone(),
                 cwd.path().to_path_buf(),
                 vec![
-                    McpServer::Stdio(McpServerStdio::new("a-b", "/usr/bin/true")),
-                    McpServer::Stdio(McpServerStdio::new("a_b", "/usr/bin/true")),
+                    McpServer::Stdio(McpServerStdio::new("a-b", absolute_command.clone(),)),
+                    McpServer::Stdio(McpServerStdio::new("a_b", absolute_command)),
                 ],
                 Vec::new(),
             )

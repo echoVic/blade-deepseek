@@ -110,6 +110,12 @@ impl CanonicalPath {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_canonical_path(name: &str) -> CanonicalPath {
+    CanonicalPath::try_new(std::env::temp_dir().join(name))
+        .expect("host temp directory yields a canonical test path")
+}
+
 impl<'de> Deserialize<'de> for CanonicalPath {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

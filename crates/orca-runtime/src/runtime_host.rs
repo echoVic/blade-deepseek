@@ -35720,6 +35720,10 @@ mod tests {
         "ORCA_RUNTIME_HOST_RESERVATION_TERMINAL_FAILURE_CHILD";
     const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+    fn test_absolute_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
     #[test]
     fn abandoned_ephemeral_reservation_expires_and_reaps_actor() {
         let cwd = tempfile::tempdir().unwrap();
@@ -36073,12 +36077,13 @@ mod tests {
             _writer: &mut (dyn io::Write + Send),
             cancel: &CancelToken,
         ) -> io::Result<ThreadOperationOutcome> {
+            let path = test_absolute_path("orca-runtime-host-notes.txt");
             let tool = ToolRequest {
                 id: "retained-capability-shutdown".to_string(),
                 name: ToolName::ReadFile,
                 action: ActionKind::Read,
-                target: Some("/workspace/notes.txt".to_string()),
-                raw_arguments: Some(r#"{"path":"/workspace/notes.txt"}"#.to_string()),
+                target: Some(path.display().to_string()),
+                raw_arguments: Some(serde_json::json!({ "path": path }).to_string()),
             };
             let turn_request = request.thread_turn_request(generation);
             let ingress = turn_request
@@ -36098,12 +36103,7 @@ mod tests {
                 },
                 request.turn_id().clone(),
             ))?;
-            match generation.read_text_file_from_acp_client(
-                &tool,
-                PathBuf::from("/workspace/notes.txt"),
-                None,
-                None,
-            ) {
+            match generation.read_text_file_from_acp_client(&tool, path, None, None) {
                 Ok(content) => {
                     ingress.commit_tool_result(&ToolResult::completed(&tool, content, false))?;
                     thread.lifecycle_mut().finish_task(RunStatus::Success);

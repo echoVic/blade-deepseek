@@ -4228,7 +4228,7 @@ mod closed_command_domain_tests {
     }
 
     fn canonical_path() -> CanonicalPath {
-        CanonicalPath::try_new(std::path::PathBuf::from("/tmp/orca-surface")).unwrap()
+        super::super::identity::test_canonical_path("orca-surface")
     }
 
     fn operation_fence(seed: u8) -> SurfaceOperationFence {

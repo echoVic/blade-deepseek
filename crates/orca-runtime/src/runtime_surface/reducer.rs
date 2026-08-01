@@ -8073,7 +8073,7 @@ pub(crate) mod tests {
             operation_id(),
             digest(10),
             digest(11),
-            CanonicalPath::try_new(std::path::PathBuf::from("/tmp/orca-surface")).unwrap(),
+            super::super::identity::test_canonical_path("orca-surface"),
             digest(12),
             PolicyEpoch::try_new(1).unwrap(),
             digest(13),
@@ -8112,7 +8112,7 @@ pub(crate) mod tests {
 
     pub(crate) fn reducer_snapshot() -> SurfaceSnapshot {
         let incarnation = SurfaceIncarnation::try_from_bytes(uuid_v7_bytes(5)).unwrap();
-        let path = CanonicalPath::try_new(std::path::PathBuf::from("/tmp/orca-surface")).unwrap();
+        let path = super::super::identity::test_canonical_path("orca-surface");
         let usage = UsageTotals {
             input_tokens: 0,
             output_tokens: 0,

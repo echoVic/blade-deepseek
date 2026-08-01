@@ -1396,6 +1396,10 @@ mod tests {
     use crate::thread_store::ThreadRelationFilter;
     use serde_json::json;
 
+    fn test_absolute_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
     #[test]
     fn submission_decodes_submit_wire_shape() {
         let submission =
@@ -1580,33 +1584,45 @@ mod tests {
 
     #[test]
     fn submission_decodes_thread_start_runtime_workspace_roots() {
-        let submission = Submission::decode(
-            r#"{"id":"req-thread","method":"thread/start","params":{"runtimeWorkspaceRoots":["/tmp/workspace-one","/tmp/workspace-two"]}}"#,
-        )
-        .expect("submission");
+        let roots = vec![
+            test_absolute_path("workspace-one"),
+            test_absolute_path("workspace-two"),
+        ];
+        let wire = json!({
+            "id": "req-thread",
+            "method": "thread/start",
+            "params": { "runtimeWorkspaceRoots": roots },
+        });
+        let submission = Submission::decode(&wire.to_string()).expect("submission");
 
         assert_eq!(
             submission.op,
             ClientOp::ThreadStart {
-                runtime_workspace_roots: Some(vec![
-                    PathBuf::from("/tmp/workspace-one"),
-                    PathBuf::from("/tmp/workspace-two")
-                ])
+                runtime_workspace_roots: Some(roots)
             }
         );
     }
 
     #[test]
     fn submission_decodes_fuzzy_file_search_session_operations() {
-        let start = Submission::decode(
-            r#"{"id":"search-start","method":"fuzzyFileSearch/sessionStart","params":{"sessionId":"files-1","roots":["/tmp/one","/tmp/two"],"exclude":["target/**"],"respectGitignore":false,"resultLimit":24}}"#,
-        )
-        .expect("start submission");
+        let roots = vec![test_absolute_path("one"), test_absolute_path("two")];
+        let wire = json!({
+            "id": "search-start",
+            "method": "fuzzyFileSearch/sessionStart",
+            "params": {
+                "sessionId": "files-1",
+                "roots": roots,
+                "exclude": ["target/**"],
+                "respectGitignore": false,
+                "resultLimit": 24,
+            },
+        });
+        let start = Submission::decode(&wire.to_string()).expect("start submission");
         assert_eq!(
             start.op,
             ClientOp::FuzzyFileSearchSessionStart {
                 session_id: "files-1".to_string(),
-                roots: vec![PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")],
+                roots,
                 exclude: vec!["target/**".to_string()],
                 respect_gitignore: false,
                 result_limit: 24,
@@ -2362,16 +2378,22 @@ mod tests {
 
     #[test]
     fn submission_decodes_turn_start_runtime_workspace_roots() {
-        let submission = Submission::decode(
-            r#"{"id":"req-1","method":"turn/start","params":{"threadId":"thread-1","runtimeWorkspaceRoots":["/tmp/new-root"],"input":[{"type":"text","text":"hello"}]}}"#,
-        )
-        .expect("submission");
+        let root = test_absolute_path("new-root");
+        let wire = json!({
+            "id": "req-1",
+            "method": "turn/start",
+            "params": {
+                "threadId": "thread-1",
+                "runtimeWorkspaceRoots": [root],
+                "input": [{ "type": "text", "text": "hello" }],
+            },
+        });
+        let submission = Submission::decode(&wire.to_string()).expect("submission");
 
         match submission.op {
-            ClientOp::Submit { permissions, .. } => assert_eq!(
-                permissions.runtime_workspace_roots,
-                Some(vec![PathBuf::from("/tmp/new-root")])
-            ),
+            ClientOp::Submit { permissions, .. } => {
+                assert_eq!(permissions.runtime_workspace_roots, Some(vec![root]))
+            }
             other => panic!("expected submit, got {other:?}"),
         }
     }
