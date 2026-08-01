@@ -106,9 +106,9 @@ fn tui_cancel_returns_to_idle_through_the_runtime_surface() {
     receive_until(
         &process,
         &mut output,
-        "Mock slow stream started.",
+        "running 0s",
         Duration::from_secs(20),
-        "TUI did not render the first durable stream delta",
+        "TUI did not render the active turn before cancellation",
     );
     cancel_running_turn_and_exit(&mut process, &mut output);
 
@@ -278,6 +278,13 @@ impl PtyProcess {
         }
     }
 
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child
+            .as_mut()
+            .expect("PTY child remains owned")
+            .try_wait()
+    }
+
     fn close_io_and_join(&mut self) {
         self.writer.take();
         if let Some(reader) = self.reader.take() {
@@ -326,9 +333,10 @@ fn cancel_running_turn_and_exit(process: &mut PtyProcess, output: &mut Vec<u8>) 
     let notice_start = output.len();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        process
-            .write(&[0x03])
-            .expect("interrupt the running turn or arm idle exit");
+        if send_ctrl_c_or_observe_idle_exit(process, "interrupt the running turn or arm idle exit")
+        {
+            return;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(
             !remaining.is_zero(),
@@ -343,7 +351,50 @@ fn cancel_running_turn_and_exit(process: &mut PtyProcess, output: &mut Vec<u8>) 
             break;
         }
     }
-    process.write(&[0x03]).expect("send second idle Ctrl-C");
+    await_idle_ctrl_c_exit(process);
+}
+
+fn send_ctrl_c_or_observe_idle_exit(process: &mut PtyProcess, action: &str) -> bool {
+    match process.write(&[0x03]) {
+        Ok(()) => false,
+        Err(error) => {
+            let status = process.wait_for_exit(Duration::from_secs(1));
+            assert_eq!(
+                status.code(),
+                Some(130),
+                "{action} failed with {error}; TUI exited with {status}"
+            );
+            true
+        }
+    }
+}
+
+fn await_idle_ctrl_c_exit(process: &mut PtyProcess) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match process.write(&[0x03]) {
+            Ok(()) => {}
+            Err(error) => {
+                if let Some(status) = process.try_wait().expect("poll idle Ctrl-C exit") {
+                    assert_eq!(
+                        status.code(),
+                        Some(130),
+                        "idle Ctrl-C closed the PTY with {error}, but TUI exited with {status}"
+                    );
+                    return;
+                }
+            }
+        }
+        if let Some(status) = process.try_wait().expect("poll idle Ctrl-C exit") {
+            assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "TUI did not consume idle Ctrl-C within 2s"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn receive_until(
