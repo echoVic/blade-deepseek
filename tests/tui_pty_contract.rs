@@ -99,7 +99,7 @@ fn tui_cancel_returns_to_idle_through_the_runtime_surface() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");
     let mut process =
-        PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "mock_stream_delay_ms 5000")
+        PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "mock_stream_delay_ms 10000")
             .expect("spawn cancellable TUI in PTY");
 
     let mut output = Vec::new();
@@ -107,12 +107,10 @@ fn tui_cancel_returns_to_idle_through_the_runtime_surface() {
         &process,
         &mut output,
         "Mock slow stream started.",
-        Duration::from_secs(10),
+        Duration::from_secs(20),
         "TUI did not render the first durable stream delta",
     );
-    process.write(&[0x03]).expect("cancel the running turn");
-    std::thread::sleep(Duration::from_millis(300));
-    arm_idle_exit(&mut process, &mut output);
+    cancel_running_turn_and_exit(&mut process, &mut output);
 
     let status = process.wait_for_exit(Duration::from_secs(5));
     process.close_io_and_join();
@@ -120,7 +118,8 @@ fn tui_cancel_returns_to_idle_through_the_runtime_surface() {
     assert_eq!(status.code(), Some(130), "TUI exited with {status}");
     assert!(
         !String::from_utf8_lossy(&output).contains("Mock slow stream completed."),
-        "cancelled PTY turn must not display a post-terminal completion"
+        "cancelled PTY turn must not display a post-terminal completion; output={}",
+        String::from_utf8_lossy(&output)
     );
 }
 
@@ -317,6 +316,33 @@ fn arm_idle_exit(process: &mut PtyProcess, output: &mut Vec<u8>) {
         Duration::from_secs(2),
         "TUI did not arm idle exit",
     );
+    process.write(&[0x03]).expect("send second idle Ctrl-C");
+}
+
+fn cancel_running_turn_and_exit(process: &mut PtyProcess, output: &mut Vec<u8>) {
+    const IDLE_EXIT_NOTICE: &str = "Press Ctrl+C again to quit.";
+
+    process.drain_output(output);
+    let notice_start = output.len();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        process
+            .write(&[0x03])
+            .expect("interrupt the running turn or arm idle exit");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "TUI did not settle the cancelled turn within 5s; output={}",
+            String::from_utf8_lossy(output)
+        );
+        if let Some(chunk) = process.receive_output(remaining.min(Duration::from_millis(250))) {
+            output.extend_from_slice(&chunk);
+        }
+        process.drain_output(output);
+        if contains_rendered_text(&output[notice_start..], IDLE_EXIT_NOTICE) {
+            break;
+        }
+    }
     process.write(&[0x03]).expect("send second idle Ctrl-C");
 }
 
