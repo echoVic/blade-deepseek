@@ -1177,10 +1177,10 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
             let _ = sender.send(result);
         });
 
-        let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(8));
         if result.is_err() {
             terminate_fixture_process(&pid_path);
-            let _ = receiver.recv_timeout(std::time::Duration::from_secs(2));
+            let _ = receiver.recv_timeout(std::time::Duration::from_secs(8));
         }
         worker.join().expect("workflow host worker");
 

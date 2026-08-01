@@ -7048,7 +7048,14 @@ arbitrary metadata
             panic!("parent-reentry edit should produce unified diff");
         };
         let parsed = crate::diff_highlight::parse_unified_diff(diff);
-        assert_eq!(parsed.destination_path.as_deref(), Some("src/item.py"));
+        let expected_relative = PathBuf::from("src")
+            .join("item.py")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            parsed.destination_path.as_deref(),
+            Some(expected_relative.as_str())
+        );
         state.update(TuiEvent::ToolRequested {
             id: request.id.clone(),
             name: "edit".to_string(),
@@ -7074,8 +7081,11 @@ arbitrary metadata
                 .canonicalize()
                 .expect("canonical item")
         );
-        assert_eq!(job.display_path, "src/item.py");
-        assert_eq!(job.parsed.destination_path.as_deref(), Some("src/item.py"));
+        assert_eq!(job.display_path, expected_relative);
+        assert_eq!(
+            job.parsed.destination_path.as_deref(),
+            Some(expected_relative.as_str())
+        );
     }
 
     #[cfg(unix)]

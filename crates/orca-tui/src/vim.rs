@@ -1169,7 +1169,8 @@ mod tests {
 
     #[test]
     fn line_positioning_avoids_composer_sized_iteration() {
-        let production = include_str!("vim.rs")
+        let source = crate::test_support::normalized_source(include_str!("vim.rs"));
+        let production = source
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
             .expect("production vim source");

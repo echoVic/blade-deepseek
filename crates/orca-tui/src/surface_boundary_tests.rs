@@ -600,13 +600,14 @@ fn typed_history_resume_projects_only_the_durable_surface_snapshot() {
 
 #[test]
 fn production_ordinary_turns_select_only_the_typed_surface_runner() {
+    let app = crate::test_support::normalized_source(APP);
     assert!(
-        APP.contains("host,\n        OrdinaryTurnRunner::Typed,\n    );"),
+        app.contains("host,\n        OrdinaryTurnRunner::Typed,\n    );"),
         "the production controller entrypoint must select the typed ordinary-turn runner"
     );
     assert!(
-        !APP.contains("run_hosted_legacy_ordinary_turn")
-            && APP.contains("#[allow(dead_code)]\nfn run_legacy_feature_turn_for_test"),
+        !app.contains("run_hosted_legacy_ordinary_turn")
+            && app.contains("#[allow(dead_code)]\nfn run_legacy_feature_turn_for_test"),
         "the frozen mutation audit anchor must remain explicitly unreachable production code"
     );
 }
@@ -669,23 +670,24 @@ fn production_app_inner_loop_owns_only_one_typed_surface_control() {
 
 #[test]
 fn production_agent_runtime_owns_only_typed_surface_control() {
-    let struct_start = AGENT_RUNTIME
+    let agent_runtime = crate::test_support::normalized_source(AGENT_RUNTIME);
+    let struct_start = agent_runtime
         .find("pub(crate) struct TuiAgentRuntime")
         .expect("agent runtime struct");
-    let struct_end = AGENT_RUNTIME[struct_start..]
+    let struct_end = agent_runtime[struct_start..]
         .find("\n}\n\nimpl TuiAgentRuntime")
         .map(|offset| struct_start + offset)
         .expect("agent runtime struct end");
-    let runtime_state = &AGENT_RUNTIME[struct_start..struct_end];
+    let runtime_state = &agent_runtime[struct_start..struct_end];
 
-    let spawn_start = AGENT_RUNTIME
+    let spawn_start = agent_runtime
         .find("fn spawn_with_dispatch_capacities(")
         .expect("typed agent runtime spawn");
-    let spawn_end = AGENT_RUNTIME[spawn_start..]
+    let spawn_end = agent_runtime[spawn_start..]
         .find("\n    #[cfg(test)]")
         .map(|offset| spawn_start + offset)
         .expect("typed agent runtime spawn end");
-    let typed_spawn = &AGENT_RUNTIME[spawn_start..spawn_end];
+    let typed_spawn = &agent_runtime[spawn_start..spawn_end];
 
     assert!(
         runtime_state.contains("controller: TuiSurfaceTaskControl")

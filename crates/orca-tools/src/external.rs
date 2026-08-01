@@ -334,7 +334,7 @@ mod tests {
             name: "slow_tool".to_string(),
             description: "slow tool".to_string(),
             action_kind: ActionKind::Shell,
-            command: "trap 'exit 42' TERM; printf before; while :; do sleep 1; done".to_string(),
+            command: "trap 'exit 42' TERM; printf before; while :; do :; done".to_string(),
             schema: serde_json::json!({}),
         };
         let request = ToolRequest {

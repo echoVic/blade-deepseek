@@ -1597,7 +1597,8 @@ mod tests {
 
     #[test]
     fn terminal_input_ownership_is_single() {
-        let production = include_str!("app.rs")
+        let source = crate::test_support::normalized_source(include_str!("app.rs"));
+        let production = source
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
             .expect("production source before tests");
@@ -1632,7 +1633,8 @@ mod tests {
 
     #[test]
     fn non_composer_input_boundaries_cancel_pending_vim_commands() {
-        let production = include_str!("app.rs")
+        let source = crate::test_support::normalized_source(include_str!("app.rs"));
+        let production = source
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
             .expect("production app source");
@@ -1650,7 +1652,8 @@ mod tests {
 
     #[test]
     fn startup_captures_workspace_status_once_before_frame_loop() {
-        let production = include_str!("app.rs")
+        let source = crate::test_support::normalized_source(include_str!("app.rs"));
+        let production = source
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
             .expect("production source before tests");
@@ -1676,7 +1679,8 @@ mod tests {
 
     #[test]
     fn focus_events_are_consumed_before_normal_input_handlers() {
-        let production = include_str!("app.rs")
+        let source = crate::test_support::normalized_source(include_str!("app.rs"));
+        let production = source
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
             .expect("production source before tests");
@@ -2200,7 +2204,9 @@ mod tests {
         let expected_workspace = syntax_workspace_root(&config);
 
         assert_eq!(
-            expected_workspace,
+            expected_workspace
+                .canonicalize()
+                .expect("canonical captured workspace"),
             directory
                 .path()
                 .canonicalize()

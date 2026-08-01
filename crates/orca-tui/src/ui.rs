@@ -6043,7 +6043,8 @@ mod tests {
         let second = status_line(&state, &theme, 120);
         assert_eq!(first, second);
 
-        let source = include_str!("ui.rs")
+        let source = crate::test_support::normalized_source(include_str!("ui.rs"));
+        let source = source
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
             .expect("production UI source");
