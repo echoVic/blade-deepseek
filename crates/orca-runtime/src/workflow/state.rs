@@ -908,7 +908,74 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
-    let content = fs::read_to_string(path)?;
+    let content = retry_transient_state_read(
+        || fs::read_to_string(path),
+        std::time::Duration::from_millis(500),
+    )?;
     serde_json::from_str(&content)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn retry_transient_state_read<T>(
+    mut operation: impl FnMut() -> io::Result<T>,
+    timeout: std::time::Duration,
+) -> io::Result<T> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match operation() {
+            Err(error)
+                if cfg!(windows)
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                    )
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
+#[cfg(test)]
+mod read_retry_tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn transient_state_read_retries_until_success() {
+        let mut calls = 0;
+        let value = retry_transient_state_read(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(io::Error::from(io::ErrorKind::NotFound))
+                } else {
+                    Ok("state")
+                }
+            },
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert_eq!(value, "state");
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn permanent_state_read_error_is_not_retried() {
+        let mut calls = 0;
+        let error = retry_transient_state_read(
+            || {
+                calls += 1;
+                Err::<(), _>(io::Error::from(io::ErrorKind::InvalidData))
+            },
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(calls, 1);
+    }
 }

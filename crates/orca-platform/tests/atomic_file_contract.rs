@@ -200,6 +200,39 @@ fn no_follow_atomic_write_rejects_a_directory_junction() {
     assert_no_temp_artifacts(temp.path());
 }
 
+#[cfg(windows)]
+#[test]
+fn concurrent_atomic_writers_and_readers_never_observe_a_gap() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("state.json");
+    atomic_write(&path, b"seed", AtomicWritePolicy::NoFollow).expect("seed state");
+
+    std::thread::scope(|scope| {
+        for writer in 0..4 {
+            let path = path.clone();
+            scope.spawn(move || {
+                for revision in 0..64 {
+                    let value = format!("writer-{writer}-revision-{revision}");
+                    atomic_write(&path, value.as_bytes(), AtomicWritePolicy::NoFollow)
+                        .expect("concurrent atomic write");
+                }
+            });
+        }
+        for _ in 0..4 {
+            let path = path.clone();
+            scope.spawn(move || {
+                for _ in 0..512 {
+                    let value = std::fs::read_to_string(&path)
+                        .expect("atomic destination must remain continuously readable");
+                    assert!(!value.is_empty());
+                }
+            });
+        }
+    });
+
+    assert_no_temp_artifacts(temp.path());
+}
+
 fn assert_no_temp_artifacts(directory: &Path) {
     let artifacts = directory
         .read_dir()

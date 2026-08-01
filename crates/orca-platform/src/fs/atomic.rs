@@ -31,6 +31,7 @@ pub fn atomic_write_with<F>(
 where
     F: FnOnce(&mut File) -> io::Result<()>,
 {
+    let _write_guard = platform::lock_atomic_write()?;
     let parent = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -192,6 +193,10 @@ mod platform {
 
     use super::*;
 
+    pub(super) fn lock_atomic_write() -> Result<(), PlatformError> {
+        Ok(())
+    }
+
     pub(super) fn create_new(path: &Path) -> io::Result<File> {
         OpenOptions::new()
             .create_new(true)
@@ -223,16 +228,33 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
+    use std::sync::{Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
+
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
 
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers,
         MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH, ReplaceFileW,
     };
 
     use super::*;
+
+    // ReplaceFileW can reject overlapping replacement attempts even when every
+    // file handle allows delete sharing. Keep one in-process replacement
+    // transaction active at a time; external holders are handled by the
+    // bounded retry in `replace`.
+    static ATOMIC_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(super) fn lock_atomic_write() -> Result<MutexGuard<'static, ()>, PlatformError> {
+        ATOMIC_WRITE_LOCK.lock().map_err(|_| PlatformError::Io {
+            kind: io::ErrorKind::Other,
+            message: "atomic write lock poisoned".to_string(),
+        })
+    }
 
     pub(super) fn create_new(path: &Path) -> io::Result<File> {
         OpenOptions::new()
@@ -259,33 +281,42 @@ mod platform {
     ) -> Result<(), PlatformError> {
         let temporary = wide_path(temporary);
         let destination = wide_path(destination);
-        let result = if destination_existed {
-            unsafe {
-                ReplaceFileW(
-                    destination.as_ptr(),
-                    temporary.as_ptr(),
-                    std::ptr::null(),
-                    REPLACEFILE_WRITE_THROUGH,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = if destination_existed {
+                unsafe {
+                    ReplaceFileW(
+                        destination.as_ptr(),
+                        temporary.as_ptr(),
+                        std::ptr::null(),
+                        REPLACEFILE_WRITE_THROUGH,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                }
+            } else {
+                unsafe {
+                    MoveFileExW(
+                        temporary.as_ptr(),
+                        destination.as_ptr(),
+                        MOVEFILE_WRITE_THROUGH,
+                    )
+                }
+            };
+            if result != 0 {
+                return Ok(());
             }
-        } else {
-            unsafe {
-                MoveFileExW(
-                    temporary.as_ptr(),
-                    destination.as_ptr(),
-                    MOVEFILE_WRITE_THROUGH,
-                )
+            let error = io::Error::last_os_error();
+            if !matches!(
+                error.raw_os_error(),
+                Some(code)
+                    if code == ERROR_SHARING_VIOLATION as i32
+                        || code == ERROR_LOCK_VIOLATION as i32
+            ) || Instant::now() >= deadline
+            {
+                return Err(PlatformError::io("atomically replace destination", error));
             }
-        };
-        if result == 0 {
-            Err(PlatformError::io(
-                "atomically replace destination",
-                io::Error::last_os_error(),
-            ))
-        } else {
-            Ok(())
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
