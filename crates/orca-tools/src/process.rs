@@ -412,7 +412,7 @@ fn spawn_bounded_line_reader<R, T, F>(
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<io::Result<BoundedLineRead<T>>>
 where
-    R: Read + Send + 'static,
+    R: ChildPipeReader + 'static,
     T: Send + 'static,
     F: FnMut(&mut T, BoundedLine<'_>) -> io::Result<()> + Send + 'static,
 {
@@ -766,20 +766,7 @@ fn spawn_reader<R: Read + Send + 'static>(
     thread::spawn(move || read_to_retained(reader, max_retained_bytes))
 }
 
-#[cfg(not(windows))]
-fn spawn_stoppable_reader<R: Read + Send + 'static>(
-    reader: R,
-    max_retained_bytes: usize,
-    stop: Arc<AtomicBool>,
-) -> thread::JoinHandle<io::Result<RetainedOutputSnapshot>> {
-    thread::spawn(move || {
-        let mut reader = StoppableReader { reader, stop };
-        read_to_retained(&mut reader, max_retained_bytes)
-    })
-}
-
-#[cfg(windows)]
-fn spawn_stoppable_reader<R: Read + std::os::windows::io::AsRawHandle + Send + 'static>(
+fn spawn_stoppable_reader<R: ChildPipeReader + 'static>(
     reader: R,
     max_retained_bytes: usize,
     stop: Arc<AtomicBool>,
@@ -796,16 +783,32 @@ struct StoppableReader<R> {
 }
 
 #[cfg(not(windows))]
-impl<R: Read> Read for StoppableReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        read_child_pipe_interruptibly(&mut self.reader, self.stop.as_ref(), buffer)
+trait ChildPipeReader: Read + Send {
+    fn read_interruptibly(&mut self, stop: &AtomicBool, buffer: &mut [u8]) -> io::Result<usize>;
+}
+
+#[cfg(not(windows))]
+impl<R: Read + Send> ChildPipeReader for R {
+    fn read_interruptibly(&mut self, stop: &AtomicBool, buffer: &mut [u8]) -> io::Result<usize> {
+        read_child_pipe_interruptibly(self, stop, buffer)
     }
 }
 
 #[cfg(windows)]
-impl<R: Read + std::os::windows::io::AsRawHandle> Read for StoppableReader<R> {
+trait ChildPipeReader: Read + std::os::windows::io::AsRawHandle + Send {
+    fn read_interruptibly(&mut self, stop: &AtomicBool, buffer: &mut [u8]) -> io::Result<usize>;
+}
+
+#[cfg(windows)]
+impl<R: Read + std::os::windows::io::AsRawHandle + Send> ChildPipeReader for R {
+    fn read_interruptibly(&mut self, stop: &AtomicBool, buffer: &mut [u8]) -> io::Result<usize> {
+        read_child_pipe_interruptibly(self, stop, buffer)
+    }
+}
+
+impl<R: ChildPipeReader> Read for StoppableReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        read_child_pipe_interruptibly(&mut self.reader, self.stop.as_ref(), buffer)
+        self.reader.read_interruptibly(self.stop.as_ref(), buffer)
     }
 }
 
