@@ -163,6 +163,78 @@ fn windows_job_object_descendant_helper() {
 }
 
 #[cfg(windows)]
+#[test]
+fn windows_background_child_does_not_hold_parent_capture_open() {
+    use std::time::{Duration, Instant};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let child_pid = temp.path().join("background-child-pid");
+    let started = Instant::now();
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "windows_background_capture_parent_helper",
+            "--nocapture",
+        ])
+        .env("ORCA_BACKGROUND_CHILD_PID", &child_pid)
+        .output()
+        .expect("run background capture parent");
+    let elapsed = started.elapsed();
+
+    assert!(output.status.success(), "helper failed: {output:?}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "captured parent output stayed open for {elapsed:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("parent-exit"),
+        "parent marker missing: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let pid = std::fs::read_to_string(&child_pid)
+        .expect("background child pid")
+        .trim()
+        .parse::<u32>()
+        .expect("valid pid");
+    assert!(windows_process_is_running(pid));
+    terminate_windows_process(pid).expect("terminate background fixture");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_background_capture_parent_helper() {
+    let Some(child_pid) = std::env::var_os("ORCA_BACKGROUND_CHILD_PID") else {
+        return;
+    };
+
+    orca_platform::process::clear_current_process_std_handle_inheritance()
+        .expect("clear inherited std handles");
+    let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "windows_background_capture_child_helper",
+            "--nocapture",
+        ])
+        .env("ORCA_BACKGROUND_CAPTURE_CHILD", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn background child");
+    std::fs::write(child_pid, child.id().to_string()).expect("write child pid");
+    println!("parent-exit");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_background_capture_child_helper() {
+    if std::env::var_os("ORCA_BACKGROUND_CAPTURE_CHILD").is_some() {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+}
+
+#[cfg(windows)]
 fn windows_process_is_running(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
@@ -176,6 +248,24 @@ fn windows_process_is_running(pid: u32) -> bool {
     let running = unsafe { WaitForSingleObject(process, 0) } != 0;
     unsafe { CloseHandle(process) };
     running
+}
+
+#[cfg(windows)]
+fn terminate_windows_process(pid: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+    let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if process.is_null() {
+        return Ok(());
+    }
+    let terminated = unsafe { TerminateProcess(process, 1) };
+    unsafe { CloseHandle(process) };
+    if terminated == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(windows)]

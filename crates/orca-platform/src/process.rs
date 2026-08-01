@@ -86,6 +86,13 @@ impl ProcessJob {
     }
 }
 
+/// Prevents subsequently spawned background children from inheriting the
+/// current process's existing standard handles. The handles remain open and
+/// usable by this process.
+pub fn clear_current_process_std_handle_inheritance() -> io::Result<()> {
+    platform::clear_current_process_std_handle_inheritance()
+}
+
 #[cfg(not(windows))]
 mod platform {
     use std::io;
@@ -93,6 +100,10 @@ mod platform {
 
     #[derive(Debug)]
     pub(super) struct ProcessJob;
+
+    pub(super) fn clear_current_process_std_handle_inheritance() -> io::Result<()> {
+        Ok(())
+    }
 
     impl ProcessJob {
         pub(super) fn spawn(
@@ -145,7 +156,13 @@ mod platform {
     use std::os::windows::process::CommandExt;
     use std::process::{Child, Command};
 
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+        SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
@@ -171,6 +188,26 @@ mod platform {
     // thread. This lets process owners move the lifetime guard to reaper
     // threads without transferring any borrowed memory.
     unsafe impl Send for ProcessJob {}
+
+    pub(super) fn clear_current_process_std_handle_inheritance() -> io::Result<()> {
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = unsafe { GetStdHandle(id) };
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                continue;
+            }
+
+            let mut flags = 0;
+            if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if flags & HANDLE_FLAG_INHERIT != 0
+                && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
 
     impl ProcessJob {
         pub(super) fn spawn(
