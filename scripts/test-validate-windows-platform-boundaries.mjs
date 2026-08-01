@@ -570,6 +570,13 @@ for (const marker of [
   "command_exec_streaming_filesystem_sandbox_denial_requests_permission_and_retries",
   "binary(=task_output_store)",
   "verifier_command_timeout_kills_descendant_processes",
+  "server_mode_interrupt_cancels_active_bash_tool_wait_and_accepts_next_turn",
+  "server_mode_reads_runtime_shell_session_incrementally",
+  "surface_goal_max_inner_continuation_is_durable_before_successor_execution",
+  "workflow_submit_streams_background_result",
+  "operation_panic_has_one_terminal_and_actor_reclaims_thread_state",
+  "panicking_goal_run_settles_outer_turn_and_fails_closed_to_paused",
+  "runtime_host_launches_saved_workflow_without_blocking_the_next_turn",
 ]) {
   assert.ok(
     nextestConfig.includes(marker),
