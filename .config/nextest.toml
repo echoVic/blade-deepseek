@@ -61,6 +61,10 @@ filter = "package(=orca-runtime) & binary(=runtime_host) & test(/^(operation_pan
 threads-required = 2
 
 [[profile.ci.overrides]]
+filter = "binary(=subagent_contract)"
+threads-required = 2
+
+[[profile.ci.overrides]]
 filter = "binary(=session_server_contract)"
 threads-required = 2
 

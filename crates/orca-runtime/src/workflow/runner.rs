@@ -1315,6 +1315,9 @@ impl WorkflowRunner {
     ) -> io::Result<bool> {
         let started = std::time::Instant::now();
         loop {
+            if self.wait_while_paused(run_id, task_id, workflow_cancel)? {
+                return Ok(true);
+            }
             if self.workflow_stop_requested(run_id, task_id, workflow_cancel)? {
                 return Ok(true);
             }
@@ -2492,6 +2495,69 @@ mod tests {
         });
 
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn workflow_agent_delay_observes_pause_and_resume_requests() {
+        let temp = tempdir().unwrap();
+        let workflow_dir = temp.path().join(".orca").join("workflows");
+        fs::create_dir_all(&workflow_dir).unwrap();
+        let script_path = workflow_dir.join("pausable-delay.js");
+        fs::write(
+            &script_path,
+            "export const meta = { name: 'pausable-delay', description: 'pause delay', phases: [] };\nexport default 'done';",
+        )
+        .unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(temp.path().to_path_buf());
+        let runner = WorkflowRunner::new(
+            config,
+            TaskRegistry::new("workflow-pausable-delay".to_string()),
+            temp.path().join("workflow-session"),
+        );
+        let prepared = runner
+            .prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
+                script_path: Some(script_path.display().to_string()),
+                ..Default::default()
+            }))
+            .unwrap();
+        runner
+            .activate_prepared_run(&prepared.prepared)
+            .expect("activate pausable delay fixture");
+        runner.state.request_pause(&prepared.run_id).unwrap();
+        let cancel = CancelToken::new();
+
+        thread::scope(|scope| {
+            let delayed = scope.spawn(|| {
+                runner.wait_for_agent_delay(
+                    &prepared.run_id,
+                    &prepared.task_id,
+                    &cancel,
+                    Duration::from_millis(500),
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let state = runner.state.load_run(&prepared.run_id).unwrap();
+                if state.status == WorkflowRunStatus::Paused {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "workflow agent delay never observed the pause request: {state:?}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            runner.state.request_resume(&prepared.run_id).unwrap();
+            assert!(
+                !delayed.join().unwrap().unwrap(),
+                "resuming a workflow delay must not cancel the workflow"
+            );
+        });
+        assert_eq!(
+            runner.state.load_run(&prepared.run_id).unwrap().status,
+            WorkflowRunStatus::Running
+        );
     }
 
     fn fake_workflow_child_executor(

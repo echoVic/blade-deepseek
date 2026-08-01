@@ -577,6 +577,7 @@ for (const marker of [
   "operation_panic_has_one_terminal_and_actor_reclaims_thread_state",
   "panicking_goal_run_settles_outer_turn_and_fails_closed_to_paused",
   "runtime_host_launches_saved_workflow_without_blocking_the_next_turn",
+  "binary(=subagent_contract)",
   "binary(=session_server_contract)",
   "test(/^acp::supervisor::tests::/)",
   "failed_private_winner_append_retries_before_capability_reroute",
@@ -655,6 +656,51 @@ for (const relativePath of [
     `${relativePath} must use the active Windows shell dialect for sleep hooks`,
   );
 }
+const subagentContract = readFileSync(
+  path.join(repoRoot, "tests/subagent_contract.rs"),
+  "utf8",
+);
+const asyncSubagentLaunchContract = subagentContract.match(
+  /fn async_subagent_launches_without_blocking_parent_tool\(\) \{([\s\S]*?)\n}/,
+);
+assert.ok(
+  asyncSubagentLaunchContract,
+  "async subagent launch contract test must remain present",
+);
+assert.ok(
+  asyncSubagentLaunchContract[1].includes("async subagent launch failed") &&
+    asyncSubagentLaunchContract[1].includes(
+      "String::from_utf8_lossy(&output.stdout)",
+    ) &&
+    asyncSubagentLaunchContract[1].includes(
+      "String::from_utf8_lossy(&output.stderr)",
+    ),
+  "async subagent launch failures must report captured stdout and stderr",
+);
+const sessionServerContract = readFileSync(
+  path.join(repoRoot, "tests/session_server_contract.rs"),
+  "utf8",
+);
+const incrementalShellReadContract = sessionServerContract.slice(
+  sessionServerContract.indexOf(
+    "fn server_mode_reads_runtime_shell_session_incrementally()",
+  ),
+  sessionServerContract.indexOf(
+    "fn server_mode_shell_read_honors_output_byte_cap()",
+  ),
+);
+assert.ok(
+  incrementalShellReadContract.includes(
+    'assert_eq!(output_delta["final"], false)',
+  ) &&
+    incrementalShellReadContract.includes(
+      'assert_eq!(update["status"], "running")',
+    ) &&
+    !incrementalShellReadContract.includes(
+      "read_sent_at.elapsed() < Duration::from_millis(500)",
+    ),
+  "incremental shell reads must be proven by protocol state instead of runner wall-clock speed",
+);
 const workflowCliContract = readFileSync(
   path.join(repoRoot, "tests/workflow_cli_contract.rs"),
   "utf8",

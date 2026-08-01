@@ -398,7 +398,10 @@ fn workflow_pause_resume_and_clone_control_persisted_run() {
 
     wait_for_workflow_terminal_status(temp.path(), Some(&home), task_id);
     let completed = workflow_show(temp.path(), Some(&home), task_id);
-    assert_eq!(completed["status"], "completed");
+    assert_eq!(
+        completed["status"], "completed",
+        "resumed workflow did not complete: {completed}"
+    );
 }
 
 #[test]

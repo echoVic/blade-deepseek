@@ -93,7 +93,13 @@ fn async_subagent_launches_without_blocking_parent_tool() {
         .output()
         .expect("run orca");
 
-    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.status.success(),
+        "async subagent launch failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 
     let events = parse_jsonl(&output.stdout);
     assert!(
