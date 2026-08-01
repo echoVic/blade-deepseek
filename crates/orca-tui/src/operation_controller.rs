@@ -1177,9 +1177,12 @@ fn cancel_surface_operation_checked(
     client: &orca_runtime::surface::RuntimeSurfaceClientHandle,
     operation_id: orca_runtime::surface::SurfaceOperationId,
 ) -> io::Result<()> {
-    match client
-        .cancel_operation(orca_runtime::surface::SurfaceRequestId::new(), operation_id)
-        .map_err(|error| io::Error::other(format!("typed surface cancel failed: {error:?}")))?
+    let request_id = orca_runtime::surface::SurfaceRequestId::new();
+    match retry_transient_surface_unavailability(
+        || client.cancel_operation(request_id.clone(), operation_id.clone()),
+        Duration::from_secs(5),
+    )
+    .map_err(|error| io::Error::other(format!("typed surface cancel failed: {error:?}")))?
     {
         orca_runtime::surface::MutationReply::Committed { .. } => Ok(()),
         orca_runtime::surface::MutationReply::Deferred { mutation, .. } => {
@@ -1191,6 +1194,23 @@ fn cancel_surface_operation_checked(
         orca_runtime::surface::MutationReply::Uncommitted { mutation } => Err(io::Error::other(
             format!("typed surface cancel did not commit: {mutation:?}"),
         )),
+    }
+}
+
+fn retry_transient_surface_unavailability<T>(
+    mut operation: impl FnMut() -> Result<T, orca_runtime::surface::SurfaceClientCommandError>,
+    timeout: Duration,
+) -> Result<T, orca_runtime::surface::SurfaceClientCommandError> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match operation() {
+            Err(orca_runtime::surface::SurfaceClientCommandError::RuntimeUnavailable)
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
     }
 }
 
@@ -1241,6 +1261,63 @@ mod tests {
         bytes[6] = 0x70 | (seed & 0x0f);
         bytes[8] = 0x80 | (seed & 0x3f);
         SurfaceOperationId::try_from_bytes(bytes).expect("surface operation id")
+    }
+
+    #[test]
+    fn transient_surface_unavailability_retries_until_success() {
+        let mut calls = 0;
+        let result = super::retry_transient_surface_unavailability(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(orca_runtime::surface::SurfaceClientCommandError::RuntimeUnavailable)
+                } else {
+                    Ok("committed")
+                }
+            },
+            std::time::Duration::from_secs(1),
+        );
+
+        assert_eq!(result.unwrap(), "committed");
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn permanent_surface_error_is_not_retried() {
+        let mut calls = 0;
+        let error = super::retry_transient_surface_unavailability(
+            || {
+                calls += 1;
+                Err::<(), _>(orca_runtime::surface::SurfaceClientCommandError::Unauthorized)
+            },
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            orca_runtime::surface::SurfaceClientCommandError::Unauthorized
+        ));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn transient_surface_unavailability_stops_at_deadline() {
+        let mut calls = 0;
+        let error = super::retry_transient_surface_unavailability(
+            || {
+                calls += 1;
+                Err::<(), _>(orca_runtime::surface::SurfaceClientCommandError::RuntimeUnavailable)
+            },
+            std::time::Duration::ZERO,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            orca_runtime::surface::SurfaceClientCommandError::RuntimeUnavailable
+        ));
+        assert_eq!(calls, 1);
     }
 
     #[test]
