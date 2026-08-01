@@ -1,6 +1,5 @@
 use orca_runtime::unstable_surface::*;
 use sha2::Digest;
-use std::path::PathBuf;
 
 const MANIFEST: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -19,7 +18,7 @@ fn digest(seed: u8) -> Sha256Digest {
 }
 
 fn path() -> CanonicalPath {
-    CanonicalPath::try_new(PathBuf::from("/tmp/orca-surface-commit")).unwrap()
+    CanonicalPath::try_new(std::env::temp_dir().join("orca-surface-commit")).unwrap()
 }
 
 fn cursor(next_seq: u64) -> SurfaceCursor {

@@ -2612,6 +2612,18 @@ mod tests {
         }
     }
 
+    fn test_command_argv(script: &str) -> Vec<String> {
+        if cfg!(windows) {
+            vec![
+                "pwsh.exe".to_string(),
+                "-Command".to_string(),
+                script.to_string(),
+            ]
+        } else {
+            vec!["sh".to_string(), "-lc".to_string(), script.to_string()]
+        }
+    }
+
     struct DelayedTerminalWriter {
         output: SharedVecWriter,
         delay_started: Arc<std::sync::atomic::AtomicBool>,
@@ -3107,7 +3119,7 @@ mod tests {
                 CommandExecProcess {
                     shell_id: Some(handle.id),
                     command_event_id: Value::from("cmd-shell-list"),
-                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    command: test_command_argv("true"),
                     cwd: cwd.path().to_path_buf(),
                     denied_writable_roots: Vec::new(),
                     stream_output: false,
@@ -3361,6 +3373,7 @@ extends = "parent"
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn command_exec_permission_profile_domain_policy_blocks_denied_http_request() {
         let mut config = test_run_config();
@@ -3400,6 +3413,7 @@ enabled = true
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn command_exec_permission_profile_domain_policy_reports_blocked_host() {
         let mut config = test_run_config();
@@ -4013,6 +4027,7 @@ enabled = true
         });
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn command_exec_streaming_permission_profile_block_requests_permission_and_retries_process() {
         with_orca_home(|home| {
@@ -4143,6 +4158,7 @@ enabled = true
         });
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn command_exec_streaming_permission_profile_delayed_block_requests_permission_on_next_drain() {
         with_orca_home(|home| {
@@ -5078,7 +5094,7 @@ enabled = true
         CommandExecProcess {
             shell_id: Some(shell_id.to_string()),
             command_event_id: Value::from("cmd"),
-            command: vec!["sh".to_string(), "-lc".to_string(), "true".to_string()],
+            command: test_command_argv("true"),
             cwd: PathBuf::from("/tmp"),
             denied_writable_roots: Vec::new(),
             stream_output: false,

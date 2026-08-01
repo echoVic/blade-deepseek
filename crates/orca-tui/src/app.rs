@@ -5010,12 +5010,13 @@ mod tests {
 
     #[test]
     fn backgrounded_hosted_tui_accepts_next_submit_before_first_turn_completes() {
-        with_orca_home(|_| {
+        with_orca_home(|home| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
             let (event_tx, event_rx) = mpsc::unbounded();
             let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
+            let release_marker = home.join("release-backgrounded-turn");
 
             let handle = std::thread::spawn({
                 let config = Arc::clone(&config);
@@ -5034,12 +5035,17 @@ mod tests {
             });
 
             action_tx
-                .send(UserAction::Submit("mock_stream_delay_ms 250".to_string()))
+                .send(UserAction::Submit(format!(
+                    "mock_stream_release_marker {}",
+                    release_marker.display()
+                )))
                 .unwrap();
 
             loop {
                 match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                    TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started.") => {
+                    TuiEvent::MessageDelta(text)
+                        if text.contains("Mock release-marker stream started.") =>
+                    {
                         break;
                     }
                     _ => {}
@@ -5057,13 +5063,24 @@ mod tests {
                         break "next-submit";
                     }
                     TuiEvent::MessageDelta(text)
-                        if text.contains("Mock slow stream completed.") =>
+                        if text.contains("Mock release-marker stream completed.") =>
                     {
                         break "first-turn-completed";
                     }
                     _ => {}
                 }
             };
+            std::fs::write(&release_marker, "release").expect("release backgrounded turn");
+            loop {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    TuiEvent::MessageDelta(text)
+                        if text.contains("Mock release-marker stream completed.") =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
 
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();

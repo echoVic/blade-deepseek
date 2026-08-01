@@ -194,6 +194,108 @@ function collectRustSources(repoRoot) {
   return result.sort();
 }
 
+const NON_PORTABLE_TEST_FIXTURE_PATTERNS = new Map([
+  [
+    "host-canonical-path",
+    String.raw`CanonicalPath::try_new\(\s*(?:std::path::)?PathBuf::from\("/tmp(?:/[^"]*)?"\)\s*\)\s*\.(?:unwrap|expect|is_ok)`,
+  ],
+  [
+    "direct-unix-command-argv",
+    String.raw`vec!\[\s*"sh"\.to_string\(\)\s*,\s*"-lc"\.to_string\(\)`,
+  ],
+]);
+
+function testFixtureSource(relativePath, source) {
+  if (
+    relativePath.startsWith("tests/") ||
+    relativePath.includes("/tests/") ||
+    /(?:^|\/)test[^/]*\.rs$/.test(relativePath) ||
+    /_tests\.rs$/.test(relativePath)
+  ) {
+    return { source, lineOffset: 0 };
+  }
+
+  const marker = /#\[cfg\(test\)\]\s*mod\s+tests\s*\{/g;
+  let match = null;
+  for (const candidate of source.matchAll(marker)) {
+    match = candidate;
+  }
+  if (match === null) {
+    return null;
+  }
+  const start = match.index;
+  return {
+    source: source.slice(start),
+    lineOffset: source.slice(0, start).split("\n").length - 1,
+  };
+}
+
+function matchIsInsidePlatformHelper(source, matchIndex) {
+  let functionName = null;
+  for (const match of source
+    .slice(0, matchIndex)
+    .matchAll(/\bfn\s+([A-Za-z0-9_]+)\s*\(/g)) {
+    functionName = match[1];
+  }
+  return (
+    functionName?.startsWith("platform_") || functionName === "test_command_argv"
+  );
+}
+
+function matchHasReviewedFixtureException(source, matchIndex) {
+  const lineStart = source.lastIndexOf("\n", matchIndex) + 1;
+  const previousLineStart = source.lastIndexOf("\n", lineStart - 2) + 1;
+  return source
+    .slice(previousLineStart, matchIndex)
+    .includes("windows-platform-boundary: protocol-shape-only");
+}
+
+export function validatePortableTestFixtures({
+  repoRoot,
+  sourceOverrides = new Map(),
+} = {}) {
+  requireString(repoRoot, "repoRoot");
+  const rustSources = new Set(collectRustSources(repoRoot));
+  for (const relativePath of sourceOverrides.keys()) {
+    requireRelativePath(relativePath, "source override path");
+    rustSources.add(relativePath);
+  }
+
+  const violations = [];
+  for (const relativePath of [...rustSources].sort()) {
+    const source = sourceOverrides.has(relativePath)
+      ? sourceOverrides.get(relativePath)
+      : readFileSync(path.join(repoRoot, relativePath), "utf8");
+    const fixture = testFixtureSource(relativePath, source);
+    if (fixture === null) {
+      continue;
+    }
+    for (const [patternId, regexSource] of NON_PORTABLE_TEST_FIXTURE_PATTERNS) {
+      for (const match of fixture.source.matchAll(new RegExp(regexSource, "g"))) {
+        if (
+          matchIsInsidePlatformHelper(fixture.source, match.index) ||
+          matchHasReviewedFixtureException(fixture.source, match.index)
+        ) {
+          continue;
+        }
+        const line =
+          fixture.lineOffset +
+          fixture.source.slice(0, match.index).split("\n").length;
+        violations.push(`${relativePath}:${line} ${patternId}`);
+      }
+    }
+  }
+
+  if (violations.length > 0) {
+    fail(
+      `non-portable test fixtures must use host-platform helpers:\n${violations.join(
+        "\n",
+      )}`,
+    );
+  }
+  return true;
+}
+
 function countMatches(source, regexSource) {
   return Array.from(source.matchAll(new RegExp(regexSource, "g"))).length;
 }
@@ -277,6 +379,7 @@ function main() {
   const manifestPath = path.join(repoRoot, process.argv[2] ?? DEFAULT_MANIFEST);
   const manifest = parseManifestText(readFileSync(manifestPath, "utf8"));
   validateCurrentInventory(manifest, { repoRoot });
+  validatePortableTestFixtures({ repoRoot });
   console.log("windows platform boundary contract passed");
 }
 

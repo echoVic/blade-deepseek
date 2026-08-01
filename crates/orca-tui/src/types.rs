@@ -6491,7 +6491,12 @@ arbitrary metadata
             ),
         };
         let result = orca_tools::edit::execute(&request, directory.path());
-        assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
+        assert_eq!(
+            result.status,
+            orca_core::tool_types::ToolStatus::Completed,
+            "symlink alias edit failed: {:?}",
+            result.error
+        );
         let preview = result
             .file_change_preview
             .as_deref()

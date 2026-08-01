@@ -1302,6 +1302,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let key_file = temp.path().join("key");
         let mut command = ProcessCommand::new("sh");
+        orca_tools::process::prepare_non_interactive_command(&mut command);
         command
             .env("ORCA_TEST_KEY_FILE", &key_file)
             .stdin(Stdio::piped())
@@ -1327,7 +1328,7 @@ mod tests {
         assert!(!command_line.contains(sentinel));
         assert!(!command_line.contains("--api-key"));
         assert_eq!(fs::read_to_string(&key_file).unwrap(), sentinel);
-        let _ = child.kill();
+        orca_tools::process::kill_child_tree(&mut child);
         let _ = child.wait();
     }
 

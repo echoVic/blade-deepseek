@@ -1,6 +1,6 @@
 use orca_runtime::unstable_surface::*;
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::thread;
 
 fn uuid(seed: u8) -> [u8; 16] {
@@ -11,7 +11,7 @@ fn uuid(seed: u8) -> [u8; 16] {
 }
 
 fn path() -> CanonicalPath {
-    CanonicalPath::try_new(PathBuf::from("/tmp/orca-surface-attach")).unwrap()
+    CanonicalPath::try_new(std::env::temp_dir().join("orca-surface-attach")).unwrap()
 }
 
 fn cursor(next_seq: u64) -> SurfaceCursor {

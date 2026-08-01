@@ -120,7 +120,8 @@ pub fn read_text_file_with_limit(
 }
 
 fn open_regular_file(path: &Path) -> Result<(File, u64), FileAdmissionError> {
-    if !path.symlink_metadata()?.is_file() {
+    let path_metadata = path.symlink_metadata()?;
+    if !path_metadata.is_file() && !path_metadata.file_type().is_symlink() {
         return Err(FileAdmissionError::NotRegularFile);
     }
     let mut options = OpenOptions::new();

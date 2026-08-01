@@ -344,6 +344,37 @@ pub async fn call_streaming_async(
                     usage: None,
                 };
             }
+            if let Some(release_marker) = mock_stream_release_marker(conversation) {
+                let started =
+                    ProviderStep::MessageDelta("Mock release-marker stream started.".to_string());
+                on_step(&started);
+                while !release_marker.exists() {
+                    if !sleep_with_cancel(Duration::from_millis(10), cancel).await {
+                        return ProviderResponse {
+                            steps: vec![started],
+                            assistant_content: Some(
+                                "Mock release-marker stream started.".to_string(),
+                            ),
+                            assistant_reasoning: None,
+                            tool_calls: Vec::new(),
+                            usage: None,
+                        };
+                    }
+                }
+                let completed =
+                    ProviderStep::MessageDelta("Mock release-marker stream completed.".to_string());
+                on_step(&completed);
+                return ProviderResponse {
+                    steps: vec![started, completed],
+                    assistant_content: Some(
+                        "Mock release-marker stream started.Mock release-marker stream completed."
+                            .to_string(),
+                    ),
+                    assistant_reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                };
+            }
             if let Some(delay_ms) = mock_stream_usage_delay_ms(conversation) {
                 let started =
                     ProviderStep::ReasoningDelta("Mock delayed usage started.".to_string());
@@ -519,6 +550,16 @@ fn mock_stream_delay_ms(conversation: &Conversation) -> Option<u64> {
         .strip_prefix("mock_stream_delay_ms ")
         .and_then(|delay| delay.trim().parse::<u64>().ok())
         .map(|delay| delay.min(10_000))
+}
+
+fn mock_stream_release_marker(conversation: &Conversation) -> Option<std::path::PathBuf> {
+    let marker = conversation
+        .last_user_message()
+        .unwrap_or("")
+        .trim()
+        .strip_prefix("mock_stream_release_marker ")?
+        .trim();
+    (!marker.is_empty()).then(|| std::path::PathBuf::from(marker))
 }
 
 fn mock_stream_usage_delay_ms(conversation: &Conversation) -> Option<u64> {
@@ -1847,6 +1888,55 @@ mod tests {
             response.assistant_content.as_deref(),
             Some("Mock slow stream started.Mock slow stream completed.")
         );
+    }
+
+    #[test]
+    fn mock_stream_release_marker_waits_for_marker_before_completing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let release_marker = temp.path().join("release");
+        let mut conversation = Conversation::new();
+        conversation.add_user(format!(
+            "mock_stream_release_marker {}",
+            release_marker.display()
+        ));
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let mut stream = start_streaming(ProviderKind::Mock, &conversation, &config, cancel);
+
+        let started = stream
+            .recv_timeout(Duration::from_secs(1))
+            .expect("release-marker stream start");
+        assert!(matches!(
+            started,
+            ProviderStreamEvent::Step(ref delivery)
+                if matches!(delivery.step(), ProviderStep::MessageDelta(text)
+                    if text == "Mock release-marker stream started.")
+        ));
+        drop(started);
+
+        assert!(matches!(
+            stream.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        std::fs::write(&release_marker, "release").expect("create release marker");
+
+        let completed_delta = stream
+            .recv_timeout(Duration::from_secs(1))
+            .expect("release-marker completion delta");
+        assert!(matches!(
+            completed_delta,
+            ProviderStreamEvent::Step(ref delivery)
+                if matches!(delivery.step(), ProviderStep::MessageDelta(text)
+                    if text == "Mock release-marker stream completed.")
+        ));
     }
 
     #[test]

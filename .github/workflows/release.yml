@@ -20,6 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
       - name: Install test runtime dependencies
         run: |
@@ -28,7 +29,10 @@ jobs:
       - name: Run tests
         env:
           RUST_BACKTRACE: "1"
-        run: cargo test --workspace --all-targets --locked -- --test-threads=1
+        run: |
+          cargo test -p orca-tui --lib --locked -- --test-threads=1
+          cargo test --test tui_pty_contract --locked -- --test-threads=1
+          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
 
   version:
     runs-on: ubuntu-latest
@@ -101,6 +105,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@nextest
+        if: runner.os == 'Windows'
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux ARM64 linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -124,7 +130,9 @@ jobs:
           cargo test -p orca-runtime --test runtime_surface_commit thread_and_policy_owner_leases_fail_closed_and_wall_rollback_has_no_authority --locked -- --nocapture
           cargo test --test history_contract history_rename_search_and_compress_work_for_latest --locked -- --nocapture
           cargo build -p orca-windows-runner --locked
-          cargo test --workspace --all-targets --locked -- --test-threads=1
+          cargo test -p orca-tui --lib --locked -- --test-threads=1
+          cargo test --test tui_pty_contract --locked -- --test-threads=1
+          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
       - name: Run native Windows ARM64 behavior gates
         if: matrix.target == 'aarch64-pc-windows-msvc'
         shell: pwsh

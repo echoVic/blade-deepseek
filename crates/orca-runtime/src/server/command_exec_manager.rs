@@ -759,6 +759,14 @@ mod tests {
         }
     }
 
+    fn platform_command_argv() -> Vec<String> {
+        if cfg!(windows) {
+            vec!["pwsh.exe".to_string(), "-Command".to_string()]
+        } else {
+            vec!["sh".to_string(), "-lc".to_string()]
+        }
+    }
+
     #[test]
     fn command_exec_permission_policy_requests_pathless_sandbox_retry() {
         let diagnostic = SandboxDenialDiagnostic {
@@ -960,7 +968,7 @@ mod tests {
                 CommandExecProcess {
                     shell_id: Some(handle.id),
                     command_event_id: Value::from("cmd-rebase"),
-                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
                     denied_writable_roots: Vec::new(),
                     stream_output: true,
@@ -1045,7 +1053,7 @@ mod tests {
                 CommandExecProcess {
                     shell_id: Some(handle.id),
                     command_event_id: Value::from("cmd-cap"),
-                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
                     denied_writable_roots: Vec::new(),
                     stream_output: true,
@@ -1138,7 +1146,7 @@ mod tests {
                 CommandExecProcess {
                     shell_id: Some(handle.id),
                     command_event_id: Value::from("cmd-omitted"),
-                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
                     denied_writable_roots: Vec::new(),
                     stream_output: true,
@@ -1207,7 +1215,7 @@ mod tests {
                 CommandExecProcess {
                     shell_id: Some(handle.id),
                     command_event_id: Value::from("cmd-stderr-omitted"),
-                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
                     denied_writable_roots: Vec::new(),
                     stream_output: true,
@@ -1280,7 +1288,7 @@ mod tests {
                 CommandExecProcess {
                     shell_id: Some(handle.id),
                     command_event_id: Value::from("cmd-omitted-cap"),
-                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
                     denied_writable_roots: Vec::new(),
                     stream_output: true,
@@ -1358,7 +1366,7 @@ mod tests {
                 CommandExecProcess {
                     shell_id: Some(handle.id.clone()),
                     command_event_id: Value::from("cmd-denied"),
-                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
                     denied_writable_roots: Vec::new(),
                     stream_output: false,
@@ -1422,7 +1430,7 @@ mod tests {
                 CommandExecProcess {
                     shell_id: Some(handle.id.clone()),
                     command_event_id: Value::from("cmd-list-owned"),
-                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
                     denied_writable_roots: Vec::new(),
                     stream_output: false,
@@ -1439,7 +1447,39 @@ mod tests {
             )
             .expect("insert command exec process");
 
-        std::thread::sleep(Duration::from_millis(100));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let terminal_status = loop {
+            let status = shell_sessions
+                .list()
+                .into_iter()
+                .find(|snapshot| snapshot.id == handle.id)
+                .map(|snapshot| snapshot.status);
+            if status.is_some_and(|status| {
+                matches!(
+                    status,
+                    orca_core::task_types::TaskStatus::Stopped
+                        | orca_core::task_types::TaskStatus::Completed
+                        | orca_core::task_types::TaskStatus::Failed
+                        | orca_core::task_types::TaskStatus::Cancelled
+                )
+            }) || std::time::Instant::now() >= deadline
+            {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            terminal_status.is_some_and(|status| {
+                matches!(
+                    status,
+                    orca_core::task_types::TaskStatus::Stopped
+                        | orca_core::task_types::TaskStatus::Completed
+                        | orca_core::task_types::TaskStatus::Failed
+                        | orca_core::task_types::TaskStatus::Cancelled
+                )
+            }),
+            "command exec shell did not reach terminal state"
+        );
         let _shell_snapshots = shell_sessions.list();
 
         let mut output = Vec::new();
@@ -1447,7 +1487,7 @@ mod tests {
             .drain_with_timeout(
                 Some(&mut shell_sessions),
                 &mut output,
-                Duration::from_millis(50),
+                Duration::from_secs(1),
             )
             .expect("drain listed command exec process");
         let events = parse_test_jsonl(&output);

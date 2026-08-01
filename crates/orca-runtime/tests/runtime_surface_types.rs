@@ -43,12 +43,24 @@ fn primitive_wrappers_enforce_the_frozen_contract() {
     assert!(NonEmptySet::<u8>::try_new(BTreeSet::new()).is_err());
     assert!(NonEmptySet::try_new(BTreeSet::from([1])).is_ok());
 
-    assert!(CanonicalPath::try_new(PathBuf::from("/tmp/surface")).is_ok());
+    let canonical_path = std::env::temp_dir().join("surface");
+    let parent_path = std::env::temp_dir().join("..").join("surface");
+    let current_path = std::env::temp_dir().join(".").join("surface");
+    let duplicate_separator_path = PathBuf::from(format!(
+        "{}{}{}surface",
+        std::env::temp_dir().display(),
+        std::path::MAIN_SEPARATOR,
+        std::path::MAIN_SEPARATOR,
+    ));
+    assert!(CanonicalPath::try_new(canonical_path).is_ok());
     assert!(CanonicalPath::try_new(PathBuf::from("relative")).is_err());
-    assert!(CanonicalPath::try_new(PathBuf::from("/tmp/../surface")).is_err());
-    assert!(CanonicalPath::try_new(PathBuf::from("/tmp/./surface")).is_err());
-    assert!(CanonicalPath::try_new(PathBuf::from("/tmp//surface")).is_err());
-    assert!(serde_json::from_value::<CanonicalPath>(serde_json::json!("/tmp//surface")).is_err());
+    assert!(CanonicalPath::try_new(parent_path).is_err());
+    assert!(CanonicalPath::try_new(current_path).is_err());
+    assert!(CanonicalPath::try_new(duplicate_separator_path.clone()).is_err());
+    assert!(
+        serde_json::from_value::<CanonicalPath>(serde_json::json!(duplicate_separator_path))
+            .is_err()
+    );
     assert!(CanonicalUri::try_new("https://example.com/path").is_ok());
     assert!(CanonicalUri::try_new("https://example.com:8443/path").is_ok());
     assert!(CanonicalUri::try_new("not a uri").is_err());

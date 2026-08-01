@@ -15027,9 +15027,12 @@ impl ThreadActor {
         &mut self,
         call_id: &surface::SurfaceCapabilityCallId,
         waiter_outcome: Option<PendingSurfaceCapabilityWaiterOutcome>,
+        physical_write_confirmed: bool,
     ) {
         let Some(waiter_outcome) = waiter_outcome else {
-            if let Some(resident) = self.resident_surface.capability_calls.get_mut(call_id) {
+            if physical_write_confirmed
+                && let Some(resident) = self.resident_surface.capability_calls.get_mut(call_id)
+            {
                 resident.write_claimed = false;
             }
             return;
@@ -15131,6 +15134,7 @@ impl ThreadActor {
     fn retry_surface_capability_transition(
         &mut self,
         call_id: &surface::SurfaceCapabilityCallId,
+        physical_write_confirmed: bool,
     ) -> bool {
         let Some(mut pending) = self
             .resident_surface
@@ -15152,7 +15156,11 @@ impl ThreadActor {
             return false;
         }
         let deferred_settlement = pending.deferred_settlement.take();
-        self.apply_committed_surface_capability_transition(call_id, pending.waiter_outcome);
+        self.apply_committed_surface_capability_transition(
+            call_id,
+            pending.waiter_outcome,
+            physical_write_confirmed,
+        );
         if let Some(deferred_settlement) = deferred_settlement {
             match deferred_settlement {
                 PendingSurfaceCapabilitySettlement::ReadTextFile {
@@ -15277,7 +15285,7 @@ impl ThreadActor {
                 .collect::<Vec<_>>();
             call_ids.sort();
             for call_id in call_ids {
-                self.retry_surface_capability_transition(&call_id);
+                self.retry_surface_capability_transition(&call_id, false);
             }
         }
         self.resident_surface
@@ -15518,7 +15526,7 @@ impl ThreadActor {
                 return Err(surface::SurfaceClientCommandError::Unauthorized);
             }
             return self
-                .retry_surface_capability_transition(&call_id)
+                .retry_surface_capability_transition(&call_id, true)
                 .then_some(())
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
@@ -15578,7 +15586,7 @@ impl ThreadActor {
                     });
             }
             return self
-                .retry_surface_capability_transition(&call_id)
+                .retry_surface_capability_transition(&call_id, false)
                 .then_some(())
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
@@ -15726,6 +15734,7 @@ impl ThreadActor {
         self.apply_committed_surface_capability_transition(
             &call_id,
             Some(Self::pending_read_capability_waiter_outcome(waiter_result)),
+            false,
         );
         Ok(())
     }
@@ -15930,7 +15939,7 @@ impl ThreadActor {
             .contains_key(&call_id)
         {
             return self
-                .retry_surface_capability_transition(&call_id)
+                .retry_surface_capability_transition(&call_id, true)
                 .then_some(())
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
@@ -15990,7 +15999,7 @@ impl ThreadActor {
                 settlement,
             });
             return self
-                .retry_surface_capability_transition(&call_id)
+                .retry_surface_capability_transition(&call_id, false)
                 .then_some(())
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
@@ -16098,6 +16107,7 @@ impl ThreadActor {
         self.apply_committed_surface_capability_transition(
             &call_id,
             Some(Self::pending_write_capability_waiter_outcome(waiter_result)),
+            false,
         );
         Ok(())
     }
@@ -16318,7 +16328,7 @@ impl ThreadActor {
             .contains_key(&call_id)
         {
             return self
-                .retry_surface_capability_transition(&call_id)
+                .retry_surface_capability_transition(&call_id, true)
                 .then_some(())
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
@@ -16379,7 +16389,7 @@ impl ThreadActor {
                     settlement,
                 });
             return self
-                .retry_surface_capability_transition(&call_id)
+                .retry_surface_capability_transition(&call_id, false)
                 .then_some(())
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
@@ -16519,6 +16529,7 @@ impl ThreadActor {
         self.apply_committed_surface_capability_transition(
             &call_id,
             Some(Self::pending_terminal_create_waiter_outcome(waiter_result)),
+            false,
         );
         Ok(())
     }
@@ -16746,7 +16757,7 @@ impl ThreadActor {
             .contains_key(&call_id)
         {
             return self
-                .retry_surface_capability_transition(&call_id)
+                .retry_surface_capability_transition(&call_id, true)
                 .then_some(())
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
@@ -16801,7 +16812,7 @@ impl ThreadActor {
                     settlement,
                 });
             return self
-                .retry_surface_capability_transition(&call_id)
+                .retry_surface_capability_transition(&call_id, false)
                 .then_some(())
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
@@ -16989,6 +17000,7 @@ impl ThreadActor {
             Some(Self::pending_terminal_observation_waiter_outcome(
                 waiter_result,
             )),
+            false,
         );
         Ok(())
     }
@@ -17173,7 +17185,7 @@ impl ThreadActor {
             .contains_key(&call_id)
         {
             return self
-                .retry_surface_capability_transition(&call_id)
+                .retry_surface_capability_transition(&call_id, true)
                 .then_some(())
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
@@ -17238,7 +17250,7 @@ impl ThreadActor {
                     settlement,
                 });
             return self
-                .retry_surface_capability_transition(&call_id)
+                .retry_surface_capability_transition(&call_id, false)
                 .then_some(())
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
@@ -17377,6 +17389,7 @@ impl ThreadActor {
             self.apply_committed_surface_capability_transition(
                 &call_id,
                 Some(PendingSurfaceCapabilityWaiterOutcome::TerminalCleanupCompleted),
+                false,
             );
             return Ok(());
         }
@@ -17570,6 +17583,7 @@ impl ThreadActor {
                 kind: io::ErrorKind::Other,
                 message: waiter_error,
             }),
+            false,
         );
         Ok(())
     }
@@ -21392,7 +21406,7 @@ impl ThreadActor {
             return;
         }
         if let PendingSurfaceTransitionRetry::CapabilityTransition(call_id) = retry {
-            self.retry_surface_capability_transition(&call_id);
+            self.retry_surface_capability_transition(&call_id, false);
             return;
         }
         if let PendingSurfaceTransitionRetry::Detach(attachment_id) = retry {

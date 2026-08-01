@@ -693,12 +693,14 @@ mod tests {
             .expect("hand off worker credential");
         let pid = child.id() as i32;
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !key_file.exists() && Instant::now() < deadline {
+        while std::fs::read_to_string(&key_file).ok().as_deref() != Some(sentinel)
+            && Instant::now() < deadline
+        {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(
             key_file.exists(),
-            "worker did not receive API key environment"
+            "worker did not receive API key through private stdin"
         );
 
         let pgid = unsafe { getpgid(pid) };

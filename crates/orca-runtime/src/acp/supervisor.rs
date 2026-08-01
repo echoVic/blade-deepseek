@@ -2762,7 +2762,7 @@ mod tests {
                 "printf".to_string(),
                 vec!["hello".to_string()],
                 vec![("LANG".to_string(), "C".to_string())],
-                Some(PathBuf::from("/workspace")),
+                Some(test_absolute_path("orca-acp-workspace")),
                 Some(4096),
             );
             let terminal = match outcome {
@@ -2839,7 +2839,7 @@ mod tests {
                 "printf".to_string(),
                 vec!["hello".to_string()],
                 Vec::new(),
-                Some(PathBuf::from("/workspace")),
+                Some(test_absolute_path("orca-acp-workspace")),
                 Some(4096),
             )?;
             let output = terminal.output()?;
@@ -2902,7 +2902,7 @@ mod tests {
                 "wait".to_string(),
                 Vec::new(),
                 Vec::new(),
-                Some(PathBuf::from("/workspace")),
+                Some(test_absolute_path("orca-acp-workspace")),
                 None,
             )?;
             let wait = terminal
@@ -3800,7 +3800,12 @@ mod tests {
             assert_eq!(create_request["params"]["sessionId"], session_id);
             assert_eq!(create_request["params"]["command"], "printf");
             assert_eq!(create_request["params"]["args"], json!(["hello"]));
-            assert_eq!(create_request["params"]["cwd"], "/workspace");
+            assert_eq!(
+                create_request["params"]["cwd"],
+                test_absolute_path("orca-acp-workspace")
+                    .display()
+                    .to_string()
+            );
             assert!(
                 outcome_rx.try_recv().is_err(),
                 "tool waiter completed before the terminal identity was durable"
@@ -4304,10 +4309,19 @@ mod tests {
             assert_eq!(cleanups[0].0, "terminal/kill");
             assert_eq!(cleanups[1].0, "terminal/kill");
             assert_ne!(cleanups[0].1, cleanups[1].1);
-            assert_eq!(
-                cleanups[2],
-                ("terminal/release".to_string(), cleanups[1].1.clone())
+            assert_eq!(cleanups[2].0, "terminal/release");
+            assert!(
+                cleanups[..2]
+                    .iter()
+                    .any(|(_, terminal_id)| terminal_id == &cleanups[2].1),
+                "release must preserve one of the exact killed terminal identities: {cleanups:?}"
             );
+            let unresolved_terminal = cleanups[..2]
+                .iter()
+                .find_map(|(_, terminal_id)| {
+                    (terminal_id != &cleanups[2].1).then_some(terminal_id.clone())
+                })
+                .expect("one killed terminal remains unreleased");
             assert_eq!(
                 tokio::task::spawn_blocking(move || outcome_rx.recv_timeout(TEST_TIMEOUT))
                     .await
@@ -4318,7 +4332,7 @@ mod tests {
             assert_persisted_terminal_cleanup_ambiguous(
                 &transcript_path,
                 crate::unstable_surface::ExternalEffectKind::TerminalRelease,
-                &cleanups[0].1,
+                &unresolved_terminal,
             );
             let _ = client_write.shutdown().await;
             drop(client_read);

@@ -473,7 +473,7 @@ mod tests {
             event: HookEvent::PreModelCall,
             command: platform_hook_script(
                 "printf before; sleep 5; printf after",
-                "[Console]::Out.Write('before'); Start-Sleep -Seconds 5; [Console]::Out.Write('after')",
+                "[Console]::Out.Write('before'); [Console]::Out.Flush(); Start-Sleep -Seconds 5; [Console]::Out.Write('after')",
             ),
             tool: None,
         }]);

@@ -2449,6 +2449,7 @@ mod tests {
             submission.op,
             ClientOp::CommandExec {
                 thread_id: Some("thread-1".to_string()),
+                // windows-platform-boundary: protocol-shape-only
                 command: vec!["sh".to_string(), "-lc".to_string(), "printf ok".to_string()],
                 command_is_argv: true,
                 process_id: Some("process-1".to_string()),

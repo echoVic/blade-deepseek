@@ -9,6 +9,7 @@ import {
   parseManifestText,
   validateCurrentInventory,
   validateManifest,
+  validatePortableTestFixtures,
 } from "./validate-windows-platform-boundaries.mjs";
 
 const repoRoot = path.resolve(
@@ -113,6 +114,55 @@ assert.throws(
 
 validateManifest(baseline);
 validateCurrentInventory(baseline, { repoRoot });
+
+{
+  const relativePath = "crates/orca-runtime/src/portable_fixture_tests.rs";
+  const sourceOverrides = new Map([
+    [
+      relativePath,
+      String.raw`
+#[cfg(test)]
+mod tests {
+    fn non_portable_fixtures() {
+        let _ = CanonicalPath::try_new(PathBuf::from("/tmp/orca-test")).unwrap();
+        let _ = vec!["sh".to_string(), "-lc".to_string()];
+    }
+}
+`,
+    ],
+  ]);
+  assert.throws(
+    () => validatePortableTestFixtures({ repoRoot, sourceOverrides }),
+    (error) =>
+      /host-canonical-path/.test(error.message) &&
+      /direct-unix-command-argv/.test(error.message),
+    "portable fixture validation must reject every reviewed host-specific test pattern",
+  );
+}
+
+{
+  const relativePath = "crates/orca-runtime/src/portable_fixture_tests.rs";
+  const sourceOverrides = new Map([
+    [
+      relativePath,
+      String.raw`
+#[cfg(test)]
+mod tests {
+    fn portable_fixtures() {
+        let _ = test_canonical_path("orca-test");
+        let _ = platform_command_argv();
+        // windows-platform-boundary: protocol-shape-only
+        let _ = vec!["sh".to_string(), "-lc".to_string()];
+    }
+}
+`,
+    ],
+  ]);
+  assert.doesNotThrow(
+    () => validatePortableTestFixtures({ repoRoot, sourceOverrides }),
+    "portable fixture validation must accept centralized host-platform helpers",
+  );
+}
 
 const migratedLockBoundaries = [
   ["crates/orca-runtime/src/goal_actor.rs", "goal runtime"],
@@ -454,7 +504,10 @@ for (const marker of [
   "node scripts/test-validate-windows-platform-boundaries.mjs",
   "cargo check --workspace --all-targets --locked",
   "cargo clippy --workspace --all-targets --locked",
-  "cargo test --workspace --all-targets --locked -- --test-threads=1",
+  "taiki-e/install-action@nextest",
+  "cargo test -p orca-tui --lib --locked -- --test-threads=1",
+  "cargo test --test tui_pty_contract --locked -- --test-threads=1",
+  "cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast",
   "cargo build --release --locked",
   "target/release/orca.exe",
   "--version",
@@ -477,7 +530,7 @@ for (const [job, label] of [
   [windowsArm64Job[1], "ARM64"],
 ]) {
   const runnerBuild = "cargo build -p orca-windows-runner --locked";
-  const fullSuite = "cargo test --workspace --all-targets --locked";
+  const fullSuite = "cargo nextest run --workspace --all-targets --locked";
   assert.ok(
     job.includes(runnerBuild),
     `Windows ${label} CI must materialize the async-worker runner before integration tests`,
@@ -487,6 +540,31 @@ for (const [job, label] of [
     `Windows ${label} CI must build the runner before the full test suite`,
   );
 }
+const nextestConfig = readFileSync(
+  path.join(repoRoot, ".config/nextest.toml"),
+  "utf8",
+);
+for (const marker of [
+  "[profile.ci]",
+  'default-filter = "not (binary(=orca_tui) | binary(=tui_pty_contract))"',
+  "fail-fast = false",
+  "test-threads = 4",
+  'slow-timeout = { period = "60s", terminate-after = 2 }',
+  "threads-required = 4",
+  "capability_mark_rails",
+  "older_incomplete_background_completion",
+  "external_tool_timeout_",
+]) {
+  assert.ok(
+    nextestConfig.includes(marker),
+    `nextest CI profile must contain ${marker}`,
+  );
+}
+assert.ok(
+  pullRequest[1].includes('".config/nextest.toml"') &&
+    push[1].includes('".config/nextest.toml"'),
+  "Windows CI must run when the nextest profile changes",
+);
 
 for (const relativePath of [
   "tests/session_server_contract.rs",
