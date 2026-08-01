@@ -107,6 +107,7 @@ struct BlockingAssistantStreamExecutor;
 struct PermissionExecutor {
     response_tx: mpsc::SyncSender<RuntimePermissionResponse>,
     tool: ToolRequest,
+    write_path: PathBuf,
 }
 
 struct BlockingResolvedToolApprovalExecutor {
@@ -543,7 +544,7 @@ impl ThreadOperationExecutor for PermissionExecutor {
                 permissions: RequestPermissionProfile {
                     file_system: Some(RequestFileSystemPermissions {
                         read: None,
-                        write: Some(vec![PathBuf::from("/workspace/output")]),
+                        write: Some(vec![self.write_path.clone()]),
                         entries: None,
                     }),
                     network: None,
@@ -1553,6 +1554,7 @@ fn native_permission_allow_cannot_widen_requested_profile() {
     let host = RuntimeHost::start_with_executor(Arc::new(PermissionExecutor {
         response_tx,
         tool: permission_tool_request(),
+        write_path: PathBuf::from("/workspace/output"),
     }))
     .expect("start runtime host");
     let thread = host
@@ -1627,28 +1629,6 @@ fn native_permission_allow_cannot_widen_requested_profile() {
     ));
     assert!(response_rx.try_recv().is_err());
 
-    let session_rejected = attachment
-        .client
-        .respond_interaction_by_id(
-            request_id(),
-            interaction.interaction_id.clone(),
-            SurfaceClientInteractionAnswer::PermissionRequest {
-                decision: SurfacePermissionClientDecision::Allow {
-                    scope: PermissionGrantScope::Session,
-                    permissions: requested.clone(),
-                    strict_auto_review: false,
-                },
-            },
-        )
-        .unwrap();
-    assert!(matches!(
-        session_rejected,
-        MutationReply::Uncommitted {
-            mutation: UncommittedMutation::Invalid { ref error, .. },
-        } if error.error().code == SurfaceMutationErrorCode::InvalidInput
-    ));
-    assert!(response_rx.try_recv().is_err());
-
     let _ = committed_value(
         attachment
             .client
@@ -1694,6 +1674,7 @@ fn sandbox_permission_is_bound_to_the_exact_effect_tool() {
     let host = RuntimeHost::start_with_executor(Arc::new(PermissionExecutor {
         response_tx,
         tool: effect_tool_request(),
+        write_path: PathBuf::from("/workspace/output"),
     }))
     .expect("start runtime host");
     let thread = host
@@ -2402,6 +2383,7 @@ fn run_effect_permission_restart_child() -> ! {
     let host = RuntimeHost::start_with_executor(Arc::new(PermissionExecutor {
         response_tx,
         tool: permission_tool_request(),
+        write_path: PathBuf::from("/workspace/output"),
     }))
     .unwrap();
     let thread = host
@@ -3875,13 +3857,17 @@ fn tool_approval_allow_wakes_only_after_exact_resolution_batch_commits() {
 }
 
 #[test]
-fn permission_allow_wakes_only_after_exact_resolution_batch_commits() {
+fn session_permission_allow_commits_settings_before_waking_and_survives_conflicting_retry() {
     with_orca_home(|home| {
         let cwd = tempfile::tempdir().unwrap();
+        let metadata_directory = cwd.path().join(".git");
+        fs::create_dir(&metadata_directory).unwrap();
+        let metadata_directory = metadata_directory.canonicalize().unwrap();
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         let host = RuntimeHost::start_with_executor(Arc::new(PermissionExecutor {
             response_tx,
             tool: permission_tool_request(),
+            write_path: metadata_directory.clone(),
         }))
         .unwrap();
         let thread = host
@@ -3929,7 +3915,7 @@ fn permission_allow_wakes_only_after_exact_resolution_batch_commits() {
             interaction.interaction_id.clone(),
             SurfaceClientInteractionAnswer::PermissionRequest {
                 decision: SurfacePermissionClientDecision::Allow {
-                    scope: PermissionGrantScope::Turn,
+                    scope: PermissionGrantScope::Session,
                     permissions: requested.clone(),
                     strict_auto_review: false,
                 },
@@ -3940,6 +3926,13 @@ fn permission_allow_wakes_only_after_exact_resolution_batch_commits() {
             Err(SurfaceClientCommandError::RuntimeUnavailable)
         ));
         assert!(response_rx.try_recv().is_err());
+        assert!(
+            fresh_snapshot(&surface)
+                .settings
+                .effective
+                .metadata_writable_directories
+                .is_empty()
+        );
         fs::remove_dir(&ledger).unwrap();
         fs::rename(&backup, &ledger).unwrap();
 
@@ -3964,8 +3957,28 @@ fn permission_allow_wakes_only_after_exact_resolution_batch_commits() {
             RespondInteractionDisposition::AlreadyResolved { .. }
         ));
         assert_eq!(
-            response_rx.recv_timeout(TEST_TIMEOUT).unwrap().decision,
-            PermissionResponseDecision::Allow
+            response_rx.recv_timeout(TEST_TIMEOUT).unwrap(),
+            RuntimePermissionResponse {
+                decision: PermissionResponseDecision::Allow,
+                scope: RuntimePermissionGrantScope::Session,
+                strict_auto_review: false,
+                permissions: RequestPermissionProfile {
+                    file_system: Some(RequestFileSystemPermissions {
+                        read: None,
+                        write: Some(vec![metadata_directory.clone()]),
+                        entries: None,
+                    }),
+                    network: None,
+                    shell: None,
+                },
+            }
+        );
+        assert_eq!(
+            fresh_snapshot(&surface)
+                .settings
+                .effective
+                .metadata_writable_directories,
+            vec![CanonicalPath::try_new(metadata_directory).unwrap()]
         );
         assert!(response_rx.try_recv().is_err());
         let replay = committed_value(

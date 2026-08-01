@@ -116,6 +116,13 @@
       "process-ownership-plan"
     ],
     [
+      "runtime-permission-test-symlink",
+      "crates/orca-runtime/src/runtime_permission.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "sandbox-denial-unix-fixture",
       "crates/orca-runtime/src/sandbox_denial.rs",
       "unix_std_api",
@@ -263,6 +270,20 @@
       "windows-sandbox-plan"
     ],
     [
+      "bwrap-sandbox-test-symlink",
+      "crates/orca-tools/src/sandbox/bwrap.rs",
+      "unix_std_api",
+      1,
+      "windows-sandbox-plan"
+    ],
+    [
+      "sandbox-metadata-test-symlink",
+      "crates/orca-tools/src/sandbox/mod.rs",
+      "unix_std_api",
+      1,
+      "windows-sandbox-plan"
+    ],
+    [
       "sandbox-test-shells",
       "crates/orca-tools/src/sandbox/mod.rs",
       "unix_shell_spawn",
@@ -273,7 +294,7 @@
       "seatbelt-unix-api",
       "crates/orca-tools/src/sandbox/seatbelt.rs",
       "unix_std_api",
-      5,
+      6,
       "windows-sandbox-plan"
     ],
     [

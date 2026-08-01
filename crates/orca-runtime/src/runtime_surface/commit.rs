@@ -635,6 +635,10 @@ enum BatchCommitAuthority<'permit> {
         actor: &'permit SurfacePublisherPermit,
         generation: &'permit SurfacePublisherPermit,
     },
+    ActorGenerationPermissionResolution {
+        actor: &'permit SurfacePublisherPermit,
+        generation: &'permit SurfacePublisherPermit,
+    },
     ActorFinalizerTaskTerminal {
         actor: &'permit SurfacePublisherPermit,
         finalizer: &'permit SurfacePublisherPermit,
@@ -706,6 +710,10 @@ enum RecoveredBatchAuthority {
         generation: SurfacePublisherPermit,
     },
     ActorGenerationInterrupt {
+        actor: SurfacePublisherPermit,
+        generation: SurfacePublisherPermit,
+    },
+    ActorGenerationPermissionResolution {
         actor: SurfacePublisherPermit,
         generation: SurfacePublisherPermit,
     },
@@ -1031,6 +1039,19 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
                         None,
                     )?;
                 }
+                RecoveredBatchAuthority::ActorGenerationPermissionResolution {
+                    actor,
+                    generation,
+                } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::ActorGenerationPermissionResolution {
+                            actor: &actor,
+                            generation: &generation,
+                        },
+                        &batch,
+                        None,
+                    )?;
+                }
                 RecoveredBatchAuthority::ActorFinalizerTaskTerminal { actor, finalizer } => {
                     coordinator.commit_batch_with_authority(
                         BatchCommitAuthority::ActorFinalizerTaskTerminal {
@@ -1236,6 +1257,16 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     &batch,
                     None,
                 )?,
+            RecoveredBatchAuthority::ActorGenerationPermissionResolution { actor, generation } => {
+                self.commit_batch_with_authority(
+                    BatchCommitAuthority::ActorGenerationPermissionResolution {
+                        actor: &actor,
+                        generation: &generation,
+                    },
+                    &batch,
+                    None,
+                )?
+            }
             RecoveredBatchAuthority::ActorFinalizerTaskTerminal { actor, finalizer } => self
                 .commit_batch_with_authority(
                     BatchCommitAuthority::ActorFinalizerTaskTerminal {
@@ -1768,6 +1799,26 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         });
         self.commit_batch_with_authority(
             BatchCommitAuthority::ActorGenerationInterrupt {
+                actor: &actor,
+                generation: &generation,
+            },
+            batch,
+            None,
+        )
+    }
+
+    pub(crate) fn commit_actor_generation_permission_resolution_batch(
+        &mut self,
+        fence: super::SurfaceOperationFence,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let actor = self.actor_control_permit.clone();
+        let generation = self.register_permit(SurfacePublisherPermit::Generation {
+            permit_id: next_permit_id(),
+            fence,
+        });
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::ActorGenerationPermissionResolution {
                 actor: &actor,
                 generation: &generation,
             },
@@ -3501,6 +3552,32 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                 });
             }
         }
+        if let Some(SurfaceScope::Generation {
+            fence: historical_fence,
+        }) = events.last().map(|event| &event.scope)
+        {
+            let generation = SurfacePublisherPermit::Generation {
+                permit_id: next_permit_id(),
+                fence: historical_fence.clone(),
+            };
+            let mut issued = self.issued_permits.clone();
+            issued.push(generation.clone());
+            if actor_generation_permission_resolution_authorized(
+                &issued,
+                &actor,
+                &generation,
+                batch,
+                self.owner_epoch,
+            ) {
+                let generation = self.register_permit(generation);
+                return Ok(
+                    RecoveredBatchAuthority::ActorGenerationPermissionResolution {
+                        actor,
+                        generation,
+                    },
+                );
+            }
+        }
         if let Some((historical_fence, operation_id)) =
             events
                 .first()
@@ -4373,6 +4450,15 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     self.owner_epoch,
                 )
             }
+            BatchCommitAuthority::ActorGenerationPermissionResolution { actor, generation } => {
+                actor_generation_permission_resolution_authorized(
+                    &self.issued_permits,
+                    actor,
+                    generation,
+                    batch,
+                    self.owner_epoch,
+                )
+            }
             BatchCommitAuthority::ActorFinalizerTaskTerminal { actor, finalizer } => {
                 actor_finalizer_task_terminal_authorized(
                     &self.state,
@@ -5099,6 +5185,54 @@ fn actor_goal_edit_run_authorized(
                 && goal_run_id == &run.goal_run_id
                 && initial_objective_revision == &second_envelope.receipt.objective_revision
         )
+}
+
+fn actor_generation_permission_resolution_authorized(
+    issued_permits: &[SurfacePublisherPermit],
+    actor_permit: &SurfacePublisherPermit,
+    generation_permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !issued_permits.contains(actor_permit) || !issued_permits.contains(generation_permit) {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::ActorControl {
+            thread_id,
+            owner_epoch: actor_owner_epoch,
+            ..
+        },
+        SurfacePublisherPermit::Generation { fence, .. },
+    ) = (actor_permit, generation_permit)
+    else {
+        return false;
+    };
+    if *actor_owner_epoch != owner_epoch
+        || thread_id != &fence.thread_id
+        || thread_id != &batch.cursor_before.thread_id
+        || thread_id != &batch.cursor_after.thread_id
+    {
+        return false;
+    }
+    let [settings, interaction] = batch.events.as_slice() else {
+        return false;
+    };
+    let settings_valid = matches!(
+        (&settings.scope, &settings.event),
+        (
+            SurfaceScope::Thread,
+            super::SurfaceEvent::Settings(super::SettingsPatch::Committed { .. })
+        )
+    );
+    let interaction_valid = matches!(
+        (&interaction.scope, &interaction.event),
+        (
+            SurfaceScope::Generation { fence: scope },
+            super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved { .. })
+        ) if scope == fence
+    );
+    settings_valid && interaction_valid
 }
 
 fn actor_generation_terminalization_authorized(

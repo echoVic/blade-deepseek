@@ -8188,6 +8188,7 @@ pub(crate) mod tests {
                         digest: digest(1),
                     },
                     additional_working_directories: Vec::new(),
+                    metadata_writable_directories: Vec::new(),
                     network_permissions: SurfaceNetworkPermissions {
                         enabled: Some(true),
                         domains: Vec::new(),

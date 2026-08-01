@@ -261,12 +261,21 @@ fn apply_permission_updates(config: &mut RunConfig, updates: Vec<PermissionUpdat
             }),
             PermissionUpdate::AddDirectories { directories } => {
                 for directory in directories {
+                    if directory.source
+                        == crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+                    {
+                        continue;
+                    }
                     if let Some(existing) = config
                         .additional_working_directories
                         .iter_mut()
                         .find(|existing| existing.path == directory.path)
                     {
-                        existing.source = directory.source;
+                        if existing.source
+                            != crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+                        {
+                            existing.source = directory.source;
+                        }
                     } else {
                         config.additional_working_directories.push(directory);
                     }
@@ -276,7 +285,8 @@ fn apply_permission_updates(config: &mut RunConfig, updates: Vec<PermissionUpdat
                 destination,
                 directories,
             } => config.additional_working_directories.retain(|directory| {
-                directory.source != destination
+                directory.source == crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+                    || directory.source != destination
                     || !directories.iter().any(|remove| remove == &directory.path)
             }),
         }
@@ -776,7 +786,9 @@ fn materialize_session_permission_grant(
     for root in roots {
         for root in materialize_workspace_roots_paths(&thread.cwd, runtime_workspace_roots, root) {
             if orca_tools::sandbox::is_protected_metadata_root(&root) {
-                push_unique_path(&mut thread.metadata_writable_directories, root);
+                if orca_tools::sandbox::is_safe_metadata_writable_root(&root) {
+                    push_unique_path(&mut thread.metadata_writable_directories, root);
+                }
             } else if !thread
                 .additional_working_directories
                 .iter()
@@ -1305,7 +1317,9 @@ fn run_command_exec<W: Write>(
                 requested,
             ) {
                 if orca_tools::sandbox::is_protected_metadata_root(&root) {
-                    push_unique_path(&mut metadata_writable_directories, root);
+                    if orca_tools::sandbox::is_safe_metadata_writable_root(&root) {
+                        push_unique_path(&mut metadata_writable_directories, root);
+                    }
                 } else {
                     push_unique_path(&mut additional_working_directories, root);
                 }
@@ -3703,6 +3717,43 @@ enabled = true
             assert_eq!(
                 std::fs::read_to_string(session_target).expect("session metadata write"),
                 "persisted"
+            );
+
+            let agent_target = repo.join(".git").join("agent-next-turn.lock");
+            let agent_request = orca_core::tool_types::ToolRequest {
+                id: "agent-session-metadata".to_string(),
+                name: orca_core::tool_types::ToolName::Bash,
+                action: orca_core::approval_types::ActionKind::Write,
+                target: Some(format!("printf agent > {}", agent_target.display())),
+                raw_arguments: None,
+            };
+            let task_registry = crate::tasks::TaskRegistry::new(thread_id.clone());
+            let mut permission_overlay =
+                crate::runtime_permission::TurnPermissionOverlay::default();
+            let agent_result = crate::runtime_bash::execute_bash_with_shell_session(
+                crate::runtime_bash::RuntimeBashInvocationContext {
+                    config: Some(&server_config.run_config),
+                    request: &agent_request,
+                    cwd: &repo,
+                    additional_roots: &[],
+                    output_truncation: orca_core::tool_types::ToolOutputTruncation::default(),
+                    shell_timeout_secs: 5,
+                    task_registry: &task_registry,
+                    cancel: None,
+                    permission_handler: None,
+                    permission_overlay: &mut permission_overlay,
+                    output_handler: None,
+                },
+            );
+
+            assert_eq!(
+                agent_result.status,
+                orca_core::tool_types::ToolStatus::Completed,
+                "a later agent turn should rehydrate the session metadata grant: {agent_result:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(agent_target).expect("agent session metadata write"),
+                "agent"
             );
         });
     }
