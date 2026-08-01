@@ -5059,6 +5059,18 @@ mod tests {
             }
 
             action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
+            let backgrounded_task = loop {
+                let event = event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("backgrounded task update");
+                if let Some(task) = matching_task_update(event, |task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                        && task.status == orca_core::task_types::TaskStatus::Running
+                        && task.is_backgrounded
+                }) {
+                    break task;
+                }
+            };
             action_tx
                 .send(UserAction::Submit("mock_history_echo".to_string()))
                 .unwrap();
@@ -5076,25 +5088,27 @@ mod tests {
                     _ => {}
                 }
             };
+            assert_eq!(
+                first_followup, "next-submit",
+                "backgrounding must let the next foreground submit run before the backgrounded turn finishes"
+            );
             std::fs::write(&release_marker, "release").expect("release backgrounded turn");
             loop {
-                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                    TuiEvent::MessageDelta(text)
-                        if text.contains("Mock release-marker stream completed.") =>
-                    {
-                        break;
-                    }
-                    _ => {}
+                let event = event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("backgrounded task completion");
+                if matching_task_update(event, |task| {
+                    task.id == backgrounded_task.id
+                        && task.status == orca_core::task_types::TaskStatus::Completed
+                })
+                .is_some()
+                {
+                    break;
                 }
             }
 
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
-
-            assert_eq!(
-                first_followup, "next-submit",
-                "backgrounding must let the next foreground submit run before the backgrounded turn finishes"
-            );
         });
     }
 
