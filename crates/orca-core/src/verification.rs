@@ -303,6 +303,14 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
+    fn platform_verifier_script(unix: &str, windows: &str) -> String {
+        if cfg!(windows) {
+            windows.to_string()
+        } else {
+            unix.to_string()
+        }
+    }
+
     #[test]
     fn verifier_command_uses_resolved_windows_shell_dialect() {
         let shell = ShellResolver::new(
@@ -336,14 +344,15 @@ mod tests {
     #[test]
     fn verifier_command_timeout_kills_descendant_processes() {
         let start = Instant::now();
-
-        let result = run_with_timeout(
-            "printf before; sleep 5; printf after",
-            Duration::from_millis(200),
+        let command = platform_verifier_script(
+            "printf before; sleep 10; printf after",
+            "[Console]::Out.Write('before'); [Console]::Out.Flush(); & \"$env:WINDIR\\System32\\ping.exe\" -n 11 127.0.0.1 > $null; [Console]::Out.Write('after')",
         );
 
+        let result = run_with_timeout(&command, Duration::from_secs(2));
+
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(5),
             "verifier should not wait for descendant processes"
         );
         assert!(!result.success);
@@ -353,7 +362,11 @@ mod tests {
 
     #[test]
     fn verifier_output_is_bounded_at_ingress() {
-        let result = run("printf HEAD; yes x | tr -d '\\n' | head -c 2097144; printf TAIL");
+        let command = platform_verifier_script(
+            "printf HEAD; yes x | tr -d '\\n' | head -c 2097144; printf TAIL",
+            "[Console]::Out.Write('HEAD'); [Console]::Out.Write([string]::new([char]'x', 2097144)); [Console]::Out.Write('TAIL')",
+        );
+        let result = run(&command);
 
         assert!(result.success, "{}", result.stderr);
         assert!(result.stdout.len() <= 1024 * 1024 + 128);
