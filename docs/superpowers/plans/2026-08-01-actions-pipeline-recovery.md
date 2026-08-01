@@ -17,6 +17,7 @@
 - Modify `crates/orca-platform/tests/process_contract.rs`: prove a background descendant cannot keep its launching parent's captured output pipe open.
 - Modify `crates/orca-runtime/src/workflow/command.rs`: invoke the process helper immediately before spawning the standalone workflow worker.
 - Modify `tests/workflow_cli_contract.rs`: assert the CLI launch returns before the deterministic six-second provider operation completes and retain live pause/stop behavior.
+- Modify `docs/superpowers/specs/2026-07-28-native-windows-platform-foundation.manifest.json`: register the added Linux platform shell constructor in the reviewed boundary inventory.
 - Modify `docs/superpowers/specs/2026-08-01-actions-pipeline-recovery-design.md`: record the reviewed, race-free handle strategy.
 
 ### Task 1: Repair Linux sandbox dispatch

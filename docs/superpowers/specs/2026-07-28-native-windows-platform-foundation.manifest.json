@@ -263,11 +263,11 @@
       "windows-sandbox-plan"
     ],
     [
-      "sandbox-test-shells",
+      "sandbox-platform-shells",
       "crates/orca-tools/src/sandbox/mod.rs",
       "unix_shell_spawn",
-      4,
-      "windows-test-portability"
+      5,
+      "windows-sandbox-plan"
     ],
     [
       "seatbelt-unix-api",
