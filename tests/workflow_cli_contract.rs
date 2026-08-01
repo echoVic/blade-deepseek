@@ -211,6 +211,7 @@ fn workflow_run_returns_before_slow_workflow_completes() {
     )
     .unwrap();
 
+    let started = Instant::now();
     let run = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
         .env("ORCA_HOME", &home)
@@ -223,8 +224,19 @@ fn workflow_run_returns_before_slow_workflow_completes() {
         ])
         .output()
         .expect("run workflow");
+    let elapsed = started.elapsed();
 
-    assert_eq!(run.status.code(), Some(0));
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "workflow launch failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "workflow run blocked for {elapsed:?}; it must return before the 6s model call completes"
+    );
     let launched: Value = serde_json::from_slice(&run.stdout).unwrap();
     let task_id = launched["taskId"].as_str().unwrap();
 

@@ -724,6 +724,10 @@ fn spawn_workflow_worker(
     if let Some(base_url) = base_url {
         command.arg("--base-url").arg(base_url);
     }
+    if let Err(error) = orca_platform::process::clear_current_process_std_handle_inheritance() {
+        eprintln!("orca: failed to isolate workflow worker standard handles: {error}");
+        return 1;
+    }
 
     let mut child = match command.spawn() {
         Ok(child) => child,
