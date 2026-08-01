@@ -2446,6 +2446,9 @@ mod tests {
     use crate::runtime_permission::RuntimePermissionRequest;
     use crate::thread::RuntimeThread;
 
+    #[cfg(windows)]
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+    #[cfg(not(windows))]
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn test_absolute_path(name: &str) -> PathBuf {

@@ -1,61 +1,73 @@
 [profile.ci]
 default-filter = "not (binary(=orca_tui) | binary(=tui_pty_contract))"
 fail-fast = false
-test-threads = 4
+test-threads = 2
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.ci.overrides]]
 filter = "package(=orca-runtime) & test(/^runtime_host::tests::(capability_mark_rails|older_incomplete_background_completion)/)"
-threads-required = 4
+threads-required = 2
 
 [[profile.ci.overrides]]
 filter = "package(=orca-tools) & test(/^external::tests::external_tool_timeout_/)"
-threads-required = 4
+threads-required = 2
 
 [[profile.ci.overrides]]
 filter = "package(=orca-provider) & test(=context::tests::in_flight_summary_request_stops_waiting_for_headers_when_cancelled)"
-threads-required = 4
+threads-required = 2
 
 [[profile.ci.overrides]]
 filter = "binary(=workflow_cli_contract) & test(=workflow_pause_resume_and_clone_control_persisted_run)"
-threads-required = 4
+threads-required = 2
 
 [[profile.ci.overrides]]
 filter = "binary(=session_server_contract) & test(=server_mode_input_eof_cancels_pending_permission_request)"
-threads-required = 4
+threads-required = 2
 
 [[profile.ci.overrides]]
 filter = "package(=orca-runtime) & test(/^acp::supervisor::tests::(production_connection_enforces_terminal_wait_canonical_result_limit|cancelling_prompt_terminalizes_outstanding_read_text_file_call|concurrent_terminals_from_one_tool_keep_cleanup_identity_exact)$/)"
-threads-required = 4
+threads-required = 2
 
 [[profile.ci.overrides]]
 filter = "package(=orca-runtime) & test(/^((hooks::tests::hook_timeout_kills_descendant_processes)|(subagent_execution::tests::subagent_batch_cancellation_stops_blocked_hook_and_unstarted_sibling))$/)"
-threads-required = 4
+threads-required = 2
 
 [[profile.ci.overrides]]
 filter = "package(=orca-tools) & test(/^bash::tests::(streaming_reports_output_chunks_and_final_result|streaming_large_unterminated_output_is_bounded_before_result_truncation|bash_commands_receive_eof_on_stdin_instead_of_inheriting_terminal|streaming_respects_shell_timeout_and_returns_partial_output|noisy_streaming_timeout_does_not_deadlock_reader_shutdown|bash_wait_observes_cancel_callback|bash_wait_preserves_one_shot_cancel_observation|streaming_bash_wait_observes_cancel_callback|noisy_streaming_cancel_does_not_deadlock_reader_shutdown)$/)"
-threads-required = 4
+threads-required = 2
 
 [[profile.ci.overrides]]
 filter = "package(=orca-runtime) & binary(=task_output_store)"
-threads-required = 4
+threads-required = 2
 
 [[profile.ci.overrides]]
 filter = "package(=orca-core) & test(=verification::tests::verifier_command_timeout_kills_descendant_processes)"
-threads-required = 4
+threads-required = 2
 
 [[profile.ci.overrides]]
 filter = "package(=orca-runtime) & test(=server::tests::command_exec_streaming_filesystem_sandbox_denial_requests_permission_and_retries)"
-threads-required = 4
+threads-required = 2
 
 [[profile.ci.overrides]]
 filter = "binary(=session_server_contract) & test(/^(server_mode_interrupt_cancels_active_bash_tool_wait_and_accepts_next_turn|server_mode_reads_runtime_shell_session_incrementally)$/)"
-threads-required = 4
+threads-required = 2
 
 [[profile.ci.overrides]]
 filter = "package(=orca-runtime) & test(/^(runtime_host::tests::surface_goal_max_inner_continuation_is_durable_before_successor_execution|server::tests::workflow_submit_streams_background_result)$/)"
-threads-required = 4
+threads-required = 2
 
 [[profile.ci.overrides]]
 filter = "package(=orca-runtime) & binary(=runtime_host) & test(/^(operation_panic_has_one_terminal_and_actor_reclaims_thread_state|panicking_goal_run_settles_outer_turn_and_fails_closed_to_paused|runtime_host_launches_saved_workflow_without_blocking_the_next_turn)$/)"
-threads-required = 4
+threads-required = 2
+
+[[profile.ci.overrides]]
+filter = "binary(=session_server_contract)"
+threads-required = 2
+
+[[profile.ci.overrides]]
+filter = "package(=orca-runtime) & test(/^acp::supervisor::tests::/)"
+threads-required = 2
+
+[[profile.ci.overrides]]
+filter = "package(=orca-runtime) & test(/^runtime_host::tests::(failed_private_winner_append_retries_before_capability_reroute|distinct_capability_loss_is_reconciled_after_retained_retry|typed_task_foreground_commits_ownership_before_registry_visibility)$/)"
+threads-required = 2

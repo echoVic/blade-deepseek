@@ -552,9 +552,9 @@ for (const marker of [
   "[profile.ci]",
   'default-filter = "not (binary(=orca_tui) | binary(=tui_pty_contract))"',
   "fail-fast = false",
-  "test-threads = 4",
+  "test-threads = 2",
   'slow-timeout = { period = "60s", terminate-after = 2 }',
-  "threads-required = 4",
+  "threads-required = 2",
   "capability_mark_rails",
   "older_incomplete_background_completion",
   "external_tool_timeout_",
@@ -577,12 +577,26 @@ for (const marker of [
   "operation_panic_has_one_terminal_and_actor_reclaims_thread_state",
   "panicking_goal_run_settles_outer_turn_and_fails_closed_to_paused",
   "runtime_host_launches_saved_workflow_without_blocking_the_next_turn",
+  "binary(=session_server_contract)",
+  "test(/^acp::supervisor::tests::/)",
+  "failed_private_winner_append_retries_before_capability_reroute",
+  "distinct_capability_loss_is_reconciled_after_retained_retry",
+  "typed_task_foreground_commits_ownership_before_registry_visibility",
 ]) {
   assert.ok(
     nextestConfig.includes(marker),
     `nextest CI profile must contain ${marker}`,
   );
 }
+const acpSupervisorSource = readNormalizedSource(
+  "crates/orca-runtime/src/acp/supervisor.rs",
+);
+assert.ok(
+  acpSupervisorSource.includes(
+    "#[cfg(windows)]\n    const TEST_TIMEOUT: Duration = Duration::from_secs(10);",
+  ),
+  "Windows ACP protocol tests must allow the ARM64 runner ten seconds per frame",
+);
 const taskRegistrySource = readNormalizedSource(
   "crates/orca-runtime/src/tasks.rs",
 );
