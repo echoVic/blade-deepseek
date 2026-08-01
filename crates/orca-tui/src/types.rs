@@ -7081,7 +7081,7 @@ arbitrary metadata
                 .canonicalize()
                 .expect("canonical item")
         );
-        assert_eq!(job.display_path, expected_relative);
+        assert_eq!(job.display_path, "src/item.py");
         assert_eq!(
             job.parsed.destination_path.as_deref(),
             Some(expected_relative.as_str())
