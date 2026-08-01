@@ -567,6 +567,7 @@ for (const marker of [
   "hook_timeout_kills_descendant_processes",
   "subagent_batch_cancellation_stops_blocked_hook_and_unstarted_sibling",
   "bash_commands_receive_eof_on_stdin_instead_of_inheriting_terminal",
+  "command_exec_streaming_filesystem_sandbox_denial_requests_permission_and_retries",
   "binary(=task_output_store)",
   "verifier_command_timeout_kills_descendant_processes",
 ]) {

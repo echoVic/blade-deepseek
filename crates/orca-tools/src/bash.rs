@@ -111,13 +111,28 @@ pub fn execute_with_shell_spec_roots_or_cancel(
         );
     }
 
-    let mut process_command = match shell.kind() {
+    let process_command = match shell.kind() {
         ShellKind::Posix | ShellKind::GitBash => {
             sandbox::bash_command_with_additional_roots(command, cwd, additional_roots)
         }
         ShellKind::PowerShell(_) | ShellKind::Cmd => unreachable!("guarded above"),
     };
+    execute_command_with_policy_or_cancel(
+        request,
+        process_command,
+        output_truncation,
+        shell_timeout,
+        should_cancel,
+    )
+}
 
+fn execute_command_with_policy_or_cancel(
+    request: &ToolRequest,
+    mut process_command: std::process::Command,
+    output_truncation: ToolOutputTruncation,
+    shell_timeout: Duration,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     process_command
         .env_remove("ORCA_API_KEY")
         .stdout(Stdio::piped())
@@ -649,6 +664,49 @@ mod tests {
         })
     }
 
+    fn host_test_command(script: &str, cwd: &Path) -> std::process::Command {
+        let shell = orca_platform::shell::ShellResolver::for_current_host()
+            .resolve_from_environment()
+            .expect("resolve host test shell");
+        let mut command = process::shell_command(&shell, script);
+        command.current_dir(cwd);
+        command
+    }
+
+    fn execute_host_test_with_policy_or_cancel(
+        request: &ToolRequest,
+        cwd: &Path,
+        output_truncation: ToolOutputTruncation,
+        shell_timeout: Duration,
+        should_cancel: impl Fn() -> bool,
+    ) -> ToolResult {
+        execute_command_with_policy_or_cancel(
+            request,
+            host_test_command(request.target.as_deref().unwrap_or_default(), cwd),
+            output_truncation,
+            shell_timeout,
+            should_cancel,
+        )
+    }
+
+    fn execute_host_test_streaming_with_policy_or_cancel(
+        request: &ToolRequest,
+        cwd: &Path,
+        output_truncation: ToolOutputTruncation,
+        shell_timeout: Duration,
+        on_output: &mut dyn FnMut(&str),
+        should_cancel: impl Fn() -> bool,
+    ) -> ToolResult {
+        execute_streaming_command_or_cancel(
+            request,
+            host_test_command(request.target.as_deref().unwrap_or_default(), cwd),
+            output_truncation,
+            shell_timeout,
+            on_output,
+            should_cancel,
+        )
+    }
+
     #[test]
     fn streaming_reports_output_chunks_and_final_result() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -659,9 +717,14 @@ mod tests {
         let request = bash_request(&command);
         let mut chunks = Vec::new();
 
-        let result = execute_streaming(&request, dir.path(), 1024, &mut |chunk| {
-            chunks.push(chunk.to_string());
-        });
+        let result = execute_host_test_streaming_with_policy_or_cancel(
+            &request,
+            dir.path(),
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_secs(120),
+            &mut |chunk| chunks.push(chunk.to_string()),
+            || false,
+        );
 
         assert_eq!(result.status, ToolStatus::Completed);
         assert_eq!(result.output.as_deref(), Some("one\ntwo"));
@@ -687,12 +750,13 @@ mod tests {
         let request = bash_request(&command);
         let mut streamed_bytes = 0usize;
 
-        let result = execute_streaming_with_policy(
+        let result = execute_host_test_streaming_with_policy_or_cancel(
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(4096),
             Duration::from_secs(10),
             &mut |chunk| streamed_bytes = streamed_bytes.saturating_add(chunk.len()),
+            || false,
         );
 
         assert_eq!(result.status, ToolStatus::Completed);
@@ -723,11 +787,12 @@ mod tests {
         let request = bash_request(&command);
         let start = Instant::now();
 
-        let result = execute_with_policy(
+        let result = execute_host_test_with_policy_or_cancel(
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
             platform_test_deadline(2, 5),
+            || false,
         );
 
         assert!(
@@ -749,12 +814,14 @@ mod tests {
         let mut chunks = Vec::new();
         let start = Instant::now();
 
-        let result = execute_streaming_with_policy(
+        let shell_timeout = platform_delay(200, 1_500);
+        let result = execute_host_test_streaming_with_policy_or_cancel(
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
-            platform_delay(200, 1_500),
+            shell_timeout,
             &mut |chunk| chunks.push(chunk.to_string()),
+            || false,
         );
 
         assert!(
@@ -767,7 +834,10 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("shell command timed out after 0s"),
+                .contains(&format!(
+                    "shell command timed out after {}s",
+                    shell_timeout.as_secs()
+                )),
             "unexpected error: {:?}",
             result.error
         );
@@ -788,17 +858,19 @@ mod tests {
         let start = Instant::now();
         let mut delayed_callback = false;
 
-        let result = execute_streaming_with_policy(
+        let shell_timeout = platform_delay(100, 1_500);
+        let result = execute_host_test_streaming_with_policy_or_cancel(
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
-            platform_delay(100, 1_500),
+            shell_timeout,
             &mut |_| {
                 if !delayed_callback {
                     delayed_callback = true;
                     std::thread::sleep(Duration::from_millis(250));
                 }
             },
+            || false,
         );
 
         assert!(
@@ -812,7 +884,10 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("shell command timed out after 0s"),
+                .contains(&format!(
+                    "shell command timed out after {}s",
+                    shell_timeout.as_secs()
+                )),
             "unexpected error: {:?}",
             result.error
         );
@@ -880,7 +955,7 @@ mod tests {
         let request = bash_request(&command);
         let start = Instant::now();
 
-        let result = execute_with_policy_or_cancel(
+        let result = execute_host_test_with_policy_or_cancel(
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
@@ -919,7 +994,7 @@ mod tests {
         let request = bash_request(&command);
         let cancellation_delivered = std::cell::Cell::new(false);
 
-        let result = execute_with_policy_or_cancel(
+        let result = execute_host_test_with_policy_or_cancel(
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
@@ -951,7 +1026,7 @@ mod tests {
         let saw_output_for_chunk = Arc::clone(&saw_output);
         let saw_output_for_cancel = Arc::clone(&saw_output);
 
-        let result = execute_streaming_with_policy_or_cancel(
+        let result = execute_host_test_streaming_with_policy_or_cancel(
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
@@ -1005,7 +1080,7 @@ mod tests {
         let cancellation_observed = AtomicBool::new(false);
         let mut chunks = Vec::new();
 
-        let result = execute_streaming_with_policy_or_cancel(
+        let result = execute_host_test_streaming_with_policy_or_cancel(
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),

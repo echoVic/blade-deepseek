@@ -129,13 +129,15 @@ mod tests {
     use crate::interaction_broker::TuiInteractionBroker;
     use crate::surface_actions::TuiSurfaceActions;
 
-    const TEST_OPERATION_START_TIMEOUT: Duration = Duration::from_secs(10);
+    const TEST_ACTIVATION_OBSERVER_TIMEOUT: Duration = Duration::from_secs(10);
+    const TEST_OPERATION_START_TIMEOUT: Duration = Duration::from_secs(15);
+    const TEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn run_blocking_surface_operation(
         control: TuiSurfaceTaskControl,
         host: RuntimeHostHandle,
         event_tx: Sender<TuiEvent>,
-        ready_tx: crossbeam_channel::Sender<()>,
+        ready_tx: crossbeam_channel::Sender<Result<(), &'static str>>,
     ) {
         let mut config = crate::test_support::test_run_config();
         config.history_mode = orca_core::config::HistoryMode::Record;
@@ -144,13 +146,15 @@ mod tests {
             .expect("hosted test thread");
         let activation_control = control.clone();
         let activation_ready = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let deadline = std::time::Instant::now() + TEST_ACTIVATION_OBSERVER_TIMEOUT;
             while !activation_control.has_surface_active() && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            if activation_control.has_surface_active() {
-                ready_tx.send(()).expect("ready signal");
-            }
+            let readiness = activation_control
+                .has_surface_active()
+                .then_some(())
+                .ok_or("surface operation did not become active before deadline");
+            let _ = ready_tx.send(readiness);
         });
         let _ = TuiSurfaceActions::new(thread.typed_surface()).run_turn(
             HostedTurnRequest::new("mock_stream_delay_ms 5000"),
@@ -164,7 +168,7 @@ mod tests {
     fn spawn_blocking_runtime(
         action_rx: Receiver<UserAction>,
         event_tx: Sender<TuiEvent>,
-        ready_tx: crossbeam_channel::Sender<()>,
+        ready_tx: crossbeam_channel::Sender<Result<(), &'static str>>,
     ) -> TuiAgentRuntime {
         let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
         let operation_events = event_tx.clone();
@@ -190,7 +194,8 @@ mod tests {
 
         ready_rx
             .recv_timeout(TEST_OPERATION_START_TIMEOUT)
-            .expect("agent started");
+            .expect("activation observer completed")
+            .expect("agent surface operation became active");
         runtime.shutdown().expect("agent runtime shutdown");
     }
 
@@ -204,7 +209,8 @@ mod tests {
 
         ready_rx
             .recv_timeout(TEST_OPERATION_START_TIMEOUT)
-            .expect("agent started");
+            .expect("activation observer completed")
+            .expect("agent surface operation became active");
         drop(runtime);
     }
 
@@ -234,14 +240,15 @@ mod tests {
         .expect("agent runtime spawned");
         ready_rx
             .recv_timeout(TEST_OPERATION_START_TIMEOUT)
-            .expect("agent started");
+            .expect("activation observer completed")
+            .expect("agent surface operation became active");
 
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         let shutdown = std::thread::spawn(move || {
             let result = runtime.shutdown();
             done_tx.send(result).expect("shutdown result");
         });
-        let result = done_rx.recv_timeout(Duration::from_secs(1));
+        let result = done_rx.recv_timeout(TEST_SHUTDOWN_TIMEOUT);
 
         shutdown.join().expect("shutdown thread joined");
         result

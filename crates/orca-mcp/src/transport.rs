@@ -1485,22 +1485,34 @@ done
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let server = temp_dir.path().join("closed_stdin_mcp_server.sh");
         let survivor_marker = temp_dir.path().join("write-survivor");
+        let ready_marker = temp_dir.path().join("write-ready");
         write_executable_stdio_fixture(
             &server,
             r#"#!/bin/sh
 exec 0<&-
 (sleep 0.4; : > "$1") &
+: > "$2"
 wait
 "#,
         );
         let transport = StdioTransport::start(&stdio_test_config(
             "closed-stdin",
             &server,
-            vec![survivor_marker.to_string_lossy().into_owned()],
+            vec![
+                survivor_marker.to_string_lossy().into_owned(),
+                ready_marker.to_string_lossy().into_owned(),
+            ],
             5_000,
         ))
         .expect("connect stdio MCP");
-        std::thread::sleep(Duration::from_millis(100));
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !ready_marker.exists() && Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready_marker.exists(),
+            "MCP fixture did not close stdin and launch its descendant before the deadline"
+        );
 
         let error = transport
             .initialize()

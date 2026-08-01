@@ -312,12 +312,13 @@ mod tests {
         };
         let start = Instant::now();
 
+        let timeout = platform_delay(200, 1_500);
         let result = execute_external_tool_with_policy(
             &config,
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
-            platform_delay(200, 1_500),
+            timeout,
         );
 
         assert!(
@@ -330,7 +331,10 @@ mod tests {
         assert_eq!(result.status, ToolStatus::Failed);
         let error = result.error.as_deref().unwrap_or_default();
         assert!(
-            error.contains("external tool 'slow_tool' timed out after 0s"),
+            error.contains(&format!(
+                "external tool 'slow_tool' timed out after {}s",
+                timeout.as_secs()
+            )),
             "unexpected error: {:?}",
             result.error
         );

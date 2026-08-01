@@ -2078,8 +2078,13 @@ mod tests {
 
         canceller.join().expect("summary canceller");
         server.join().expect("summary server");
+        let cancellation_deadline = if cfg!(windows) {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(500)
+        };
         assert!(
-            elapsed < Duration::from_millis(500),
+            elapsed < cancellation_deadline,
             "cancelled summary request waited {elapsed:?} for response headers"
         );
         assert!(

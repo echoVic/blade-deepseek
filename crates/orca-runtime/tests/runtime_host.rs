@@ -2624,6 +2624,22 @@ fn generation_scoped_approval_handler_controls_canonical_tool_execution() {
         &OperationOutcome::Completed(RunStatus::Success)
     );
     assert_eq!(calls.load(Ordering::Acquire), 1);
+    let output_deadline = Instant::now() + TEST_TIMEOUT;
+    while output
+        .json_events()
+        .into_iter()
+        .filter(|event| {
+            event["type"] == "tool.call.completed" && event["payload"]["status"] == "completed"
+        })
+        .count()
+        < 1
+    {
+        assert!(
+            Instant::now() < output_deadline,
+            "completed tool event was not flushed before deadline"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert_eq!(
         output
             .json_events()

@@ -43,3 +43,7 @@ threads-required = 4
 [[profile.ci.overrides]]
 filter = "package(=orca-core) & test(=verification::tests::verifier_command_timeout_kills_descendant_processes)"
 threads-required = 4
+
+[[profile.ci.overrides]]
+filter = "package(=orca-runtime) & test(=server::tests::command_exec_streaming_filesystem_sandbox_denial_requests_permission_and_retries)"
+threads-required = 4
