@@ -637,6 +637,45 @@ assert.ok(
   workflowCliContract.includes("wait_until_active"),
   "tests/workflow_cli_contract.rs must wait for persisted active state instead of racing worker startup",
 );
+assert.ok(
+  workflowCliContract.includes(
+    'wait_for_workflow_status(temp.path(), Some(&home), task_id, "running")',
+  ),
+  "workflow pause/resume must wait for the persisted worker to be running before requesting pause",
+);
+const bashToolSource = readNormalizedSource("crates/orca-tools/src/bash.rs");
+const noisyCancelFixture = bashToolSource.slice(
+  bashToolSource.indexOf(
+    "fn noisy_streaming_cancel_does_not_deadlock_reader_shutdown()",
+  ),
+  bashToolSource.indexOf(
+    "fn bash_command_allows_additional_working_directory_writes()",
+  ),
+);
+assert.ok(
+  noisyCancelFixture.includes("execute_host_test_streaming_with_policy_or_cancel("),
+  "Windows noisy streaming cancellation must exercise the shared process core through the host test command",
+);
+const runtimeHostContract = readNormalizedSource(
+  "crates/orca-runtime/tests/runtime_host.rs",
+);
+const generationApprovalFixture = runtimeHostContract.slice(
+  runtimeHostContract.indexOf(
+    "fn generation_scoped_approval_handler_controls_canonical_tool_execution()",
+  ),
+  runtimeHostContract.indexOf(
+    "fn request_scoped_approval_handler_remains_the_hosted_fallback()",
+  ),
+);
+assert.ok(
+  generationApprovalFixture.includes(
+    'HostedTurnRequest::new("edit notes.txt :: old => approved")',
+  ) &&
+    generationApprovalFixture.includes(
+      'event["payload"]["status"] == "completed"',
+    ),
+  "generation-scoped approval must use a portable successful write fixture and keep its completed terminal assertion",
+);
 const nativeLockBehaviorTests = [
   "goal_runtime_lease_is_shared_in_process_and_exclusive_across_processes",
   "thread_and_policy_owner_leases_fail_closed_and_wall_rollback_has_no_authority",

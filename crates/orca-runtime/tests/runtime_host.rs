@@ -2597,14 +2597,16 @@ fn canonical_hosted_default_turn_does_not_emit_main_session_task_events() {
 #[test]
 fn generation_scoped_approval_handler_controls_canonical_tool_execution() {
     let cwd = tempfile::tempdir().unwrap();
+    let target = cwd.path().join("notes.txt");
+    std::fs::write(&target, "old").unwrap();
     let host = RuntimeHost::start().expect("start runtime host");
     let thread = host
         .start_thread(test_config(cwd.path().to_path_buf()), "canonical approval")
         .expect("start runtime thread");
     let calls = Arc::new(AtomicUsize::new(0));
     let handler_calls = Arc::clone(&calls);
-    let request =
-        HostedTurnRequest::new("bash true").with_generation_handlers(move |_fence, _cancel| {
+    let request = HostedTurnRequest::new("edit notes.txt :: old => approved")
+        .with_generation_handlers(move |_fence, _cancel| {
             HostedGenerationHandlers::default().with_approval_handler(Arc::new(
                 AllowApprovalHandler {
                     calls: Arc::clone(&handler_calls),
@@ -2650,6 +2652,7 @@ fn generation_scoped_approval_handler_controls_canonical_tool_execution() {
             .count(),
         1
     );
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "approved");
 
     host.shutdown().expect("shutdown runtime host");
 }

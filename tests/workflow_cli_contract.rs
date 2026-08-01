@@ -341,9 +341,11 @@ fn workflow_pause_resume_and_clone_control_persisted_run() {
     let task_id = launched["taskId"].as_str().unwrap();
     let run_id = launched["runId"].as_str().unwrap();
 
-    // Poll until the run is active, then request the pause. The runner observes
-    // the pause before the second agent, so the workflow settles into `paused`.
-    wait_until_active(temp.path(), Some(&home), task_id);
+    // Wait until the worker has moved beyond the queued startup window before
+    // requesting the pause. A persisted queued task can accept a pause request
+    // before its worker reaches the pause barrier, allowing an immediate resume
+    // to race worker startup on fast Windows runners.
+    wait_for_workflow_status(temp.path(), Some(&home), task_id, "running");
     let pause = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
         .env("ORCA_HOME", &home)

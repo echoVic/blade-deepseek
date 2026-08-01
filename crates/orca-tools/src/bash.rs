@@ -1142,7 +1142,7 @@ mod tests {
         let start = Instant::now();
         let mut delayed_callback = false;
 
-        let result = execute_streaming_with_policy_or_cancel(
+        let result = execute_host_test_streaming_with_policy_or_cancel(
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
