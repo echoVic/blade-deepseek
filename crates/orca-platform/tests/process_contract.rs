@@ -235,6 +235,53 @@ fn windows_background_capture_child_helper() {
 }
 
 #[cfg(windows)]
+#[test]
+fn windows_child_pipe_read_observes_stop_before_pipe_eof() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::{Duration, Instant};
+
+    use orca_platform::process::{ProcessJob, read_child_pipe_interruptibly};
+
+    let mut command = std::process::Command::new("cmd.exe");
+    command
+        .args(["/D", "/S", "/C", "ping -n 30 127.0.0.1 > nul"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let (mut child, job) = ProcessJob::spawn(&mut command).expect("spawn pipe holder");
+    let mut stdout = child.stdout.take().expect("captured stdout");
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_stop = Arc::clone(&stop);
+    let reader = std::thread::spawn(move || {
+        let mut buffer = [0_u8; 64];
+        read_child_pipe_interruptibly(&mut stdout, reader_stop.as_ref(), &mut buffer)
+    });
+
+    assert!(
+        child.try_wait().expect("inspect pipe holder").is_none(),
+        "fixture exited before the stop request"
+    );
+    stop.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !reader.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let stopped_before_eof = reader.is_finished();
+
+    job.terminate(1).expect("terminate pipe holder");
+    let _ = child.wait();
+    let read = reader.join().expect("join pipe reader");
+
+    assert!(
+        stopped_before_eof,
+        "pipe read did not observe stop until the child closed its handle"
+    );
+    assert_eq!(read.expect("interruptible pipe read"), 0);
+}
+
+#[cfg(windows)]
 fn windows_process_is_running(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{

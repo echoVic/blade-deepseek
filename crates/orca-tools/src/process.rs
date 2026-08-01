@@ -16,6 +16,7 @@ use orca_core::retained_output::{
     DEFAULT_RETAINED_OUTPUT_BYTES, RetainedOutputSnapshot, read_to_retained,
 };
 use orca_platform::process::ProcessJob;
+use orca_platform::process::read_child_pipe_interruptibly;
 use orca_platform::shell::ShellSpec;
 
 pub const DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM: usize = DEFAULT_RETAINED_OUTPUT_BYTES;
@@ -762,10 +763,23 @@ fn spawn_reader<R: Read + Send + 'static>(
     reader: R,
     max_retained_bytes: usize,
 ) -> thread::JoinHandle<io::Result<RetainedOutputSnapshot>> {
-    spawn_stoppable_reader(reader, max_retained_bytes, Arc::new(AtomicBool::new(false)))
+    thread::spawn(move || read_to_retained(reader, max_retained_bytes))
 }
 
+#[cfg(not(windows))]
 fn spawn_stoppable_reader<R: Read + Send + 'static>(
+    reader: R,
+    max_retained_bytes: usize,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<RetainedOutputSnapshot>> {
+    thread::spawn(move || {
+        let mut reader = StoppableReader { reader, stop };
+        read_to_retained(&mut reader, max_retained_bytes)
+    })
+}
+
+#[cfg(windows)]
+fn spawn_stoppable_reader<R: Read + std::os::windows::io::AsRawHandle + Send + 'static>(
     reader: R,
     max_retained_bytes: usize,
     stop: Arc<AtomicBool>,
@@ -781,20 +795,17 @@ struct StoppableReader<R> {
     stop: Arc<AtomicBool>,
 }
 
+#[cfg(not(windows))]
 impl<R: Read> Read for StoppableReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        loop {
-            match self.reader.read(buffer) {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if self.stop.load(Ordering::Acquire) {
-                        return Ok(0);
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                result => return result,
-            }
-        }
+        read_child_pipe_interruptibly(&mut self.reader, self.stop.as_ref(), buffer)
+    }
+}
+
+#[cfg(windows)]
+impl<R: Read + std::os::windows::io::AsRawHandle> Read for StoppableReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        read_child_pipe_interruptibly(&mut self.reader, self.stop.as_ref(), buffer)
     }
 }
 

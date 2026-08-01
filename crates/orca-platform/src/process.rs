@@ -1,5 +1,6 @@
-use std::io;
+use std::io::{self, Read};
 use std::process::{Child, Command};
+use std::sync::atomic::AtomicBool;
 
 /// Owns the operating-system process-tree boundary for one spawned child.
 /// Windows uses a Job Object with kill-on-close; other hosts keep this API as
@@ -93,16 +94,60 @@ pub fn clear_current_process_std_handle_inheritance() -> io::Result<()> {
     platform::clear_current_process_std_handle_inheritance()
 }
 
+/// Reads a captured child pipe without making cancellation depend on a
+/// blocking operating-system read returning first.
+#[cfg(not(windows))]
+pub fn read_child_pipe_interruptibly<R: Read>(
+    reader: &mut R,
+    stop: &AtomicBool,
+    buffer: &mut [u8],
+) -> io::Result<usize> {
+    platform::read_child_pipe_interruptibly(reader, stop, buffer)
+}
+
+/// Reads a captured child pipe without making cancellation depend on a
+/// blocking operating-system read returning first.
+#[cfg(windows)]
+pub fn read_child_pipe_interruptibly<R: Read + std::os::windows::io::AsRawHandle>(
+    reader: &mut R,
+    stop: &AtomicBool,
+    buffer: &mut [u8],
+) -> io::Result<usize> {
+    platform::read_child_pipe_interruptibly(reader, stop, buffer)
+}
+
 #[cfg(not(windows))]
 mod platform {
-    use std::io;
+    use std::io::{self, Read};
     use std::process::{Child, Command};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
     #[derive(Debug)]
     pub(super) struct ProcessJob;
 
     pub(super) fn clear_current_process_std_handle_inheritance() -> io::Result<()> {
         Ok(())
+    }
+
+    pub(super) fn read_child_pipe_interruptibly<R: Read>(
+        reader: &mut R,
+        stop: &AtomicBool,
+        buffer: &mut [u8],
+    ) -> io::Result<usize> {
+        loop {
+            match reader.read(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if stop.load(Ordering::Acquire) {
+                        return Ok(0);
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
     }
 
     impl ProcessJob {
@@ -155,9 +200,13 @@ mod platform {
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
     use std::process::{Child, Command};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+        CloseHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
+        GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
         SetHandleInformation,
     };
     use windows_sys::Win32::System::Console::{
@@ -172,6 +221,7 @@ mod platform {
         JobObjectExtendedLimitInformation, OpenJobObjectW, SetInformationJobObject,
         TerminateJobObject,
     };
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
     use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
     use windows_sys::Win32::System::Threading::{
         CREATE_SUSPENDED, GetCurrentProcess, OpenProcess, OpenThread,
@@ -207,6 +257,55 @@ mod platform {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn read_child_pipe_interruptibly<R: io::Read + AsRawHandle>(
+        reader: &mut R,
+        stop: &AtomicBool,
+        buffer: &mut [u8],
+    ) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let mut available = 0_u32;
+            let peeked = unsafe {
+                PeekNamedPipe(
+                    reader.as_raw_handle().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if peeked == 0 {
+                let error = io::Error::last_os_error();
+                if matches!(
+                    error.raw_os_error(),
+                    Some(code)
+                        if code == ERROR_BROKEN_PIPE as i32
+                            || code == ERROR_NO_DATA as i32
+                            || code == ERROR_PIPE_NOT_CONNECTED as i32
+                ) {
+                    return Ok(0);
+                }
+                return Err(error);
+            }
+            if available == 0 {
+                if stop.load(Ordering::Acquire) {
+                    return Ok(0);
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+
+            let read_limit = buffer.len().min(available as usize);
+            match reader.read(&mut buffer[..read_limit]) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
     }
 
     impl ProcessJob {

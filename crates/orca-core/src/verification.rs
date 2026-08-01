@@ -15,6 +15,7 @@ use std::os::unix::process::CommandExt;
 use serde::{Deserialize, Serialize};
 
 use orca_platform::process::ProcessJob;
+use orca_platform::process::read_child_pipe_interruptibly;
 use orca_platform::shell::{ShellResolver, ShellSpec};
 
 use crate::retained_output::{
@@ -206,7 +207,19 @@ fn wait_for_child_output_with_timeout(
     })
 }
 
+#[cfg(not(windows))]
 fn spawn_stoppable_reader<R: Read + Send + 'static>(
+    reader: R,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<RetainedOutputSnapshot>> {
+    thread::spawn(move || {
+        let mut reader = StoppableReader { reader, stop };
+        read_to_retained(&mut reader, DEFAULT_RETAINED_OUTPUT_BYTES)
+    })
+}
+
+#[cfg(windows)]
+fn spawn_stoppable_reader<R: Read + std::os::windows::io::AsRawHandle + Send + 'static>(
     reader: R,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<io::Result<RetainedOutputSnapshot>> {
@@ -221,20 +234,17 @@ struct StoppableReader<R> {
     stop: Arc<AtomicBool>,
 }
 
+#[cfg(not(windows))]
 impl<R: Read> Read for StoppableReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        loop {
-            match self.reader.read(buffer) {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if self.stop.load(Ordering::Acquire) {
-                        return Ok(0);
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                result => return result,
-            }
-        }
+        read_child_pipe_interruptibly(&mut self.reader, self.stop.as_ref(), buffer)
+    }
+}
+
+#[cfg(windows)]
+impl<R: Read + std::os::windows::io::AsRawHandle> Read for StoppableReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        read_child_pipe_interruptibly(&mut self.reader, self.stop.as_ref(), buffer)
     }
 }
 
@@ -345,7 +355,7 @@ mod tests {
     fn verifier_command_timeout_kills_descendant_processes() {
         let start = Instant::now();
         let command = platform_verifier_script(
-            "printf before; sleep 10; printf after",
+            "printf before; trap 'exit 143' TERM; sleep 10; printf after",
             "[Console]::Out.Write('before'); [Console]::Out.Flush(); & \"$env:WINDIR\\System32\\ping.exe\" -n 11 127.0.0.1 > $null; [Console]::Out.Write('after')",
         );
 
