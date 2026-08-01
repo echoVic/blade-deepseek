@@ -258,7 +258,7 @@ impl WorkflowStateStore {
     }
 
     pub fn load_state(&self, run_id: &str) -> io::Result<WorkflowRunState> {
-        read_json(&self.state_path(run_id))
+        read_workflow_run_state(&self.state_path(run_id))
     }
 
     pub fn write_evidence_bundle(&self, bundle: &WorkflowEvidenceBundle) -> io::Result<()> {
@@ -908,6 +908,10 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let content = serde_json::to_string_pretty(value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     atomic_write(path, content.as_bytes(), AtomicWritePolicy::NoFollow).map_err(io::Error::other)
+}
+
+pub(crate) fn read_workflow_run_state(path: &Path) -> io::Result<WorkflowRunState> {
+    read_json(path)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {

@@ -525,7 +525,13 @@ fn workflow_show(cwd: &std::path::Path, home: Option<&std::path::Path>, task_id:
         .output()
         .expect("show workflow");
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "workflow show failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     serde_json::from_slice(&output.stdout).unwrap()
 }
 

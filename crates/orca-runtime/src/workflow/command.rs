@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::command::config::{DesktopNotifications, RunConfigRequest, build_run_config};
 use crate::tasks::TaskRegistry;
 use crate::workflow::script::{find_saved_workflow, parse_workflow_meta};
-use crate::workflow::state::WorkflowStateStore;
+use crate::workflow::state::{WorkflowStateStore, read_workflow_run_state};
 use crate::workflow::{WorkflowDraftStore, WorkflowLaunchRequest, WorkflowRunner};
 
 const MAX_WORKER_API_KEY_BYTES: u64 = 64 * 1024;
@@ -921,10 +921,17 @@ fn load_persisted_workflow_runs_inner(
             }
             let migrated_api_key = migrate_legacy_workflow_cli_launch_record(&run_entry.path())?;
             let state_path = run_entry.path().join("state.json");
-            if !state_path.exists() {
-                continue;
-            }
-            let state = read_workflow_state(&state_path)?;
+            let state = match read_workflow_run_state(&state_path) {
+                Ok(state) => state,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    return Err(format!(
+                        "invalid workflow state at {}: {error}",
+                        state_path.display()
+                    ));
+                }
+                Err(error) => return Err(error.to_string()),
+            };
             let legacy_api_key = capture_legacy_key_for_run_id
                 .is_some_and(|run_id| run_id == state.run_id)
                 .then_some(migrated_api_key)
@@ -970,12 +977,6 @@ fn find_workflow_by_run_id_for_restart(
     Ok(load_persisted_workflow_runs_inner(cwd, Some(run_id))?
         .into_iter()
         .find(|run| run.state.run_id == run_id))
-}
-
-fn read_workflow_state(path: &Path) -> Result<WorkflowRunState, String> {
-    let content = fs::read_to_string(path).map_err(|error| error.to_string())?;
-    serde_json::from_str(&content)
-        .map_err(|error| format!("invalid workflow state at {}: {error}", path.display()))
 }
 
 fn print_json_stdout(value: &impl Serialize) -> Result<(), String> {
@@ -1130,6 +1131,51 @@ mod tests {
     use std::io;
 
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn workflow_run_scan_waits_for_a_transient_atomic_replace_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = workflow_session_root(temp.path())
+            .join("session-retry")
+            .join("workflow-runs")
+            .join("run-retry");
+        fs::create_dir_all(&run_dir).unwrap();
+        let path = run_dir.join("state.json");
+        let state = serde_json::to_string(&WorkflowRunState {
+            run_id: "run-retry".to_string(),
+            task_id: "task-retry".to_string(),
+            session_id: "session-retry".to_string(),
+            cwd: "/tmp/workspace".to_string(),
+            workflow_name: "retry".to_string(),
+            meta: orca_core::workflow_types::WorkflowMeta {
+                name: "retry".to_string(),
+                description: "retry a transient read".to_string(),
+                phases: Vec::new(),
+                tags: Vec::new(),
+                version: None,
+            },
+            script_digest: "script".to_string(),
+            args_digest: "args".to_string(),
+            status: orca_core::workflow_types::WorkflowRunStatus::Running,
+            phases: Vec::new(),
+            total_agent_count: 0,
+            final_summary: None,
+            error: None,
+        })
+        .unwrap();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            fs::write(writer_path, state).unwrap();
+        });
+
+        let runs = load_persisted_workflow_runs(temp.path()).unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].state.task_id, "task-retry");
+    }
 
     #[test]
     fn workflow_launch_record_never_serializes_api_key() {
