@@ -17,6 +17,10 @@ const repoRoot = path.resolve(
   "..",
 );
 const normalizeLineEndings = (source) => source.replace(/\r\n?/g, "\n");
+const readNormalizedSource = (relativePath) =>
+  normalizeLineEndings(
+    readFileSync(path.join(repoRoot, relativePath), "utf8"),
+  );
 assert.equal(
   normalizeLineEndings("pull_request:\r\n  push:\r\n"),
   "pull_request:\n  push:\n",
@@ -571,9 +575,8 @@ for (const marker of [
     `nextest CI profile must contain ${marker}`,
   );
 }
-const taskRegistrySource = readFileSync(
-  path.join(repoRoot, "crates/orca-runtime/src/tasks.rs"),
-  "utf8",
+const taskRegistrySource = readNormalizedSource(
+  "crates/orca-runtime/src/tasks.rs",
 );
 for (const marker of [
   "ExclusiveFileLock::acquire(&self.index_lock_path())",
@@ -587,13 +590,11 @@ for (const marker of [
     `task persistence and recovered workers must contain ${marker}`,
   );
 }
-const providerSource = readFileSync(
-  path.join(repoRoot, "crates/orca-provider/src/lib.rs"),
-  "utf8",
+const providerSource = readNormalizedSource(
+  "crates/orca-provider/src/lib.rs",
 );
-const runtimeHostSource = readFileSync(
-  path.join(repoRoot, "crates/orca-runtime/src/runtime_host.rs"),
-  "utf8",
+const runtimeHostSource = readNormalizedSource(
+  "crates/orca-runtime/src/runtime_host.rs",
 );
 assert.ok(
   runtimeHostSource.includes(
