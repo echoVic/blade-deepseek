@@ -368,6 +368,13 @@ mod platform {
         resolved_windows_shell_command(script, cwd)
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn plain_bash_command(command: &str, cwd: &Path) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(command).current_dir(cwd);
+        cmd
+    }
+
     #[cfg(target_os = "windows")]
     pub fn workspace_write_bash_command(
         context: WorkspaceWriteSandboxCommandContext<'_>,
@@ -475,6 +482,27 @@ mod platform {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command).current_dir(cwd);
         cmd
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod linux_tests {
+        use super::*;
+
+        #[test]
+        fn plain_commands_use_the_native_posix_shell() {
+            let cwd = std::env::current_dir().expect("current directory");
+            let command = plain_bash_command("printf orca", &cwd);
+
+            assert_eq!(command.get_program(), "sh");
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                [
+                    std::ffi::OsStr::new("-c"),
+                    std::ffi::OsStr::new("printf orca")
+                ]
+            );
+            assert_eq!(command.get_current_dir(), Some(cwd.as_path()));
+        }
     }
 
     pub fn platform_default_read_roots() -> Vec<PathBuf> {
