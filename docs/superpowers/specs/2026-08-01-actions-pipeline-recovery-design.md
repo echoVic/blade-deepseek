@@ -1,7 +1,7 @@
 # GitHub Actions Pipeline Recovery Design
 
 Date: 2026-08-01
-Status: design approved; written-spec review pending
+Status: approved for implementation
 Scope: restore every currently failing pipeline on `main`, specifically the Windows and Release workflows
 
 ## Objective
@@ -112,22 +112,21 @@ Avoid routing through an imported outer name. Tests and compile checks must prov
 
 ### Windows workflow spawn boundary
 
-Introduce a narrowly scoped helper for spawning the workflow worker. On Windows it will:
+Introduce a narrowly scoped helper for the standalone workflow launch boundary. On Windows it will:
 
 1. inspect the launching process's current standard handles;
-2. temporarily clear `HANDLE_FLAG_INHERIT` only for valid inheritable parent standard handles;
-3. spawn the worker, whose explicitly configured API-key stdin and launch-response stdout handles remain inheritable;
-4. restore every modified parent handle flag before returning, including on spawn failure; and
-5. serialize this temporary mutation with a process-wide lock.
+2. clear `HANDLE_FLAG_INHERIT` only for valid inheritable parent standard handles; and
+3. spawn the worker, whose explicitly configured API-key stdin and launch-response stdout pipes are created independently by `Command::spawn`.
 
-On non-Windows targets the helper delegates directly to `Command::spawn`. The helper is used only by the standalone workflow-worker launch boundary. It does not detach the worker from Orca's durable task ownership or change the workflow runner's internal process-tree controls.
+The flags remain cleared because this standalone CLI process exits immediately after it receives the worker's durable launch response. Clearing inheritance does not close or otherwise invalidate the handles, so the CLI can still print its response. Avoiding restoration also avoids a window in which another concurrent child could inherit the outer capture handles.
+
+On non-Windows targets the helper is a no-op. It is used only immediately before the standalone workflow-worker launch. It does not detach the worker from Orca's durable task ownership or change the workflow runner's internal process-tree controls. Rust's Windows process implementation continues to create and inherit the worker's explicitly requested `Stdio::piped` and `Stdio::null` handles under its own process-creation lock.
 
 If implementation investigation shows that a stable Windows handle allowlist is available without recreating command-line quoting and environment construction, prefer that allowlist. The required observable contract remains the same: only handles intentionally configured for the worker may cross this spawn boundary.
 
 ### Failure handling
 
-- Failure to inspect or change a valid parent handle is treated as a launch error rather than silently returning to unsafe inheritance.
-- Parent handle flags are restored through an RAII guard on every return path.
+- Null and invalid standard handles are ignored; failure to inspect or change any other standard handle is treated as a launch error rather than silently returning to unsafe inheritance.
 - Existing API-key handoff failure handling continues to terminate and reap the worker.
 - The launch-response reader continues to require a complete newline-terminated JSON response before returning success.
 
