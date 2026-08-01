@@ -395,15 +395,14 @@ fn wait_for_path(path: &std::path::Path) {
 fn shell_session_read_returns_incremental_output_without_waiting_for_exit() {
     let temp = tempfile::tempdir().expect("tempdir");
     let _windows_sandbox = prepare_windows_sandbox(temp.path());
+    let started_marker = temp.path().join("shell-started");
+    let release_marker = temp.path().join("shell-release");
     let tasks = TaskRegistry::new("session-shell".to_string());
     let mut sessions = RuntimeShellSessionManager::new(tasks.clone());
 
     let handle = sessions
         .spawn(ShellSessionCommand {
-            command: platform_shell_script(
-                "printf ready; sleep 30; printf done",
-                "Write-Host -NoNewline 'ready'; Start-Sleep -Seconds 30; Write-Host -NoNewline 'done'",
-            ),
+            command: marker_wait_script(&started_marker, &release_marker),
             argv: None,
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
@@ -417,22 +416,31 @@ fn shell_session_read_returns_incremental_output_without_waiting_for_exit() {
         })
         .expect("spawn shell session");
 
-    let started_at = std::time::Instant::now();
+    wait_for_path(&started_marker);
+    let output_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while sessions.output_store().size(&handle.task_id) == 0 {
+        assert!(
+            std::time::Instant::now() < output_deadline,
+            "incremental shell output was not buffered"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!release_marker.exists(), "shell was released before read");
+
     let output = sessions
-        .read(&handle.id, Duration::from_secs(5))
+        .read(&handle.id, Duration::ZERO)
         .expect("read shell session");
+    let task_status = tasks.get(&handle.task_id).expect("shell task").status;
+    sessions.kill(&handle.id).expect("cleanup shell session");
 
     assert!(
-        started_at.elapsed() < Duration::from_millis(500),
-        "read waited for process completion instead of returning available output"
+        !release_marker.exists(),
+        "read returned only after the shell was released"
     );
     assert_eq!(output.exit_code, None);
     assert_eq!(output.status, TaskStatus::Running);
-    assert_eq!(output.stdout, "ready");
-    let task = tasks.get(&handle.task_id).expect("shell task");
-    assert_eq!(task.status, TaskStatus::Running);
-
-    sessions.kill(&handle.id).expect("cleanup shell session");
+    assert_eq!(output.stdout, "started");
+    assert_eq!(task_status, TaskStatus::Running);
 }
 
 #[test]
