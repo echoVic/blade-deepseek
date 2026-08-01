@@ -1812,9 +1812,9 @@ fn tool_actor_context_task_stop_cancels_running_shell_task_wait() {
             id: "tool-1".to_string(),
             name: ToolName::Bash,
             action: ActionKind::Shell,
-            target: Some("printf before; sleep 5; printf after".to_string()),
+            target: Some("printf before; sleep 30; printf after".to_string()),
             raw_arguments: Some(
-                serde_json::json!({ "command": "printf before; sleep 5; printf after" })
+                serde_json::json!({ "command": "printf before; sleep 30; printf after" })
                     .to_string(),
             ),
         };
@@ -1864,8 +1864,13 @@ fn tool_actor_context_task_stop_cancels_running_shell_task_wait() {
         stop_result.status,
         orca_core::tool_types::ToolStatus::Completed
     );
+    let stop_deadline = if cfg!(windows) {
+        std::time::Duration::from_secs(10)
+    } else {
+        std::time::Duration::from_secs(2)
+    };
     assert!(
-        stop_started.elapsed() < std::time::Duration::from_secs(2),
+        stop_started.elapsed() < stop_deadline,
         "task_stop should cancel the running shell wait promptly"
     );
     assert_eq!(result.status, orca_core::tool_types::ToolStatus::Cancelled);

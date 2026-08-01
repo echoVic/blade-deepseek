@@ -597,6 +597,15 @@ assert.ok(
   ),
   "Windows ACP protocol tests must allow the ARM64 runner ten seconds per frame",
 );
+const runtimeHostContractSource = readNormalizedSource(
+  "crates/orca-runtime/tests/runtime_host.rs",
+);
+assert.ok(
+  runtimeHostContractSource.includes(
+    "#[cfg(windows)]\nconst TEST_TIMEOUT: Duration = Duration::from_secs(10);",
+  ),
+  "Windows runtime host integration tests must allow ten seconds for process-backed workflows",
+);
 const taskRegistrySource = readNormalizedSource(
   "crates/orca-runtime/src/tasks.rs",
 );
@@ -663,6 +672,27 @@ assert.ok(
     'wait_for_workflow_status(temp.path(), Some(&home), task_id, "running")',
   ),
   "workflow pause/resume must wait for the persisted worker to be running before requesting pause",
+);
+const pauseResumeFixture = workflowCliContract.slice(
+  workflowCliContract.indexOf(
+    "fn workflow_pause_resume_and_clone_control_persisted_run()",
+  ),
+  workflowCliContract.indexOf(
+    "fn workflow_restart_commands_launch_from_persisted_run_record()",
+  ),
+);
+assert.ok(
+  pauseResumeFixture.includes("agent('first', { minHoldMs: 6000 })") &&
+    !pauseResumeFixture.includes("agent('mock_stream_delay_ms 6000')"),
+  "workflow pause/resume must create its pause window at the workflow runner boundary",
+);
+const runtimeLifecycleContract = readNormalizedSource(
+  "tests/runtime_lifecycle_contract.rs",
+);
+assert.ok(
+  runtimeLifecycleContract.includes("Duration::from_secs(10)") &&
+    runtimeLifecycleContract.includes("printf before; sleep 30; printf after"),
+  "Windows shell cancellation must stay bounded well below the fixture's natural completion",
 );
 const bashToolSource = readNormalizedSource("crates/orca-tools/src/bash.rs");
 const noisyCancelFixture = bashToolSource.slice(

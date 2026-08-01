@@ -314,12 +314,11 @@ fn workflow_pause_resume_and_clone_control_persisted_run() {
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");
     let script = temp.path().join("pausable.js");
-    // The first model call is deterministically slow via the mock provider's
-    // in-provider delay, so the run is reliably active when we request the
-    // pause; the runner then observes the pause before the second agent.
+    // Hold the first call at the workflow runner's native agent boundary so
+    // pause is observed before any provider work can complete.
     fs::write(
         &script,
-        "export const meta = { name: 'pausable', description: 'Pausable workflow', phases: [] };\nawait agent('mock_stream_delay_ms 6000');\nexport default await agent('second');",
+        "export const meta = { name: 'pausable', description: 'Pausable workflow', phases: [] };\nawait agent('first', { minHoldMs: 6000 });\nexport default await agent('second');",
     )
     .unwrap();
 

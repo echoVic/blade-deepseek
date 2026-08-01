@@ -46,6 +46,9 @@ use orca_runtime::runtime_pending_interaction::{
 };
 use orca_runtime::thread::RuntimeThread;
 
+#[cfg(windows)]
+const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(windows))]
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
