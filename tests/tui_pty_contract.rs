@@ -347,6 +347,14 @@ fn cancel_running_turn_and_exit(process: &mut PtyProcess, output: &mut Vec<u8>) 
             output.extend_from_slice(&chunk);
         }
         process.drain_output(output);
+        if let Some(status) = process.try_wait().expect("poll cancelled TUI exit") {
+            assert_eq!(
+                status.code(),
+                Some(130),
+                "cancelled TUI exited with {status}"
+            );
+            return;
+        }
         if contains_rendered_text(&output[notice_start..], IDLE_EXIT_NOTICE) {
             break;
         }
