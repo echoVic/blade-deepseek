@@ -225,6 +225,7 @@ fn concurrent_atomic_writers_complete_and_leave_a_readable_destination() {
                     match std::fs::read_to_string(&path) {
                         Ok(value) => assert!(!value.is_empty()),
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => {}
                         Err(error) => panic!("concurrent atomic read failed: {error}"),
                     }
                 }

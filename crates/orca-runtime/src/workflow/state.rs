@@ -784,7 +784,10 @@ where
 }
 
 fn read_agent_cache(path: &Path) -> io::Result<HashMap<String, CachedWorkflowAgentRecord>> {
-    let content = fs::read_to_string(path)?;
+    let content = retry_transient_workflow_read(
+        || fs::read_to_string(path),
+        std::time::Duration::from_millis(500),
+    )?;
     let cache_file: WorkflowAgentCacheFileOnDisk = serde_json::from_str(&content)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     Ok(match cache_file {
@@ -908,7 +911,7 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
-    let content = retry_transient_state_read(
+    let content = retry_transient_workflow_read(
         || fs::read_to_string(path),
         std::time::Duration::from_millis(500),
     )?;
@@ -916,7 +919,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn retry_transient_state_read<T>(
+fn retry_transient_workflow_read<T>(
     mut operation: impl FnMut() -> io::Result<T>,
     timeout: std::time::Duration,
 ) -> io::Result<T> {
@@ -924,11 +927,7 @@ fn retry_transient_state_read<T>(
     loop {
         match operation() {
             Err(error)
-                if cfg!(windows)
-                    && matches!(
-                        error.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
-                    )
+                if transient_workflow_read_error(&error)
                     && std::time::Instant::now() < deadline =>
             {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -938,19 +937,41 @@ fn retry_transient_state_read<T>(
     }
 }
 
+fn transient_workflow_read_error(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+        ) || matches!(
+            error.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 #[cfg(test)]
 mod read_retry_tests {
     use super::*;
 
     #[cfg(windows)]
     #[test]
-    fn transient_state_read_retries_until_success() {
+    fn transient_workflow_read_retries_until_success() {
         let mut calls = 0;
-        let value = retry_transient_state_read(
+        let value = retry_transient_workflow_read(
             || {
                 calls += 1;
-                if calls < 3 {
+                if calls == 1 {
                     Err(io::Error::from(io::ErrorKind::NotFound))
+                } else if calls == 2 {
+                    Err(io::Error::from_raw_os_error(32))
                 } else {
                     Ok("state")
                 }
@@ -964,9 +985,9 @@ mod read_retry_tests {
     }
 
     #[test]
-    fn permanent_state_read_error_is_not_retried() {
+    fn permanent_workflow_read_error_is_not_retried() {
         let mut calls = 0;
-        let error = retry_transient_state_read(
+        let error = retry_transient_workflow_read(
             || {
                 calls += 1;
                 Err::<(), _>(io::Error::from(io::ErrorKind::InvalidData))
