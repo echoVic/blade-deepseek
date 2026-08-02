@@ -402,7 +402,6 @@ jobs:
       - name: Smoke the installed native Windows runner and sandbox lifecycle
         shell: powershell
         run: |
-          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
           $root = Join-Path $env:RUNNER_TEMP "orca-native-helper-smoke"
           $installDir = Join-Path (Join-Path $env:RUNNER_TEMP "orca-installer-smoke") "bin"
           $runner = Join-Path $installDir "orca-windows-runner.exe"
@@ -411,6 +410,28 @@ jobs:
           $stateDir = Join-Path $root "state"
           New-Item -ItemType Directory -Force -Path $workspace | Out-Null
           New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+
+          # The PowerShell pipeline re-encodes text piped to native programs
+          # (BOM-carrying UTF-8 on hosted runners), and the helpers parse
+          # stdin as strict JSON bytes. Write the frame through the process
+          # API so the helpers receive exactly BOM-less UTF-8.
+          function Invoke-JsonHelper([string]$Exe, [string]$Json) {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $Exe
+            $psi.RedirectStandardInput = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.UseShellExecute = $false
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes("$Json`n")
+            $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+            $proc.StandardInput.Close()
+            $text = $proc.StandardOutput.ReadToEnd()
+            $proc.WaitForExit()
+            if ($proc.ExitCode -ne 0) {
+              throw "$(Split-Path -Leaf $Exe) exited with code $($proc.ExitCode): $text"
+            }
+            return $text
+          }
 
           $runnerRequest = @{
             version = 1
@@ -421,8 +442,7 @@ jobs:
             job_name = $null
             forward_stdin = $false
           } | ConvertTo-Json -Compress
-          $runnerResponseText = $runnerRequest | & $runner
-          if ($LASTEXITCODE -ne 0) { throw "native Windows runner exited with code ${LASTEXITCODE}: $runnerResponseText" }
+          $runnerResponseText = Invoke-JsonHelper $runner $runnerRequest
           $runnerResponse = $runnerResponseText | ConvertFrom-Json
           if (-not $runnerResponse.ok -or $runnerResponse.exit_code -ne 0) {
             throw "native Windows runner smoke failed: $runnerResponseText"
@@ -439,8 +459,7 @@ jobs:
               state_dir = $stateDir
               workspace = $workspace
             } | ConvertTo-Json -Compress
-            $responseText = $request | & $setup
-            if ($LASTEXITCODE -ne 0) { throw "sandbox setup '$Operation' exited with code $($LASTEXITCODE): $responseText" }
+            $responseText = Invoke-JsonHelper $setup $request
             $response = $responseText | ConvertFrom-Json
             if (-not $response.ok) { throw "sandbox setup '$Operation' failed: $responseText" }
             return $response
