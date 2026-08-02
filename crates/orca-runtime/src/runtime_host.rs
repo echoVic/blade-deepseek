@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -38,11 +38,11 @@ use crate::goal_actor::{GoalContinuationStatus, GoalRuntimeHandle};
 use crate::goal_store::{
     AdmittedGoalContinuationForSurface, BeginGoalOuterTurnForSurfaceInput,
     CreateGoalAndPrepareRunForSurfaceInput, CreateGoalInput, EditGoalAndPrepareRunForSurfaceInput,
-    FinishGoalOuterTurnForSurfaceInput, GoalStore, GoalSurfaceMutation, GoalSurfaceMutationContext,
-    GoalSurfaceMutationRecord, GoalSurfaceRowState, GoalSurfaceTokenBudgetUpdate,
-    GoalSurfaceTurnProgress, PauseGoalForSurfaceInput, PauseQuiescentGoalForSurfaceInput,
-    PrepareGoalRunForSurfaceInput, RecoverGoalRunForSurfaceInput,
-    ReplaceGoalContinuationForSurfaceInput,
+    FinishGoalOuterTurnForSurfaceInput, GoalRecoveryRecord, GoalStore, GoalSurfaceMutation,
+    GoalSurfaceMutationContext, GoalSurfaceMutationRecord, GoalSurfaceRowState,
+    GoalSurfaceTokenBudgetUpdate, GoalSurfaceTurnProgress, PauseGoalForSurfaceInput,
+    PauseQuiescentGoalForSurfaceInput, PrepareGoalRunForSurfaceInput,
+    RecoverGoalRunForSurfaceInput, ReplaceGoalContinuationForSurfaceInput,
 };
 use crate::goal_verifier::{
     DeepSeekGoalVerifier, DeterministicGoalVerifier, GoalVerificationRequest, GoalVerifier,
@@ -8551,6 +8551,21 @@ struct PendingSurfaceStreamRedaction {
     raw_tail: String,
 }
 
+const GOAL_COMPLETION_CAPACITY: usize = 8;
+
+enum GoalBlockingCompletion {
+    RuntimeOpened {
+        reply: SyncSender<Result<GoalRuntimeHandle, RuntimeHostError>>,
+        result: Result<OpenedGoalRuntime, RuntimeHostError>,
+    },
+}
+
+struct OpenedGoalRuntime {
+    handle: GoalRuntimeHandle,
+    join: Option<std::thread::JoinHandle<()>>,
+    recoveries: Vec<GoalRecoveryRecord>,
+}
+
 struct ThreadActor {
     state: Option<ThreadActorState>,
     config: RunConfig,
@@ -8562,6 +8577,10 @@ struct ThreadActor {
     background_capacity: usize,
     background_completion_tx: tokio_mpsc::UnboundedSender<String>,
     background_completion_rx: tokio_mpsc::UnboundedReceiver<String>,
+    goal_completion_tx: tokio_mpsc::Sender<GoalBlockingCompletion>,
+    goal_completion_rx: tokio_mpsc::Receiver<GoalBlockingCompletion>,
+    goal_blocking_in_flight: bool,
+    deferred_goal_commands: VecDeque<ThreadCommand>,
     usage_ledger: RuntimeUsageLedger,
     resident_surface: ResidentSurfaceSlot,
     pending_manual_compaction_completion: Option<PendingManualCompactionCompletion>,
@@ -11906,31 +11925,27 @@ impl ThreadActor {
             })
             .cloned()
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        let request = match input {
-            surface::GoalRunInput::Supplied { request } => request,
+        let (request, expected_receipt_digest) = match input {
+            surface::GoalRunInput::Supplied { request } => (request, None),
             surface::GoalRunInput::DerivedFromGoal {
                 goal_id,
                 objective_revision,
                 goal_receipt_digest,
             } => {
-                let current_digest = GoalStore::load_default()
-                    .and_then(|store| store.current_surface_receipt_digest(&session_id))
-                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
-                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-                if goal_id != goal.goal_id
-                    || objective_revision != goal.objective_revision
-                    || goal_receipt_digest != surface::Sha256Digest::new(current_digest)
-                {
+                if goal_id != goal.goal_id || objective_revision != goal.objective_revision {
                     return Err(surface::SurfaceClientCommandError::Unauthorized);
                 }
-                surface::SurfaceInputRequest {
-                    blocks: surface::NonEmptyVec::try_new(vec![
-                        surface::SurfaceInputRequestBlock::Text {
-                            text: surface::DisplayText::new(objective.as_str()),
-                        },
-                    ])
-                    .expect("Goal objective produces one input block"),
-                }
+                (
+                    surface::SurfaceInputRequest {
+                        blocks: surface::NonEmptyVec::try_new(vec![
+                            surface::SurfaceInputRequestBlock::Text {
+                                text: surface::DisplayText::new(objective.as_str()),
+                            },
+                        ])
+                        .expect("Goal objective produces one input block"),
+                    },
+                    Some(*goal_receipt_digest.as_bytes()),
+                )
             }
         };
         if resolve_surface_input(&request).is_none() {
@@ -12064,6 +12079,7 @@ impl ThreadActor {
                     session_id,
                     expected_goal_id: core_goal_id,
                     expected_goal_revision,
+                    expected_receipt_digest,
                     objective: objective.as_str().to_string(),
                     token_budget,
                     goal_run_id: core_goal_run_id,
@@ -12284,31 +12300,27 @@ impl ThreadActor {
             })
             .cloned()
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        let request = match input {
-            surface::GoalRunInput::Supplied { request } => request,
+        let (request, expected_receipt_digest) = match input {
+            surface::GoalRunInput::Supplied { request } => (request, None),
             surface::GoalRunInput::DerivedFromGoal {
                 goal_id,
                 objective_revision,
                 goal_receipt_digest,
             } => {
-                let current_digest = GoalStore::load_default()
-                    .and_then(|store| store.current_surface_receipt_digest(&session_id))
-                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
-                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-                if goal_id != goal.goal_id
-                    || objective_revision != goal.objective_revision
-                    || goal_receipt_digest != surface::Sha256Digest::new(current_digest)
-                {
+                if goal_id != goal.goal_id || objective_revision != goal.objective_revision {
                     return Err(surface::SurfaceClientCommandError::Unauthorized);
                 }
-                surface::SurfaceInputRequest {
-                    blocks: surface::NonEmptyVec::try_new(vec![
-                        surface::SurfaceInputRequestBlock::Text {
-                            text: surface::DisplayText::new(goal.objective.as_str()),
-                        },
-                    ])
-                    .expect("Goal objective produces one input block"),
-                }
+                (
+                    surface::SurfaceInputRequest {
+                        blocks: surface::NonEmptyVec::try_new(vec![
+                            surface::SurfaceInputRequestBlock::Text {
+                                text: surface::DisplayText::new(goal.objective.as_str()),
+                            },
+                        ])
+                        .expect("Goal objective produces one input block"),
+                    },
+                    Some(*goal_receipt_digest.as_bytes()),
+                )
             }
         };
         if resolve_surface_input(&request).is_none() {
@@ -12415,6 +12427,7 @@ impl ThreadActor {
                     expected_goal_id: core_goal_id,
                     expected_goal_revision: u32::try_from(fence.goal_revision.get())
                         .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                    expected_receipt_digest,
                     goal_run_id: core_goal_run_id,
                     operation: Box::new(operation),
                     origin: orca_core::goal_runtime::GoalTurnOrigin::Resume,
@@ -28729,6 +28742,8 @@ impl ThreadActor {
         let usage_ledger = RuntimeUsageLedger::new(thread.session().aggregate_usage_totals());
         let events = thread.event_factory();
         let (background_completion_tx, background_completion_rx) = tokio_mpsc::unbounded_channel();
+        let (goal_completion_tx, goal_completion_rx) =
+            tokio_mpsc::channel(GOAL_COMPLETION_CAPACITY);
         let pending_background_approval_resolutions = resident_surface
             .as_ref()
             .map(|resident| {
@@ -28746,6 +28761,10 @@ impl ThreadActor {
             background_capacity,
             background_completion_tx,
             background_completion_rx,
+            goal_completion_tx,
+            goal_completion_rx,
+            goal_blocking_in_flight: false,
+            deferred_goal_commands: VecDeque::new(),
             usage_ledger,
             resident_surface: ResidentSurfaceSlot(resident_surface),
             pending_manual_compaction_completion: None,
@@ -28891,6 +28910,91 @@ impl ThreadActor {
         Err(last_error)
     }
 
+    fn open_goal_runtime_off_actor(
+        &mut self,
+        reply: SyncSender<Result<GoalRuntimeHandle, RuntimeHostError>>,
+    ) {
+        let completion_tx = self.goal_completion_tx.clone();
+        let session_id = self.handle.session_id.clone();
+        self.goal_blocking_in_flight = true;
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let (handle, join) = GoalRuntimeHandle::open_default().map_err(|error| {
+                    RuntimeHostError::GoalControlFailed {
+                        message: error.to_string(),
+                    }
+                })?;
+                let recoveries = match session_id {
+                    Some(session_id) => handle.take_recoveries(&session_id),
+                    None => Ok(Vec::new()),
+                };
+                let recoveries = match recoveries {
+                    Ok(recoveries) => recoveries,
+                    Err(error) => {
+                        let _ = handle.shutdown();
+                        let _ = join.join();
+                        return Err(RuntimeHostError::GoalControlFailed {
+                            message: error.to_string(),
+                        });
+                    }
+                };
+                Ok(OpenedGoalRuntime {
+                    handle,
+                    join: Some(join),
+                    recoveries,
+                })
+            })
+            .await
+            .map_err(|error| RuntimeHostError::GoalControlFailed {
+                message: format!("goal runtime initialization task failed: {error}"),
+            })
+            .and_then(|result| result);
+            let _ = completion_tx
+                .send(GoalBlockingCompletion::RuntimeOpened { reply, result })
+                .await;
+        });
+    }
+
+    fn handle_goal_blocking_completion(&mut self, completion: GoalBlockingCompletion) {
+        self.goal_blocking_in_flight = false;
+        match completion {
+            GoalBlockingCompletion::RuntimeOpened { reply, result } => {
+                let result = result.and_then(|mut opened| {
+                    let Some(state) = self.state.as_mut() else {
+                        let _ = opened.handle.shutdown();
+                        if let Some(join) = opened.join.take() {
+                            let _ = join.join();
+                        }
+                        return Err(RuntimeHostError::ThreadUnavailable);
+                    };
+                    let returned = opened.handle.clone();
+                    state
+                        .thread
+                        .install_goal_runtime(
+                            opened.handle,
+                            opened
+                                .join
+                                .take()
+                                .expect("opened Goal runtime owns its join"),
+                        )
+                        .map_err(|error| RuntimeHostError::GoalControlFailed {
+                            message: error.to_string(),
+                        })?;
+                    Self::publish_goal_recovery_records(state, opened.recoveries, None);
+                    Ok(returned)
+                });
+                let _ = reply.send(result);
+            }
+        }
+
+        while !self.goal_blocking_in_flight {
+            let Some(command) = self.deferred_goal_commands.pop_front() else {
+                break;
+            };
+            self.handle_idle_command(command);
+        }
+    }
+
     async fn run(
         mut self,
         mut command_rx: tokio_mpsc::Receiver<ThreadCommand>,
@@ -28934,6 +29038,11 @@ impl ThreadActor {
                             && self.pending_manual_compaction_completion.is_none()
                         {
                             self.reconcile_surface_interaction_capabilities(None);
+                        }
+                    }
+                    completion = self.goal_completion_rx.recv(), if self.goal_blocking_in_flight => {
+                        if let Some(completion) = completion {
+                            self.handle_goal_blocking_completion(completion);
                         }
                     }
                     command = command_rx.recv() => {
@@ -29764,6 +29873,17 @@ impl ThreadActor {
     }
 
     fn handle_idle_command(&mut self, command: ThreadCommand) {
+        let permitted_during_goal_blocking = matches!(
+            &command,
+            ThreadCommand::ReadState { .. } | ThreadCommand::ReadSnapshot { .. }
+        );
+        #[cfg(test)]
+        let permitted_during_goal_blocking = permitted_during_goal_blocking
+            || matches!(&command, ThreadCommand::SurfaceActorTestProbe { .. });
+        if self.goal_blocking_in_flight && !permitted_during_goal_blocking {
+            self.deferred_goal_commands.push_back(command);
+            return;
+        }
         let permitted_during_manual_retry = matches!(
             &command,
             ThreadCommand::SurfaceWaitOperationTerminal { .. }
@@ -30497,20 +30617,20 @@ impl ThreadActor {
                 let _ = reply.send(result);
             }
             ThreadCommand::GoalRuntime { reply } => {
-                let result = self
+                let initialized = self
                     .state
-                    .as_mut()
-                    .ok_or(RuntimeHostError::ThreadUnavailable)
-                    .and_then(|state| {
-                        let runtime = state.thread.goal_runtime_handle().map_err(|error| {
-                            RuntimeHostError::ThreadStartFailed {
-                                message: error.to_string(),
-                            }
-                        })?;
-                        Self::publish_goal_recoveries(state, &runtime, None)?;
-                        Ok(runtime)
-                    });
-                let _ = reply.send(result);
+                    .as_ref()
+                    .and_then(|state| state.thread.initialized_goal_runtime_handle());
+                if let Some(runtime) = initialized {
+                    let _ = reply.send(Ok(runtime));
+                } else if self.state.is_none() {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                } else if self.goal_blocking_in_flight {
+                    self.deferred_goal_commands
+                        .push_back(ThreadCommand::GoalRuntime { reply });
+                } else {
+                    self.open_goal_runtime_off_actor(reply);
+                }
             }
             ThreadCommand::SetGoal {
                 session_id,
@@ -31685,6 +31805,15 @@ impl ThreadActor {
                 message: error.to_string(),
             }
         })?;
+        Self::publish_goal_recovery_records(state, recoveries, observer);
+        Ok(())
+    }
+
+    fn publish_goal_recovery_records(
+        state: &mut ThreadActorState,
+        recoveries: Vec<GoalRecoveryRecord>,
+        observer: Option<&dyn EventObserver>,
+    ) {
         for recovery in recoveries {
             observe_runtime_event(
                 observer,
@@ -31696,7 +31825,6 @@ impl ThreadActor {
                 ),
             );
         }
-        Ok(())
     }
 
     fn request_goal_pause(

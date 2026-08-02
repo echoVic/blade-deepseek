@@ -173,14 +173,35 @@ impl RuntimeThread {
     pub(crate) fn goal_runtime_handle(&mut self) -> io::Result<GoalRuntimeHandle> {
         if self.goal_runtime.is_none() {
             let (handle, join) = GoalRuntimeHandle::open_default().map_err(io::Error::other)?;
-            self.goal_runtime = Some(handle);
-            self.goal_actor_join = Some(join);
+            self.install_goal_runtime(handle, join)?;
         }
         Ok(self
             .goal_runtime
             .as_ref()
             .expect("goal runtime initialized")
             .clone())
+    }
+
+    pub(crate) fn initialized_goal_runtime_handle(&self) -> Option<GoalRuntimeHandle> {
+        self.goal_runtime.clone()
+    }
+
+    pub(crate) fn install_goal_runtime(
+        &mut self,
+        handle: GoalRuntimeHandle,
+        join: std::thread::JoinHandle<()>,
+    ) -> io::Result<()> {
+        if self.goal_runtime.is_some() || self.goal_actor_join.is_some() {
+            let _ = handle.shutdown();
+            let _ = join.join();
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "goal runtime is already initialized",
+            ));
+        }
+        self.goal_runtime = Some(handle);
+        self.goal_actor_join = Some(join);
+        Ok(())
     }
 
     pub(crate) fn bind_surface_goal_turn(

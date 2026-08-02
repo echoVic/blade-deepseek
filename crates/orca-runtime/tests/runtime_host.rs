@@ -3319,6 +3319,49 @@ fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
 }
 
 #[test]
+fn goal_store_wait_does_not_block_thread_actor() {
+    with_orca_home(|home| {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start runtime host");
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host
+            .start_thread(config, "goal store responsiveness")
+            .expect("start recorded runtime thread");
+
+        let lock = rusqlite::Connection::open(home.join("goals.sqlite3")).unwrap();
+        lock.busy_timeout(TEST_TIMEOUT).unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let goal_thread = thread.clone();
+        let (goal_tx, goal_rx) = std::sync::mpsc::sync_channel(1);
+        let goal_request = std::thread::spawn(move || {
+            let _ = goal_tx.send(goal_thread.goal_runtime());
+        });
+        std::thread::sleep(Duration::from_millis(50));
+
+        let snapshot_thread = thread.clone();
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(1);
+        let snapshot_request = std::thread::spawn(move || {
+            let _ = snapshot_tx.send(snapshot_thread.snapshot());
+        });
+        let snapshot = snapshot_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("goal store wait blocked the runtime thread actor");
+        assert!(snapshot.is_ok());
+
+        lock.execute_batch("ROLLBACK").unwrap();
+        goal_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("goal runtime request did not settle after releasing SQLite")
+            .expect("goal runtime request failed after releasing SQLite");
+        goal_request.join().unwrap();
+        snapshot_request.join().unwrap();
+        host.shutdown().expect("shutdown runtime host");
+    });
+}
+
+#[test]
 fn turn_with_goal_usage_tracking_accounts_tokens_and_flips_budget_limited() {
     with_orca_home(|_home| {
         let executor = Arc::new(ScriptedExecutor::new([

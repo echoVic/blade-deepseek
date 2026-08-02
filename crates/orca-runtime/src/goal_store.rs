@@ -167,6 +167,7 @@ pub struct PrepareGoalRunForSurfaceInput {
     pub session_id: String,
     pub expected_goal_id: GoalId,
     pub expected_goal_revision: u32,
+    pub expected_receipt_digest: Option<[u8; 32]>,
     pub goal_run_id: GoalRunId,
     pub operation: Box<OperationRecord>,
     pub origin: GoalTurnOrigin,
@@ -187,6 +188,7 @@ pub struct EditGoalAndPrepareRunForSurfaceInput {
     pub session_id: String,
     pub expected_goal_id: GoalId,
     pub expected_goal_revision: u32,
+    pub expected_receipt_digest: Option<[u8; 32]>,
     pub objective: String,
     pub token_budget: Option<i64>,
     pub goal_run_id: GoalRunId,
@@ -404,6 +406,7 @@ struct StoredGoalSurfaceState {
     catalog_revision: u32,
     goal_owner_epoch: u64,
     row_present: bool,
+    last_receipt_digest: [u8; 32],
 }
 
 struct StoredSurfaceMutation {
@@ -1173,6 +1176,9 @@ impl GoalStore {
         if !state.row_present
             || state.goal_id != input.expected_goal_id
             || state.goal_revision != input.expected_goal_revision
+            || input
+                .expected_receipt_digest
+                .is_some_and(|digest| digest != state.last_receipt_digest)
         {
             return Err(GoalStoreError::Invalid(
                 "goal surface fence is stale".to_string(),
@@ -1326,6 +1332,9 @@ impl GoalStore {
         if !state.row_present
             || state.goal_id != input.expected_goal_id
             || state.goal_revision != input.expected_goal_revision
+            || input
+                .expected_receipt_digest
+                .is_some_and(|digest| digest != state.last_receipt_digest)
         {
             return Err(GoalStoreError::Invalid(
                 "Goal edit-and-run fence is stale".to_string(),
@@ -5190,7 +5199,7 @@ fn load_goal_surface_state(
     let stored = connection
         .query_row(
             "SELECT goal_id, goal_revision, objective_revision, catalog_revision,
-                    goal_owner_epoch, row_present
+                    goal_owner_epoch, row_present, last_receipt_digest
              FROM goal_surface_state WHERE session_id = ?1",
             [session_id],
             |row| {
@@ -5201,6 +5210,7 @@ fn load_goal_surface_state(
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
                 ))
             },
         )
@@ -5212,6 +5222,7 @@ fn load_goal_surface_state(
         catalog_revision,
         goal_owner_epoch,
         row_present,
+        last_receipt_digest,
     )) = stored
     else {
         return Ok(None);
@@ -5237,6 +5248,7 @@ fn load_goal_surface_state(
         catalog_revision: positive_u32(catalog_revision, "catalog revision")?,
         goal_owner_epoch,
         row_present: row_present == 1,
+        last_receipt_digest: exact_digest(&last_receipt_digest, "receipt digest")?,
     }))
 }
 
@@ -5759,6 +5771,28 @@ mod tests {
             [41; 32],
             owner_epoch,
         );
+        let expected_receipt_digest = created.receipt.receipt_digest;
+
+        assert!(matches!(
+            store.prepare_goal_run_for_surface(
+                PrepareGoalRunForSurfaceInput {
+                    session_id: "surface-run-preparation".to_string(),
+                    expected_goal_id: created.receipt.goal_id.clone(),
+                    expected_goal_revision: created.receipt.goal_revision,
+                    expected_receipt_digest: Some([42; 32]),
+                    goal_run_id: goal_run_id.clone(),
+                    operation: Box::new(operation.clone()),
+                    origin: GoalTurnOrigin::User,
+                    started_at: 101,
+                },
+                surface_context(
+                    "019f8b4d-7d73-7b52-8f44-2cfeac060112",
+                    [42; 32],
+                    owner_epoch,
+                ),
+            ),
+            Err(GoalStoreError::Invalid(message)) if message.contains("fence is stale")
+        ));
 
         let prepared = store
             .prepare_goal_run_for_surface(
@@ -5766,6 +5800,7 @@ mod tests {
                     session_id: "surface-run-preparation".to_string(),
                     expected_goal_id: created.receipt.goal_id.clone(),
                     expected_goal_revision: created.receipt.goal_revision,
+                    expected_receipt_digest: Some(expected_receipt_digest),
                     goal_run_id: goal_run_id.clone(),
                     operation: Box::new(operation.clone()),
                     origin: GoalTurnOrigin::User,
@@ -5823,6 +5858,7 @@ mod tests {
                         session_id: "surface-run-preparation".to_string(),
                         expected_goal_id: created.receipt.goal_id,
                         expected_goal_revision: created.receipt.goal_revision,
+                        expected_receipt_digest: Some(expected_receipt_digest),
                         goal_run_id,
                         operation: Box::new(operation),
                         origin: GoalTurnOrigin::User,
