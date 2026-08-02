@@ -131,7 +131,7 @@ jobs:
           cargo test --test history_contract history_rename_search_and_compress_work_for_latest --locked -- --nocapture
           cargo build -p orca-windows-runner --locked
           cargo nextest run -p orca-tui --lib --locked --profile ci-serial
-          cargo nextest run --test tui_pty_contract --locked --profile ci-serial
+          cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass
           cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
       - name: Run native Windows ARM64 behavior gates
         if: matrix.target == 'aarch64-pc-windows-msvc'
