@@ -3587,7 +3587,16 @@ metadata instead of paired new header
 +value = 1
 ";
 
-        let lines = render_unified_diff(diff, &theme, None);
+        // Pin the inline deadline: in a cold test process the first hunk's
+        // syntect start-up can exceed INLINE_DIFF_DEADLINE, which would send
+        // the second hunk into the plain fallback and hide the parser-state
+        // behavior this test is about.
+        let lines = render_parsed_diff_with_inline_deadline(
+            &parse_unified_diff(diff),
+            &theme,
+            None,
+            Instant::now() + Duration::from_secs(60),
+        );
         let inserted = find_rendered_line(&lines, "+value = 1");
         let fresh = highlight_sequence("item.py", &["value = 1"], &theme);
         let leaked = highlight_sequence("item.py", &["\"\"\"open string", "value = 1"], &theme);
