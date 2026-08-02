@@ -370,11 +370,11 @@ git commit -m "perf(runtime): append assistant deltas"
 - Modify: crates/orca-tui/src/types.rs
 - Test: crates/orca-tui/src/types.rs
 
-- [ ] **Step 1: Write mutation equivalence tests**
+- [x] **Step 1: Write mutation equivalence tests**
 
 Exercise push, replace, clear, truncate, retain, and history reload. After each operation compare tool_call_message_index with a test-only linear scan and call assert_tool_call_index_consistent.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 cargo test -p orca-tui tool_call_index_matches_canonical_scan_after_mutations --lib
@@ -382,15 +382,15 @@ cargo test -p orca-tui tool_call_index_matches_canonical_scan_after_mutations --
 
 Expected: FAIL because index APIs do not exist.
 
-- [ ] **Step 3: Add the index**
+- [x] **Step 3: Add the index**
 
 Add tool_call_indices: HashMap<String, usize> to AppState. Preserve current duplicate behavior by indexing the first surviving message. Insert unique append IDs incrementally; rebuild once after removals or reorder.
 
-- [ ] **Step 4: Replace hot scans**
+- [x] **Step 4: Replace hot scans**
 
 Use the index in push_message duplicate detection and ToolCallProgress lookup. Debug/test builds assert consistency after structural transcript mutations.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
 ~~~sh
 cargo test -p orca-tui tool_call_index --lib

@@ -818,6 +818,7 @@ type EditHighlightDrain = fn(&mut EditHighlightRuntime) -> DrainResults;
 pub struct AppState {
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) message_revisions: Vec<u64>,
+    tool_call_indices: HashMap<String, usize>,
     next_message_revision: u64,
     pub(crate) transcript_render_cache: TranscriptRenderCache,
     pub(crate) transcript_search: TranscriptSearchState,
@@ -987,6 +988,7 @@ impl AppState {
         Self {
             messages: Vec::new(),
             message_revisions: Vec::new(),
+            tool_call_indices: HashMap::new(),
             next_message_revision: 1,
             transcript_render_cache: TranscriptRenderCache::default(),
             transcript_search: TranscriptSearchState::default(),
@@ -1581,6 +1583,7 @@ impl AppState {
     }
 
     pub(crate) fn reconcile_message_tracking(&mut self) {
+        let structure_changed = self.message_revisions.len() != self.messages.len();
         if self.message_revisions.len() > self.messages.len() {
             self.message_revisions.truncate(self.messages.len());
             self.transcript_render_cache.truncate(self.messages.len());
@@ -1592,6 +1595,10 @@ impl AppState {
         }
         self.transcript_render_cache
             .reconcile_len(self.messages.len());
+        if structure_changed {
+            self.rebuild_tool_call_indices();
+        }
+        self.assert_tool_call_index_consistent();
     }
 
     fn reset_message_tracking(&mut self) {
@@ -1603,20 +1610,73 @@ impl AppState {
         }
         self.transcript_render_cache
             .reconcile_len(self.messages.len());
+        self.rebuild_tool_call_indices();
+        self.assert_tool_call_index_consistent();
     }
+
+    fn rebuild_tool_call_indices(&mut self) {
+        self.tool_call_indices.clear();
+        for (index, message) in self.messages.iter().enumerate() {
+            if let ChatMessage::ToolCall { id, .. } = message {
+                self.tool_call_indices.entry(id.clone()).or_insert(index);
+            }
+        }
+    }
+
+    fn tool_call_message_index(&self, id: &str) -> Option<usize> {
+        self.tool_call_indices.get(id).copied()
+    }
+
+    fn receiving_tool_call_message_index(&self, id: &str) -> Option<usize> {
+        let is_receiving = |message: &ChatMessage| {
+            matches!(
+                message,
+                ChatMessage::ToolCall {
+                    id: existing_id,
+                    status,
+                    ..
+                } if existing_id == id && status == "receiving"
+            )
+        };
+        let first = self.tool_call_message_index(id)?;
+        if is_receiving(&self.messages[first]) {
+            return Some(first);
+        }
+        self.messages[first + 1..]
+            .iter()
+            .rposition(is_receiving)
+            .map(|offset| first + 1 + offset)
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn assert_tool_call_index_consistent(&self) {
+        let mut canonical = HashMap::new();
+        for (index, message) in self.messages.iter().enumerate() {
+            if let ChatMessage::ToolCall { id, .. } = message {
+                canonical.entry(id.clone()).or_insert(index);
+            }
+        }
+        debug_assert_eq!(self.tool_call_indices, canonical);
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    fn assert_tool_call_index_consistent(&self) {}
 
     pub(crate) fn push_message(&mut self, message: ChatMessage) {
         self.reconcile_message_tracking();
         if let ChatMessage::ToolCall { id, .. } = &message {
-            let reused_tool_id = self.messages.iter().any(
-                |existing| matches!(existing, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == id),
-            );
+            let reused_tool_id = self.tool_call_message_index(id).is_some();
             self.remove_applied_highlights_for_tool_id(id);
             if reused_tool_id {
                 self.clear_pending_edit_highlights();
             }
         }
         let revision = self.allocate_message_revision();
+        if let ChatMessage::ToolCall { id, .. } = &message {
+            self.tool_call_indices
+                .entry(id.clone())
+                .or_insert(self.messages.len());
+        }
         self.messages.push(message);
         self.message_revisions.push(revision);
         self.transcript_render_cache
@@ -1626,6 +1686,7 @@ impl AppState {
         if !self.auto_scroll {
             self.unseen_messages = self.unseen_messages.saturating_add(1);
         }
+        self.assert_tool_call_index_consistent();
     }
 
     pub(crate) fn replace_messages(&mut self, messages: impl IntoIterator<Item = ChatMessage>) {
@@ -1647,6 +1708,7 @@ impl AppState {
         self.transcript_search.reset();
         self.messages.clear();
         self.message_revisions.clear();
+        self.tool_call_indices.clear();
         self.transcript_render_cache.clear();
         self.applied_diff_highlights.clear();
         self.clear_pending_edit_highlights();
@@ -1664,7 +1726,8 @@ impl AppState {
             self.reset_assistant_stream();
         }
         self.reconcile_message_tracking();
-        if len < self.messages.len() {
+        let did_truncate = len < self.messages.len();
+        if did_truncate {
             self.invalidate_selection();
             self.clear_pending_edit_highlights();
         }
@@ -1674,6 +1737,10 @@ impl AppState {
         self.finalized_count = self.finalized_count.min(len);
         self.flushed_count = self.flushed_count.min(len);
         self.prune_applied_diff_highlights();
+        if did_truncate {
+            self.rebuild_tool_call_indices();
+        }
+        self.assert_tool_call_index_consistent();
     }
 
     pub(crate) fn replace_message(&mut self, index: usize, message: ChatMessage) -> bool {
@@ -1683,6 +1750,7 @@ impl AppState {
         }
         self.remove_applied_highlight_for_message(index);
         self.messages[index] = message;
+        self.rebuild_tool_call_indices();
         self.touch_message(index);
         true
     }
@@ -1694,7 +1762,18 @@ impl AppState {
     ) -> Option<R> {
         self.reconcile_message_tracking();
         self.remove_applied_highlight_for_message(index);
+        let previous_tool_id = self.messages.get(index).and_then(|message| match message {
+            ChatMessage::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        });
         let result = mutate(self.messages.get_mut(index)?);
+        let current_tool_id = self.messages.get(index).and_then(|message| match message {
+            ChatMessage::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        });
+        if previous_tool_id != current_tool_id {
+            self.rebuild_tool_call_indices();
+        }
         self.touch_message(index);
         Some(result)
     }
@@ -1749,6 +1828,7 @@ impl AppState {
             }
         }
         self.transcript_render_cache.retain(&retained_mask);
+        self.rebuild_tool_call_indices();
         if active_tail.is_some() {
             if retained_tail.is_some() {
                 self.assistant_stream_tail = retained_tail;
@@ -1766,6 +1846,7 @@ impl AppState {
             self.prune_applied_diff_highlights();
             self.invalidate_selection();
         }
+        self.assert_tool_call_index_consistent();
     }
 
     pub fn enter_running(&mut self) {
@@ -2330,6 +2411,7 @@ impl AppState {
     }
 
     pub fn update(&mut self, event: TuiEvent) {
+        self.reconcile_message_tracking();
         match event {
             TuiEvent::NewSessionStarted { session_id } => {
                 self.current_session_id = Some(session_id);
@@ -2470,9 +2552,7 @@ impl AppState {
                 if name == "subagent" || name == "update_plan" {
                     return;
                 }
-                if let Some(index) = self.messages.iter().rposition(|message| {
-                    matches!(message, ChatMessage::ToolCall { id: existing_id, status, .. } if existing_id == &id && status == "receiving")
-                }) {
+                if let Some(index) = self.receiving_tool_call_message_index(&id) {
                     self.mutate_message(index, |message| {
                         let ChatMessage::ToolCall {
                             name: existing_name,
@@ -2519,9 +2599,7 @@ impl AppState {
                     "receiving arguments... {}",
                     format_argument_bytes(arguments_bytes)
                 ));
-                if let Some(index) = self.messages.iter().rposition(|message| {
-                    matches!(message, ChatMessage::ToolCall { id: existing_id, status, .. } if existing_id == &id && status == "receiving")
-                }) {
+                if let Some(index) = self.receiving_tool_call_message_index(&id) {
                     self.mutate_message(index, |message| {
                         let ChatMessage::ToolCall {
                             name: existing_name,
@@ -3063,11 +3141,11 @@ impl AppState {
                     }
                 })
                 .collect();
+            self.reset_message_tracking();
         }
         self.proposed_plan_parser = ProposedPlanStreamParser::default();
         if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
-            self.messages
-                .push(ChatMessage::Reasoning(reasoning.to_string()));
+            self.push_message(ChatMessage::Reasoning(reasoning.to_string()));
         }
         if let Some(message) = message.filter(|text| !text.is_empty()) {
             self.handle_message_delta(message);
@@ -5460,6 +5538,54 @@ mod tests {
             }
             other => panic!("expected tool call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_call_index_matches_canonical_scan_after_mutations() {
+        fn tool_call(id: &str) -> ChatMessage {
+            ChatMessage::ToolCall {
+                id: id.to_string(),
+                name: "bash".to_string(),
+                target: None,
+                status: "completed".to_string(),
+                output: None,
+                diff: None,
+                kind: None,
+                expanded: false,
+            }
+        }
+
+        fn assert_matches_canonical_scan(state: &AppState, ids: &[&str]) {
+            state.assert_tool_call_index_consistent();
+            for id in ids {
+                let canonical = state.messages.iter().position(|message| {
+                    matches!(message, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == id)
+                });
+                assert_eq!(state.tool_call_message_index(id), canonical, "id={id}");
+            }
+        }
+
+        let mut state = state();
+        state.push_message(tool_call("first"));
+        state.push_message(ChatMessage::System("between".to_string()));
+        state.push_message(tool_call("duplicate"));
+        state.push_message(tool_call("duplicate"));
+        assert_matches_canonical_scan(&state, &["first", "duplicate", "missing"]);
+
+        assert!(state.replace_message(0, tool_call("replacement")));
+        assert_matches_canonical_scan(&state, &["first", "replacement", "duplicate", "missing"]);
+
+        state.truncate_messages(3);
+        assert_matches_canonical_scan(&state, &["replacement", "duplicate"]);
+
+        state.retain_messages(|message| !matches!(message, ChatMessage::System(_)));
+        assert_matches_canonical_scan(&state, &["replacement", "duplicate"]);
+
+        state.replace_messages([tool_call("history"), tool_call("history")]);
+        assert_matches_canonical_scan(&state, &["replacement", "history"]);
+
+        state.clear_messages();
+        assert_matches_canonical_scan(&state, &["history"]);
     }
 
     #[test]
