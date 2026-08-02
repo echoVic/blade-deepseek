@@ -93,7 +93,7 @@ git commit -m "docs(audit): track remediation evidence"
 - Test: crates/orca-runtime/src/goal_actor.rs
 - Modify: docs/reports/2026-08-03-orca-audit-remediation-evidence.md
 
-- [ ] **Step 1: Write a timeout regression**
+- [x] **Step 1: Write a timeout regression**
 
 Add a test-only delayed command and bounded constructor. Assert:
 
@@ -108,7 +108,7 @@ assert!(matches!(
 
 After the delayed command settles, issue another request and prove the actor remains healthy.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 cargo test -p orca-runtime goal_actor_request_times_out_with_typed_error --lib -- --nocapture
@@ -116,7 +116,7 @@ cargo test -p orca-runtime goal_actor_request_times_out_with_typed_error --lib -
 
 Expected: FAIL because Timeout and the bounded test constructor do not exist.
 
-- [ ] **Step 3: Implement the bounded API**
+- [x] **Step 3: Implement the bounded API**
 
 Add:
 
@@ -139,7 +139,7 @@ pub struct GoalRuntimeHandle {
 
 Use recv_timeout. Map Timeout to GoalActorError::Timeout and Disconnected to Closed. Do not retry timed-out mutations.
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 ~~~sh
 cargo test -p orca-runtime goal_actor_request_times_out --lib -- --nocapture
@@ -148,7 +148,7 @@ cargo test -p orca-runtime goal_actor --lib -- --test-threads=1
 
 Expected: all matching tests pass.
 
-- [ ] **Step 5: Update C1 and commit**
+- [x] **Step 5: Update C1 and commit**
 
 ~~~sh
 git add crates/orca-runtime/src/goal_actor.rs docs/reports/2026-08-03-orca-audit-remediation-evidence.md
