@@ -57,7 +57,7 @@ Evidence and release:
 - Reference: docs/reports/2026-08-03-architecture-performance-design-review.md
 - Reference: docs/superpowers/specs/2026-08-03-orca-audit-remediation-v032-design.md
 
-- [ ] **Step 1: Create one row per requirement**
+- [x] **Step 1: Create one row per requirement**
 
 Use this exact table shape:
 
@@ -69,7 +69,7 @@ Use this exact table shape:
 
 Use IDs C1-C5 for concurrency/contracts, S1-S6 for session lifecycle, A1-A9 for architecture, and P1-P6 for performance/state. Include every numbered or bulleted audit finding exactly once.
 
-- [ ] **Step 2: Verify row uniqueness**
+- [x] **Step 2: Verify row uniqueness**
 
 Run:
 
@@ -79,7 +79,7 @@ rg -n '^\| (C|S|A|P)[0-9]+' docs/reports/2026-08-03-orca-audit-remediation-evide
 
 Expected: every planned identifier appears exactly once and no row is missing.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ~~~sh
 git add docs/reports/2026-08-03-orca-audit-remediation-evidence.md
