@@ -1,7 +1,7 @@
 # Orca Audit Remediation v0.3.2 Design
 
 Date: 2026-08-03
-Status: approved for specification
+Status: approved for implementation
 Target release: v0.3.2
 Scope: remediate every confirmed defect, performance cliff, missing contract gate,
 test gap, and planned architectural debt item from the 2026-08-03 comprehensive
