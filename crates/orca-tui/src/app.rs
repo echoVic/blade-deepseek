@@ -53,7 +53,7 @@ use crate::runtime_interaction_adapter::{
 use crate::slash_command_actions::{SettingsIntent, decode_settings_intent};
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::submitted_turn::SubmittedTurn;
-use crate::surface_actions::TuiSurfaceActions;
+use crate::surface_actions::{TuiHostActions, TuiSurfaceActions};
 use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
@@ -3688,6 +3688,95 @@ mod tests {
     }
 
     #[test]
+    fn hosted_tui_fork_preserves_source_and_projects_copied_history() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("investigate auth".to_string()));
+            let source_id = match harness
+                .recv_until(|event| matches!(event, TuiEvent::MentionRuntimeReady(_)))
+            {
+                TuiEvent::MentionRuntimeReady(thread) => {
+                    thread.session_id().expect("source session id").to_string()
+                }
+                _ => unreachable!(),
+            };
+            harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+
+            harness.send(UserAction::ForkCurrentSession {
+                title: Some("Auth experiment".to_string()),
+            });
+            let fork_id = match harness.recv_until(|event| {
+                matches!(
+                    event,
+                    TuiEvent::SessionForked { session_id, .. }
+                        if session_id != &source_id
+                )
+            }) {
+                TuiEvent::SessionForked { session_id, title } => {
+                    assert_eq!(title, "Auth experiment");
+                    session_id
+                }
+                _ => unreachable!(),
+            };
+
+            assert_ne!(fork_id, source_id);
+            let source = history::load_session(&source_id).expect("source remains loadable");
+            let fork = history::load_session(&fork_id).expect("fork remains loadable");
+            assert_eq!(fork.meta.parent_id.as_deref(), Some(source_id.as_str()));
+            assert_eq!(fork.meta.title, "Auth experiment");
+            assert!(fork.messages.iter().any(|message| {
+                matches!(message, Message::User { content, .. } if content == "investigate auth")
+            }));
+            assert!(source.meta.parent_id.is_none());
+            assert!(matches!(
+                harness.config.lock().unwrap().history_mode,
+                HistoryMode::Fork(ref selector) if selector == &source_id
+            ));
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn hosted_tui_rename_updates_durable_title_and_projection_event() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("release notes".to_string()));
+            let session_id = match harness
+                .recv_until(|event| matches!(event, TuiEvent::MentionRuntimeReady(_)))
+            {
+                TuiEvent::MentionRuntimeReady(thread) => thread
+                    .session_id()
+                    .expect("recorded session id")
+                    .to_string(),
+                _ => unreachable!(),
+            };
+            harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+
+            harness.send(UserAction::RenameCurrentSession {
+                title: "Release triage".to_string(),
+            });
+            let renamed =
+                harness.recv_until(|event| matches!(event, TuiEvent::SessionRenamed { .. }));
+
+            assert!(matches!(
+                renamed,
+                TuiEvent::SessionRenamed {
+                    session_id: ref renamed_id,
+                    title: ref renamed_title,
+                } if renamed_id == &session_id && renamed_title == "Release triage"
+            ));
+            assert_eq!(
+                history::load_session(&session_id)
+                    .expect("renamed session")
+                    .meta
+                    .title,
+                "Release triage"
+            );
+            harness.shutdown();
+        });
+    }
+
+    #[test]
     fn hosted_tui_new_session_rejects_active_background_work() {
         with_orca_home(|_| {
             let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
@@ -4163,31 +4252,40 @@ mod tests {
     }
 
     #[test]
-    fn recovery_slash_commands_dispatch_explicit_runtime_actions() {
+    fn resume_slash_command_never_implicitly_resumes_a_recoverable_operation() {
+        with_orca_home(|_| {
+            let mut config = test_config(HistoryMode::Record);
+            let shared_config = Arc::new(Mutex::new(config.clone()));
+            let (mut state, _) = test_state();
+            let (action_tx, action_rx) = mpsc::unbounded();
+            state.recoverable_operation_id = Some(
+                orca_runtime::surface::SurfaceOperationId::try_from_bytes([
+                    0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1,
+                ])
+                .unwrap(),
+            );
+
+            handle_slash_command(
+                "/resume",
+                &mut config,
+                &shared_config,
+                &mut state,
+                &action_tx,
+            );
+
+            assert!(action_rx.try_recv().is_err());
+            assert_eq!(state.status, AppStatus::Idle);
+            assert!(matches!(
+                state.messages.last(),
+                Some(ChatMessage::System(message)) if message == "No saved conversations."
+            ));
+        });
+    }
+
+    #[test]
+    fn cancel_operation_slash_command_dispatches_explicit_runtime_action() {
         let mut config = test_config(HistoryMode::Record);
         let shared_config = Arc::new(Mutex::new(config.clone()));
-        let (mut resume_state, _) = test_state();
-        let (resume_tx, resume_rx) = mpsc::unbounded();
-        let resume_operation_id = orca_runtime::surface::SurfaceOperationId::try_from_bytes([
-            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1,
-        ])
-        .unwrap();
-        resume_state.recoverable_operation_id = Some(resume_operation_id.clone());
-
-        handle_slash_command(
-            "/resume",
-            &mut config,
-            &shared_config,
-            &mut resume_state,
-            &resume_tx,
-        );
-
-        assert!(matches!(
-            resume_rx.try_recv(),
-            Ok(UserAction::ResumeOperation { operation_id })
-                if operation_id == resume_operation_id
-        ));
-        assert_eq!(resume_state.status, AppStatus::Running);
 
         let (mut cancel_state, _) = test_state();
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
@@ -7643,6 +7741,164 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     }
                 }
             }
+            Ok(UserAction::ForkCurrentSession { title }) => {
+                match start_forked_hosted_session(
+                    &mut thread,
+                    &host,
+                    &config,
+                    &preloaded,
+                    &mcp_registry,
+                    &pending_workflow_notifications,
+                    &event_tx,
+                    title,
+                ) {
+                    Ok((_mode, session_id, title)) => {
+                        let _ = event_tx.send(TuiEvent::SessionForked { session_id, title });
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                    }
+                }
+            }
+            Ok(UserAction::RenameCurrentSession { title }) => {
+                let Some(session_id) = thread
+                    .as_ref()
+                    .and_then(RuntimeThreadHandle::session_id)
+                    .map(str::to_string)
+                else {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(
+                        "current conversation is not resumable yet".to_string(),
+                    ));
+                    continue;
+                };
+                match TuiHostActions::rename_saved_session(&session_id, &title) {
+                    Ok(()) => {
+                        let _ = event_tx.send(TuiEvent::SessionRenamed { session_id, title });
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                            "failed to rename conversation: {error}"
+                        )));
+                    }
+                }
+            }
+            Ok(UserAction::ResumeSavedSession { session_id }) => {
+                match switch_saved_hosted_session(
+                    &mut thread,
+                    &host,
+                    &config,
+                    &preloaded,
+                    &mcp_registry,
+                    &pending_workflow_notifications,
+                    &event_tx,
+                    HistoryMode::Resume(session_id),
+                    None,
+                ) {
+                    Ok(mode) => {
+                        if let Some(runtime_thread) = thread.as_ref()
+                            && let Err(error) =
+                                emit_typed_history_snapshot(runtime_thread, &mode, &event_tx)
+                        {
+                            let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                                "failed to project resumed conversation: {error}"
+                            )));
+                        }
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                    }
+                }
+            }
+            Ok(UserAction::ForkSavedSession { session_id }) => {
+                match switch_saved_hosted_session(
+                    &mut thread,
+                    &host,
+                    &config,
+                    &preloaded,
+                    &mcp_registry,
+                    &pending_workflow_notifications,
+                    &event_tx,
+                    HistoryMode::Fork(session_id),
+                    None,
+                ) {
+                    Ok(_) => {
+                        if let Some(runtime_thread) = thread.as_ref()
+                            && let (Some(fork_id), Ok(snapshot)) = (
+                                runtime_thread.session_id(),
+                                TuiSurfaceActions::new(runtime_thread.typed_surface())
+                                    .read_snapshot(),
+                            )
+                        {
+                            let _ = event_tx.send(TuiEvent::SessionForked {
+                                session_id: fork_id.to_string(),
+                                title: snapshot.thread.title.as_str().to_string(),
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                    }
+                }
+            }
+            Ok(UserAction::RenameSavedSession { session_id, title }) => {
+                match TuiHostActions::rename_saved_session(&session_id, &title) {
+                    Ok(()) => refresh_saved_session_picker(
+                        &event_tx,
+                        format!("Renamed conversation to {title}."),
+                    ),
+                    Err(error) => {
+                        let _ = event_tx.send(TuiEvent::SavedSessionActionFailed(format!(
+                            "failed to rename conversation: {error}"
+                        )));
+                    }
+                }
+            }
+            Ok(UserAction::ArchiveSavedSession { session_id }) => {
+                if thread
+                    .as_ref()
+                    .and_then(RuntimeThreadHandle::session_id)
+                    .is_some_and(|current| current == session_id)
+                {
+                    let _ = event_tx.send(TuiEvent::SavedSessionActionFailed(
+                        "cannot archive the current conversation".to_string(),
+                    ));
+                    continue;
+                }
+                match TuiHostActions::archive_saved_session(&session_id) {
+                    Ok(()) => refresh_saved_session_picker(
+                        &event_tx,
+                        "Archived saved conversation.".to_string(),
+                    ),
+                    Err(error) => {
+                        let _ = event_tx.send(TuiEvent::SavedSessionActionFailed(format!(
+                            "failed to archive conversation: {error}"
+                        )));
+                    }
+                }
+            }
+            Ok(UserAction::DeleteSavedSession { session_id }) => {
+                if thread
+                    .as_ref()
+                    .and_then(RuntimeThreadHandle::session_id)
+                    .is_some_and(|current| current == session_id)
+                {
+                    let _ = event_tx.send(TuiEvent::SavedSessionActionFailed(
+                        "cannot delete the current conversation".to_string(),
+                    ));
+                    continue;
+                }
+                match TuiHostActions::delete_saved_session(&session_id) {
+                    Ok(()) => refresh_saved_session_picker(
+                        &event_tx,
+                        "Deleted saved conversation.".to_string(),
+                    ),
+                    Err(error) => {
+                        let _ = event_tx.send(TuiEvent::SavedSessionActionFailed(format!(
+                            "failed to delete conversation: {error}"
+                        )));
+                    }
+                }
+            }
             Ok(UserAction::Submit(prompt)) => handle_hosted_submitted_turn(
                 SubmittedTurn::user(prompt),
                 &config,
@@ -8134,44 +8390,7 @@ fn start_new_hosted_session(
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<String, String> {
-    if let Some(current) = thread.as_ref() {
-        let snapshot = TuiSurfaceActions::new(current.typed_surface())
-            .read_snapshot()
-            .map_err(|error| format!("failed to inspect the current conversation: {error}"))?;
-        let has_non_terminal_task = snapshot.tasks.iter().any(|task| {
-            !matches!(
-                task.status,
-                orca_runtime::surface::SurfaceTaskStatus::Stopped
-                    | orca_runtime::surface::SurfaceTaskStatus::Completed
-                    | orca_runtime::surface::SurfaceTaskStatus::Failed
-                    | orca_runtime::surface::SurfaceTaskStatus::Cancelled
-            )
-        });
-        let has_non_terminal_workflow = snapshot.workflows.iter().any(|workflow| {
-            !matches!(
-                workflow.status,
-                orca_runtime::surface::SurfaceWorkflowStatus::Stopped
-                    | orca_runtime::surface::SurfaceWorkflowStatus::Completed
-                    | orca_runtime::surface::SurfaceWorkflowStatus::Failed
-                    | orca_runtime::surface::SurfaceWorkflowStatus::Cancelled
-            )
-        });
-        let has_active_goal = snapshot.goal.as_ref().is_some_and(|goal| {
-            matches!(goal.state, orca_runtime::surface::SurfaceGoalState::Active)
-        });
-        if snapshot.foreground_operation.is_some()
-            || !snapshot.queued_operations.is_empty()
-            || !snapshot.background_operations.is_empty()
-            || has_non_terminal_task
-            || has_non_terminal_workflow
-            || has_active_goal
-        {
-            return Err(
-                "cannot start a new conversation while the current session has active work"
-                    .to_string(),
-            );
-        }
-    }
+    ensure_current_session_switchable(thread.as_ref())?;
 
     let mut next_config = config.lock().unwrap().clone();
     next_config.history_mode = HistoryMode::Record;
@@ -8207,20 +8426,189 @@ fn start_new_hosted_session(
     Ok(session_id)
 }
 
+fn ensure_current_session_switchable(current: Option<&RuntimeThreadHandle>) -> Result<(), String> {
+    let Some(current) = current else {
+        return Ok(());
+    };
+    let snapshot = TuiSurfaceActions::new(current.typed_surface())
+        .read_snapshot()
+        .map_err(|error| format!("failed to inspect the current conversation: {error}"))?;
+    let has_non_terminal_task = snapshot.tasks.iter().any(|task| {
+        !matches!(
+            task.status,
+            orca_runtime::surface::SurfaceTaskStatus::Stopped
+                | orca_runtime::surface::SurfaceTaskStatus::Completed
+                | orca_runtime::surface::SurfaceTaskStatus::Failed
+                | orca_runtime::surface::SurfaceTaskStatus::Cancelled
+        )
+    });
+    let has_non_terminal_workflow = snapshot.workflows.iter().any(|workflow| {
+        !matches!(
+            workflow.status,
+            orca_runtime::surface::SurfaceWorkflowStatus::Stopped
+                | orca_runtime::surface::SurfaceWorkflowStatus::Completed
+                | orca_runtime::surface::SurfaceWorkflowStatus::Failed
+                | orca_runtime::surface::SurfaceWorkflowStatus::Cancelled
+        )
+    });
+    let has_active_goal = snapshot
+        .goal
+        .as_ref()
+        .is_some_and(|goal| matches!(goal.state, orca_runtime::surface::SurfaceGoalState::Active));
+    if snapshot.foreground_operation.is_some()
+        || !snapshot.queued_operations.is_empty()
+        || !snapshot.background_operations.is_empty()
+        || has_non_terminal_task
+        || has_non_terminal_workflow
+        || has_active_goal
+    {
+        return Err("current conversation has active work".to_string());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_forked_hosted_session(
+    thread: &mut Option<RuntimeThreadHandle>,
+    host: &RuntimeHostHandle,
+    config: &Arc<Mutex<RunConfig>>,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    mcp_registry: &orca_mcp::McpRegistry,
+    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    title: Option<String>,
+) -> Result<(HistoryMode, String, String), String> {
+    ensure_current_session_switchable(thread.as_ref())?;
+    let source_id = thread
+        .as_ref()
+        .and_then(RuntimeThreadHandle::session_id)
+        .ok_or_else(|| "current conversation is not resumable yet".to_string())?
+        .to_string();
+    let mode = HistoryMode::Fork(source_id);
+    let fork_title = title.unwrap_or_else(|| "Forked conversation".to_string());
+    let mut next_config = config.lock().unwrap().clone();
+    next_config.history_mode = mode.clone();
+    next_config.prompt.clear();
+    next_config.show_session_picker = false;
+    let request = RuntimeThreadStartRequest::new(next_config.clone(), fork_title.clone());
+    #[cfg(test)]
+    let request = request.with_mcp_registry(mcp_registry.clone());
+    #[cfg(not(test))]
+    let _ = mcp_registry;
+    let started = host
+        .start_thread_with_request(request)
+        .map_err(|error| format!("failed to fork conversation: {error}"))?;
+    let session_id = started
+        .session_id()
+        .ok_or_else(|| "fork did not create a resumable session".to_string())?
+        .to_string();
+
+    if let Some(current) = thread.as_ref()
+        && let Err(error) = current.shutdown()
+    {
+        let _ = started.shutdown();
+        return Err(format!(
+            "failed to close the current conversation before switching: {error}"
+        ));
+    }
+
+    *config.lock().unwrap() = next_config;
+    *preloaded.lock().unwrap() = None;
+    pending_workflow_notifications.clear();
+    announce_runtime_ready(&started, event_tx);
+    *thread = Some(started);
+    Ok((mode, session_id, fork_title))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn switch_saved_hosted_session(
+    thread: &mut Option<RuntimeThreadHandle>,
+    host: &RuntimeHostHandle,
+    config: &Arc<Mutex<RunConfig>>,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    mcp_registry: &orca_mcp::McpRegistry,
+    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    mode: HistoryMode,
+    title: Option<String>,
+) -> Result<HistoryMode, String> {
+    ensure_current_session_switchable(thread.as_ref())?;
+    let selector = match &mode {
+        HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => selector,
+        HistoryMode::Record | HistoryMode::Disabled => {
+            return Err("saved-session switch requires resume or fork mode".to_string());
+        }
+    };
+    let transcript = RuntimeSurfaceHostHandle::load_saved_session(selector)
+        .map_err(|error| format!("failed to load saved conversation: {error}"))?;
+    let switch_title = title.unwrap_or_else(|| match mode {
+        HistoryMode::Resume(_) => transcript.meta.title.clone(),
+        HistoryMode::Fork(_) => format!("Fork of {}", transcript.meta.title),
+        HistoryMode::Record | HistoryMode::Disabled => unreachable!(),
+    });
+    let mut next_config = config.lock().unwrap().clone();
+    next_config.history_mode = mode.clone();
+    next_config.prompt.clear();
+    next_config.show_session_picker = false;
+    let request = RuntimeThreadStartRequest::new(next_config.clone(), switch_title)
+        .with_preloaded(transcript);
+    #[cfg(test)]
+    let request = request.with_mcp_registry(mcp_registry.clone());
+    #[cfg(not(test))]
+    let _ = mcp_registry;
+    let started = host
+        .start_thread_with_request(request)
+        .map_err(|error| format!("failed to switch saved conversation: {error}"))?;
+
+    if let Some(current) = thread.as_ref()
+        && let Err(error) = current.shutdown()
+    {
+        let _ = started.shutdown();
+        return Err(format!(
+            "failed to close the current conversation before switching: {error}"
+        ));
+    }
+
+    *config.lock().unwrap() = next_config;
+    *preloaded.lock().unwrap() = None;
+    pending_workflow_notifications.clear();
+    announce_runtime_ready(&started, event_tx);
+    *thread = Some(started);
+    Ok(mode)
+}
+
+fn refresh_saved_session_picker(event_tx: &mpsc::Sender<TuiEvent>, notice: String) {
+    match RuntimeSurfaceHostHandle::list_saved_sessions(20) {
+        Ok(sessions) => {
+            let _ = event_tx.send(TuiEvent::SavedSessionsUpdated { sessions, notice });
+        }
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                "saved conversation changed, but the list could not be refreshed: {error}"
+            )));
+        }
+    }
+}
+
 fn announce_runtime_ready(thread: &RuntimeThreadHandle, event_tx: &mpsc::Sender<TuiEvent>) {
     let _ = event_tx.send(TuiEvent::MentionRuntimeReady(thread.typed_surface()));
     let actions = TuiSurfaceActions::new(thread.typed_surface());
-    if let Ok(Some(recovery)) = actions
-        .read_snapshot()
-        .map(|snapshot| snapshot.recoverable_user_operation())
-    {
-        let _ = event_tx.send(TuiEvent::RecoveryAvailable {
-            operation_id: recovery.operation_id().clone(),
-        });
-        let _ = event_tx.send(TuiEvent::Notice(
-            "A recoverable operation is suspended. Use /resume to continue it or /cancel-operation to close it."
-                .to_string(),
-        ));
+    if let Ok(snapshot) = actions.read_snapshot() {
+        if let Some(session_id) = thread.session_id() {
+            let _ = event_tx.send(TuiEvent::SessionIdentityUpdated {
+                session_id: session_id.to_string(),
+                title: snapshot.thread.title.as_str().to_string(),
+            });
+        }
+        if let Some(recovery) = snapshot.recoverable_user_operation() {
+            let _ = event_tx.send(TuiEvent::RecoveryAvailable {
+                operation_id: recovery.operation_id().clone(),
+            });
+            let _ = event_tx.send(TuiEvent::Notice(
+                "A recoverable operation is suspended. Use the recovery controls to continue it or /cancel-operation to close it."
+                    .to_string(),
+            ));
+        }
     }
 }
 

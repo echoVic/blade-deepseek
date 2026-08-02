@@ -38,6 +38,24 @@ impl TuiHostActions {
     pub(crate) fn save_api_key(api_key: &str) -> Result<PathBuf, String> {
         orca_runtime::surface::RuntimeSurfaceHostHandle::save_api_key(api_key)
     }
+
+    pub(crate) fn rename_saved_session(session_id: &str, title: &str) -> Result<(), String> {
+        orca_runtime::surface::RuntimeSurfaceHostHandle::rename_saved_session(session_id, title)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn archive_saved_session(session_id: &str) -> Result<(), String> {
+        orca_runtime::surface::RuntimeSurfaceHostHandle::archive_saved_session(session_id)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn delete_saved_session(session_id: &str) -> Result<(), String> {
+        orca_runtime::surface::RuntimeSurfaceHostHandle::delete_saved_session(session_id)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
 }
 
 impl TuiSurfaceActions {

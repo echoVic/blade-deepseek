@@ -25,7 +25,9 @@ use crate::syntax_highlight::highlight_code;
 use crate::theme::Theme;
 use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::{TranscriptRenderContext, viewport_paragraph};
-use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, CopyNotice, PanelMode};
+use crate::types::{
+    AppState, AppStatus, ApprovalOption, ChatMessage, CopyNotice, PanelMode, SessionPickerPhase,
+};
 use crate::workspace_status::{GitIdentity, compact_cwd};
 
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
@@ -129,9 +131,66 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         render_approval_dialog(frame, state, theme);
     }
 
+    if state.status == AppStatus::Idle && state.recovery_prompt_visible {
+        render_recovery_prompt(frame, state, theme);
+    }
+
     if state.show_shortcuts {
         render_shortcuts(frame, state, theme);
     }
+}
+
+fn render_recovery_prompt(frame: &mut Frame, state: &AppState, theme: &Theme) {
+    let area = centered_rect(frame.area(), 58, 7);
+    frame.render_widget(Clear, area);
+    let continue_style = if state.recovery_prompt_selected == 0 {
+        Style::default()
+            .fg(theme.border)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.text)
+    };
+    let cancel_style = if state.recovery_prompt_selected == 1 {
+        Style::default()
+            .fg(theme.error)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    let content = vec![
+        Line::from("A suspended operation can continue from its last checkpoint."),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                if state.recovery_prompt_selected == 0 {
+                    "> Continue"
+                } else {
+                    "  Continue"
+                },
+                continue_style,
+            ),
+            Span::raw("    "),
+            Span::styled(
+                if state.recovery_prompt_selected == 1 {
+                    "> Cancel operation"
+                } else {
+                    "  Cancel operation"
+                },
+                cancel_style,
+            ),
+        ]),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Recover Operation ")
+        .border_style(Style::default().fg(theme.border));
+    frame.render_widget(
+        Paragraph::new(content)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn main_layout(
@@ -378,8 +437,18 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
             Style::default().fg(theme.muted),
         ),
     ]));
+    let hints = match state.session_picker_phase {
+        SessionPickerPhase::Browsing => {
+            "↑↓ select · Enter resume · Tab actions · Backspace edit · Esc quit"
+        }
+        SessionPickerPhase::Actions { .. } => "↑↓ select action · Enter choose · Esc sessions",
+        SessionPickerPhase::Renaming { .. } => "Enter rename · Esc actions",
+        SessionPickerPhase::ConfirmArchive { .. } | SessionPickerPhase::ConfirmDelete { .. } => {
+            "←→ choose · Enter confirm · Esc cancel"
+        }
+    };
     lines.push(Line::from(Span::styled(
-        "↑↓ select · Enter resume · Backspace edit · Esc quit",
+        hints,
         Style::default().fg(theme.muted),
     )));
     lines.push(Line::from(""));
@@ -392,7 +461,16 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
     }
 
     let needle = state.session_picker_query.to_lowercase();
-    for &index in &filtered {
+    let visible_sessions = if state.session_picker_phase == SessionPickerPhase::Browsing {
+        filtered.clone()
+    } else {
+        filtered
+            .iter()
+            .copied()
+            .filter(|index| *index == state.session_picker_selected)
+            .collect()
+    };
+    for index in visible_sessions {
         let session = &state.session_picker_sessions[index];
         let selected = index == state.session_picker_selected;
         let marker = if selected { "> " } else { "  " };
@@ -425,8 +503,109 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
         }
     }
 
+    if let Some(error) = state.session_picker_error.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            error,
+            Style::default().fg(theme.error),
+        )));
+    }
+
+    match &state.session_picker_phase {
+        SessionPickerPhase::Browsing => {}
+        SessionPickerPhase::Actions { selected, .. } => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Session actions",
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            )));
+            for (index, label) in [
+                "Resume",
+                "Fork",
+                "Rename",
+                "Archive",
+                "Delete",
+                "Copy session ID",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let style = if index == *selected {
+                    Style::default()
+                        .fg(theme.border)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{} {label}", if index == *selected { ">" } else { " " }),
+                    style,
+                )));
+            }
+        }
+        SessionPickerPhase::Renaming { value, .. } => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("New title: ", Style::default().fg(theme.muted)),
+                Span::styled(format!("{value}_"), Style::default().fg(theme.text)),
+            ]));
+        }
+        SessionPickerPhase::ConfirmArchive {
+            title, selected, ..
+        } => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("Archive \"{title}\"?"),
+                Style::default().fg(theme.text),
+            )));
+            lines.push(confirmation_line(*selected, "Archive", theme));
+        }
+        SessionPickerPhase::ConfirmDelete {
+            title, selected, ..
+        } => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("Permanently delete \"{title}\"?"),
+                Style::default().fg(theme.error),
+            )));
+            lines.push(confirmation_line(*selected, "Delete", theme));
+        }
+    }
+
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, inner);
+}
+
+fn confirmation_line<'a>(selected: usize, confirm_label: &'a str, theme: &Theme) -> Line<'a> {
+    let cancel = if selected == 0 {
+        Style::default()
+            .fg(theme.border)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.text)
+    };
+    let confirm = if selected == 1 {
+        Style::default()
+            .fg(theme.error)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    Line::from(vec![
+        Span::styled(
+            if selected == 0 {
+                "> Cancel"
+            } else {
+                "  Cancel"
+            },
+            cancel,
+        ),
+        Span::raw("    "),
+        Span::styled(
+            format!("{} {confirm_label}", if selected == 1 { ">" } else { " " }),
+            confirm,
+        ),
+    ])
 }
 
 fn session_permission_metadata_label(session: &SessionSummary) -> Option<String> {

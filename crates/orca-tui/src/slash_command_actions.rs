@@ -1,5 +1,6 @@
 use crossbeam_channel as mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::RunConfig;
@@ -11,6 +12,7 @@ use crate::types::{AppState, AppStatus, ChatMessage, TuiMemoryScope, UserAction}
 
 pub(crate) enum SlashOutcome {
     Continue,
+    Prefill(String),
 }
 
 pub(crate) fn handle_slash_command(
@@ -181,24 +183,54 @@ pub(crate) fn handle_slash_command(
             state.enter_running();
             let _ = action_tx.send(UserAction::Compact);
         }
-        SlashCommand::Resume => {
-            if let Some(operation_id) = state.recoverable_operation_id.clone() {
+        SlashCommand::Resume => match RuntimeSurfaceHostHandle::list_saved_sessions(20) {
+            Ok(sessions) if !sessions.is_empty() => {
+                state.reset_queued_user_messages();
+                state.session_picker_sessions = sessions;
+                state.session_picker_selected = 0;
+                state.session_picker_phase = crate::types::SessionPickerPhase::Browsing;
+                state.session_picker_error = None;
+                state.status = AppStatus::SessionPicker;
+            }
+            Ok(_) => state.push_message(ChatMessage::System("No saved conversations.".to_string())),
+            Err(error) => state.push_message(ChatMessage::Error(format!(
+                "failed to list saved conversations: {error}"
+            ))),
+        },
+        SlashCommand::Fork(title) => {
+            if state.status == AppStatus::Idle {
                 state.enter_running();
-                let _ = action_tx.send(UserAction::ResumeOperation { operation_id });
+                let _ = action_tx.send(UserAction::ForkCurrentSession { title });
             } else {
-                match RuntimeSurfaceHostHandle::list_saved_sessions(20) {
-                    Ok(sessions) if !sessions.is_empty() => {
-                        state.reset_queued_user_messages();
-                        state.session_picker_sessions = sessions;
-                        state.session_picker_selected = 0;
-                        state.status = AppStatus::SessionPicker;
-                    }
-                    Ok(_) => state
-                        .push_message(ChatMessage::System("No saved conversations.".to_string())),
-                    Err(error) => state.push_message(ChatMessage::Error(format!(
-                        "failed to list saved conversations: {error}"
-                    ))),
-                }
+                state.push_message(ChatMessage::Error(
+                    "finish or cancel the current work before forking this conversation"
+                        .to_string(),
+                ));
+            }
+        }
+        SlashCommand::Rename(None) => return Some(SlashOutcome::Prefill("/rename ".to_string())),
+        SlashCommand::Rename(Some(title)) => {
+            state.enter_running();
+            let _ = action_tx.send(UserAction::RenameCurrentSession { title });
+        }
+        SlashCommand::Status => {
+            state.push_message(ChatMessage::System(format_status(state, config)));
+        }
+        SlashCommand::Copy(argument) => {
+            let position = match argument.as_deref() {
+                None => Some(1),
+                Some(value) => value.parse::<usize>().ok().filter(|value| *value > 0),
+            };
+            match position.and_then(|position| {
+                state
+                    .nth_final_assistant_response(position)
+                    .map(str::to_string)
+            }) {
+                Some(text) => state.stage_clipboard_copy(text, Instant::now()),
+                None => state.push_message(ChatMessage::Error(
+                    "usage: /copy [N], where N selects a completed assistant response from newest to oldest"
+                        .to_string(),
+                )),
             }
         }
         SlashCommand::CancelOperation => {
@@ -250,6 +282,64 @@ pub(crate) fn handle_slash_command(
     }
     state.scroll_to_bottom();
     Some(SlashOutcome::Continue)
+}
+
+fn format_status(state: &AppState, config: &RunConfig) -> String {
+    let session_id = state.current_session_id.as_deref().unwrap_or("-");
+    let title = state.current_session_title.as_deref().unwrap_or("-");
+    let context = if state.context_limit_tokens == 0 {
+        "-".to_string()
+    } else {
+        format!(
+            "{} / {}",
+            state.context_used_tokens, state.context_limit_tokens
+        )
+    };
+    let active_tasks = state
+        .workflow_panel
+        .tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.status,
+                orca_core::task_types::TaskStatus::Queued
+                    | orca_core::task_types::TaskStatus::Running
+                    | orca_core::task_types::TaskStatus::Paused
+                    | orca_core::task_types::TaskStatus::Stopping
+                    | orca_core::task_types::TaskStatus::ApprovalRequired
+            )
+        })
+        .count();
+    let goal = state.current_goal.as_ref().map_or("-", |goal| {
+        orca_core::goal_types::goal_status_label(goal.status)
+    });
+    format!(
+        "Session status\n\
+         title: {title}\n\
+         id: {session_id}\n\
+         model: {} ({})\n\
+         mode: {}\n\
+         cwd: {}\n\
+         context: {context}\n\
+         usage: {} input, {} output, {} cache\n\
+         cost: ${:.6}\n\
+         goal: {goal}\n\
+         active tasks: {active_tasks}\n\
+         recoverable: {}",
+        state.model_name,
+        state.reasoning_effort.as_str(),
+        config.approval_mode.as_str(),
+        state.cwd,
+        state.usage.input_tokens,
+        state.usage.output_tokens,
+        state.usage.cache_tokens,
+        state.usage.estimated_cost_usd,
+        if state.recoverable_operation_id.is_some() {
+            "yes"
+        } else {
+            "no"
+        },
+    )
 }
 
 pub(crate) fn parse_approval_mode(mode: &str) -> Option<ApprovalMode> {
@@ -324,6 +414,17 @@ pub(crate) fn decode_settings_intent(value: &str) -> Option<SettingsIntent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_run_config;
+
+    fn state() -> AppState {
+        let (action_tx, _) = mpsc::unbounded();
+        AppState::new(
+            action_tx,
+            "test".to_string(),
+            "deepseek-v4-pro".to_string(),
+            "/tmp/project".to_string(),
+        )
+    }
 
     #[test]
     fn low_reasoning_effort_round_trips_through_settings_intent() {
@@ -339,5 +440,145 @@ mod tests {
             decoded.reasoning_effort,
             Some(orca_core::config::ReasoningEffort::Low)
         );
+    }
+
+    #[test]
+    fn copy_slash_command_stages_nth_final_response() {
+        let mut state = state();
+        state.push_message(ChatMessage::Assistant("older".to_string()));
+        state.push_message(ChatMessage::AssistantChunk {
+            text: "unfinished".to_string(),
+            trailing_blank: false,
+        });
+        state.push_message(ChatMessage::Assistant("latest".to_string()));
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, _) = mpsc::unbounded();
+
+        handle_slash_command("/copy 2", &mut config, &shared, &mut state, &action_tx);
+
+        assert_eq!(state.pending_clipboard_copy.as_deref(), Some("older"));
+    }
+
+    #[test]
+    fn copy_slash_command_rejects_invalid_or_missing_indices() {
+        for command in ["/copy 0", "/copy nope", "/copy 2"] {
+            let mut state = state();
+            state.push_message(ChatMessage::Assistant("only".to_string()));
+            let mut config = test_run_config();
+            let shared = Arc::new(Mutex::new(config.clone()));
+            let (action_tx, _) = mpsc::unbounded();
+
+            handle_slash_command(command, &mut config, &shared, &mut state, &action_tx);
+
+            assert!(state.pending_clipboard_copy.is_none(), "accepted {command}");
+            assert!(matches!(state.messages.last(), Some(ChatMessage::Error(_))));
+        }
+    }
+
+    #[test]
+    fn status_slash_command_reports_session_snapshot() {
+        let mut state = state();
+        state.current_session_id = Some("session-1".to_string());
+        state.current_session_title = Some("Release triage".to_string());
+        state.context_used_tokens = 250;
+        state.context_limit_tokens = 1_000;
+        state.usage.input_tokens = 100;
+        state.usage.output_tokens = 50;
+        state.usage.cache_tokens = 25;
+        state.usage.estimated_cost_usd = 0.125;
+        state.recoverable_operation_id = Some(
+            orca_runtime::surface::SurfaceOperationId::try_from_bytes([
+                0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 3,
+            ])
+            .unwrap(),
+        );
+        let mut config = test_run_config();
+        config.approval_mode = ApprovalMode::Plan;
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, _) = mpsc::unbounded();
+
+        handle_slash_command("/status", &mut config, &shared, &mut state, &action_tx);
+
+        let Some(ChatMessage::System(status)) = state.messages.last() else {
+            panic!("status output was not appended");
+        };
+        for expected in [
+            "Release triage",
+            "session-1",
+            "deepseek-v4-pro",
+            "plan",
+            "/tmp/project",
+            "250 / 1000",
+            "100 input, 50 output, 25 cache",
+            "$0.125000",
+            "recoverable: yes",
+        ] {
+            assert!(status.contains(expected), "missing {expected}: {status}");
+        }
+    }
+
+    #[test]
+    fn fork_slash_command_dispatches_typed_action_only_while_idle() {
+        for (status, should_dispatch) in [(AppStatus::Idle, true), (AppStatus::Running, false)] {
+            let mut state = state();
+            state.status = status;
+            let mut config = test_run_config();
+            let shared = Arc::new(Mutex::new(config.clone()));
+            let (action_tx, action_rx) = mpsc::unbounded();
+
+            handle_slash_command(
+                "/fork auth experiment",
+                &mut config,
+                &shared,
+                &mut state,
+                &action_tx,
+            );
+
+            if should_dispatch {
+                assert!(matches!(
+                    action_rx.try_recv(),
+                    Ok(UserAction::ForkCurrentSession { title: Some(title) })
+                        if title == "auth experiment"
+                ));
+                assert_eq!(state.status, AppStatus::Running);
+            } else {
+                assert!(action_rx.try_recv().is_err());
+                assert!(matches!(state.messages.last(), Some(ChatMessage::Error(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn rename_slash_command_prefills_or_dispatches_typed_action() {
+        let mut state = state();
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::unbounded();
+
+        assert!(matches!(
+            handle_slash_command(
+                "/rename",
+                &mut config,
+                &shared,
+                &mut state,
+                &action_tx,
+            ),
+            Some(SlashOutcome::Prefill(value)) if value == "/rename "
+        ));
+        assert!(action_rx.try_recv().is_err());
+
+        handle_slash_command(
+            "/rename release triage",
+            &mut config,
+            &shared,
+            &mut state,
+            &action_tx,
+        );
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::RenameCurrentSession { title }) if title == "release triage"
+        ));
+        assert_eq!(state.status, AppStatus::Running);
     }
 }

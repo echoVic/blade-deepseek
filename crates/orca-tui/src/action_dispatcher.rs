@@ -258,6 +258,13 @@ fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
             });
         }
         UserAction::NewSession
+        | UserAction::ForkCurrentSession { .. }
+        | UserAction::RenameCurrentSession { .. }
+        | UserAction::ResumeSavedSession { .. }
+        | UserAction::ForkSavedSession { .. }
+        | UserAction::RenameSavedSession { .. }
+        | UserAction::ArchiveSavedSession { .. }
+        | UserAction::DeleteSavedSession { .. }
         | UserAction::SubmitWorkflowNotification(_)
         | UserAction::RunWorkflow { .. }
         | UserAction::Compact

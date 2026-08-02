@@ -5,7 +5,9 @@ use tui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
 
-use crate::composer_textarea::{expand_pending_pastes, make_textarea, textarea_text};
+use crate::composer_textarea::{
+    expand_pending_pastes, make_textarea, make_textarea_with_text, textarea_text,
+};
 use crate::slash_command_actions::{SlashOutcome, handle_slash_command};
 use crate::theme::Theme;
 use crate::types::{
@@ -40,6 +42,12 @@ pub(crate) fn handle_idle_submit(
                 state.pending_pastes.clear();
                 state.mention_bindings.clear();
                 reset_composer_after_submit(textarea, vim_state, theme);
+                return true;
+            }
+            SlashOutcome::Prefill(value) => {
+                state.pending_pastes.clear();
+                state.mention_bindings.clear();
+                *textarea = make_textarea_with_text(&value, vim_state, theme);
                 return true;
             }
         }

@@ -266,9 +266,11 @@ fn select_slash_menu_command(
                     SlashOutcome::Continue => {
                         *textarea = make_textarea(vim_state, theme);
                     }
+                    SlashOutcome::Prefill(value) => {
+                        *textarea = make_textarea_with_text(&value, vim_state, theme);
+                    }
                 }
             }
-            *textarea = make_textarea(vim_state, theme);
         }
     }
 }

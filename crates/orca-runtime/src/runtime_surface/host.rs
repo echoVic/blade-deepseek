@@ -61,6 +61,18 @@ impl RuntimeSurfaceHostHandle {
         crate::history::load_session(selector)
     }
 
+    pub fn rename_saved_session(selector: &str, title: &str) -> std::io::Result<PathBuf> {
+        crate::history::rename_session(selector, title)
+    }
+
+    pub fn archive_saved_session(selector: &str) -> std::io::Result<PathBuf> {
+        crate::history::archive_session(selector)
+    }
+
+    pub fn delete_saved_session(selector: &str) -> std::io::Result<PathBuf> {
+        crate::history::delete_session(selector)
+    }
+
     pub fn folder_is_trusted(path: &Path) -> bool {
         orca_core::config::folder_trust::is_trusted(path)
     }

@@ -4,6 +4,10 @@ pub enum SlashCommand {
     Model(Option<String>),
     Compact,
     Resume,
+    Fork(Option<String>),
+    Rename(Option<String>),
+    Status,
+    Copy(Option<String>),
     CancelOperation,
     Cost,
     ConfigShow,
@@ -92,6 +96,10 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
         )),
         "compact" => Some(SlashCommand::Compact),
         "resume" => Some(SlashCommand::Resume),
+        "fork" => Some(SlashCommand::Fork(optional_argument(parts))),
+        "rename" => Some(SlashCommand::Rename(optional_argument(parts))),
+        "status" if parts.next().is_none() => Some(SlashCommand::Status),
+        "copy" => Some(SlashCommand::Copy(optional_argument(parts))),
         "cancel-operation" => Some(SlashCommand::CancelOperation),
         "cost" => Some(SlashCommand::Cost),
         "config" if parts.next() == Some("show") => Some(SlashCommand::ConfigShow),
@@ -139,6 +147,10 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/model", "Switch model and reasoning effort"),
         ("/compact", "Compress conversation context"),
         ("/resume", "Resume a saved conversation"),
+        ("/fork", "Fork this conversation"),
+        ("/rename", "Rename this conversation"),
+        ("/status", "Show session status"),
+        ("/copy", "Copy an assistant response"),
         ("/cancel-operation", "Cancel a recoverable operation"),
         ("/cost", "Show session cost"),
         ("/config show", "Show merged config"),
@@ -152,6 +164,11 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/remember", "Save a note to memory"),
         ("/trust", "Manage folder trust for the OS sandbox"),
     ]
+}
+
+fn optional_argument<'a>(parts: impl Iterator<Item = &'a str>) -> Option<String> {
+    let argument = parts.collect::<Vec<_>>().join(" ");
+    (!argument.is_empty()).then_some(argument)
 }
 
 pub fn available_commands(cwd: &Path) -> Vec<(String, String)> {
@@ -347,6 +364,38 @@ mod tests {
             parse("/cancel-operation"),
             Some(SlashCommand::CancelOperation)
         );
+    }
+
+    #[test]
+    fn parses_session_lifecycle_commands_with_optional_arguments() {
+        assert_eq!(parse("/fork"), Some(SlashCommand::Fork(None)));
+        assert_eq!(
+            parse("/fork auth experiment"),
+            Some(SlashCommand::Fork(Some("auth experiment".to_string())))
+        );
+        assert_eq!(parse("/rename"), Some(SlashCommand::Rename(None)));
+        assert_eq!(
+            parse("/rename release triage"),
+            Some(SlashCommand::Rename(Some("release triage".to_string())))
+        );
+        assert_eq!(parse("/status"), Some(SlashCommand::Status));
+        assert_eq!(parse("/copy"), Some(SlashCommand::Copy(None)));
+        assert_eq!(
+            parse("/copy 2"),
+            Some(SlashCommand::Copy(Some("2".to_string())))
+        );
+    }
+
+    #[test]
+    fn slash_menu_exposes_the_public_session_lifecycle_commands() {
+        let command_names = all_commands()
+            .iter()
+            .map(|(command, _)| *command)
+            .collect::<Vec<_>>();
+
+        for command in ["/fork", "/rename", "/status", "/copy"] {
+            assert!(command_names.contains(&command), "missing {command}");
+        }
     }
 
     #[test]

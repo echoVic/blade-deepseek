@@ -2,7 +2,7 @@ use crossbeam_channel as mpsc;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use crossterm::event::{Event, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent};
 use tui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
@@ -32,7 +32,7 @@ pub(crate) fn handle_status_key<F>(
     config: &mut RunConfig,
     shared_config: &Arc<Mutex<RunConfig>>,
     action_tx: &mpsc::Sender<UserAction>,
-    preloaded_transcript: &Arc<Mutex<Option<SessionTranscript>>>,
+    _preloaded_transcript: &Arc<Mutex<Option<SessionTranscript>>>,
     textarea: &mut TextArea,
     vim_state: &mut VimState,
     theme: &Theme,
@@ -63,20 +63,19 @@ where
 
     if state.status == AppStatus::SessionPicker {
         vim_state.cancel_pending_command();
-        handle_session_picker_key(
-            key,
-            state,
-            config,
-            shared_config,
-            preloaded_transcript,
-            clear_terminal,
-        )?;
+        handle_session_picker_key(key, state, action_tx, clear_terminal)?;
         return Ok(StatusKeyFlow::Continue);
     }
 
     if state.status == AppStatus::WaitingApproval {
         vim_state.cancel_pending_command();
         handle_approval_dialog_key(key, state, action_tx);
+        return Ok(StatusKeyFlow::Continue);
+    }
+
+    if state.status == AppStatus::Idle && state.recovery_prompt_visible {
+        vim_state.cancel_pending_command();
+        handle_recovery_prompt_key(key, state, action_tx);
         return Ok(StatusKeyFlow::Continue);
     }
 
@@ -138,6 +137,33 @@ where
     }
 
     Ok(StatusKeyFlow::Continue)
+}
+
+fn handle_recovery_prompt_key(
+    key: &KeyEvent,
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+) {
+    match key.code {
+        KeyCode::Left | KeyCode::Up => state.recovery_prompt_selected = 0,
+        KeyCode::Right | KeyCode::Down => state.recovery_prompt_selected = 1,
+        KeyCode::Enter => {
+            let Some(operation_id) = state.recoverable_operation_id.clone() else {
+                state.recovery_prompt_visible = false;
+                return;
+            };
+            let action = if state.recovery_prompt_selected == 0 {
+                UserAction::ResumeOperation { operation_id }
+            } else {
+                UserAction::CancelOperation { operation_id }
+            };
+            state.recovery_prompt_visible = false;
+            state.enter_running();
+            let _ = action_tx.send(action);
+        }
+        KeyCode::Esc => state.recovery_prompt_visible = false,
+        _ => {}
+    }
 }
 
 fn compacting_shortcut_allowed(shortcut: RunningShortcut) -> bool {
@@ -804,6 +830,76 @@ mod tests {
         assert!(matches!(flow, StatusKeyFlow::Continue));
         assert_eq!(state.status, AppStatus::Running);
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+    }
+
+    #[test]
+    fn recoverable_operation_uses_explicit_interaction() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let operation_id = orca_runtime::surface::SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 4,
+        ])
+        .unwrap();
+        state.update(crate::types::TuiEvent::RecoveryAvailable {
+            operation_id: operation_id.clone(),
+        });
+        let mut config = config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let mut textarea = TextArea::default();
+        let mut vim = VimState::new(false);
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        press_status_key(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        press_status_key(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::CancelOperation { operation_id: selected })
+                if selected == operation_id
+        ));
+        assert_eq!(state.status, AppStatus::Running);
+        assert!(!state.recovery_prompt_visible);
+
+        state.set_status(AppStatus::Idle);
+        state.recovery_prompt_visible = true;
+        press_status_key(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert!(!state.recovery_prompt_visible);
+        assert_eq!(state.recoverable_operation_id, Some(operation_id));
     }
 
     #[test]

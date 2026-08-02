@@ -54,17 +54,24 @@ orca                                      # open the TUI
 orca exec "fix the failing test"          # run headlessly
 orca exec --verifier "cargo test" "fix it" # verify before finishing
 orca --mode=acp                           # connect an ACP client
+orca --resume [SESSION_ID]                # resume a saved conversation
+orca --fork SESSION_ID                    # fork a saved conversation
 ```
 
 On Windows PowerShell, set the key with `$env:DEEPSEEK_API_KEY = "sk-..."`;
 the `orca` commands are the same.
 
-In the TUI, `@` searches files, skills, plugins, and MCP resources. Use `/new`
-to start a fresh recorded conversation (`/clear` is an alias), `/resume` to
-reopen a saved conversation, `/plan` for read-only planning, `/goal` for a
-persistent objective, `/workflows` for background work, and `/trust` to manage
-the current folder's sandbox permissions. `Ctrl+L` clears only the displayed
-transcript and terminal scrollback; it keeps the current conversation context.
+In the TUI, `@` searches files, skills, plugins, and MCP resources. Session
+commands are `/new`, `/resume`, `/fork [name]`, `/rename [name]`, `/status`,
+and `/copy [N]`. The resume picker also supports fork, rename, archive, delete,
+and copying a session ID. `/history` is retired; `/clear` remains a hidden
+compatibility alias for `/new`. `Ctrl+L` clears only the displayed transcript
+and terminal scrollback, keeping the current conversation context. On exit,
+Orca prints the exact `orca --resume <SESSION_ID>` command for the session.
+
+Use `/plan` for read-only planning, `/goal` for a persistent objective,
+`/workflows` for background work, and `/trust` to manage the current folder's
+sandbox permissions.
 
 ## What it does
 

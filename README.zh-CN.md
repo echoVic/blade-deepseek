@@ -52,12 +52,20 @@ orca                                      # 打开 TUI
 orca exec "修复失败的测试"                 # 无界面运行
 orca exec --verifier "cargo test" "修复它" # 完成前执行验证
 orca --mode=acp                           # 连接 ACP 客户端
+orca --resume [SESSION_ID]                # 恢复保存的会话
+orca --fork SESSION_ID                    # 分叉保存的会话
 ```
 
 Windows PowerShell 使用 `$env:DEEPSEEK_API_KEY = "sk-..."` 设置密钥；
 后续 `orca` 命令相同。
 
-在 TUI 中，`@` 可以搜索文件、Skills、Plugins 和 MCP Resources。
+在 TUI 中，`@` 可以搜索文件、Skills、Plugins 和 MCP Resources。会话指令包括
+`/new`、`/resume`、`/fork [名称]`、`/rename [名称]`、`/status` 和
+`/copy [N]`。`/resume` 选择器还可以分叉、重命名、归档、删除会话和复制
+Session ID。`/history` 已移除；`/clear` 仅作为 `/new` 的隐藏兼容别名保留。
+`Ctrl+L` 只清除屏幕内容和终端回滚区，不会清除当前会话上下文。退出 TUI 时，
+Orca 会输出准确的 `orca --resume <SESSION_ID>` 恢复命令。
+
 使用 `/plan` 进行只读规划，使用 `/goal` 管理持久目标，使用 `/workflows`
 查看后台任务，使用 `/trust` 管理当前目录的沙箱权限。
 

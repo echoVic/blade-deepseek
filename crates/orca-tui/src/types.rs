@@ -398,6 +398,23 @@ pub enum TuiEvent {
     NewSessionStarted {
         session_id: String,
     },
+    SessionIdentityUpdated {
+        session_id: String,
+        title: String,
+    },
+    SessionRenamed {
+        session_id: String,
+        title: String,
+    },
+    SessionForked {
+        session_id: String,
+        title: String,
+    },
+    SavedSessionsUpdated {
+        sessions: Vec<SessionSummary>,
+        notice: String,
+    },
+    SavedSessionActionFailed(String),
     Notice(String),
     MentionSearchDirty {
         generation: SessionGeneration,
@@ -455,6 +472,28 @@ pub enum TuiMemoryScope {
 #[derive(Debug, Clone)]
 pub enum UserAction {
     NewSession,
+    ForkCurrentSession {
+        title: Option<String>,
+    },
+    RenameCurrentSession {
+        title: String,
+    },
+    ResumeSavedSession {
+        session_id: String,
+    },
+    ForkSavedSession {
+        session_id: String,
+    },
+    RenameSavedSession {
+        session_id: String,
+        title: String,
+    },
+    ArchiveSavedSession {
+        session_id: String,
+    },
+    DeleteSavedSession {
+        session_id: String,
+    },
     Submit(String),
     SubmitWithMentions {
         prompt: String,
@@ -517,6 +556,29 @@ pub enum AppStatus {
     Compacting,
     WaitingApproval,
     WaitingUserInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionPickerPhase {
+    Browsing,
+    Actions {
+        session_id: String,
+        selected: usize,
+    },
+    Renaming {
+        session_id: String,
+        value: String,
+    },
+    ConfirmArchive {
+        session_id: String,
+        title: String,
+        selected: usize,
+    },
+    ConfirmDelete {
+        session_id: String,
+        title: String,
+        selected: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -781,6 +843,8 @@ pub struct AppState {
     pub reasoning_effort: orca_core::config::ReasoningEffort,
     pub approval_mode: ApprovalMode,
     pub cwd: String,
+    pub current_session_id: Option<String>,
+    pub current_session_title: Option<String>,
     pub(crate) workspace_git: Option<GitIdentity>,
     #[allow(dead_code)]
     pub event_tx: mpsc::Sender<UserAction>,
@@ -805,6 +869,8 @@ pub struct AppState {
     pub session_picker_sessions: Vec<SessionSummary>,
     pub session_picker_selected: usize,
     pub session_picker_query: String,
+    pub session_picker_phase: SessionPickerPhase,
+    pub session_picker_error: Option<String>,
     pub usage: UsageTotals,
     pub context_used_tokens: usize,
     pub context_limit_tokens: usize,
@@ -820,6 +886,8 @@ pub struct AppState {
     pub plan_update_failed: bool,
     pub current_goal: Option<ThreadGoal>,
     pub recoverable_operation_id: Option<SurfaceOperationId>,
+    pub recovery_prompt_visible: bool,
+    pub recovery_prompt_selected: usize,
     pub panel_mode: PanelMode,
     pub workflow_panel: WorkflowPanelState,
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
@@ -936,6 +1004,8 @@ impl AppState {
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             approval_mode: ApprovalMode::default(),
             cwd,
+            current_session_id: None,
+            current_session_title: None,
             workspace_git: None,
             event_tx,
             approval_dialog: None,
@@ -957,6 +1027,8 @@ impl AppState {
             session_picker_sessions: Vec::new(),
             session_picker_selected: 0,
             session_picker_query: String::new(),
+            session_picker_phase: SessionPickerPhase::Browsing,
+            session_picker_error: None,
             usage: UsageTotals::default(),
             context_used_tokens: 0,
             context_limit_tokens: 0,
@@ -970,6 +1042,8 @@ impl AppState {
             plan_update_failed: false,
             current_goal: None,
             recoverable_operation_id: None,
+            recovery_prompt_visible: false,
+            recovery_prompt_selected: 0,
             panel_mode: PanelMode::Conversation,
             workflow_panel: WorkflowPanelState::default(),
             pending_workflow_notifications: VecDeque::new(),
@@ -2214,6 +2288,20 @@ impl AppState {
             .map(|session| session.session_id.clone())
     }
 
+    pub fn nth_final_assistant_response(&self, position: usize) -> Option<&str> {
+        if position == 0 {
+            return None;
+        }
+        self.messages
+            .iter()
+            .rev()
+            .filter_map(|message| match message {
+                ChatMessage::Assistant(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .nth(position - 1)
+    }
+
     /// Allowlist key for a tool alone.
     pub fn approval_key_tool(tool: &str) -> String {
         tool.to_string()
@@ -2243,13 +2331,16 @@ impl AppState {
 
     pub fn update(&mut self, event: TuiEvent) {
         match event {
-            TuiEvent::NewSessionStarted { .. } => {
+            TuiEvent::NewSessionStarted { session_id } => {
+                self.current_session_id = Some(session_id);
+                self.current_session_title = Some("New conversation".to_string());
                 self.clear_messages();
                 self.current_plan = None;
                 self.proposed_plan_parser = ProposedPlanStreamParser::default();
                 self.plan_update_failed = false;
                 self.current_goal = None;
                 self.recoverable_operation_id = None;
+                self.recovery_prompt_visible = false;
                 self.usage = UsageTotals::default();
                 self.context_used_tokens = 0;
                 self.context_limit_tokens = 0;
@@ -2259,6 +2350,8 @@ impl AppState {
                 self.session_picker_sessions.clear();
                 self.session_picker_selected = 0;
                 self.session_picker_query.clear();
+                self.session_picker_phase = SessionPickerPhase::Browsing;
+                self.session_picker_error = None;
                 self.slash_menu = None;
                 self.mention = MentionPopupState::default();
                 self.mention_bindings.clear();
@@ -2277,6 +2370,39 @@ impl AppState {
                 self.scroll_offset = 0;
                 self.auto_scroll = true;
                 self.set_status(AppStatus::Idle);
+            }
+            TuiEvent::SessionIdentityUpdated { session_id, title } => {
+                self.current_session_id = Some(session_id);
+                self.current_session_title = Some(title);
+            }
+            TuiEvent::SessionRenamed { session_id, title } => {
+                self.current_session_id = Some(session_id);
+                self.current_session_title = Some(title.clone());
+                self.push_message(ChatMessage::System(format!(
+                    "Renamed conversation to {title}."
+                )));
+                self.set_status(AppStatus::Idle);
+            }
+            TuiEvent::SessionForked { session_id, title } => {
+                self.current_session_id = Some(session_id);
+                self.current_session_title = Some(title.clone());
+                self.push_message(ChatMessage::System(format!(
+                    "Forked conversation as {title}."
+                )));
+                self.set_status(AppStatus::Idle);
+            }
+            TuiEvent::SavedSessionsUpdated { sessions, notice } => {
+                self.session_picker_sessions = sessions;
+                self.reset_session_selection_to_first_match();
+                self.session_picker_phase = SessionPickerPhase::Browsing;
+                self.session_picker_error = None;
+                self.push_message(ChatMessage::System(notice));
+                self.set_status(AppStatus::SessionPicker);
+            }
+            TuiEvent::SavedSessionActionFailed(message) => {
+                self.session_picker_error = Some(message);
+                self.session_picker_phase = SessionPickerPhase::Browsing;
+                self.set_status(AppStatus::SessionPicker);
             }
             TuiEvent::HistoryLoaded {
                 messages,
@@ -2777,6 +2903,8 @@ impl AppState {
             }
             TuiEvent::RecoveryAvailable { operation_id } => {
                 self.recoverable_operation_id = Some(operation_id);
+                self.recovery_prompt_visible = true;
+                self.recovery_prompt_selected = 0;
             }
             TuiEvent::MentionSearchDirty { .. }
             | TuiEvent::MentionCatalogDirty { .. }
@@ -2815,6 +2943,7 @@ impl AppState {
             }
             TuiEvent::SessionCompleted { status } => {
                 self.recoverable_operation_id = None;
+                self.recovery_prompt_visible = false;
                 let was_backgrounded = self.suppress_background_main_session_output;
                 self.suppress_background_main_session_output = false;
                 self.approval_dialog = None;
@@ -3931,6 +4060,38 @@ mod tests {
         assert!(state.copy_notice.is_none());
         assert!(state.last_left_click.is_none());
         assert!(!state.composer_mouse_selecting);
+    }
+
+    #[test]
+    fn session_identity_updates_current_projection() {
+        let mut state = state();
+
+        state.update(TuiEvent::SessionIdentityUpdated {
+            session_id: "session-1".to_string(),
+            title: "Auth investigation".to_string(),
+        });
+
+        assert_eq!(state.current_session_id.as_deref(), Some("session-1"));
+        assert_eq!(
+            state.current_session_title.as_deref(),
+            Some("Auth investigation")
+        );
+    }
+
+    #[test]
+    fn nth_final_assistant_response_ignores_streaming_chunks() {
+        let mut state = state();
+        state.push_message(ChatMessage::Assistant("older".to_string()));
+        state.push_message(ChatMessage::AssistantChunk {
+            text: "unfinished".to_string(),
+            trailing_blank: false,
+        });
+        state.push_message(ChatMessage::Assistant("latest".to_string()));
+
+        assert_eq!(state.nth_final_assistant_response(1), Some("latest"));
+        assert_eq!(state.nth_final_assistant_response(2), Some("older"));
+        assert_eq!(state.nth_final_assistant_response(0), None);
+        assert_eq!(state.nth_final_assistant_response(3), None);
     }
 
     fn session(id: &str, title: &str) -> SessionSummary {

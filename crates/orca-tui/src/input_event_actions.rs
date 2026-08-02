@@ -9,7 +9,7 @@ use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{insert_composer_paste, insert_pasted_text};
 use crate::selection::{SelectionGranularity, TranscriptSelection};
 use crate::terminal_presentation::TerminalPresentation;
-use crate::types::{AppState, AppStatus, PanelMode};
+use crate::types::{AppState, AppStatus, PanelMode, SessionPickerPhase};
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum BatchedInputEvent {
@@ -234,6 +234,9 @@ pub(crate) fn handle_scroll_lines(state: &mut AppState, lines: i32, now: Instant
     // The wheel drives whichever list currently has focus: the session
     // picker, an open popup menu, the workflows panel — or the transcript.
     if state.status == AppStatus::SessionPicker {
+        if state.session_picker_phase != SessionPickerPhase::Browsing {
+            return;
+        }
         for _ in 0..steps {
             if upward {
                 state.select_previous_session();
@@ -384,6 +387,9 @@ pub(crate) fn handle_mouse_event(
 
             // Session picker: click selects, click on the selection resumes.
             if state.status == AppStatus::SessionPicker {
+                if state.session_picker_phase != SessionPickerPhase::Browsing {
+                    return MouseFlow::Handled;
+                }
                 if let Some(index) = crate::ui::session_picker_hit_index(state, mouse.row) {
                     if state.session_picker_selected == index {
                         return MouseFlow::SyntheticEnter;

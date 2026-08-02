@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.1":
+        "Orca now has a complete session lifecycle in the TUI. /resume is the single saved-session entry point, with resume, fork, rename, archive, delete and session-ID copy actions in one picker. /new starts a clean conversation, /fork preserves the current context in a new durable session, /rename updates the active session, /status reports the current runtime state and /copy copies a finalized assistant response. Recoverable operations use an explicit Continue or Cancel prompt, and exit prints the exact orca --resume command for returning later.",
       "v0.3.0":
         "Orca now ships native Windows x64 and ARM64 support across the CLI, TUI, shell sessions, sandboxing, updates, persistence, npm packages and GitHub release archives. PowerShell 7, Windows PowerShell and cmd.exe resolve through explicit dialect-aware commands; ConPTY provides interactive terminal sessions; AltGr input, clipboard access, process-tree cleanup, atomic replacement and cross-process locks follow Windows semantics. The PowerShell installer verifies checksums, installs the runtime plus sandbox helpers and can provision, repair or remove the per-workspace sandbox capability. Native x64 and ARM64 CI run the platform contracts and full workspace tests before release.",
       "v0.2.56":
@@ -558,6 +560,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.1":
+        "Orca 的 TUI 现在具备完整的会话生命周期交互。/resume 是唯一的已保存会话入口，同一个选择器内支持恢复、分叉、重命名、归档、删除和复制 Session ID；/new 开启空白会话，/fork 将当前上下文复制到新的持久化会话，/rename 修改当前会话名称，/status 查看运行状态，/copy 复制已完成的 Assistant 回复。可恢复任务改为显式 Continue 或 Cancel，退出时会打印可直接返回当前会话的 orca --resume 命令。",
       "v0.3.0":
         "Orca 现在原生支持 Windows x64 与 ARM64，覆盖 CLI、TUI、Shell Session、沙箱、更新、持久化、npm 包和 GitHub Release。PowerShell 7、Windows PowerShell 与 cmd.exe 使用各自的命令方言，ConPTY 提供交互终端，AltGr 输入、剪贴板、进程树清理、原子替换和跨进程锁按 Windows 语义实现。PowerShell 安装器会校验 checksum，安装主程序与沙箱 helper，并支持配置、修复或移除按工作区绑定的沙箱 capability。发布前由原生 x64 和 ARM64 runner 执行平台契约与完整工作区测试。",
       "v0.2.56":
