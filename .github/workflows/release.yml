@@ -400,7 +400,7 @@ jobs:
             -InstallDir (Join-Path $root "bin") `
             -NonInteractive
       - name: Smoke the installed native Windows runner and sandbox lifecycle
-        shell: powershell
+        shell: pwsh
         run: |
           $root = Join-Path $env:RUNNER_TEMP "orca-native-helper-smoke"
           $installDir = Join-Path (Join-Path $env:RUNNER_TEMP "orca-installer-smoke") "bin"
@@ -421,6 +421,7 @@ jobs:
             $psi.RedirectStandardInput = $true
             $psi.RedirectStandardOutput = $true
             $psi.UseShellExecute = $false
+            $psi.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
             $proc = [System.Diagnostics.Process]::Start($psi)
             $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes("$Json`n")
             $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
