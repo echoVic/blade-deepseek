@@ -189,6 +189,7 @@ impl<'a> RuntimeTurnRequestContext<'a> {
             subagent_depth: self.turn_context.subagent_depth,
             emit_deltas: self.turn_context.emit_deltas,
             subagent_type: self.turn_context.subagent_type,
+            root_task_id: self.turn_context.root_task_id,
             continuation: self.turn_context.continuation.take(),
             steer_handle: self.turn_context.steer_handle,
             provider_suspension_control: self.turn_context.provider_suspension_control,

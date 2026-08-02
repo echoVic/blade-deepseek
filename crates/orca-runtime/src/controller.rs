@@ -240,6 +240,7 @@ pub struct ThreadTurnRequest {
     tool_mode: ThreadTurnToolMode,
     goal_turn_origin: Option<orca_core::goal_runtime::GoalTurnOrigin>,
     main_session_task_id: Option<String>,
+    root_task_id: Option<String>,
     options: ControllerRunOptions,
     emit_session_completed: bool,
     steer_handle: Option<ThreadSteerHandle>,
@@ -612,6 +613,7 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
 
         let loop_context = AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
             .with_turn_id(request.turn_id().clone())
+            .with_root_task_id(request.root_task_id())
             .with_services(
                 parts.instructions,
                 parts.memory,
@@ -818,6 +820,7 @@ impl ThreadTurnRequest {
             tool_mode: ThreadTurnToolMode::Standard,
             goal_turn_origin: None,
             main_session_task_id: None,
+            root_task_id: None,
             options: ControllerRunOptions::default(),
             emit_session_completed: true,
             steer_handle: None,
@@ -892,6 +895,15 @@ impl ThreadTurnRequest {
 
     pub fn main_session_task_id(&self) -> Option<&str> {
         self.main_session_task_id.as_deref()
+    }
+
+    pub(crate) fn with_root_task_id(mut self, root_task_id: impl Into<String>) -> Self {
+        self.root_task_id = Some(root_task_id.into());
+        self
+    }
+
+    pub(crate) fn root_task_id(&self) -> Option<&str> {
+        self.root_task_id.as_deref()
     }
 
     pub fn with_wait_for_background_workflows(mut self, wait: bool) -> Self {
@@ -2642,6 +2654,7 @@ mod tests {
                 workflow_child_executor: execute_child_agent_loop,
                 workflow_lifecycle_ingress: None,
                 wait_for_background_workflows: true,
+                root_task_id: None,
             })
             .unwrap();
 
@@ -2713,6 +2726,7 @@ mod tests {
                     workflow_child_executor: execute_child_agent_loop,
                     workflow_lifecycle_ingress: None,
                     wait_for_background_workflows: true,
+                    root_task_id: None,
                 })
                 .expect("dispatch normal call");
 

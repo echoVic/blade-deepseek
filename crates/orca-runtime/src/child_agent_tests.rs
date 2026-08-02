@@ -87,6 +87,8 @@ fn runtime<'a>(
         hooks,
         cancel,
         lifecycle: None,
+        task_registry: None,
+        root_task_id: None,
         executor,
     })
 }

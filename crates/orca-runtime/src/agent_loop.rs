@@ -116,7 +116,14 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
     runtime: &mut ChildAgentRuntime<'_, W>,
     child_cost_tracker: &mut CostTracker,
 ) -> io::Result<ChildAgentResult> {
-    let task_registry = TaskRegistry::new_for_cwd(runtime.events.run_id().to_string(), runtime.cwd);
+    let fallback_task_registry;
+    let task_registry = if let Some(task_registry) = runtime.task_registry {
+        task_registry
+    } else {
+        fallback_task_registry =
+            TaskRegistry::new_for_cwd(runtime.events.run_id().to_string(), runtime.cwd);
+        &fallback_task_registry
+    };
     let mut background_workflows = Vec::new();
     let child = run_agent_loop(
         config,
@@ -127,13 +134,14 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
             request.emit_deltas,
             &request.subagent_type,
         )
+        .with_root_task_id(runtime.root_task_id)
         .with_services(
             runtime.instructions,
             runtime.memory,
             runtime.mcp_registry,
             runtime.hooks,
         )
-        .with_runtime(child_cost_tracker, runtime.cancel, &task_registry)
+        .with_runtime(child_cost_tracker, runtime.cancel, task_registry)
         .with_execution(
             &mut background_workflows,
             request.workflow_ipc.as_ref(),
@@ -157,7 +165,7 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         runtime.events,
         runtime.sink,
         &mut background_workflows,
-        &task_registry,
+        task_registry,
         runtime.cancel,
         None,
     )?;

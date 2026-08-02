@@ -380,6 +380,7 @@ pub struct HostedTurnRequest {
     resumes_existing_turn: bool,
     task_id: Option<String>,
     main_session_task_id: Option<String>,
+    root_task_id: Option<String>,
     generation_handler_factory: Option<Arc<HostedGenerationHandlerFactory>>,
     pending_interactions: Option<RuntimePendingInteractionStore>,
     usage_credit: UsageTotals,
@@ -541,6 +542,7 @@ impl HostedTurnRequest {
             resumes_existing_turn: false,
             task_id: None,
             main_session_task_id: None,
+            root_task_id: None,
             generation_handler_factory: None,
             pending_interactions: None,
             usage_credit: UsageTotals::default(),
@@ -836,6 +838,9 @@ impl HostedTurnRequest {
         }
         if let Some(task_id) = self.main_session_task_id.as_deref() {
             request = request.with_main_session_task_id(task_id);
+        }
+        if let Some(root_task_id) = self.root_task_id.as_deref() {
+            request = request.with_root_task_id(root_task_id);
         }
         request
     }
@@ -10868,6 +10873,8 @@ struct ActiveOperation {
     operation_id: OperationId,
     runtime_task_id: Option<String>,
     main_session_task_id: Option<String>,
+    task_registry: TaskRegistry,
+    root_task_id: String,
     completion: OperationCompletion,
     request: HostedTurnRequest,
     config: RunConfig,
@@ -21464,7 +21471,7 @@ impl ThreadActor {
                 && active.surface_operation.as_ref() == Some(&pending.fence)
             {
                 active.surface_terminalization = Some(pending.cause);
-                active.generation.cancel.cancel();
+                Self::cancel_active_task_tree(active);
             }
             self.apply_surface_interaction_cancellations(&pending.interaction_ids);
             self.apply_surface_capability_cancellations(&pending.capability_call_ids);
@@ -27860,7 +27867,7 @@ impl ThreadActor {
                         .map(|(interaction_id, _)| interaction_id)
                         .collect::<Vec<_>>(),
                 );
-                active.generation.cancel.cancel();
+                Self::cancel_active_task_tree(active);
                 Ok(Self::committed_jsonl_turn_control(
                     request_id,
                     operation.operation_id,
@@ -28404,7 +28411,6 @@ impl ThreadActor {
             &fence,
             surface::TerminalizationCause::UserCancel,
         )?;
-        active.generation.cancel.cancel();
         Ok(Self::committed_surface_mutation(
             request_id,
             operation_id.clone(),
@@ -28746,7 +28752,7 @@ impl ThreadActor {
             .commit_actor_generation_terminalization_batch(fence.clone(), &prepared.batch)
         {
             Ok(_) => {
-                active.generation.cancel.cancel();
+                Self::cancel_active_task_tree(active);
                 self.apply_surface_interaction_cancellations(&prepared.interaction_ids);
                 self.apply_surface_capability_cancellations(&prepared.capability_call_ids);
                 Ok(prepared.batch)
@@ -30566,6 +30572,11 @@ impl ThreadActor {
                     .active_task()
                     .map(|task| task.id().to_string());
                 let main_session_task_id = request.main_session_task_id.clone();
+                let root_task_id = main_session_task_id
+                    .clone()
+                    .unwrap_or_else(|| format!("operation-root-{:?}", operation_id));
+                request.root_task_id = Some(root_task_id.clone());
+                let task_registry = state.thread.session().task_registry().clone();
                 let steer_handle = ThreadSteerHandle::default();
                 let generation = self.spawn_generation(
                     state,
@@ -30583,6 +30594,8 @@ impl ThreadActor {
                     operation_id,
                     runtime_task_id,
                     main_session_task_id,
+                    task_registry,
+                    root_task_id,
                     completion: completion.clone(),
                     request,
                     config,
@@ -31638,7 +31651,7 @@ impl ThreadActor {
                     let _ = reply.send(Err(error));
                     return;
                 } else {
-                    active.generation.cancel.cancel();
+                    Self::cancel_active_task_tree(active);
                     InterruptOperationResult::Requested { generation }
                 };
                 let _ = reply.send(Ok(result));
@@ -31968,6 +31981,21 @@ impl ThreadActor {
             cancel,
             join,
         }
+    }
+
+    fn cancel_active_task_tree(active: &ActiveOperation) {
+        active.generation.cancel.cancel();
+        let root_task_id = active.root_task_id.clone();
+        if let Err(error) = active.task_registry.signal_stop_tree(&root_task_id) {
+            eprintln!("orca: failed to signal foreground task tree cancellation: {error}");
+            return;
+        }
+        let task_registry = active.task_registry.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = task_registry.request_stop_tree(&root_task_id) {
+                eprintln!("orca: failed to stop foreground task tree: {error}");
+            }
+        });
     }
 
     fn finish_surface_background_transfer(
@@ -35902,7 +35930,7 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::path::PathBuf;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender};
     use std::time::Instant;
@@ -36195,6 +36223,31 @@ mod tests {
         entered: SyncSender<()>,
         cancel_observed: SyncSender<()>,
         completed: SyncSender<()>,
+    }
+
+    #[cfg(unix)]
+    struct ForegroundTaskTreeCancelExecutor {
+        ready: SyncSender<ForegroundTaskTreeFixture>,
+    }
+
+    #[cfg(unix)]
+    struct ForegroundTaskTreeFixture {
+        registry: TaskRegistry,
+        root_id: String,
+        child_id: String,
+        grandchild_id: String,
+        detached_id: String,
+        child_pid: u32,
+        grandchild_pid: u32,
+        detached_pid: u32,
+    }
+
+    #[cfg(unix)]
+    impl Drop for ForegroundTaskTreeFixture {
+        fn drop(&mut self) {
+            let _ = self.registry.request_stop_tree(&self.root_id);
+            let _ = self.registry.request_stop(&self.detached_id);
+        }
     }
 
     struct QueuedInteractionShutdownExecutor {
@@ -36709,6 +36762,201 @@ mod tests {
             self.completed.send(()).expect("report worker completion");
             Ok(RunStatus::Cancelled.into())
         }
+    }
+
+    #[cfg(unix)]
+    impl ThreadOperationExecutor for ForegroundTaskTreeCancelExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            _generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let registry = thread.session().task_registry().clone();
+            let root_id = request
+                .root_task_id
+                .clone()
+                .expect("hosted foreground turn carries a task-tree root");
+            let child = registry.create_subagent_with_parent(
+                "foreground async child".to_string(),
+                None,
+                Some(root_id.clone()),
+            );
+            let grandchild = registry.create_subagent_with_parent(
+                "foreground async grandchild".to_string(),
+                None,
+                Some(child.id.clone()),
+            );
+            let detached = registry.create_subagent("detached background child".to_string(), None);
+            let child_pid = spawn_owned_task_tree_worker(&registry, &child.id)?;
+            let grandchild_pid = spawn_owned_task_tree_worker(&registry, &grandchild.id)?;
+            let detached_pid = spawn_owned_task_tree_worker(&registry, &detached.id)?;
+            self.ready
+                .send(ForegroundTaskTreeFixture {
+                    registry,
+                    root_id,
+                    child_id: child.id,
+                    grandchild_id: grandchild.id,
+                    detached_id: detached.id,
+                    child_pid,
+                    grandchild_pid,
+                    detached_pid,
+                })
+                .map_err(|_| io::Error::other("foreground task-tree observer closed"))?;
+            while !cancel.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            thread.lifecycle_mut().finish_task(RunStatus::Cancelled);
+            Ok(RunStatus::Cancelled.into())
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_owned_task_tree_worker(registry: &TaskRegistry, task_id: &str) -> io::Result<u32> {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("while :; do sleep 1; done")
+            .arg0(crate::tasks::subagent_worker_process_name(task_id))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let child = command.spawn()?;
+        let pid = child.id();
+        registry
+            .adopt_subagent_worker(task_id, child)
+            .map_err(io::Error::other)?;
+        Ok(pid)
+    }
+
+    #[cfg(unix)]
+    fn unix_process_exists(pid: u32) -> bool {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_interrupt_stops_owned_subagent_process_tree_only() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ForegroundTaskTreeCancelExecutor {
+            ready: ready_tx,
+        }))
+        .expect("start foreground task-tree runtime");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled),
+                "foreground task-tree cancellation",
+            )
+            .expect("start foreground task-tree thread");
+        let operation = thread
+            .start_turn(
+                HostedTurnRequest::new("hold foreground task tree")
+                    .with_task_description("hold foreground task tree"),
+                io::sink(),
+            )
+            .expect("start foreground task-tree turn");
+        let fixture = ready_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("foreground task-tree workers did not start");
+
+        assert_eq!(
+            fixture
+                .registry
+                .get(&fixture.child_id)
+                .unwrap()
+                .parent_task_id,
+            Some(fixture.root_id.clone())
+        );
+        assert_eq!(
+            fixture
+                .registry
+                .get(&fixture.grandchild_id)
+                .unwrap()
+                .parent_task_id,
+            Some(fixture.child_id.clone())
+        );
+        assert!(unix_process_exists(fixture.child_pid));
+        assert!(unix_process_exists(fixture.grandchild_pid));
+        assert!(unix_process_exists(fixture.detached_pid));
+
+        assert!(matches!(
+            operation
+                .interrupt()
+                .expect("interrupt foreground task tree"),
+            InterruptOperationResult::Requested { .. }
+        ));
+        let late_child = fixture.registry.create_subagent_with_parent(
+            "late foreground child".to_string(),
+            None,
+            Some(fixture.root_id.clone()),
+        );
+        assert_eq!(
+            fixture.registry.get(&late_child.id).unwrap().status,
+            TaskStatus::Stopping,
+            "a child created after cancellation must inherit the cancelled root"
+        );
+
+        let terminal = operation
+            .wait_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("foreground operation did not settle after interruption");
+        assert_eq!(
+            terminal.outcome(),
+            &OperationOutcome::Completed(RunStatus::Cancelled)
+        );
+        assert_eq!(operation.completion().try_terminal(), Some(terminal));
+
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        while Instant::now() < deadline {
+            let child = fixture.registry.get(&fixture.child_id).unwrap();
+            let grandchild = fixture.registry.get(&fixture.grandchild_id).unwrap();
+            if child.status == TaskStatus::Stopped
+                && grandchild.status == TaskStatus::Stopped
+                && !unix_process_exists(fixture.child_pid)
+                && !unix_process_exists(fixture.grandchild_pid)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            fixture.registry.get(&fixture.child_id).unwrap().status,
+            TaskStatus::Stopped
+        );
+        assert_eq!(
+            fixture.registry.get(&fixture.grandchild_id).unwrap().status,
+            TaskStatus::Stopped
+        );
+        assert!(!unix_process_exists(fixture.child_pid));
+        assert!(!unix_process_exists(fixture.grandchild_pid));
+        assert_eq!(
+            fixture.registry.get(&fixture.detached_id).unwrap().status,
+            TaskStatus::Running
+        );
+        assert!(
+            unix_process_exists(fixture.detached_pid),
+            "detached background work must survive foreground interruption"
+        );
+
+        fixture
+            .registry
+            .request_stop(&fixture.detached_id)
+            .expect("clean up detached worker");
+        assert!(!unix_process_exists(fixture.detached_pid));
+        host.shutdown()
+            .expect("shutdown foreground task-tree runtime");
     }
 
     impl ThreadOperationExecutor for QueuedInteractionShutdownExecutor {

@@ -98,6 +98,7 @@ pub(crate) struct ToolExecutionContext<'a> {
     extension_stores: Option<RuntimeExtensionStores<'a>>,
     goal_runtime: Option<GoalRuntimeHandle>,
     goal_turn: Option<GoalTurnContext>,
+    root_task_id: Option<&'a str>,
 }
 
 pub(crate) struct ToolApprovalGateContext<'a, W: io::Write> {
@@ -194,11 +195,17 @@ impl<'a> ToolExecutionContext<'a> {
             extension_stores: None,
             goal_runtime: None,
             goal_turn: None,
+            root_task_id: None,
         }
     }
 
     pub(crate) fn with_goal_mode(mut self, goal_mode: bool) -> Self {
         self.goal_mode = goal_mode;
+        self
+    }
+
+    pub(crate) fn with_root_task_id(mut self, root_task_id: Option<&'a str>) -> Self {
+        self.root_task_id = root_task_id;
         self
     }
 
@@ -496,6 +503,7 @@ impl ToolExecutionActor {
             extension_stores,
             goal_runtime,
             goal_turn,
+            root_task_id,
         } = context;
         let instructions = instructions.expect("tool execution instructions");
         let memory = memory.expect("tool execution memory");
@@ -718,6 +726,7 @@ impl ToolExecutionActor {
                 workflow_child_executor,
                 workflow_lifecycle_ingress,
                 wait_for_background_workflows,
+                root_task_id,
             },
         ) {
             Ok(output) => output,

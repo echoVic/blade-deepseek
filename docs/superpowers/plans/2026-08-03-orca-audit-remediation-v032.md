@@ -300,11 +300,11 @@ git commit -m "fix(tools): cancel web search cooperatively"
 - Modify: crates/orca-tui/src/app.rs
 - Test: tests/subagent_contract.rs
 
-- [ ] **Step 1: Write foreground cancellation regression**
+- [x] **Step 1: Write foreground cancellation regression**
 
 Launch an async subagent helper that records its PID and waits. Send UserAction::Cancel. Assert within two seconds that its task is stopped, its process tree is absent, and one terminal event exists. Launch an independently detached background task and prove it remains active.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 cargo test --test subagent_contract foreground_cancel_stops_async_subagent_tree_only -- --nocapture
@@ -312,15 +312,15 @@ cargo test --test subagent_contract foreground_cancel_stops_async_subagent_tree_
 
 Expected: FAIL because foreground cancellation only cancels generation.
 
-- [ ] **Step 3: Track operation task ownership**
+- [x] **Step 3: Track operation task ownership**
 
 Associate admitted SurfaceOperationId values with root TaskIds. Add TaskRegistry::request_stop_tree, traversing canonical parent IDs and invoking existing process-tree stop for active descendants.
 
-- [ ] **Step 4: Unify runtime cancellation**
+- [x] **Step 4: Unify runtime cancellation**
 
 InterruptOperation cancels generation, settles approval/permission/input/elicitation waits, requests stop for operation-owned roots, and commits one cancelled terminal state. Repeated commands return already-terminal state.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
 ~~~sh
 cargo test --test subagent_contract foreground_cancel_stops_async_subagent_tree_only -- --nocapture

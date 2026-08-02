@@ -77,6 +77,7 @@ pub(crate) struct AsyncSubagentLaunchContext<'a> {
     pub request: subagent::SubagentRequest,
     pub subagent_depth: u32,
     pub task_registry: &'a TaskRegistry,
+    pub root_task_id: Option<&'a str>,
 }
 
 pub(crate) struct AsyncSubagentLaunchOutput {
@@ -152,6 +153,8 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             hooks: &hooks,
             cancel: &cancel,
             lifecycle: Some(&mut child_lifecycle),
+            task_registry: Some(&task_registry),
+            root_task_id: Some(&agent_id),
             executor: child_executor,
         });
         crate::agent_child::run_child_agent(&config, &child_request, &mut child_runtime)
@@ -223,6 +226,7 @@ pub(crate) fn launch_async_subagent(
         request,
         subagent_depth,
         task_registry,
+        root_task_id,
     } = context;
     if task_registry.is_process_local() {
         return AsyncSubagentLaunchOutput {
@@ -237,8 +241,26 @@ pub(crate) fn launch_async_subagent(
     let agent_type = serde_json::to_value(&request.subagent_type)
         .ok()
         .and_then(|value| value.as_str().map(str::to_string));
-    let task = task_registry.create_subagent(request.description.clone(), agent_type);
+    let task = task_registry.create_subagent_with_parent(
+        request.description.clone(),
+        agent_type,
+        root_task_id.map(str::to_string),
+    );
     let agent_id = task.id.clone();
+    if task_registry.is_cancelled(&agent_id) {
+        let _ = task_registry.stop(
+            &agent_id,
+            "Task stopped because its foreground owner was cancelled".to_string(),
+        );
+        return async_launch_output(
+            task_registry,
+            &agent_id,
+            tool_types::ToolResult::cancelled_before_start(
+                tool_request,
+                "the foreground operation was cancelled before the async subagent started",
+            ),
+        );
+    }
     let worktree_guard = if request.isolation == SubagentIsolation::Worktree {
         match WorktreeGuard::create(cwd) {
             Ok(guard) => Some(guard),
@@ -342,7 +364,7 @@ fn wait_for_async_subagent_adoption(
     let pid = std::process::id();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let registry = TaskRegistry::new_for_cwd(task_session_id.to_string(), cwd);
+        let registry = TaskRegistry::attach_for_cwd(task_session_id.to_string(), cwd);
         let record = registry.get(agent_id).ok_or_else(|| {
             format!("async subagent task '{agent_id}' disappeared before adoption")
         })?;
@@ -614,6 +636,7 @@ mod tests {
             request,
             subagent_depth: 0,
             task_registry: &registry,
+            root_task_id: None,
         });
 
         assert_eq!(output.result.status, ToolStatus::Failed);

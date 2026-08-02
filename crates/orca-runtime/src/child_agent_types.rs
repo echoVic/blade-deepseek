@@ -16,6 +16,7 @@ use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::RuntimeSessionLifecycle;
 use crate::memory::MemoryBlock;
+use crate::tasks::TaskRegistry;
 use crate::workflow::ipc::WorkflowIpcContext;
 
 #[derive(Clone, Debug)]
@@ -75,6 +76,8 @@ pub(crate) struct ChildAgentRuntime<'a, W: io::Write> {
     pub hooks: &'a HookRunner,
     pub cancel: &'a CancelToken,
     pub lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
+    pub task_registry: Option<&'a TaskRegistry>,
+    pub root_task_id: Option<&'a str>,
     executor: ChildAgentExecutor<W>,
 }
 
@@ -88,6 +91,8 @@ pub(crate) struct ChildAgentRuntimeContext<'a, W: io::Write> {
     pub hooks: &'a HookRunner,
     pub cancel: &'a CancelToken,
     pub lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
+    pub task_registry: Option<&'a TaskRegistry>,
+    pub root_task_id: Option<&'a str>,
     pub executor: ChildAgentExecutor<W>,
 }
 
@@ -103,6 +108,8 @@ impl<'a, W: io::Write> ChildAgentRuntime<'a, W> {
             hooks: context.hooks,
             cancel: context.cancel,
             lifecycle: context.lifecycle,
+            task_registry: context.task_registry,
+            root_task_id: context.root_task_id,
             executor: context.executor,
         }
     }

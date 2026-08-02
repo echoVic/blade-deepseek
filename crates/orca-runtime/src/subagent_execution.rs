@@ -71,6 +71,8 @@ pub(crate) struct RuntimeSubagentBatchToolTurnServices<'a> {
 
 pub(crate) struct RuntimeSubagentBatchToolTurnRuntime<'a> {
     pub(crate) cancel: &'a CancelToken,
+    pub(crate) task_registry: &'a TaskRegistry,
+    pub(crate) root_task_id: Option<&'a str>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
 }
 
@@ -191,6 +193,8 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
     } = services;
     let RuntimeSubagentBatchToolTurnRuntime {
         cancel,
+        task_registry,
+        root_task_id,
         workflow_ipc,
     } = runtime;
     let execution = execute_subagent_batch(
@@ -207,6 +211,8 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         hooks,
         cost_tracker,
         cancel,
+        task_registry,
+        root_task_id,
         workflow_ipc,
         child_executor,
     );
@@ -252,6 +258,8 @@ fn execute_subagent_batch(
     hooks: &HookRunner,
     cost_tracker: &mut CostTracker,
     cancel: &CancelToken,
+    task_registry: &TaskRegistry,
+    root_task_id: Option<&str>,
     workflow_ipc: Option<&WorkflowIpcContext>,
     child_executor: ChildAgentExecutor<io::Sink>,
 ) -> SubagentBatchExecution {
@@ -383,6 +391,8 @@ fn execute_subagent_batch(
             workflow_ipc,
             subagent_depth + 1,
             child_executor,
+            task_registry,
+            root_task_id,
         );
         let admission = runtime.admit(idx, invocation, |task| {
             if !emit_deltas {
@@ -460,6 +470,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
     cost_tracker: &mut CostTracker,
     cancel: &CancelToken,
     task_registry: &TaskRegistry,
+    root_task_id: Option<&str>,
     workflow_ipc: Option<&WorkflowIpcContext>,
     child_executor: ChildAgentExecutor<io::Sink>,
     event_error: &mut Option<io::Error>,
@@ -503,6 +514,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
             request,
             subagent_depth,
             task_registry,
+            root_task_id,
         });
         if emit_deltas && let Some(task) = launch.task.as_ref() {
             emit_batch_event(sink, events.task_status_updated(task), event_error);
@@ -522,6 +534,8 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
         workflow_ipc,
         subagent_depth + 1,
         child_executor,
+        task_registry,
+        root_task_id,
     );
     let tool_calls = RuntimeToolCallRuntime::for_normal_execution();
     let execution = tool_calls.execute_subagent(invocation, cancel, |task| {
@@ -933,6 +947,7 @@ mod tests {
         let hooks = HookRunner::default();
         let mut cost_tracker = CostTracker::new(None);
         let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("subagent-batch-turn".to_string());
         let mut conversation = orca_core::conversation::Conversation::new();
 
         let outcome =
@@ -959,6 +974,8 @@ mod tests {
                 },
                 runtime: super::RuntimeSubagentBatchToolTurnRuntime {
                     cancel: &cancel,
+                    task_registry: &task_registry,
+                    root_task_id: None,
                     workflow_ipc: None,
                 },
                 child_executor: fake_child_executor::<std::io::Sink>,
@@ -1096,6 +1113,7 @@ mod tests {
         }]);
         let mut cost_tracker = CostTracker::new(None);
         let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("subagent-batch-hook-cancel".to_string());
         let mut conversation = orca_core::conversation::Conversation::new();
         let started = Instant::now();
 
@@ -1123,6 +1141,8 @@ mod tests {
                 },
                 runtime: super::RuntimeSubagentBatchToolTurnRuntime {
                     cancel: &cancel,
+                    task_registry: &task_registry,
+                    root_task_id: None,
                     workflow_ipc: None,
                 },
                 child_executor: cancelling_child_executor::<std::io::Sink>,
@@ -1165,6 +1185,7 @@ mod tests {
         let hooks = HookRunner::default();
         let mut cost_tracker = CostTracker::new(None);
         let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("subagent-batch-event-error".to_string());
         let mut conversation = orca_core::conversation::Conversation::new();
         let started = Instant::now();
 
@@ -1192,6 +1213,8 @@ mod tests {
                 },
                 runtime: super::RuntimeSubagentBatchToolTurnRuntime {
                     cancel: &cancel,
+                    task_registry: &task_registry,
+                    root_task_id: None,
                     workflow_ipc: None,
                 },
                 child_executor: delayed_child_executor::<std::io::Sink>,
@@ -1236,6 +1259,7 @@ mod tests {
         let hooks = HookRunner::default();
         let mut cost_tracker = CostTracker::new(None);
         let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("subagent-batch-panic".to_string());
         let mut conversation = orca_core::conversation::Conversation::new();
 
         let outcome =
@@ -1262,6 +1286,8 @@ mod tests {
                 },
                 runtime: super::RuntimeSubagentBatchToolTurnRuntime {
                     cancel: &cancel,
+                    task_registry: &task_registry,
+                    root_task_id: None,
                     workflow_ipc: None,
                 },
                 child_executor: panic_child_executor::<std::io::Sink>,
@@ -1375,6 +1401,7 @@ mod tests {
             &cancel,
             &task_registry,
             None,
+            None,
             remove_worktree_child_executor::<io::Sink>,
             &mut event_error,
         )
@@ -1447,6 +1474,7 @@ mod tests {
             &cancel,
             &task_registry,
             None,
+            None,
             panic_child_executor::<io::Sink>,
             &mut event_error,
         )
@@ -1490,6 +1518,7 @@ mod tests {
         let hooks = HookRunner::default();
         let mut cost_tracker = CostTracker::new(None);
         let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("subagent-batch-cancelled".to_string());
         let mut conversation = orca_core::conversation::Conversation::new();
 
         let outcome =
@@ -1516,6 +1545,8 @@ mod tests {
                 },
                 runtime: super::RuntimeSubagentBatchToolTurnRuntime {
                     cancel: &cancel,
+                    task_registry: &task_registry,
+                    root_task_id: None,
                     workflow_ipc: None,
                 },
                 child_executor: cancelled_child_executor::<std::io::Sink>,
@@ -1583,6 +1614,7 @@ mod tests {
             &cancel,
             &task_registry,
             None,
+            None,
             fake_child_executor::<io::Sink>,
             &mut event_error,
         )
@@ -1630,6 +1662,7 @@ mod tests {
             &mut cost_tracker,
             &cancel,
             &task_registry,
+            None,
             None,
             unexpected_child_executor::<io::Sink>,
             &mut event_error,
@@ -1685,6 +1718,7 @@ mod tests {
             &mut cost_tracker,
             &cancel,
             &task_registry,
+            None,
             None,
             panic_child_executor::<io::Sink>,
             &mut event_error,
@@ -1758,6 +1792,7 @@ mod tests {
             &cancel,
             &task_registry,
             None,
+            None,
             unexpected_child_executor::<io::Sink>,
             &mut event_error,
         )
@@ -1805,6 +1840,7 @@ mod tests {
             &mut cost_tracker,
             &cancel,
             &task_registry,
+            None,
             None,
             cancelled_child_executor::<io::Sink>,
             &mut event_error,

@@ -104,6 +104,7 @@ pub(crate) struct RuntimeNormalToolTurnRequest<'a> {
     pub(crate) emit_deltas: bool,
     pub(crate) goal_mode: bool,
     pub(crate) policy: &'a ApprovalPolicy,
+    pub(crate) root_task_id: Option<&'a str>,
 }
 
 pub(crate) struct RuntimeNormalToolTurnIo<'a, W: io::Write> {
@@ -209,6 +210,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let cwd = step_snapshot.turn_context.cwd;
     let tool_policy = step_snapshot.tool_policy;
     let subagent_depth = step_snapshot.turn_context.subagent_depth;
+    let root_task_id = step_snapshot.turn_context.root_task_id;
     let emit_deltas = step_snapshot.turn_context.emit_deltas;
     let provider_response_ingress = step_snapshot.turn_context.provider_response_ingress();
     let workflow_lifecycle_ingress = step_snapshot.turn_context.workflow_lifecycle_ingress();
@@ -322,6 +324,8 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 },
                 runtime: RuntimeSubagentBatchToolTurnRuntime {
                     cancel,
+                    task_registry,
+                    root_task_id,
                     workflow_ipc,
                 },
                 child_executor: batch_child_executor,
@@ -436,6 +440,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 emit_deltas,
                 goal_mode: tool_policy.is_goal_mode(),
                 policy,
+                root_task_id,
             },
             io: RuntimeNormalToolTurnIo {
                 events,
@@ -671,6 +676,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         emit_deltas,
         goal_mode,
         policy,
+        root_task_id,
     } = request;
     let RuntimeNormalToolTurnExecutors {
         subagent_child_executor,
@@ -733,6 +739,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
     }
     let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
         .with_goal_mode(goal_mode)
+        .with_root_task_id(root_task_id)
         .with_services(instructions, memory, mcp_registry, hooks)
         .with_runtime(
             cost_tracker,
@@ -1466,6 +1473,7 @@ mod tests {
                 emit_deltas: false,
                 goal_mode: false,
                 policy: &policy,
+                root_task_id: None,
             },
             io: RuntimeNormalToolTurnIo {
                 events: &mut events,
@@ -2809,6 +2817,7 @@ mod tests {
                 emit_deltas: false,
                 goal_mode: false,
                 policy: &policy,
+                root_task_id: None,
             },
             io: RuntimeNormalToolTurnIo {
                 events: &mut events,
