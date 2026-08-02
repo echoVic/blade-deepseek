@@ -99,7 +99,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           cargo nextest run -p orca-tui --lib --locked --profile ci-serial
-          cargo nextest run --test tui_pty_contract --locked --profile ci-serial
+          cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass
           cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
 
   native-arm64:
@@ -163,5 +163,5 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           cargo nextest run -p orca-tui --lib --locked --profile ci-serial
-          cargo nextest run --test tui_pty_contract --locked --profile ci-serial
+          cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass
           cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast

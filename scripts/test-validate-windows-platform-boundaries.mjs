@@ -624,7 +624,7 @@ for (const marker of [
   "cargo clippy --workspace --all-targets --locked",
   "taiki-e/install-action@nextest",
   "cargo nextest run -p orca-tui --lib --locked --profile ci-serial",
-  "cargo nextest run --test tui_pty_contract --locked --profile ci-serial",
+  "cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass",
   "cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast",
   "cargo build --release --locked",
   "target/release/orca.exe",
