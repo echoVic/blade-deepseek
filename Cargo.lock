@@ -1669,6 +1669,7 @@ dependencies = [
  "serde_json",
  "similar",
  "tempfile",
+ "tokio",
  "toml",
  "walkdir",
 ]

@@ -694,7 +694,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::GitStatus,
     ));
     registry.register(BuiltinTool::new(
-        conservative_builtin_spec(
+        cooperative_builtin_spec(
             "web_search",
             "Search the web for current information using Brave Search. Returns top results with title, summary, and URL.",
             json!({
@@ -1668,7 +1668,11 @@ impl Tool for BuiltinTool {
             }
             BuiltinExecutor::WriteFile => write_file::execute(request, ctx.cwd),
             BuiltinExecutor::GitStatus => git::status(request, ctx.cwd, ctx.max_output_bytes()),
-            BuiltinExecutor::WebSearch => web_search::execute(request, ctx.max_output_bytes()),
+            BuiltinExecutor::WebSearch => {
+                web_search::execute_or_cancel(request, ctx.max_output_bytes(), || {
+                    ctx.is_cancelled()
+                })
+            }
             BuiltinExecutor::Subagent => ToolResult::failed(
                 request,
                 "subagent tool must be executed by the runtime",
@@ -2196,9 +2200,18 @@ mod tests {
             );
         }
 
+        let web_search = registry.resolve("web_search").expect("web search tool");
+        assert_eq!(
+            web_search.spec.interrupt_semantics,
+            InterruptSemantics::CooperativeCancel
+        );
+        assert_eq!(
+            web_search.spec.replay_semantics,
+            ReplaySemantics::IndeterminateAfterStart
+        );
+
         for name in [
             "write_file",
-            "web_search",
             "subagent",
             "request_permissions",
             "request_user_input",

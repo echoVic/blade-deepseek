@@ -253,11 +253,11 @@ git commit -m "fix(runtime): isolate host session storage"
 - Modify: crates/orca-runtime/src/runtime_tool_call.rs
 - Test: crates/orca-tools/src/web_search.rs
 
-- [ ] **Step 1: Write withheld-response cancellation test**
+- [x] **Step 1: Write withheld-response cancellation test**
 
 Start a local TCP server that accepts but never responds. Execute web search with a CancelToken, cancel after accept, and assert it settles within 250 ms as ToolStatus::Cancelled.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 cargo test -p orca-tools web_search_cancellation_preempts_http_timeout -- --nocapture
@@ -265,7 +265,7 @@ cargo test -p orca-tools web_search_cancellation_preempts_http_timeout -- --noca
 
 Expected: FAIL because web search is blocking and has no cooperative token.
 
-- [ ] **Step 3: Add the execution context**
+- [x] **Step 3: Add the execution context**
 
 Add:
 
@@ -279,11 +279,11 @@ pub struct ToolExecutionContext<'a> {
 
 Declare ExecutionMode::AsyncCooperative for web_search while preserving the synchronous path for ordinary file tools.
 
-- [ ] **Step 4: Convert web search**
+- [x] **Step 4: Convert web search**
 
 Use reqwest::Client with the existing 25-second fallback timeout. Race send and response body reads against cancel.cancelled() with tokio::select!. Return the canonical cancelled ToolResult, not an HTTP error.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
 ~~~sh
 cargo test -p orca-tools web_search -- --nocapture
