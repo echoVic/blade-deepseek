@@ -17,7 +17,7 @@ use crate::tool_schema::deepseek_tools_schema_with_mcp_and_external;
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
-const DEFAULT_CHAT_MAX_TOKENS: u32 = 128_000;
+const DEFAULT_CHAT_MAX_TOKENS: u32 = 384_000;
 const DEEPSEEK_MAX_TOOLS: usize = 128;
 const EMPTY_RESPONSE_RETRIES: usize = 1;
 const STREAM_INTEGRITY_RETRIES: usize = 1;
@@ -134,6 +134,7 @@ fn is_strict_schema_rejection(error: &str) -> bool {
 struct ChatRequest {
     model: String,
     messages: Vec<ApiMessage>,
+    thinking: ThinkingConfig,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
@@ -143,6 +144,20 @@ struct ChatRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<orca_core::config::ReasoningEffort>,
+}
+
+#[derive(Debug, Serialize)]
+struct ThinkingConfig {
+    #[serde(rename = "type")]
+    thinking_type: &'static str,
+}
+
+impl Default for ThinkingConfig {
+    fn default() -> Self {
+        Self {
+            thinking_type: "enabled",
+        }
+    }
 }
 
 fn add_empty_response_recovery_instruction(request: &mut ChatRequest) {
@@ -330,6 +345,7 @@ async fn request_chat_streaming(
     let mut request = ChatRequest {
         model: model.to_string(),
         messages,
+        thinking: ThinkingConfig::default(),
         stream: true,
         stream_options: Some(StreamOptions {
             include_usage: true,
@@ -448,11 +464,7 @@ async fn request_chat_streaming(
         }
 
         let assistant_reasoning = if stream_result.reasoning.is_empty() {
-            if !raw_calls_for_history.is_empty() {
-                Some("(reasoning omitted)".to_string())
-            } else {
-                None
-            }
+            None
         } else {
             if !raw_calls_for_history.is_empty() {
                 let tool_call_ids: Vec<String> = raw_calls_for_history
@@ -539,6 +551,7 @@ fn request_chat(
     let mut request = ChatRequest {
         model: model.to_string(),
         messages,
+        thinking: ThinkingConfig::default(),
         stream: false,
         stream_options: None,
         tools: Some(strict_tools.unwrap_or_else(|| tools.clone())),
@@ -611,7 +624,9 @@ fn request_chat(
             }
         }
 
-        let assistant_reasoning = message.reasoning_content.filter(|text| !text.is_empty());
+        let assistant_reasoning = message
+            .reasoning_content
+            .filter(|text| !text.trim().is_empty());
         let assistant_content = message.content.filter(|text| !text.is_empty());
 
         if let Some(ref reasoning) = assistant_reasoning {
@@ -1692,21 +1707,23 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_serializes_reasoning_effort() {
+    fn chat_request_serializes_latest_reasoning_contract() {
         let request = ChatRequest {
             model: "deepseek-v4-pro".to_string(),
             messages: Vec::new(),
+            thinking: ThinkingConfig::default(),
             stream: true,
             stream_options: None,
             tools: None,
             max_tokens: Some(DEFAULT_CHAT_MAX_TOKENS),
-            reasoning_effort: Some(orca_core::config::ReasoningEffort::Max),
+            reasoning_effort: Some(orca_core::config::ReasoningEffort::Low),
         };
 
         let json = serde_json::to_value(request).expect("serialize request");
 
-        assert_eq!(json["reasoning_effort"], "max");
-        assert_eq!(json["max_tokens"], DEFAULT_CHAT_MAX_TOKENS);
+        assert_eq!(json["reasoning_effort"], "low");
+        assert_eq!(json["thinking"]["type"], "enabled");
+        assert_eq!(json["max_tokens"], 384_000);
     }
 
     #[test]
@@ -1791,6 +1808,38 @@ mod tests {
             bodies.lock().expect("lock captured bodies").len(),
             EMPTY_RESPONSE_RETRIES + 1
         );
+    }
+
+    #[test]
+    fn non_streaming_tool_call_without_reasoning_does_not_fabricate_replay_state() {
+        let missing_reasoning = r#"{"choices":[{"message":{"content":null,"reasoning_content":"   ","tool_calls":[{"id":"call_missing_reasoning","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+        let (base_url, _bodies) = spawn_response_sequence_server(vec![missing_reasoning]);
+        let mut conversation = Conversation::new();
+        conversation.add_user("read the file".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-pro".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        let response = request_chat(&conversation, &config)
+            .expect("tool calls without server-provided reasoning remain executable");
+
+        assert!(response.steps.iter().any(|step| matches!(
+            step,
+            ProviderStep::ToolCall(request) if request.id == "call_missing_reasoning"
+        )));
+        assert!(
+            response
+                .steps
+                .iter()
+                .all(|step| !matches!(step, ProviderStep::ReplayState(_)))
+        );
+        assert_eq!(response.assistant_reasoning, None);
     }
 
     #[test]
@@ -2078,6 +2127,42 @@ mod tests {
                     && request.raw_arguments.as_deref()
                         == Some("{\"path\":\"src/main.rs\",\"content\":\"partial")
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_tool_call_without_reasoning_does_not_fabricate_replay_state() {
+        let missing_reasoning = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_missing_reasoning\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":null}]}\n\n\
+                                 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                                 data: [DONE]\n\n";
+        let (base_url, _bodies) = spawn_streaming_response_sequence_server(vec![missing_reasoning]);
+        let mut conversation = Conversation::new();
+        conversation.add_user("read the file".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+
+        let response = request_chat_streaming(&conversation, &config, &cancel, &mut |_| {})
+            .await
+            .expect("tool calls without server-provided reasoning remain executable");
+
+        assert!(response.steps.iter().any(|step| matches!(
+            step,
+            ProviderStep::ToolCall(request) if request.id == "call_missing_reasoning"
+        )));
+        assert!(
+            response
+                .steps
+                .iter()
+                .all(|step| !matches!(step, ProviderStep::ReplayState(_)))
+        );
+        assert_eq!(response.assistant_reasoning, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

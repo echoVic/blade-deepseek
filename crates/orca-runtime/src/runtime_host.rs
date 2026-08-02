@@ -7774,6 +7774,7 @@ fn initial_surface_snapshot(
         ApprovalMode::Plan => surface::SurfaceApprovalMode::Plan,
     };
     let reasoning_effort = match config.reasoning_effort {
+        orca_core::config::ReasoningEffort::Low => surface::SurfaceReasoningEffort::Low,
         orca_core::config::ReasoningEffort::High => surface::SurfaceReasoningEffort::High,
         orca_core::config::ReasoningEffort::Max => surface::SurfaceReasoningEffort::Max,
     };
@@ -7969,7 +7970,8 @@ fn apply_runtime_settings_patch(
         }
         surface::RuntimeSettingsPatch::SetReasoning { effort } => {
             config.reasoning_effort = match effort {
-                surface::SurfaceReasoningEffort::Low | surface::SurfaceReasoningEffort::Medium => {
+                surface::SurfaceReasoningEffort::Low => orca_core::config::ReasoningEffort::Low,
+                surface::SurfaceReasoningEffort::Medium => {
                     return Err(surface::SurfaceClientCommandError::Unauthorized);
                 }
                 surface::SurfaceReasoningEffort::High => orca_core::config::ReasoningEffort::High,
@@ -41669,7 +41671,7 @@ mod tests {
                             model: surface::NonEmptyText::try_new("deepseek-v4-pro").unwrap(),
                         },
                         surface::RuntimeSettingsPatch::SetReasoning {
-                            effort: surface::SurfaceReasoningEffort::High,
+                            effort: surface::SurfaceReasoningEffort::Low,
                         },
                         surface::RuntimeSettingsPatch::SetApprovalMode {
                             mode: surface::SurfaceApprovalMode::Plan,
@@ -41686,7 +41688,7 @@ mod tests {
         assert_eq!(updated.settings.effective.model.as_str(), "deepseek-v4-pro");
         assert_eq!(
             updated.settings.effective.reasoning_effort,
-            surface::SurfaceReasoningEffort::High
+            surface::SurfaceReasoningEffort::Low
         );
         assert_eq!(
             updated.settings.effective.approval_mode,
@@ -41754,7 +41756,7 @@ mod tests {
             (
                 "deepseek-v4-pro".to_string(),
                 ApprovalMode::Plan,
-                orca_core::config::ReasoningEffort::High,
+                orca_core::config::ReasoningEffort::Low,
             )
         );
 
@@ -41786,6 +41788,15 @@ mod tests {
         assert_eq!(
             resumed.baseline.snapshot.settings.effective.approval_mode,
             surface::SurfaceApprovalMode::Plan
+        );
+        assert_eq!(
+            resumed
+                .baseline
+                .snapshot
+                .settings
+                .effective
+                .reasoning_effort,
+            surface::SurfaceReasoningEffort::Low
         );
         let resumed_reserved = committed_surface_value(
             resumed
@@ -41826,7 +41837,7 @@ mod tests {
             (
                 "deepseek-v4-pro".to_string(),
                 ApprovalMode::Plan,
-                orca_core::config::ReasoningEffort::High,
+                orca_core::config::ReasoningEffort::Low,
             )
         );
         resumed_thread

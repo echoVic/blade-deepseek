@@ -313,10 +313,11 @@ pub fn parse_approval_mode_value(mode: &str) -> Result<ApprovalMode, String> {
 
 fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort, String> {
     match value {
+        "low" => Ok(ReasoningEffort::Low),
         "high" => Ok(ReasoningEffort::High),
         "max" => Ok(ReasoningEffort::Max),
         other => Err(format!(
-            "unsupported reasoning_effort '{other}'. Use high or max"
+            "unsupported reasoning_effort '{other}'. Use low, high, or max"
         )),
     }
 }
@@ -940,6 +941,13 @@ soft_compact_token_limit = 64000
             config.reasoning_effort,
             crate::config::ReasoningEffort::High
         );
+    }
+
+    #[test]
+    fn parse_low_reasoning_effort_config() {
+        let config: FileConfig = toml::from_str(r#"reasoning_effort = "low""#).unwrap();
+
+        assert_eq!(config.reasoning_effort, crate::config::ReasoningEffort::Low);
     }
 
     #[test]

@@ -1090,14 +1090,16 @@ fn apply_surface_settings_to_run_config(
         })
         .collect();
     config.reasoning_effort = match settings.reasoning_effort {
+        crate::unstable_surface::SurfaceReasoningEffort::Low => {
+            orca_core::config::ReasoningEffort::Low
+        }
         crate::unstable_surface::SurfaceReasoningEffort::High => {
             orca_core::config::ReasoningEffort::High
         }
         crate::unstable_surface::SurfaceReasoningEffort::Max => {
             orca_core::config::ReasoningEffort::Max
         }
-        crate::unstable_surface::SurfaceReasoningEffort::Low
-        | crate::unstable_surface::SurfaceReasoningEffort::Medium => {
+        crate::unstable_surface::SurfaceReasoningEffort::Medium => {
             return Err(io::Error::other(
                 "JSONL fork source uses an unsupported reasoning effort",
             ));

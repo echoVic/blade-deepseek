@@ -161,6 +161,7 @@ impl ModelRuntimeConfig {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    Low,
     High,
     #[default]
     Max,
@@ -169,6 +170,7 @@ pub enum ReasoningEffort {
 impl ReasoningEffort {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Low => "low",
             Self::High => "high",
             Self::Max => "max",
         }

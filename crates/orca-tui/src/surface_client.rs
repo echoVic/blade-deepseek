@@ -1795,6 +1795,9 @@ fn typed_config_matches_surface(
         }
     };
     let expected_reasoning = match config.reasoning_effort {
+        orca_core::config::ReasoningEffort::Low => {
+            orca_runtime::surface::SurfaceReasoningEffort::Low
+        }
         orca_core::config::ReasoningEffort::High => {
             orca_runtime::surface::SurfaceReasoningEffort::High
         }

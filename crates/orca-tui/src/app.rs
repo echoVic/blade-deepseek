@@ -8562,6 +8562,9 @@ fn settings_intent_patches(
     if let Some(effort) = intent.reasoning_effort {
         patches.push(orca_runtime::surface::RuntimeSettingsPatch::SetReasoning {
             effort: match effort {
+                orca_core::config::ReasoningEffort::Low => {
+                    orca_runtime::surface::SurfaceReasoningEffort::Low
+                }
                 orca_core::config::ReasoningEffort::High => {
                     orca_runtime::surface::SurfaceReasoningEffort::High
                 }
@@ -8618,14 +8621,16 @@ fn apply_hosted_settings_action(
         };
         let model = settings.effective.model.as_str().to_string();
         let reasoning_effort = match settings.effective.reasoning_effort {
+            orca_runtime::surface::SurfaceReasoningEffort::Low => {
+                orca_core::config::ReasoningEffort::Low
+            }
             orca_runtime::surface::SurfaceReasoningEffort::High => {
                 orca_core::config::ReasoningEffort::High
             }
             orca_runtime::surface::SurfaceReasoningEffort::Max => {
                 orca_core::config::ReasoningEffort::Max
             }
-            orca_runtime::surface::SurfaceReasoningEffort::Low
-            | orca_runtime::surface::SurfaceReasoningEffort::Medium => {
+            orca_runtime::surface::SurfaceReasoningEffort::Medium => {
                 let _ = event_tx.send(TuiEvent::OperationRejected(
                     "runtime returned an unsupported reasoning effort".to_string(),
                 ));
@@ -8671,14 +8676,16 @@ fn apply_hosted_settings_action(
             }
             orca_runtime::surface::RuntimeSettingsPatch::SetReasoning { effort } => {
                 cfg.reasoning_effort = match effort {
+                    orca_runtime::surface::SurfaceReasoningEffort::Low => {
+                        orca_core::config::ReasoningEffort::Low
+                    }
                     orca_runtime::surface::SurfaceReasoningEffort::High => {
                         orca_core::config::ReasoningEffort::High
                     }
                     orca_runtime::surface::SurfaceReasoningEffort::Max => {
                         orca_core::config::ReasoningEffort::Max
                     }
-                    orca_runtime::surface::SurfaceReasoningEffort::Low
-                    | orca_runtime::surface::SurfaceReasoningEffort::Medium => continue,
+                    orca_runtime::surface::SurfaceReasoningEffort::Medium => continue,
                 };
             }
             orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode { mode } => {

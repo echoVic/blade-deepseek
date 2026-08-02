@@ -267,7 +267,10 @@ The default (and only production) provider is DeepSeek. Internal test providers 
 
 - Default model: `auto` (main loop uses `deepseek-v4-pro`, auxiliary tasks use `deepseek-v4-flash`)
 - Default base URL: `https://api.deepseek.com`
-- Default reasoning effort: `max` (`reasoning_effort = "high"` or `DEEPSEEK_REASONING_EFFORT=high` lowers it)
+- Transport: OpenAI-compatible Chat Completions (the Responses API is not required by the runtime)
+- Thinking mode: explicitly enabled on every request with `thinking.type = "enabled"`
+- Default reasoning effort: `max`; supported values are `low`, `high`, and `max` via `reasoning_effort`, `ORCA_REASONING_EFFORT`, or `DEEPSEEK_REASONING_EFFORT`
+- Model limits: 1M-token context window and 384K maximum output for both `deepseek-v4-flash` and `deepseek-v4-pro`
 - Streaming: SSE with real-time reasoning/content deltas
 - Authentication: `DEEPSEEK_API_KEY` (required)
 - HTTP retry: 3 attempts with exponential backoff for 429/5xx status codes
@@ -279,6 +282,7 @@ Response mapping:
 - `reasoning_content` → `assistant.reasoning.delta` + `provider.replay.updated`
 - `content` → `assistant.message.delta`
 - `tool_calls` → parsed into `tool.call.requested` events
+- a tool-call response without `reasoning_content` → tool call remains executable, with no fabricated replay state
 - errors → `error` event + status `failed`
 
 ### Agent Loop
@@ -299,7 +303,7 @@ Context window management:
 
 ### Replay State
 
-`provider.replay.updated` preserves provider-specific context for multi-turn DeepSeek thinking/tool-use flows (reasoning_content + tool call IDs). This is part of the trace for maintaining DeepSeek replay semantics.
+`provider.replay.updated` preserves provider-specific context for multi-turn DeepSeek thinking/tool-use flows (`reasoning_content` + tool call IDs). When DeepSeek returns reasoning with a tool call, the next request fully replays that reasoning alongside its assistant tool calls. If DeepSeek omits reasoning for a tool call, Orca executes the call without fabricating replay state.
 
 ## Configuration
 

@@ -86,6 +86,13 @@ then defaults. Run `orca --help` or `orca exec --help` for the full command
 surface. User configuration lives at `~/.orca/config.toml`; trusted projects
 can also provide `.orca/config.toml`, `AGENTS.md`, rules, skills, and workflows.
 
+DeepSeek V4 thinking is enabled explicitly. Set `reasoning_effort` to `low`,
+`high`, or `max` (the default) in `config.toml`, or use
+`ORCA_REASONING_EFFORT`. Both `deepseek-v4-flash` and `deepseek-v4-pro` use a
+1M-token context window and allow up to 384K output tokens. Orca keeps the
+Chat Completions transport and fully replays any returned `reasoning_content`
+across tool turns as required by DeepSeek.
+
 More detail:
 
 - [Persistent Goal Mode](docs/goal-mode.md)

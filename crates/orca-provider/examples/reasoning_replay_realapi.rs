@@ -6,10 +6,9 @@
 //! subsequent requests. If your code does not correctly pass back
 //! reasoning_content, the API will return a 400 error."
 //!
-//! Orca's `conversation_to_api_messages` currently strips reasoning_content on
-//! every assistant replay (an R1-era rule). This harness measures what the
-//! live API actually does for both replay styles, on the default and beta
-//! endpoints. Makes REAL, BILLED calls.
+//! This harness measures what the live API does for both the required replay
+//! style and an intentionally invalid stripped-reasoning control, on the
+//! default and beta endpoints. Makes REAL, BILLED calls.
 //!
 //! Run: `cargo run -p orca-provider --example reasoning_replay_realapi`
 
@@ -69,6 +68,9 @@ fn first_turn(api_key: &str, base_url: &str) -> Result<FirstTurn, String> {
             {"role": "user", "content": USER_PROMPT},
         ],
         "tools": update_plan_tool_schema(),
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+        "max_tokens": 384_000,
         "stream": false,
     });
     let payload = post(api_key, base_url, &body)?;
@@ -92,8 +94,8 @@ fn first_turn(api_key: &str, base_url: &str) -> Result<FirstTurn, String> {
     })
 }
 
-/// Continue the tool loop, either replaying reasoning_content (docs style) or
-/// stripping it (orca's current style). Returns (ok, detail).
+/// Continue the tool loop, either replaying reasoning_content or intentionally
+/// stripping it as a negative control. Returns (ok, detail).
 fn continue_loop(
     api_key: &str,
     base_url: &str,
@@ -121,6 +123,9 @@ fn continue_loop(
             },
         ],
         "tools": update_plan_tool_schema(),
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+        "max_tokens": 384_000,
         "stream": false,
     });
     match post(api_key, base_url, &body) {
@@ -177,8 +182,8 @@ fn main() {
         println!("  replay WITH reasoning_content    -> {with_detail}");
         println!("  replay WITHOUT reasoning_content -> {without_detail}");
         let verdict = match (with_ok, without_ok) {
-            (true, false) => "STRIPPING BREAKS THE LOOP (orca style rejected)",
-            (true, true) => "both accepted (stripping tolerated today, docs still say 400)",
+            (true, false) => "required replay accepted; negative control rejected",
+            (true, true) => "both accepted (negative control tolerated today)",
             (false, _) => "docs-style replay itself failed — inspect detail",
         };
         println!("  verdict: {verdict}\n");

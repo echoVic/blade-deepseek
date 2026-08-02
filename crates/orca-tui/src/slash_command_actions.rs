@@ -301,6 +301,7 @@ pub(crate) fn decode_settings_intent(value: &str) -> Option<SettingsIntent> {
     };
     let reasoning_effort = match fields[1] {
         "-" => None,
+        "low" => Some(orca_core::config::ReasoningEffort::Low),
         "high" => Some(orca_core::config::ReasoningEffort::High),
         "max" => Some(orca_core::config::ReasoningEffort::Max),
         _ => return None,
@@ -320,4 +321,25 @@ pub(crate) fn decode_settings_intent(value: &str) -> Option<SettingsIntent> {
             approval_mode,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low_reasoning_effort_round_trips_through_settings_intent() {
+        let encoded = encode_settings_intent(
+            Some("deepseek-v4-flash"),
+            Some(orca_core::config::ReasoningEffort::Low),
+            None,
+        );
+
+        let decoded = decode_settings_intent(&encoded).expect("decode low effort intent");
+
+        assert_eq!(
+            decoded.reasoning_effort,
+            Some(orca_core::config::ReasoningEffort::Low)
+        );
+    }
 }

@@ -315,7 +315,8 @@ fn reasoning_effort_submenu(pending_model: String, current: ReasoningEffort) -> 
 
 fn reasoning_effort_options() -> &'static [(ReasoningEffort, &'static str)] {
     &[
-        (ReasoningEffort::High, "(faster, lighter reasoning)"),
+        (ReasoningEffort::Low, "(fastest, light reasoning)"),
+        (ReasoningEffort::High, "(balanced reasoning)"),
         (ReasoningEffort::Max, "(deepest reasoning, default)"),
     ]
 }
