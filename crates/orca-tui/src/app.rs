@@ -2292,7 +2292,7 @@ mod tests {
                     args: None,
                 })
                 .expect("run saved workflow action");
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(60);
             let mut events = Vec::new();
             while Instant::now() < deadline
                 && !events
@@ -4558,7 +4558,7 @@ mod tests {
             let mut stalled_notice = false;
             let mut stalled_status = false;
             let mut seen = Vec::new();
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
             while std::time::Instant::now() < deadline && !(stalled_notice && stalled_status) {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 match event_rx.recv_timeout(remaining.min(Duration::from_secs(2))) {

@@ -30,8 +30,8 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
         run: |
-          cargo test -p orca-tui --lib --locked -- --test-threads=1
-          cargo test --test tui_pty_contract --locked -- --test-threads=1
+          cargo nextest run -p orca-tui --lib --locked --profile ci-serial
+          cargo nextest run --test tui_pty_contract --locked --profile ci-serial
           cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
 
   version:
@@ -130,8 +130,8 @@ jobs:
           cargo test -p orca-runtime --test runtime_surface_commit thread_and_policy_owner_leases_fail_closed_and_wall_rollback_has_no_authority --locked -- --nocapture
           cargo test --test history_contract history_rename_search_and_compress_work_for_latest --locked -- --nocapture
           cargo build -p orca-windows-runner --locked
-          cargo test -p orca-tui --lib --locked -- --test-threads=1
-          cargo test --test tui_pty_contract --locked -- --test-threads=1
+          cargo nextest run -p orca-tui --lib --locked --profile ci-serial
+          cargo nextest run --test tui_pty_contract --locked --profile ci-serial
           cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
       - name: Run native Windows ARM64 behavior gates
         if: matrix.target == 'aarch64-pc-windows-msvc'

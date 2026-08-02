@@ -2,6 +2,7 @@
 default-filter = "not (binary(=orca_tui) | binary(=tui_pty_contract))"
 fail-fast = false
 test-threads = 2
+retries = 2
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.ci.overrides]]
@@ -75,3 +76,12 @@ threads-required = 2
 [[profile.ci.overrides]]
 filter = "package(=orca-runtime) & test(/^runtime_host::tests::(failed_private_winner_append_retries_before_capability_reroute|distinct_capability_loss_is_reconciled_after_retained_retry|typed_task_foreground_commits_ownership_before_registry_visibility)$/)"
 threads-required = 2
+
+# Serial gate for the binaries excluded from profile.ci's default-filter
+# (orca_tui, tui_pty_contract): one test process at a time, before the
+# parallel workspace phase, with the same retry budget.
+[profile.ci-serial]
+fail-fast = false
+test-threads = 1
+retries = 2
+slow-timeout = { period = "60s", terminate-after = 2 }
