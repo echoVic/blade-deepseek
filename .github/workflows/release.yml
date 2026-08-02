@@ -402,6 +402,7 @@ jobs:
       - name: Smoke the installed native Windows runner and sandbox lifecycle
         shell: powershell
         run: |
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
           $root = Join-Path $env:RUNNER_TEMP "orca-native-helper-smoke"
           $installDir = Join-Path (Join-Path $env:RUNNER_TEMP "orca-installer-smoke") "bin"
           $runner = Join-Path $installDir "orca-windows-runner.exe"
@@ -421,7 +422,7 @@ jobs:
             forward_stdin = $false
           } | ConvertTo-Json -Compress
           $runnerResponseText = $runnerRequest | & $runner
-          if ($LASTEXITCODE -ne 0) { throw "native Windows runner exited with code $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "native Windows runner exited with code ${LASTEXITCODE}: $runnerResponseText" }
           $runnerResponse = $runnerResponseText | ConvertFrom-Json
           if (-not $runnerResponse.ok -or $runnerResponse.exit_code -ne 0) {
             throw "native Windows runner smoke failed: $runnerResponseText"
