@@ -298,8 +298,8 @@ mod tests {
             description: "slow tool".to_string(),
             action_kind: ActionKind::Shell,
             command: platform_script(
-                "printf stdout-before; printf stderr-before >&2; sleep 5; printf after",
-                "[Console]::Out.Write('stdout-before'); [Console]::Out.Flush(); [Console]::Error.Write('stderr-before'); [Console]::Error.Flush(); Start-Sleep -Seconds 5; [Console]::Out.Write('after')",
+                "printf stdout-before; printf stderr-before >&2; sleep 5; sleep 5; printf after",
+                "[Console]::Out.Write('stdout-before'); [Console]::Out.Flush(); [Console]::Error.Write('stderr-before'); [Console]::Error.Flush(); Start-Sleep -Seconds 5; Start-Sleep -Seconds 5; [Console]::Out.Write('after')",
             ),
             schema: serde_json::json!({}),
         };

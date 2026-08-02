@@ -3176,7 +3176,7 @@ mod tests {
             completion_error: None,
             next_event_seq: 0,
             semantic_events: Vec::new(),
-            path: std::path::PathBuf::from("/tmp/resumed-goal.jsonl"),
+            path: std::env::temp_dir().join("resumed-goal.jsonl"),
         }
     }
 

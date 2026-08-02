@@ -1400,6 +1400,10 @@ mod tests {
         std::env::temp_dir().join(name)
     }
 
+    fn test_protocol_path(value: &str) -> PathBuf {
+        PathBuf::from(value)
+    }
+
     #[test]
     fn submission_decodes_submit_wire_shape() {
         let submission =
@@ -1520,7 +1524,7 @@ mod tests {
                     permissions.permission_updates[5],
                     crate::server::PermissionUpdate::RemoveDirectories {
                         destination: "session".to_string(),
-                        directories: vec![std::path::PathBuf::from("/tmp/old")]
+                        directories: vec![test_protocol_path("/tmp/old")]
                     }
                 );
             }
@@ -1716,7 +1720,7 @@ mod tests {
         assert_eq!(
             bindings.bindings()[0].target,
             crate::mentions::MentionTarget::File {
-                root: PathBuf::from("/tmp/two"),
+                root: test_protocol_path("/tmp/two"),
                 path: "same.txt".to_string(),
                 kind: crate::mentions::MentionFileKind::File,
             }
@@ -2102,7 +2106,7 @@ mod tests {
                 permissions: RequestPermissionProfile {
                     file_system: Some(RequestFileSystemPermissions {
                         read: None,
-                        write: Some(vec![PathBuf::from("/tmp/extra")]),
+                        write: Some(vec![test_protocol_path("/tmp/extra")]),
                         entries: None,
                     }),
                     network: None,
@@ -2206,12 +2210,12 @@ mod tests {
                 permissions: RequestPermissionProfile {
                     file_system: Some(RequestFileSystemPermissions {
                         read: Some(vec![
-                            PathBuf::from("/tmp/readable"),
-                            PathBuf::from("/tmp/both"),
+                            test_protocol_path("/tmp/readable"),
+                            test_protocol_path("/tmp/both"),
                         ]),
                         write: Some(vec![
-                            PathBuf::from("/tmp/writable"),
-                            PathBuf::from("/tmp/both"),
+                            test_protocol_path("/tmp/writable"),
+                            test_protocol_path("/tmp/both"),
                         ]),
                         entries: None,
                     }),
@@ -2239,7 +2243,7 @@ mod tests {
                 permissions: RequestPermissionProfile {
                     file_system: Some(RequestFileSystemPermissions {
                         read: None,
-                        write: Some(vec![PathBuf::from("/tmp/extra")]),
+                        write: Some(vec![test_protocol_path("/tmp/extra")]),
                         entries: None,
                     }),
                     network: None,
@@ -2441,6 +2445,7 @@ mod tests {
     #[test]
     fn submission_decodes_command_exec_wire_shape() {
         let submission = Submission::decode(
+            // windows-platform-boundary: protocol-shape-only
             r#"{"id":"cmd","method":"command/exec","params":{"threadId":"thread-1","command":["sh","-lc","printf ok"],"processId":"process-1","cwd":"/tmp/orca-command","env":{"ORCA_COMMAND_EXEC_BASE":"request","ORCA_COMMAND_EXEC_REMOVE":null},"tty":false,"streamStdin":true,"streamStdoutStderr":true,"outputBytesCap":1024,"disableTimeout":false,"timeoutMs":5000,"permissionProfile":"read-only"}}"#,
         )
         .expect("command/exec submission");
@@ -2453,7 +2458,7 @@ mod tests {
                 command: vec!["sh".to_string(), "-lc".to_string(), "printf ok".to_string()],
                 command_is_argv: true,
                 process_id: Some("process-1".to_string()),
-                cwd: Some(PathBuf::from("/tmp/orca-command")),
+                cwd: Some(test_protocol_path("/tmp/orca-command")),
                 env: BTreeMap::from([
                     (
                         "ORCA_COMMAND_EXEC_BASE".to_string(),
@@ -2535,6 +2540,7 @@ mod tests {
     #[test]
     fn submission_decodes_command_exec_workspace_write_sandbox_policy() {
         let submission = Submission::decode(
+            // windows-platform-boundary: protocol-shape-only
             r#"{"id":"cmd","method":"command/exec","params":{"command":["sh","-lc","true"],"sandboxPolicy":{"type":"workspaceWrite","writableRoots":["/tmp/allowed"],"networkAccess":true,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false}}}"#,
         )
         .expect("command/exec workspaceWrite submission");
@@ -2544,7 +2550,7 @@ mod tests {
                 assert_eq!(
                     options.sandbox_policy,
                     CommandSandboxPolicy::WorkspaceWrite {
-                        writable_roots: vec![PathBuf::from("/tmp/allowed")],
+                        writable_roots: vec![test_protocol_path("/tmp/allowed")],
                         network_access: true,
                         exclude_tmpdir_env_var: false,
                         exclude_slash_tmp: false,
@@ -2558,6 +2564,7 @@ mod tests {
     #[test]
     fn submission_decodes_command_exec_read_only_sandbox_policy() {
         let submission = Submission::decode(
+            // windows-platform-boundary: protocol-shape-only
             r#"{"id":"cmd","method":"command/exec","params":{"command":["sh","-lc","true"],"sandboxPolicy":{"type":"readOnly","networkAccess":true}}}"#,
         )
         .expect("command/exec readOnly submission");
@@ -2578,6 +2585,7 @@ mod tests {
     #[test]
     fn submission_decodes_command_exec_external_sandbox_policy() {
         let submission = Submission::decode(
+            // windows-platform-boundary: protocol-shape-only
             r#"{"id":"cmd","method":"command/exec","params":{"command":["sh","-lc","true"],"sandboxPolicy":{"type":"externalSandbox","networkAccess":"enabled"}}}"#,
         )
         .expect("command/exec externalSandbox submission");

@@ -120,6 +120,104 @@ validateManifest(baseline);
 validateCurrentInventory(baseline, { repoRoot });
 
 {
+  const relativePath = "crates/orca-runtime/src/visible_fixture_module.rs";
+  const sourceOverrides = new Map([
+    [
+      relativePath,
+      String.raw`
+#[cfg(test)]
+pub(crate) mod tests {
+    fn non_portable_fixture() {
+        let _ = PathBuf::from("/tmp/visible");
+    }
+}
+`,
+    ],
+  ]);
+  assert.throws(
+    () => validatePortableTestFixtures({ repoRoot, sourceOverrides }),
+    /host-canonical-path/,
+    "portable fixture validation must scan visible cfg(test) modules",
+  );
+}
+
+{
+  const relativePath = "crates/orca-runtime/src/combined_cfg_fixture.rs";
+  const sourceOverrides = new Map([
+    [
+      relativePath,
+      String.raw`
+#[cfg(all(test, unix))]
+mod unix_tests {
+    fn non_portable_fixture() {
+        let _ = ["sh", "-lc"];
+    }
+}
+`,
+    ],
+  ]);
+  assert.throws(
+    () => validatePortableTestFixtures({ repoRoot, sourceOverrides }),
+    /direct-unix-command-argv/,
+    "portable fixture validation must scan cfg expressions that include test",
+  );
+}
+
+{
+  const relativePath = "crates/orca-runtime/src/raw_protocol_fixture.rs";
+  const sourceOverrides = new Map([
+    [
+      relativePath,
+      String.raw`
+#[cfg(test)]
+mod tests {
+    fn non_portable_raw_protocol_fixture() {
+        let _ = r#"{"command":["sh","-lc","true"]}"#;
+    }
+}
+`,
+    ],
+  ]);
+  assert.throws(
+    () => validatePortableTestFixtures({ repoRoot, sourceOverrides }),
+    /direct-unix-command-argv/,
+    "portable fixture validation must reject Unix argv embedded in raw protocol requests",
+  );
+}
+
+{
+  const relativePath = "crates/orca-runtime/src/multiple_fixture_modules.rs";
+  const sourceOverrides = new Map([
+    [
+      relativePath,
+      String.raw`
+#[cfg(test)]
+mod first_tests {
+    fn non_portable_fixture() {
+        let _ = CanonicalPath::try_new(PathBuf::from("/tmp/first")).unwrap();
+        // windows-platform-boundary: protocol-shape-only
+        let _ = r#"wire shape with braces { "command": ["sh", "-lc"] }"#;
+        /* nested comment { /* inner } */ still ignored } */
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    fn portable_fixture() {
+        let _ = test_canonical_path("second");
+    }
+}
+`,
+    ],
+  ]);
+  assert.throws(
+    () => validatePortableTestFixtures({ repoRoot, sourceOverrides }),
+    /host-canonical-path/,
+    "portable fixture validation must scan every cfg(test) module regardless of its name",
+  );
+}
+
+{
   const relativePath = "crates/orca-runtime/src/portable_fixture_tests.rs";
   const sourceOverrides = new Map([
     [
@@ -128,8 +226,13 @@ validateCurrentInventory(baseline, { repoRoot });
 #[cfg(test)]
 mod tests {
     fn non_portable_fixtures() {
-        let _ = CanonicalPath::try_new(PathBuf::from("/tmp/orca-test")).unwrap();
-        let _ = vec!["sh".to_string(), "-lc".to_string()];
+        let _ = PathBuf::from("/tmp/orca-test");
+        let _ = ["sh", "-lc"];
+        let _ = std::path::PathBuf::from( "/tmp/second" );
+        let _ = PathBuf::from("/tmp-orca-prefix");
+        let _ = vec![String::from("sh"), String::from("-lc")];
+        let _ = ["sh".into(), "-lc".to_owned()];
+        let _ = ["bash", "-lc"];
     }
 }
 `,
@@ -137,9 +240,18 @@ mod tests {
   ]);
   assert.throws(
     () => validatePortableTestFixtures({ repoRoot, sourceOverrides }),
-    (error) =>
-      /host-canonical-path/.test(error.message) &&
-      /direct-unix-command-argv/.test(error.message),
+    (error) => {
+      const fixtureDiagnostics = error.message
+        .split("\n")
+        .filter((line) => line.includes(relativePath));
+      return (
+        fixtureDiagnostics.filter((line) => line.includes("host-canonical-path"))
+          .length === 3 &&
+        fixtureDiagnostics.filter((line) =>
+          line.includes("direct-unix-command-argv"),
+        ).length === 4
+      );
+    },
     "portable fixture validation must reject every reviewed host-specific test pattern",
   );
 }
@@ -155,6 +267,8 @@ mod tests {
     fn portable_fixtures() {
         let _ = test_canonical_path("orca-test");
         let _ = platform_command_argv();
+        // Documentation example only: ["sh", "-lc"]
+        /* Another documentation example: vec!["bash", "-lc"] */
         // windows-platform-boundary: protocol-shape-only
         let _ = vec!["sh".to_string(), "-lc".to_string()];
     }

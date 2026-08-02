@@ -164,7 +164,6 @@ mod tests {
     use std::borrow::Cow;
     use std::collections::HashMap;
     use std::io;
-    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     fn normalized_source(source: &str) -> Cow<'_, str> {
@@ -429,7 +428,7 @@ mod tests {
         let turn_store = ExtensionData::new("turn-1");
         let reducer = RuntimeTurnReducer::new(&thread_store, &turn_store);
         let mut overlay = TurnPermissionOverlay::default();
-        let write_root = PathBuf::from("/tmp/orca-write-root");
+        let write_root = std::env::temp_dir().join("orca-write-root");
         let mut domains = HashMap::new();
         domains.insert(
             "api.deepseek.com".to_string(),

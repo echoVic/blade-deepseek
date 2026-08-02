@@ -1331,12 +1331,12 @@ mod tests {
     #[test]
     fn stable_ids_do_not_collide_when_components_contain_separators() {
         let first = MentionTarget::File {
-            root: PathBuf::from("/tmp/a"),
+            root: std::env::temp_dir().join("a"),
             path: "b:c".to_string(),
             kind: MentionFileKind::File,
         };
         let second = MentionTarget::File {
-            root: PathBuf::from("/tmp/a:b"),
+            root: std::env::temp_dir().join("a:b"),
             path: "c".to_string(),
             kind: MentionFileKind::File,
         };

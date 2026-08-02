@@ -101,10 +101,7 @@ fn primitive_wrappers_enforce_the_frozen_contract() {
 
 #[test]
 fn canonical_path_unicode_wire_shape_round_trips() {
-    #[cfg(unix)]
-    let path = PathBuf::from("/tmp/orca-\u{8868}\u{9762}");
-    #[cfg(windows)]
-    let path = PathBuf::from("C:\\tmp\\orca-\u{8868}\u{9762}");
+    let path = std::env::temp_dir().join("orca-\u{8868}\u{9762}");
 
     let canonical = CanonicalPath::try_new(path).unwrap();
     let encoded = serde_json::to_value(&canonical).unwrap();

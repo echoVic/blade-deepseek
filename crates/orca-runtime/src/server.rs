@@ -2624,12 +2624,33 @@ mod tests {
         }
     }
 
+    fn test_command_exec_request(id: &str, script: &str, mut params: Value) -> String {
+        let params = params
+            .as_object_mut()
+            .expect("command/exec fixture params must be an object");
+        assert!(
+            params
+                .insert("command".to_string(), json!(test_command_argv(script)))
+                .is_none(),
+            "command/exec fixture command must be owned by the platform helper"
+        );
+        json!({"id": id, "method": "command/exec", "params": params}).to_string()
+    }
+
     fn test_shell_script(unix: &str, windows: &str) -> String {
         if cfg!(windows) {
             windows.to_string()
         } else {
             unix.to_string()
         }
+    }
+
+    fn platform_slash_tmp_path() -> PathBuf {
+        PathBuf::from("/tmp")
+    }
+
+    fn platform_unix_socket_path(name: &str) -> PathBuf {
+        platform_slash_tmp_path().join(name)
     }
 
     struct DelayedTerminalWriter {
@@ -3341,7 +3362,7 @@ extends = ":workspace"
 
         assert_eq!(
             sandbox.allowed_unix_socket_roots,
-            vec![PathBuf::from("/tmp/orca-browser.sock")]
+            vec![platform_unix_socket_path("orca-browser.sock")]
         );
     }
 
@@ -3399,8 +3420,12 @@ enabled = true
         let cwd = tempdir().expect("cwd");
         config.cwd = Some(cwd.path().to_path_buf());
         let input = Cursor::new(
-            br#"{"id":"cmd-deny","method":"command/exec","params":{"command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"permissionProfile":"limited-network","timeoutMs":5000}}"#
-                .to_vec(),
+            test_command_exec_request(
+                "cmd-deny",
+                "curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true",
+                json!({"permissionProfile": "limited-network", "timeoutMs": 5000}),
+            )
+            .into_bytes(),
         );
         let output = SharedVecWriter::default();
 
@@ -3439,8 +3464,12 @@ enabled = true
         let cwd = tempdir().expect("cwd");
         config.cwd = Some(cwd.path().to_path_buf());
         let input = Cursor::new(
-            br#"{"id":"cmd-allowlist","method":"command/exec","params":{"command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://other.orca.invalid/ || true"],"permissionProfile":"limited-network","timeoutMs":5000}}"#
-                .to_vec(),
+            test_command_exec_request(
+                "cmd-allowlist",
+                "curl --noproxy '' -sS -D - -o /dev/null http://other.orca.invalid/ || true",
+                json!({"permissionProfile": "limited-network", "timeoutMs": 5000}),
+            )
+            .into_bytes(),
         );
         let output = SharedVecWriter::default();
 
@@ -3518,8 +3547,10 @@ enabled = true
                 .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
                 .expect("thread id");
 
-            let request = format!(
-                r#"{{"id":"cmd-network","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc","curl --noproxy '' -sS http://127.0.0.1:{port}/"],"permissionProfile":"limited-network","timeoutMs":5000}}}}"#
+            let request = test_command_exec_request(
+                "cmd-network",
+                &format!("curl --noproxy '' -sS http://127.0.0.1:{port}/"),
+                json!({"threadId": thread_id, "permissionProfile": "limited-network", "timeoutMs": 5000}),
             );
             handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
                 .expect("command exec");
@@ -3637,10 +3668,10 @@ enabled = true
                 .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
                 .expect("thread id");
 
-            let request = format!(
-                r#"{{"id":"cmd-fs","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc",{}],"timeoutMs":5000}}}}"#,
-                serde_json::to_string(&format!("printf locked > {}", index_lock.display()))
-                    .expect("command json")
+            let request = test_command_exec_request(
+                "cmd-fs",
+                &format!("printf locked > {}", index_lock.display()),
+                json!({"threadId": thread_id, "timeoutMs": 5000}),
             );
             handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
                 .expect("command exec");
@@ -3708,10 +3739,10 @@ enabled = true
             assert_eq!(read.meta.metadata_writable_directories, vec![git_dir]);
 
             let session_target = repo.join(".git").join("session.lock");
-            let session_request = format!(
-                r#"{{"id":"cmd-fs-session","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc",{}],"timeoutMs":5000}}}}"#,
-                serde_json::to_string(&format!("printf persisted > {}", session_target.display()))
-                    .expect("session command json")
+            let session_request = test_command_exec_request(
+                "cmd-fs-session",
+                &format!("printf persisted > {}", session_target.display()),
+                json!({"threadId": thread_id, "timeoutMs": 5000}),
             );
             handle_line(
                 &server_config,
@@ -3774,9 +3805,10 @@ enabled = true
                 "touch {} 2>/dev/null || {{ printf %s\\\\n \"fatal: could not read Username for 'https://github.com': Operation not permitted\" >&2; exit 128; }}",
                 marker.display()
             );
-            let request = format!(
-                r#"{{"id":"cmd-unsandboxed","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc",{}],"timeoutMs":5000}}}}"#,
-                serde_json::to_string(&command).expect("command json")
+            let request = test_command_exec_request(
+                "cmd-unsandboxed",
+                &command,
+                json!({"threadId": thread_id, "timeoutMs": 5000}),
             );
             handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
                 .expect("command exec");
@@ -3880,9 +3912,10 @@ enabled = true
                 "touch {} 2>/dev/null || {{ printf %s\\\\n \"fatal: could not read Username for 'https://github.com': Operation not permitted\" >&2; exit 128; }}",
                 marker.display()
             );
-            let request = format!(
-                r#"{{"id":"cmd-unsandboxed-stream","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc",{}],"processId":"unsandboxed-stream-1","streamStdoutStderr":true,"timeoutMs":5000}}}}"#,
-                serde_json::to_string(&command).expect("command json")
+            let request = test_command_exec_request(
+                "cmd-unsandboxed-stream",
+                &command,
+                json!({"threadId": thread_id, "processId": "unsandboxed-stream-1", "streamStdoutStderr": true, "timeoutMs": 5000}),
             );
             handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
                 .expect("command exec");
@@ -3966,10 +3999,10 @@ enabled = true
                 .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
                 .expect("thread id");
 
-            let request = format!(
-                r#"{{"id":"cmd-fs-stream","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc",{}],"processId":"fs-stream-1","streamStdoutStderr":true,"timeoutMs":5000}}}}"#,
-                serde_json::to_string(&format!("printf locked > {}", index_lock.display()))
-                    .expect("command json")
+            let request = test_command_exec_request(
+                "cmd-fs-stream",
+                &format!("printf locked > {}", index_lock.display()),
+                json!({"threadId": thread_id, "processId": "fs-stream-1", "streamStdoutStderr": true, "timeoutMs": 5000}),
             );
             handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
                 .expect("command exec");
@@ -4086,8 +4119,10 @@ enabled = true
                 .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
                 .expect("thread id");
 
-            let request = format!(
-                r#"{{"id":"cmd-stream","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc","curl --noproxy '' -sS http://127.0.0.1:{port}/"],"processId":"net-stream-1","streamStdoutStderr":true,"permissionProfile":"limited-network","timeoutMs":5000}}}}"#
+            let request = test_command_exec_request(
+                "cmd-stream",
+                &format!("curl --noproxy '' -sS http://127.0.0.1:{port}/"),
+                json!({"threadId": thread_id, "processId": "net-stream-1", "streamStdoutStderr": true, "permissionProfile": "limited-network", "timeoutMs": 5000}),
             );
             handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
                 .expect("command exec");
@@ -4201,8 +4236,10 @@ enabled = true
                 .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
                 .expect("thread id");
 
-            let request = format!(
-                r#"{{"id":"cmd-stream","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc","sleep 1.2; curl --noproxy '' -sS http://127.0.0.1:9/"],"processId":"net-stream-delayed","streamStdoutStderr":true,"permissionProfile":"limited-network","timeoutMs":5000}}}}"#
+            let request = test_command_exec_request(
+                "cmd-stream",
+                "sleep 1.2; curl --noproxy '' -sS http://127.0.0.1:9/",
+                json!({"threadId": thread_id, "processId": "net-stream-delayed", "streamStdoutStderr": true, "permissionProfile": "limited-network", "timeoutMs": 5000}),
             );
             handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
                 .expect("command exec");
@@ -4279,8 +4316,10 @@ enabled = true
                 .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
                 .expect("thread id");
 
-            let request = format!(
-                r#"{{"id":"cmd-deny","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"permissionProfile":"limited-network","timeoutMs":5000}}}}"#
+            let request = test_command_exec_request(
+                "cmd-deny",
+                "curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true",
+                json!({"threadId": thread_id, "permissionProfile": "limited-network", "timeoutMs": 5000}),
             );
             handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
                 .expect("command exec");
@@ -4339,8 +4378,10 @@ enabled = true
         config.permission_profiles = file_config.permission_profiles;
         let cwd = tempdir().expect("cwd");
         config.cwd = Some(cwd.path().to_path_buf());
-        let request = format!(
-            r#"{{"id":"cmd-allow","method":"command/exec","params":{{"command":["sh","-lc","curl --noproxy '' -sS http://127.0.0.1:{port}/"],"permissionProfile":"limited-network","timeoutMs":5000}}}}"#
+        let request = test_command_exec_request(
+            "cmd-allow",
+            &format!("curl --noproxy '' -sS http://127.0.0.1:{port}/"),
+            json!({"permissionProfile": "limited-network", "timeoutMs": 5000}),
         );
         let input = Cursor::new(request.into_bytes());
         let output = SharedVecWriter::default();
@@ -4380,8 +4421,10 @@ enabled = true
         config.permission_profiles = file_config.permission_profiles;
         let cwd = tempdir().expect("cwd");
         config.cwd = Some(cwd.path().to_path_buf());
-        let request = format!(
-            r#"{{"id":"cmd-local-deny","method":"command/exec","params":{{"command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://127.0.0.1:{port}/ || true"],"permissionProfile":"limited-network","timeoutMs":5000}}}}"#
+        let request = test_command_exec_request(
+            "cmd-local-deny",
+            &format!("curl --noproxy '' -sS -D - -o /dev/null http://127.0.0.1:{port}/ || true"),
+            json!({"permissionProfile": "limited-network", "timeoutMs": 5000}),
         );
         let input = Cursor::new(request.into_bytes());
         let output = SharedVecWriter::default();
@@ -4425,8 +4468,12 @@ enabled = true
         config.permission_profiles = file_config.permission_profiles;
         let cwd = tempdir().expect("cwd");
         config.cwd = Some(cwd.path().to_path_buf());
-        let request = br#"{"id":"cmd-localhost-deny","method":"command/exec","params":{"command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://localhost/ || true"],"permissionProfile":"limited-network","timeoutMs":5000}}"#;
-        let input = Cursor::new(request.to_vec());
+        let request = test_command_exec_request(
+            "cmd-localhost-deny",
+            "curl --noproxy '' -sS -D - -o /dev/null http://localhost/ || true",
+            json!({"permissionProfile": "limited-network", "timeoutMs": 5000}),
+        );
+        let input = Cursor::new(request.into_bytes());
         let output = SharedVecWriter::default();
 
         run_with_io(ServerConfig { run_config: config }, input, output.clone())
@@ -4971,7 +5018,7 @@ enabled = true
 
         assert_eq!(
             sandbox.additional_writable_roots,
-            vec![PathBuf::from("/tmp")]
+            vec![platform_slash_tmp_path()]
         );
         assert_eq!(sandbox.denied_writable_roots, vec![tmpdir]);
     }
@@ -5100,7 +5147,7 @@ enabled = true
             shell_id: Some(shell_id.to_string()),
             command_event_id: Value::from("cmd"),
             command: test_command_argv("true"),
-            cwd: PathBuf::from("/tmp"),
+            cwd: std::env::temp_dir(),
             denied_writable_roots: Vec::new(),
             stream_output: false,
             output_bytes_cap: None,
@@ -8092,7 +8139,7 @@ rl.on("line", (line) => {
             .canonicalize()
             .expect("canonical macOS HOME");
             for root in [
-                Some(PathBuf::from("/tmp")),
+                Some(platform_slash_tmp_path()),
                 std::env::var_os("TMPDIR").map(PathBuf::from),
             ]
             .into_iter()

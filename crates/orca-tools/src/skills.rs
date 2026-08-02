@@ -606,7 +606,7 @@ mod tests {
             when_to_use: None,
             paths: vec![],
             source: SkillSource::User,
-            path: PathBuf::from("/tmp/SKILL.md"),
+            path: std::env::temp_dir().join("SKILL.md"),
             body: "Use logs first.".to_string(),
         };
 

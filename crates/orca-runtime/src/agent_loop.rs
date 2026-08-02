@@ -179,11 +179,10 @@ mod tests {
     use orca_core::provider_types::{ProviderResponse, ProviderStep};
     use orca_core::subagent_types::SubagentType;
     use orca_mcp::McpRegistry;
-    use std::path::PathBuf;
 
     #[test]
     fn runtime_turn_context_snapshots_agent_loop_entry_values() {
-        let cwd = PathBuf::from("/tmp/orca-runtime-turn-context");
+        let cwd = std::env::temp_dir().join("orca-runtime-turn-context");
         let subagent_type = SubagentType::General;
 
         let context = RuntimeTurnContext::new(&cwd, "inspect repo", 2, false, &subagent_type);
@@ -197,7 +196,7 @@ mod tests {
 
     #[test]
     fn agent_loop_context_exposes_runtime_turn_context() {
-        let cwd = PathBuf::from("/tmp/orca-agent-loop-context");
+        let cwd = std::env::temp_dir().join("orca-agent-loop-context");
         let subagent_type = SubagentType::General;
 
         let agent_context = AgentLoopContext::new(&cwd, "inspect repo", 1, true, &subagent_type);
@@ -212,7 +211,7 @@ mod tests {
 
     #[test]
     fn agent_loop_context_carries_initial_provider_response() {
-        let cwd = PathBuf::from("/tmp/orca-agent-loop-continuation");
+        let cwd = std::env::temp_dir().join("orca-agent-loop-continuation");
         let subagent_type = SubagentType::General;
         let response = ProviderResponse {
             steps: vec![ProviderStep::MessageDelta("continued".to_string())],
@@ -236,7 +235,7 @@ mod tests {
 
     #[test]
     fn agent_loop_context_carries_runtime_turn_continuation() {
-        let cwd = PathBuf::from("/tmp/orca-agent-loop-runtime-continuation");
+        let cwd = std::env::temp_dir().join("orca-agent-loop-runtime-continuation");
         let subagent_type = SubagentType::General;
         let response = ProviderResponse {
             steps: vec![ProviderStep::MessageDelta("continued".to_string())],
@@ -266,7 +265,7 @@ mod tests {
 
     #[test]
     fn agent_loop_context_carries_readonly_services() {
-        let cwd = PathBuf::from("/tmp/orca-agent-loop-services");
+        let cwd = std::env::temp_dir().join("orca-agent-loop-services");
         let subagent_type = SubagentType::General;
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
@@ -299,7 +298,7 @@ mod tests {
 
     #[test]
     fn agent_loop_context_exposes_runtime_turn_deps() {
-        let cwd = PathBuf::from("/tmp/orca-agent-loop-deps");
+        let cwd = std::env::temp_dir().join("orca-agent-loop-deps");
         let subagent_type = SubagentType::General;
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
@@ -318,7 +317,7 @@ mod tests {
 
     #[test]
     fn agent_loop_context_carries_runtime_refs() {
-        let cwd = PathBuf::from("/tmp/orca-agent-loop-runtime");
+        let cwd = std::env::temp_dir().join("orca-agent-loop-runtime");
         let subagent_type = SubagentType::General;
         let mut cost_tracker = CostTracker::new(None);
         let cancel = CancelToken::new();
@@ -438,7 +437,7 @@ mod tests {
 
     #[test]
     fn agent_loop_context_exposes_runtime_turn_state() {
-        let cwd = PathBuf::from("/tmp/orca-agent-loop-state");
+        let cwd = std::env::temp_dir().join("orca-agent-loop-state");
         let subagent_type = SubagentType::General;
         let mut cost_tracker = CostTracker::new(None);
         let cancel = CancelToken::new();
@@ -455,7 +454,7 @@ mod tests {
 
     #[test]
     fn agent_loop_context_carries_execution_refs() {
-        let cwd = PathBuf::from("/tmp/orca-agent-loop-execution");
+        let cwd = std::env::temp_dir().join("orca-agent-loop-execution");
         let subagent_type = SubagentType::General;
         let mut background_workflows = Vec::new();
         let mut lifecycle = RuntimeSessionLifecycle::new("agent-loop-execution");
@@ -538,7 +537,7 @@ mod tests {
 
     #[test]
     fn agent_loop_context_exposes_runtime_turn_interactions() {
-        let cwd = PathBuf::from("/tmp/orca-agent-loop-interactions");
+        let cwd = std::env::temp_dir().join("orca-agent-loop-interactions");
         let subagent_type = SubagentType::General;
         let handler = TestPermissionHandler;
         let user_input_handler = TestUserInputHandler;
@@ -569,7 +568,7 @@ mod tests {
 
     #[test]
     fn agent_loop_context_exposes_runtime_turn_execution() {
-        let cwd = PathBuf::from("/tmp/orca-agent-loop-execution-context");
+        let cwd = std::env::temp_dir().join("orca-agent-loop-execution-context");
         let subagent_type = SubagentType::General;
         let mut background_workflows = Vec::new();
         let mut lifecycle = RuntimeSessionLifecycle::new("agent-loop-execution-context");

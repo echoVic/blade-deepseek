@@ -3833,7 +3833,6 @@ mod tests {
 
     fn session(id: &str, title: &str) -> SessionSummary {
         use chrono::Utc;
-        use std::path::PathBuf;
         SessionSummary {
             session_id: id.to_string(),
             title: title.to_string(),
@@ -3842,7 +3841,7 @@ mod tests {
             model: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            path: PathBuf::from("/tmp"),
+            path: std::env::temp_dir(),
             archived: false,
             parent_id: None,
             forked: false,

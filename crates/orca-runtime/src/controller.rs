@@ -2437,7 +2437,7 @@ mod tests {
 
     #[test]
     fn tool_execution_context_groups_tool_services() {
-        let cwd = PathBuf::from("/tmp/orca-tool-execution-services");
+        let cwd = std::env::temp_dir().join("orca-tool-execution-services");
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
         let registry = McpRegistry::default();
@@ -2463,7 +2463,7 @@ mod tests {
 
     #[test]
     fn tool_execution_context_groups_runtime_state() {
-        let cwd = PathBuf::from("/tmp/orca-tool-execution-runtime");
+        let cwd = std::env::temp_dir().join("orca-tool-execution-runtime");
         let policy = ApprovalPolicy::new(ApprovalMode::FullAuto);
         let mut cost_tracker = CostTracker::new(None);
         let cancel = CancelToken::new();

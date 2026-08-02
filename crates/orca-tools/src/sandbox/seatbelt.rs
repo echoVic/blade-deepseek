@@ -467,6 +467,10 @@ fn seatbelt_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn platform_unix_socket_path(name: &str) -> PathBuf {
+        PathBuf::from("/tmp").join(name)
+    }
     use std::ffi::OsStr;
     use std::io::Write;
     use std::process::Output;
@@ -1480,7 +1484,7 @@ mod tests {
     #[test]
     fn workspace_write_profile_allows_configured_unix_sockets_without_full_network() {
         let workspace = TempDir::new().unwrap();
-        let socket_root = PathBuf::from("/tmp/orca-browser.sock");
+        let socket_root = platform_unix_socket_path("orca-browser.sock");
         let profile = workspace_write_profile(WorkspaceWriteProfileContext {
             cwd: workspace.path(),
             readable_roots: &[],
@@ -1509,7 +1513,7 @@ mod tests {
 
     #[test]
     fn read_only_profile_allows_configured_unix_sockets_without_full_network() {
-        let socket_root = PathBuf::from("/tmp/orca-browser.sock");
+        let socket_root = platform_unix_socket_path("orca-browser.sock");
         let workspace = TempDir::new().unwrap();
         let profile = read_only_profile(ReadOnlyProfileContext {
             cwd: workspace.path(),

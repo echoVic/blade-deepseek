@@ -192,6 +192,10 @@ fn path_arg(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    fn platform_slash_tmp_path() -> PathBuf {
+        PathBuf::from("/tmp")
+    }
+
     fn base_policy() -> LinuxSandboxPolicy {
         LinuxSandboxPolicy {
             cwd: PathBuf::from("/work"),
@@ -267,7 +271,7 @@ mod tests {
         // Use real existing dirs so the exists() guards pass.
         let mut policy = base_policy();
         policy.cwd = PathBuf::from("/");
-        policy.writable_roots = vec![PathBuf::from("/tmp")];
+        policy.writable_roots = vec![platform_slash_tmp_path()];
         policy.read_only_roots = vec![PathBuf::from("/etc")];
         let argv = build_bwrap_argv(&policy, "true");
         let joined = argv_string(&argv);

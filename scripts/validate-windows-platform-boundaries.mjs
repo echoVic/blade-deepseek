@@ -197,37 +197,127 @@ function collectRustSources(repoRoot) {
 const NON_PORTABLE_TEST_FIXTURE_PATTERNS = new Map([
   [
     "host-canonical-path",
-    String.raw`CanonicalPath::try_new\(\s*(?:std::path::)?PathBuf::from\("/tmp(?:/[^"]*)?"\)\s*\)\s*\.(?:unwrap|expect|is_ok)`,
+    String.raw`(?:std::path::)?PathBuf::from\(\s*"/tmp[^"]*"\s*\)`,
   ],
   [
     "direct-unix-command-argv",
-    String.raw`vec!\[\s*"sh"\.to_string\(\)\s*,\s*"-lc"\.to_string\(\)`,
+    String.raw`(?:vec!\s*)?\[\s*(?:String::from\(\s*)?"(?:sh|bash)"(?:\s*\)|\.(?:to_string|to_owned|into)\(\))?\s*,\s*(?:String::from\(\s*)?"-lc"(?:\s*\)|\.(?:to_string|to_owned|into)\(\))?`,
   ],
 ]);
 
-function testFixtureSource(relativePath, source) {
+function rustNonCodeEnd(source, index) {
+    if (source.startsWith("//", index)) {
+      const newline = source.indexOf("\n", index + 2);
+      return { end: newline === -1 ? source.length : newline + 1, kind: "comment" };
+    }
+    if (source.startsWith("/*", index)) {
+      let commentDepth = 1;
+      let cursor = index + 2;
+      while (cursor < source.length && commentDepth > 0) {
+        if (source.startsWith("/*", cursor)) {
+          commentDepth += 1;
+          cursor += 2;
+        } else if (source.startsWith("*/", cursor)) {
+          commentDepth -= 1;
+          cursor += 2;
+        } else {
+          cursor += 1;
+        }
+      }
+      return { end: cursor, kind: "comment" };
+    }
+
+    const rawString = source
+      .slice(index)
+      .match(/^(?:b|c)?r(#+)?"/);
+    if (rawString !== null) {
+      const hashes = rawString[1] ?? "";
+      const terminator = `"${hashes}`;
+      const end = source.indexOf(terminator, index + rawString[0].length);
+      return {
+        end: end === -1 ? source.length : end + terminator.length,
+        kind: "string",
+      };
+    }
+    const quotedString = source.slice(index).match(/^(?:b|c)?"/);
+    if (quotedString !== null) {
+      let cursor = index + quotedString[0].length;
+      while (cursor < source.length) {
+        if (source[cursor] === "\\") {
+          cursor += 2;
+        } else if (source[cursor] === '"') {
+          return { end: cursor + 1, kind: "string" };
+        } else {
+          cursor += 1;
+        }
+      }
+      return { end: source.length, kind: "string" };
+    }
+    const character = source
+      .slice(index)
+      .match(/^(?:b)?'(?:\\.|[^'\\\n])'/);
+    if (character !== null) {
+      return { end: index + character[0].length, kind: "string" };
+    }
+    return null;
+}
+
+function findRustBlockEnd(source, openBraceIndex) {
+  let depth = 0;
+  for (let index = openBraceIndex; index < source.length; index += 1) {
+    const nonCodeEnd = rustNonCodeEnd(source, index);
+    if (nonCodeEnd !== null) {
+      index = nonCodeEnd.end - 1;
+      continue;
+    }
+
+    if (source[index] === "{") {
+      depth += 1;
+    } else if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return index + 1;
+      }
+    }
+  }
+  fail("unterminated cfg(test) module");
+}
+
+function rustNonCodeKindAt(source, matchIndex) {
+  for (let index = 0; index < matchIndex; index += 1) {
+    const nonCodeEnd = rustNonCodeEnd(source, index);
+    if (nonCodeEnd === null) {
+      continue;
+    }
+    if (matchIndex < nonCodeEnd.end) {
+      return nonCodeEnd.kind;
+    }
+    index = nonCodeEnd.end - 1;
+  }
+  return null;
+}
+
+function testFixtureSources(relativePath, source) {
   if (
     relativePath.startsWith("tests/") ||
     relativePath.includes("/tests/") ||
     /(?:^|\/)test[^/]*\.rs$/.test(relativePath) ||
     /_tests\.rs$/.test(relativePath)
   ) {
-    return { source, lineOffset: 0 };
+    return [{ source, lineOffset: 0 }];
   }
 
-  const marker = /#\[cfg\(test\)\]\s*mod\s+tests\s*\{/g;
-  let match = null;
-  for (const candidate of source.matchAll(marker)) {
-    match = candidate;
+  const fixtures = [];
+  const marker = /#\[cfg\([^\]\n]*\btest\b[^\]\n]*\)\]\s*(?:#\[[^\]]+\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{/g;
+  for (const match of source.matchAll(marker)) {
+    const openBraceIndex = match.index + match[0].lastIndexOf("{");
+    const end = findRustBlockEnd(source, openBraceIndex);
+    fixtures.push({
+      source: source.slice(match.index, end),
+      lineOffset: source.slice(0, match.index).split("\n").length - 1,
+    });
   }
-  if (match === null) {
-    return null;
-  }
-  const start = match.index;
-  return {
-    source: source.slice(start),
-    lineOffset: source.slice(0, start).split("\n").length - 1,
-  };
+  return fixtures;
 }
 
 function matchIsInsidePlatformHelper(source, matchIndex) {
@@ -238,7 +328,10 @@ function matchIsInsidePlatformHelper(source, matchIndex) {
     functionName = match[1];
   }
   return (
-    functionName?.startsWith("platform_") || functionName === "test_command_argv"
+    functionName?.startsWith("platform_") ||
+    functionName === "test_command_argv" ||
+    functionName === "test_canonical_path" ||
+    functionName === "test_protocol_path"
   );
 }
 
@@ -266,22 +359,23 @@ export function validatePortableTestFixtures({
     const source = sourceOverrides.has(relativePath)
       ? sourceOverrides.get(relativePath)
       : readFileSync(path.join(repoRoot, relativePath), "utf8");
-    const fixture = testFixtureSource(relativePath, source);
-    if (fixture === null) {
-      continue;
-    }
-    for (const [patternId, regexSource] of NON_PORTABLE_TEST_FIXTURE_PATTERNS) {
-      for (const match of fixture.source.matchAll(new RegExp(regexSource, "g"))) {
-        if (
-          matchIsInsidePlatformHelper(fixture.source, match.index) ||
-          matchHasReviewedFixtureException(fixture.source, match.index)
-        ) {
-          continue;
+    for (const fixture of testFixtureSources(relativePath, source)) {
+      for (const [patternId, regexSource] of NON_PORTABLE_TEST_FIXTURE_PATTERNS) {
+        for (const match of fixture.source.matchAll(new RegExp(regexSource, "g"))) {
+          const nonCodeKind = rustNonCodeKindAt(fixture.source, match.index);
+          if (
+            nonCodeKind === "comment" ||
+            (patternId === "host-canonical-path" && nonCodeKind === "string") ||
+            matchIsInsidePlatformHelper(fixture.source, match.index) ||
+            matchHasReviewedFixtureException(fixture.source, match.index)
+          ) {
+            continue;
+          }
+          const line =
+            fixture.lineOffset +
+            fixture.source.slice(0, match.index).split("\n").length;
+          violations.push(`${relativePath}:${line} ${patternId}`);
         }
-        const line =
-          fixture.lineOffset +
-          fixture.source.slice(0, match.index).split("\n").length;
-        violations.push(`${relativePath}:${line} ${patternId}`);
       }
     }
   }

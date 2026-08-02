@@ -179,6 +179,42 @@ fn platform_command(unix: &str, windows: &str) -> Vec<String> {
     }
 }
 
+fn command_exec_request(id: &str, unix: &str, windows: &str, mut params: Value) -> Value {
+    let params = params
+        .as_object_mut()
+        .expect("command/exec fixture params must be an object");
+    assert!(
+        params
+            .insert(
+                "command".to_string(),
+                json!(platform_command(unix, windows))
+            )
+            .is_none(),
+        "command/exec fixture command must be owned by the platform helper"
+    );
+    json!({"id": id, "method": "command/exec", "params": params})
+}
+
+fn command_exec_request_for_platform_script(id: &str, script: &str, params: Value) -> Value {
+    #[cfg(windows)]
+    {
+        command_exec_request(id, "", script, params)
+    }
+    #[cfg(not(windows))]
+    {
+        command_exec_request(id, script, "", params)
+    }
+}
+
+fn unix_command_exec_request(id: &str, unix: &str, params: Value) -> Value {
+    command_exec_request(
+        id,
+        unix,
+        "throw 'Unix command fixture reached Windows execution'",
+        params,
+    )
+}
+
 fn platform_fixture_command(unix: &str, windows_node: &str) -> Vec<String> {
     #[cfg(windows)]
     {
@@ -3396,13 +3432,13 @@ fn server_mode_command_exec_uses_thread_additional_working_directories() {
 
         {
             let stdin = child.stdin_mut();
-            writeln!(
-                stdin,
-                r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
-                thread_id,
-                serde_json::to_string(&command).expect("json command")
-            )
-            .expect("write command/exec");
+            let request = command_exec_request(
+                "cmd",
+                &command,
+                "throw 'unexpected Windows execution'",
+                json!({"threadId": thread_id}),
+            );
+            writeln!(stdin, "{request}").expect("write command/exec");
             stdin.flush().expect("flush command/exec");
         }
         let completed = child.expect_event("cmd", "command_exec_completed");
@@ -3465,12 +3501,13 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd-request","method":"command/exec","params":{{"threadId":"{}","permissionProfile":"net","command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://api.example.com/ || true"],"timeoutMs":5000}}}}"#,
-            thread_id,
-        )
-        .expect("write command/exec permission request");
+        let request = command_exec_request(
+            "cmd-request",
+            "curl --noproxy '' -sS -D - -o /dev/null http://api.example.com/ || true",
+            "exit 0",
+            json!({"threadId": thread_id, "permissionProfile": "net", "timeoutMs": 5000}),
+        );
+        writeln!(stdin, "{request}").expect("write command/exec permission request");
         stdin
             .flush()
             .expect("flush command/exec permission request");
@@ -3538,12 +3575,13 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"timeoutMs":5000}}}}"#,
-            thread_id,
-        )
-        .expect("write command/exec");
+        let request = command_exec_request(
+            "cmd",
+            "curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true",
+            "exit 0",
+            json!({"threadId": thread_id, "timeoutMs": 5000}),
+        );
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
     let completed = child.expect_event("cmd", "command_exec_completed");
@@ -3608,12 +3646,13 @@ fn server_mode_session_network_deny_overrides_permission_profile_allow() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd-request","method":"command/exec","params":{{"threadId":"{}","permissionProfile":"requester","command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"timeoutMs":5000}}}}"#,
-            thread_id,
-        )
-        .expect("write command/exec permission request");
+        let request = command_exec_request(
+            "cmd-request",
+            "curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true",
+            "exit 0",
+            json!({"threadId": thread_id, "permissionProfile": "requester", "timeoutMs": 5000}),
+        );
+        writeln!(stdin, "{request}").expect("write command/exec permission request");
         stdin
             .flush()
             .expect("flush command/exec permission request");
@@ -3644,12 +3683,13 @@ fn server_mode_session_network_deny_overrides_permission_profile_allow() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","permissionProfile":"net","command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"timeoutMs":5000}}}}"#,
-            thread_id,
-        )
-        .expect("write command/exec");
+        let request = command_exec_request(
+            "cmd",
+            "curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true",
+            "exit 0",
+            json!({"threadId": thread_id, "permissionProfile": "net", "timeoutMs": 5000}),
+        );
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
     let error = child.expect_event("cmd", "error");
@@ -3695,13 +3735,9 @@ fn server_mode_command_exec_danger_full_access_bypasses_workspace_sandbox() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"blocked","method":"command/exec","params":{{"command":["sh","-lc",{}]}}}}"#,
-            serde_json::to_string(&format!("printf blocked > {}", blocked_file.display()))
-                .expect("blocked command json")
-        )
-        .expect("write sandboxed command/exec");
+        let command = platform_write_file_command(&blocked_file, "blocked");
+        let request = command_exec_request_for_platform_script("blocked", &command, json!({}));
+        writeln!(stdin, "{request}").expect("write sandboxed command/exec");
         stdin.flush().expect("flush sandboxed command/exec");
     }
     let blocked = child.expect_event("blocked", "command_exec_completed");
@@ -3710,13 +3746,13 @@ fn server_mode_command_exec_danger_full_access_bypasses_workspace_sandbox() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"allowed","method":"command/exec","params":{{"command":["sh","-lc",{}],"sandboxPolicy":{{"type":"dangerFullAccess"}}}}}}"#,
-            serde_json::to_string(&format!("printf allowed > {}", allowed_file.display()))
-                .expect("allowed command json")
-        )
-        .expect("write danger full access command/exec");
+        let command = platform_write_file_command(&allowed_file, "allowed");
+        let request = command_exec_request_for_platform_script(
+            "allowed",
+            &command,
+            json!({"sandboxPolicy": {"type": "dangerFullAccess"}}),
+        );
+        writeln!(stdin, "{request}").expect("write danger full access command/exec");
         stdin
             .flush()
             .expect("flush danger full access command/exec");
@@ -3751,9 +3787,9 @@ fn server_mode_command_exec_workspace_write_allows_only_writable_roots() {
     let allowed_file = allowed_root.join("allowed.txt");
     let blocked_file = blocked_root.join("blocked.txt");
     let command = format!(
-        "printf allowed > {}; printf blocked > {}",
-        allowed_file.display(),
-        blocked_file.display()
+        "{}; {}",
+        platform_write_file_command(&allowed_file, "allowed"),
+        platform_write_file_command(&blocked_file, "blocked")
     );
 
     let mut child = orca_command()
@@ -3773,13 +3809,12 @@ fn server_mode_command_exec_workspace_write_allows_only_writable_roots() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"sandboxPolicy":{{"type":"workspaceWrite","writableRoots":["{}"],"networkAccess":true,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false}}}}}}"#,
-            serde_json::to_string(&command).expect("command json"),
-            allowed_root.display()
-        )
-        .expect("write workspaceWrite command/exec");
+        let request = command_exec_request_for_platform_script(
+            "cmd",
+            &command,
+            json!({"sandboxPolicy": {"type": "workspaceWrite", "writableRoots": [allowed_root], "networkAccess": true, "excludeTmpdirEnvVar": false, "excludeSlashTmp": false}}),
+        );
+        writeln!(stdin, "{request}").expect("write workspaceWrite command/exec");
         stdin.flush().expect("flush workspaceWrite command/exec");
     }
     child.close_stdin();
@@ -3805,7 +3840,7 @@ fn server_mode_command_exec_read_only_blocks_workspace_writes() {
 
     let workspace = tempdir().expect("workspace");
     let workspace_file = workspace.path().join("blocked.txt");
-    let command = format!("printf blocked > {}", workspace_file.display());
+    let command = platform_write_file_command(&workspace_file, "blocked");
 
     let mut child = orca_command()
         .args([
@@ -3824,12 +3859,12 @@ fn server_mode_command_exec_read_only_blocks_workspace_writes() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"sandboxPolicy":{{"type":"readOnly","networkAccess":false}}}}}}"#,
-            serde_json::to_string(&command).expect("command json")
-        )
-        .expect("write readOnly command/exec");
+        let request = command_exec_request_for_platform_script(
+            "cmd",
+            &command,
+            json!({"sandboxPolicy": {"type": "readOnly", "networkAccess": false}}),
+        );
+        writeln!(stdin, "{request}").expect("write readOnly command/exec");
         stdin.flush().expect("flush readOnly command/exec");
     }
     child.close_stdin();
@@ -3851,7 +3886,7 @@ fn server_mode_command_exec_permission_profile_read_only_blocks_workspace_writes
 
     let workspace = tempdir().expect("workspace");
     let workspace_file = workspace.path().join("blocked.txt");
-    let command = format!("printf blocked > {}", workspace_file.display());
+    let command = platform_write_file_command(&workspace_file, "blocked");
 
     let mut child = orca_command()
         .args([
@@ -3870,12 +3905,12 @@ fn server_mode_command_exec_permission_profile_read_only_blocks_workspace_writes
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"permissionProfile":"read-only"}}}}"#,
-            serde_json::to_string(&command).expect("command json")
-        )
-        .expect("write read-only permissionProfile command/exec");
+        let request = command_exec_request_for_platform_script(
+            "cmd",
+            &command,
+            json!({"permissionProfile": "read-only"}),
+        );
+        writeln!(stdin, "{request}").expect("write read-only permissionProfile command/exec");
         stdin
             .flush()
             .expect("flush read-only permissionProfile command/exec");
@@ -4111,13 +4146,12 @@ fn server_mode_command_exec_uses_configured_permission_profile_filesystem_write_
 
         {
             let stdin = child.stdin_mut();
-            writeln!(
-                stdin,
-                r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
-                thread_id,
-                serde_json::to_string(&command).expect("command json")
-            )
-            .expect("write filesystem permissionProfile command/exec");
+            let request = command_exec_request_for_platform_script(
+                "cmd",
+                &command,
+                json!({"threadId": thread_id}),
+            );
+            writeln!(stdin, "{request}").expect("write filesystem permissionProfile command/exec");
             stdin
                 .flush()
                 .expect("flush filesystem permissionProfile command/exec");
@@ -4205,13 +4239,13 @@ fn server_mode_command_exec_configured_permission_profile_materializes_workspace
 
         {
             let stdin = child.stdin_mut();
-            writeln!(
-                stdin,
-                r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
-                thread_id,
-                serde_json::to_string(&command).expect("command json")
-            )
-            .expect("write workspace roots permissionProfile command/exec");
+            let request = command_exec_request_for_platform_script(
+                "cmd",
+                &command,
+                json!({"threadId": thread_id}),
+            );
+            writeln!(stdin, "{request}")
+                .expect("write workspace roots permissionProfile command/exec");
             stdin
                 .flush()
                 .expect("flush workspace roots permissionProfile command/exec");
@@ -4301,13 +4335,13 @@ fn server_mode_command_exec_configured_permission_profile_uses_scoped_filesystem
 
         {
             let stdin = child.stdin_mut();
-            writeln!(
-                stdin,
-                r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
-                thread_id,
-                serde_json::to_string(&command).expect("command json")
-            )
-            .expect("write scoped filesystem permissionProfile command/exec");
+            let request = command_exec_request_for_platform_script(
+                "cmd",
+                &command,
+                json!({"threadId": thread_id}),
+            );
+            writeln!(stdin, "{request}")
+                .expect("write scoped filesystem permissionProfile command/exec");
             stdin
                 .flush()
                 .expect("flush scoped filesystem permissionProfile command/exec");
@@ -4373,12 +4407,12 @@ fn server_mode_command_exec_configured_permission_profile_uses_trailing_globstar
 
         {
             let stdin = child.stdin_mut();
-            writeln!(
-                stdin,
-                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"permissionProfile":"globstar"}}}}"#,
-                serde_json::to_string(&command).expect("command json")
-            )
-            .expect("write globstar permissionProfile command/exec");
+            let request = command_exec_request_for_platform_script(
+                "cmd",
+                &command,
+                json!({"permissionProfile": "globstar"}),
+            );
+            writeln!(stdin, "{request}").expect("write globstar permissionProfile command/exec");
             stdin
                 .flush()
                 .expect("flush globstar permissionProfile command/exec");
@@ -4445,12 +4479,12 @@ fn server_mode_command_exec_configured_permission_profile_deny_overrides_write_r
 
         {
             let stdin = child.stdin_mut();
-            writeln!(
-                stdin,
-                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"permissionProfile":"mixed"}}}}"#,
-                serde_json::to_string(&command).expect("command json")
-            )
-            .expect("write deny permissionProfile command/exec");
+            let request = command_exec_request_for_platform_script(
+                "cmd",
+                &command,
+                json!({"permissionProfile": "mixed"}),
+            );
+            writeln!(stdin, "{request}").expect("write deny permissionProfile command/exec");
             stdin
                 .flush()
                 .expect("flush deny permissionProfile command/exec");
@@ -4518,12 +4552,12 @@ fn server_mode_command_exec_configured_permission_profile_deny_blocks_reads() {
 
         {
             let stdin = child.stdin_mut();
-            writeln!(
-                stdin,
-                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"permissionProfile":"mixed"}}}}"#,
-                serde_json::to_string(&command).expect("command json")
-            )
-            .expect("write deny-read permissionProfile command/exec");
+            let request = command_exec_request_for_platform_script(
+                "cmd",
+                &command,
+                json!({"permissionProfile": "mixed"}),
+            );
+            writeln!(stdin, "{request}").expect("write deny-read permissionProfile command/exec");
             stdin
                 .flush()
                 .expect("flush deny-read permissionProfile command/exec");
@@ -4591,12 +4625,12 @@ fn server_mode_command_exec_configured_permission_profile_enforces_deny_glob_ent
 
         {
             let stdin = child.stdin_mut();
-            writeln!(
-                stdin,
-                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"permissionProfile":"globbed"}}}}"#,
-                serde_json::to_string(&command).expect("command json")
-            )
-            .expect("write glob permissionProfile command/exec");
+            let request = command_exec_request_for_platform_script(
+                "cmd",
+                &command,
+                json!({"permissionProfile": "globbed"}),
+            );
+            writeln!(stdin, "{request}").expect("write glob permissionProfile command/exec");
             stdin
                 .flush()
                 .expect("flush glob permissionProfile command/exec");
@@ -4644,11 +4678,13 @@ fn server_mode_command_exec_configured_permission_profile_materializes_minimal_s
 
         {
             let stdin = child.stdin_mut();
-            writeln!(
-                stdin,
-                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","true"],"permissionProfile":"minimal"}}}}"#
-            )
-            .expect("write minimal permissionProfile command/exec");
+            let request = command_exec_request(
+                "cmd",
+                "true",
+                "exit 0",
+                json!({"permissionProfile": "minimal"}),
+            );
+            writeln!(stdin, "{request}").expect("write minimal permissionProfile command/exec");
             stdin
                 .flush()
                 .expect("flush minimal permissionProfile command/exec");
@@ -4697,11 +4733,13 @@ fn server_mode_command_exec_configured_permission_profile_enforces_network_domai
 
         {
             let stdin = child.stdin_mut();
-            writeln!(
-                stdin,
-                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"permissionProfile":"net","timeoutMs":5000}}}}"#
-            )
-            .expect("write network domain permissionProfile command/exec");
+            let request = unix_command_exec_request(
+                "cmd",
+                "curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true",
+                json!({"permissionProfile": "net", "timeoutMs": 5000}),
+            );
+            writeln!(stdin, "{request}")
+                .expect("write network domain permissionProfile command/exec");
             stdin
                 .flush()
                 .expect("flush network domain permissionProfile command/exec");
@@ -4961,12 +4999,12 @@ fn server_mode_command_exec_configured_permission_profile_materializes_tmpdir() 
 
         {
             let stdin = child.stdin_mut();
-            writeln!(
-                stdin,
-                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"permissionProfile":"tmp"}}}}"#,
-                serde_json::to_string(&command).expect("command json")
-            )
-            .expect("write tmpdir permissionProfile command/exec");
+            let request = command_exec_request_for_platform_script(
+                "cmd",
+                &command,
+                json!({"permissionProfile": "tmp"}),
+            );
+            writeln!(stdin, "{request}").expect("write tmpdir permissionProfile command/exec");
             stdin
                 .flush()
                 .expect("flush tmpdir permissionProfile command/exec");
@@ -5038,13 +5076,12 @@ fn server_mode_command_exec_sandbox_policy_overrides_thread_active_permission_pr
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}],"sandboxPolicy":{{"type":"workspaceWrite","writableRoots":[],"networkAccess":true,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false}}}}}}"#,
-            thread_id,
-            serde_json::to_string(&command).expect("command json")
-        )
-        .expect("write explicit sandboxPolicy command/exec");
+        let request = command_exec_request_for_platform_script(
+            "cmd",
+            &command,
+            json!({"threadId": thread_id, "sandboxPolicy": {"type": "workspaceWrite", "writableRoots": [], "networkAccess": true, "excludeTmpdirEnvVar": false, "excludeSlashTmp": false}}),
+        );
+        writeln!(stdin, "{request}").expect("write explicit sandboxPolicy command/exec");
         stdin
             .flush()
             .expect("flush explicit sandboxPolicy command/exec");
@@ -5091,12 +5128,12 @@ fn server_mode_command_exec_external_sandbox_bypasses_workspace_sandbox() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"sandboxPolicy":{{"type":"externalSandbox","networkAccess":"enabled"}}}}}}"#,
-            serde_json::to_string(&command).expect("command json")
-        )
-        .expect("write externalSandbox command/exec");
+        let request = command_exec_request_for_platform_script(
+            "cmd",
+            &command,
+            json!({"sandboxPolicy": {"type": "externalSandbox", "networkAccess": "enabled"}}),
+        );
+        writeln!(stdin, "{request}").expect("write externalSandbox command/exec");
         stdin.flush().expect("flush externalSandbox command/exec");
     }
     child.close_stdin();
@@ -5146,12 +5183,12 @@ fn server_mode_command_exec_workspace_write_can_exclude_slash_tmp() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"sandboxPolicy":{{"type":"workspaceWrite","writableRoots":[],"networkAccess":true,"excludeTmpdirEnvVar":true,"excludeSlashTmp":true}}}}}}"#,
-            serde_json::to_string(&command).expect("command json")
-        )
-        .expect("write workspaceWrite command/exec");
+        let request = command_exec_request_for_platform_script(
+            "cmd",
+            &command,
+            json!({"sandboxPolicy": {"type": "workspaceWrite", "writableRoots": [], "networkAccess": true, "excludeTmpdirEnvVar": true, "excludeSlashTmp": true}}),
+        );
+        writeln!(stdin, "{request}").expect("write workspaceWrite command/exec");
         stdin.flush().expect("flush workspaceWrite command/exec");
     }
     child.close_stdin();
@@ -5198,12 +5235,12 @@ fn server_mode_command_exec_workspace_write_allows_slash_tmp_by_default() {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"sandboxPolicy":{{"type":"workspaceWrite","writableRoots":[],"networkAccess":true,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false}}}}}}"#,
-            serde_json::to_string(&command).expect("command json")
-        )
-        .expect("write workspaceWrite command/exec");
+        let request = command_exec_request_for_platform_script(
+            "cmd",
+            &command,
+            json!({"sandboxPolicy": {"type": "workspaceWrite", "writableRoots": [], "networkAccess": true, "excludeTmpdirEnvVar": false, "excludeSlashTmp": false}}),
+        );
+        writeln!(stdin, "{request}").expect("write workspaceWrite command/exec");
         stdin.flush().expect("flush workspaceWrite command/exec");
     }
     child.close_stdin();
@@ -5324,39 +5361,39 @@ fn server_mode_command_exec_caps_buffered_output_by_bytes() {
 #[test]
 fn server_mode_command_exec_rejects_invalid_option_combinations() {
     assert_command_exec_error(
-        r#"{"command":["sh","-lc","sleep 1"],"processId":"invalid-timeout","disableTimeout":true,"timeoutMs":1000}"#,
+        json!({"command": platform_command("sleep 1", "Start-Sleep -Seconds 1"), "processId": "invalid-timeout", "disableTimeout": true, "timeoutMs": 1000}),
         "command/exec cannot set both timeoutMs and disableTimeout",
     );
     assert_command_exec_error(
-        r#"{"command":["sh","-lc","sleep 1"],"processId":"invalid-cap","disableOutputCap":true,"outputBytesCap":1024}"#,
+        json!({"command": platform_command("sleep 1", "Start-Sleep -Seconds 1"), "processId": "invalid-cap", "disableOutputCap": true, "outputBytesCap": 1024}),
         "command/exec cannot set both outputBytesCap and disableOutputCap",
     );
     assert_command_exec_error(
-        r#"{"command":["sh","-lc","sleep 1"],"processId":"negative-timeout","timeoutMs":-1}"#,
+        json!({"command": platform_command("sleep 1", "Start-Sleep -Seconds 1"), "processId": "negative-timeout", "timeoutMs": -1}),
         "command/exec timeoutMs must be non-negative, got -1",
     );
     assert_command_exec_error(
-        r#"{"command":["sh","-lc","true"],"sandboxPolicy":{"type":"dangerFullAccess"},"permissionProfile":"read-only"}"#,
+        json!({"command": platform_command("true", "exit 0"), "sandboxPolicy": {"type": "dangerFullAccess"}, "permissionProfile": "read-only"}),
         "`permissionProfile` cannot be combined with `sandboxPolicy`",
     );
     assert_command_exec_error(
-        r#"{"command":["sh","-lc","cat"],"streamStdoutStderr":true}"#,
+        json!({"command": platform_command("cat", "$input | Write-Output"), "streamStdoutStderr": true}),
         "command/exec tty or streaming requires a client-supplied processId",
     );
     assert_command_exec_error(
-        r#"{"command":["sh","-lc","cat"],"streamStdin":true}"#,
+        json!({"command": platform_command("cat", "$input | Write-Output"), "streamStdin": true}),
         "command/exec tty or streaming requires a client-supplied processId",
     );
     assert_command_exec_error(
-        r#"{"command":["sh","-lc","printf tty"],"tty":true}"#,
+        json!({"command": platform_command("printf tty", "Write-Host -NoNewline 'tty'"), "tty": true}),
         "command/exec tty or streaming requires a client-supplied processId",
     );
     assert_command_exec_error(
-        r#"{"command":["sh","-lc","true"],"processId":"size-without-tty","size":{"rows":24,"cols":80}}"#,
+        json!({"command": platform_command("true", "exit 0"), "processId": "size-without-tty", "size": {"rows": 24, "cols": 80}}),
         "command/exec size requires tty: true",
     );
     assert_command_exec_error(
-        r#"{"command":["sh","-lc","true"],"processId":"zero-size","tty":true,"size":{"rows":0,"cols":80}}"#,
+        json!({"command": platform_command("true", "exit 0"), "processId": "zero-size", "tty": true, "size": {"rows": 0, "cols": 80}}),
         "command/exec size rows and cols must be greater than 0",
     );
 }
@@ -5612,11 +5649,19 @@ fn server_mode_command_exec_rejects_duplicate_active_process_id() {
 
     {
         let stdin = child.stdin_mut();
+        let duplicate_command = platform_fixture_command_with_args(
+            "printf leaked > \"$1\"",
+            &format!(
+                "require('fs').writeFileSync({}, 'leaked')",
+                javascript_path(&duplicate_marker)
+            ),
+            &[duplicate_marker_arg],
+        );
         let request = json!({
             "id": "cmd-2",
             "method": "command/exec",
             "params": {
-                "command": ["sh", "-lc", "printf leaked > \"$1\"", "sh", duplicate_marker_arg],
+                "command": duplicate_command,
                 "processId": "dup-1"
             }
         });
@@ -9896,7 +9941,7 @@ fn wait_for_path(path: &Path) {
     }
 }
 
-fn assert_command_exec_error(params: &str, expected_message: &str) {
+fn assert_command_exec_error(params: Value, expected_message: &str) {
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -9915,11 +9960,8 @@ fn assert_command_exec_error(params: &str, expected_message: &str) {
 
     {
         let stdin = child.stdin_mut();
-        writeln!(
-            stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{params}}}"#
-        )
-        .expect("write command/exec");
+        let request = json!({"id": "cmd", "method": "command/exec", "params": params});
+        writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
     child.close_stdin();
