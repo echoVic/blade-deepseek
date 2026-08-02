@@ -3435,6 +3435,7 @@ impl RuntimeHost {
                 .expect("generated host incarnation is v7");
         let supervisor_host_incarnation = host_incarnation.clone();
         let (command_tx, command_rx) = tokio_mpsc::channel(HOST_COMMAND_CAPACITY);
+        let supervisor_command_tx = command_tx.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let supervisor = thread::Builder::new()
             .name("orca-runtime-host".to_string())
@@ -3451,6 +3452,7 @@ impl RuntimeHost {
                         let _ = ready_tx.send(Ok(()));
                         runtime.block_on(run_host_supervisor(
                             command_rx,
+                            supervisor_command_tx,
                             executor,
                             background_capacity,
                             surface_hub_config,
@@ -3532,6 +3534,10 @@ impl Drop for RuntimeHost {
 enum HostCommand {
     StartThread {
         request: Box<RuntimeThreadStartRequest>,
+        reply: SyncSender<Result<RuntimeThreadHandle, RuntimeHostError>>,
+    },
+    PreparedThreadStart {
+        prepared: Result<Box<PreparedStartedRuntimeThread>, RuntimeHostError>,
         reply: SyncSender<Result<RuntimeThreadHandle, RuntimeHostError>>,
     },
     JsonlListSessions {
@@ -4154,8 +4160,85 @@ struct HostShutdownActor {
     state: HostShutdownActorState,
 }
 
+struct PreparedStartedRuntimeThread {
+    thread: RuntimeThread,
+    actor_config: RunConfig,
+    actor_title: String,
+    surface_owner: Option<PreparedSurfaceOwner>,
+    ephemeral_reservation_timeout: Duration,
+    #[cfg(test)]
+    ephemeral_close_commit_failures: usize,
+}
+
+fn prepare_and_start_runtime_thread(
+    request: RuntimeThreadStartRequest,
+) -> Result<PreparedStartedRuntimeThread, RuntimeHostError> {
+    let actor_title = request.title.clone();
+    let actor_config = request.config.clone();
+    let ephemeral_reservation_timeout = request.ephemeral_reservation_timeout;
+    #[cfg(test)]
+    let ephemeral_close_commit_failures = request.ephemeral_close_commit_failures;
+    let PreparedRuntimeThreadStart {
+        request,
+        surface_owner,
+        resume_scope_replacement,
+    } = request.prepare()?;
+    let thread = request
+        .start()
+        .map_err(|error| RuntimeHostError::ThreadStartFailed {
+            message: error.to_string(),
+        })?;
+    if let Some(replacement) = resume_scope_replacement {
+        let owner = surface_owner
+            .as_ref()
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "replacement runtime scope requires a durable surface owner".to_string(),
+            })?;
+        SessionStore::new()
+            .update_thread_metadata(
+                &owner.thread_id,
+                ThreadMetadataPatch {
+                    runtime_workspace_roots: Some(replacement.runtime_workspace_roots),
+                    additional_working_directories: Some(
+                        replacement.additional_working_directories,
+                    ),
+                    ..ThreadMetadataPatch::default()
+                },
+            )
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to persist replacement runtime scope: {error}"),
+            })?;
+    }
+    Ok(PreparedStartedRuntimeThread {
+        thread,
+        actor_config,
+        actor_title,
+        surface_owner,
+        ephemeral_reservation_timeout,
+        #[cfg(test)]
+        ephemeral_close_commit_failures,
+    })
+}
+
+fn dispatch_host_store<T>(
+    operation: &'static str,
+    reply: SyncSender<io::Result<T>>,
+    work: impl FnOnce() -> io::Result<T> + Send + 'static,
+) where
+    T: Send + 'static,
+{
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(work)
+            .await
+            .map_err(|error| io::Error::other(format!("{operation} worker failed: {error}")))
+            .and_then(|result| result);
+        let _ = reply.send(result);
+    });
+}
+
 async fn run_host_supervisor(
     mut command_rx: tokio_mpsc::Receiver<HostCommand>,
+    command_tx: tokio_mpsc::Sender<HostCommand>,
     executor: Arc<dyn ThreadOperationExecutor>,
     background_capacity: usize,
     surface_hub_config: surface::SurfaceHubConfig,
@@ -4182,82 +4265,52 @@ async fn run_host_supervisor(
         };
         match command {
             HostCommand::StartThread { request, reply } => {
-                let actor_title = request.title.clone();
-                let prepared = tokio::task::spawn_blocking(move || request.prepare()).await;
-                let prepared = match prepared {
-                    Ok(Ok(prepared)) => prepared,
-                    Ok(Err(error)) => {
+                let completion_tx = command_tx.clone();
+                tokio::spawn(async move {
+                    let prepared = tokio::task::spawn_blocking(move || {
+                        prepare_and_start_runtime_thread(*request)
+                    })
+                    .await
+                    .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                        message: error.to_string(),
+                    })
+                    .and_then(|prepared| prepared)
+                    .map(Box::new);
+                    if let Err(error) = completion_tx
+                        .send(HostCommand::PreparedThreadStart { prepared, reply })
+                        .await
+                    {
+                        if let HostCommand::PreparedThreadStart { reply, .. } = error.0 {
+                            let _ = reply.send(Err(RuntimeHostError::HostUnavailable));
+                        }
+                    }
+                });
+            }
+            HostCommand::PreparedThreadStart { prepared, reply } => {
+                let PreparedStartedRuntimeThread {
+                    mut thread,
+                    mut actor_config,
+                    actor_title,
+                    surface_owner,
+                    ephemeral_reservation_timeout,
+                    #[cfg(test)]
+                    ephemeral_close_commit_failures,
+                } = match prepared {
+                    Ok(prepared) => *prepared,
+                    Err(error) => {
                         let _ = reply.send(Err(error));
                         continue;
                     }
-                    Err(error) => {
-                        let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
-                            message: error.to_string(),
-                        }));
-                        continue;
-                    }
                 };
-                if prepared
-                    .surface_owner
+                if surface_owner
                     .as_ref()
                     .is_some_and(|owner| actors.contains_key(&owner.thread_id))
                 {
-                    let thread_id = &prepared.surface_owner.as_ref().unwrap().thread_id;
+                    let thread_id = &surface_owner.as_ref().unwrap().thread_id;
                     let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
                         message: format!("duplicate runtime thread id: {thread_id}"),
                     }));
                     continue;
-                }
-                let PreparedRuntimeThreadStart {
-                    request,
-                    surface_owner,
-                    resume_scope_replacement,
-                } = prepared;
-                let mut actor_config = request.config.clone();
-                let ephemeral_reservation_timeout = request.ephemeral_reservation_timeout;
-                #[cfg(test)]
-                let ephemeral_close_commit_failures = request.ephemeral_close_commit_failures;
-                let started = tokio::task::spawn_blocking(move || request.start()).await;
-                let mut thread = match started {
-                    Ok(Ok(thread)) => thread,
-                    Ok(Err(error)) => {
-                        let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
-                            message: error.to_string(),
-                        }));
-                        continue;
-                    }
-                    Err(error) => {
-                        let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
-                            message: error.to_string(),
-                        }));
-                        continue;
-                    }
-                };
-                if let Some(replacement) = resume_scope_replacement {
-                    let Some(owner) = surface_owner.as_ref() else {
-                        let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
-                            message: "replacement runtime scope requires a durable surface owner"
-                                .to_string(),
-                        }));
-                        continue;
-                    };
-                    if let Err(error) = SessionStore::new().update_thread_metadata(
-                        &owner.thread_id,
-                        ThreadMetadataPatch {
-                            runtime_workspace_roots: Some(replacement.runtime_workspace_roots),
-                            additional_working_directories: Some(
-                                replacement.additional_working_directories,
-                            ),
-                            ..ThreadMetadataPatch::default()
-                        },
-                    ) {
-                        let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
-                            message: format!(
-                                "failed to persist replacement runtime scope: {error}"
-                            ),
-                        }));
-                        continue;
-                    }
                 }
                 let thread_id = thread.thread_id().to_string();
                 let session_id = thread.session().session_id().map(str::to_string);
@@ -4355,15 +4408,16 @@ async fn run_host_supervisor(
                 search_term,
                 reply,
             } => {
-                let result = SessionStore::new().list_threads(
-                    cursor.as_deref(),
-                    limit,
-                    filters,
-                    sort_key,
-                    sort_direction,
-                    search_term.as_deref(),
-                );
-                let _ = reply.send(result);
+                dispatch_host_store("list sessions", reply, move || {
+                    SessionStore::new().list_threads(
+                        cursor.as_deref(),
+                        limit,
+                        filters,
+                        sort_key,
+                        sort_direction,
+                        search_term.as_deref(),
+                    )
+                });
             }
             HostCommand::JsonlSearchSessions {
                 query,
@@ -4374,15 +4428,16 @@ async fn run_host_supervisor(
                 sort_direction,
                 reply,
             } => {
-                let result = SessionStore::new().search_threads(
-                    &query,
-                    cursor.as_deref(),
-                    limit,
-                    include_archived,
-                    sort_key,
-                    sort_direction,
-                );
-                let _ = reply.send(result);
+                dispatch_host_store("search sessions", reply, move || {
+                    SessionStore::new().search_threads(
+                        &query,
+                        cursor.as_deref(),
+                        limit,
+                        include_archived,
+                        sort_key,
+                        sort_direction,
+                    )
+                });
             }
             HostCommand::JsonlReadSession {
                 thread_id,
@@ -4390,9 +4445,9 @@ async fn run_host_supervisor(
                 include_turns,
                 reply,
             } => {
-                let result =
-                    SessionStore::new().read_thread(&thread_id, include_messages, include_turns);
-                let _ = reply.send(result);
+                dispatch_host_store("read session", reply, move || {
+                    SessionStore::new().read_thread(&thread_id, include_messages, include_turns)
+                });
             }
             HostCommand::JsonlListTurns {
                 thread_id,
@@ -4402,14 +4457,15 @@ async fn run_host_supervisor(
                 items_view,
                 reply,
             } => {
-                let result = SessionStore::new().list_thread_turns(
-                    &thread_id,
-                    cursor.as_deref(),
-                    limit,
-                    sort_direction,
-                    items_view,
-                );
-                let _ = reply.send(result);
+                dispatch_host_store("list session turns", reply, move || {
+                    SessionStore::new().list_thread_turns(
+                        &thread_id,
+                        cursor.as_deref(),
+                        limit,
+                        sort_direction,
+                        items_view,
+                    )
+                });
             }
             HostCommand::JsonlListItems {
                 thread_id,
@@ -4419,24 +4475,26 @@ async fn run_host_supervisor(
                 sort_direction,
                 reply,
             } => {
-                let result = SessionStore::new().list_thread_items(
-                    &thread_id,
-                    turn_id.as_deref(),
-                    cursor.as_deref(),
-                    limit,
-                    sort_direction,
-                );
-                let _ = reply.send(result);
+                dispatch_host_store("list session items", reply, move || {
+                    SessionStore::new().list_thread_items(
+                        &thread_id,
+                        turn_id.as_deref(),
+                        cursor.as_deref(),
+                        limit,
+                        sort_direction,
+                    )
+                });
             }
             HostCommand::JsonlUpdateSessionMetadata {
                 thread_id,
                 patch,
                 reply,
             } => {
-                let result = SessionStore::new()
-                    .update_thread_metadata(&thread_id, patch)
-                    .map(|_| ());
-                let _ = reply.send(result);
+                dispatch_host_store("update session metadata", reply, move || {
+                    SessionStore::new()
+                        .update_thread_metadata(&thread_id, patch)
+                        .map(|_| ())
+                });
             }
             HostCommand::ControlJsonlTurn {
                 client,
@@ -35842,6 +35900,7 @@ mod tests {
     use orca_core::subagent_config::SubagentConfig;
     use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
     use std::fs;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -35868,6 +35927,73 @@ mod tests {
 
     fn test_absolute_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(name)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_listing_does_not_block_host_supervisor() {
+        use std::ffi::CString;
+        use std::fs::OpenOptions;
+
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let sessions = home.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let fifo = sessions.join("blocked-session.jsonl");
+        let fifo_path = CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+
+        let host = RuntimeHost::start().expect("start runtime host");
+        let handle = host.handle();
+        let (list_tx, list_rx) = mpsc::sync_channel(1);
+        let list_handle = handle.clone();
+        let list_request = std::thread::spawn(move || {
+            let result = list_handle.jsonl_list_sessions(
+                None,
+                10,
+                ThreadListFilters::active(),
+                ThreadSortKey::UpdatedAt,
+                SortDirection::Desc,
+                None,
+            );
+            let _ = list_tx.send(result);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(matches!(list_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        let cwd = tempfile::tempdir().unwrap();
+        let (start_tx, start_rx) = mpsc::sync_channel(1);
+        let start_handle = handle.clone();
+        let start_request = std::thread::spawn(move || {
+            let result = start_handle.start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled),
+                "supervisor responsiveness",
+            );
+            let _ = start_tx.send(result);
+        });
+        start_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("blocked session listing stalled the host supervisor")
+            .expect("unrelated runtime thread failed to start");
+
+        OpenOptions::new()
+            .write(true)
+            .open(&fifo)
+            .and_then(|mut writer| writer.write_all(b"\n"))
+            .expect("release blocked session-list reader");
+        list_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("session listing did not settle after FIFO release")
+            .expect("session listing failed after FIFO release");
+        list_request.join().unwrap();
+        start_request.join().unwrap();
+        host.shutdown().expect("shutdown runtime host");
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
     }
 
     #[test]

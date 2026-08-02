@@ -209,11 +209,11 @@ git commit -m "fix(runtime): isolate goal store waits"
 - Test: crates/orca-runtime/tests/runtime_host.rs
 - Test: tests/thread_store_contract.rs
 
-- [ ] **Step 1: Write supervisor responsiveness test**
+- [x] **Step 1: Write supervisor responsiveness test**
 
 Inject a ThreadStore whose list_threads blocks on a barrier. While blocked, start an ephemeral thread and require startup within 100 ms.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 cargo test -p orca-runtime --test runtime_host session_listing_does_not_block_host_supervisor -- --nocapture
@@ -221,24 +221,24 @@ cargo test -p orca-runtime --test runtime_host session_listing_does_not_block_ho
 
 Expected: FAIL by timeout.
 
-- [ ] **Step 3: Add a typed blocking store dispatcher**
+- [x] **Step 3: Add a typed blocking store dispatcher**
 
 Create one helper that accepts a static operation name, a Send closure, and the command's reply sender. It runs the closure in spawn_blocking, maps JoinError into that HostCommand's declared error, and sends exactly one result from a separately spawned async task.
 
 Route replacement-scope metadata, list, search, read, list-turns, list-items, and update-metadata through it.
 
-- [ ] **Step 4: Prove bounded picker materialization**
+- [x] **Step 4: Prove bounded picker materialization**
 
 Create 2,000 metadata-only sessions in tests/thread_store_contract.rs. Request the picker page with its finite limit. Assert the page length does not exceed the limit and a test read counter proves transcript message bodies outside the page were not parsed.
 
-- [ ] **Step 5: Run GREEN**
+- [x] **Step 5: Run GREEN**
 
 ~~~sh
 cargo test -p orca-runtime --test runtime_host session_listing_does_not_block_host_supervisor -- --nocapture
 cargo test --test thread_store_contract bounded_session_page_does_not_materialize_all_transcripts -- --nocapture
 ~~~
 
-- [ ] **Step 6: Update C2 and commit**
+- [x] **Step 6: Update C2 and commit**
 
 ~~~sh
 git add crates/orca-runtime/src/runtime_host.rs crates/orca-runtime/tests/runtime_host.rs tests/thread_store_contract.rs docs/reports/2026-08-03-orca-audit-remediation-evidence.md
