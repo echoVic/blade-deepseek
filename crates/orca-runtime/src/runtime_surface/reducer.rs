@@ -3619,7 +3619,7 @@ fn apply_assistant_patch(
                     "assistant delta offset is not contiguous",
                 ));
             }
-            stream.text = DisplayText::new(format!("{}{}", stream.text.as_str(), text.as_str()));
+            stream.text.push_str(text.as_str());
             stream.next_offset = ByteOffset::new(offset.get() + text.as_str().len() as u64);
             Ok(())
         }
@@ -8319,6 +8319,17 @@ pub(crate) mod tests {
             finalization: None,
             terminal: None,
         }
+    }
+
+    #[test]
+    fn assistant_delta_append_counts_only_delta_bytes() {
+        let mut text = DisplayText::new("");
+        DisplayText::reset_appended_byte_count();
+        for _ in 0..1_000 {
+            text.push_str("0123456789");
+        }
+        assert_eq!(text.as_str().len(), 10_000);
+        assert_eq!(DisplayText::appended_byte_count(), 10_000);
     }
 
     #[test]

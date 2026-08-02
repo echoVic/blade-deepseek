@@ -1571,6 +1571,66 @@ fn generation_owned_families_reject_stale_exact_fences() {
 }
 
 #[test]
+fn assistant_delta_append_is_linear_and_uses_utf8_byte_offsets() {
+    let (initial, active_generation) = active_generation_state();
+    let stream_id = SurfaceStreamId::try_from_bytes(uuid_v7_bytes(41_232)).unwrap();
+    let mut stream_snapshot = initial.snapshot().clone();
+    stream_snapshot
+        .assistant_streams
+        .push(SurfaceAssistantStream {
+            stream_id: stream_id.clone(),
+            fence: active_generation.fence.clone(),
+            turn_id: active_generation.logical_turn_id.clone(),
+            item_id: SurfaceItemId::new(),
+            channel: AssistantChannel::Message,
+            next_offset: ByteOffset::new(0),
+            text: DisplayText::new(""),
+            state: SurfaceAssistantStreamState::Open,
+        });
+    let mut state = SurfaceReducerState::new(stream_snapshot.clone());
+    let mut replayed = SurfaceReducerState::new(stream_snapshot);
+    let mut offset = 0_u64;
+    let mut expected = String::new();
+    for (index, delta) in ["hello", " ", "\u{4e16}\u{754c}", " ", "\u{1f680}"]
+        .into_iter()
+        .chain(std::iter::repeat_n("0123456789", 1_000))
+        .enumerate()
+    {
+        let update = batch(
+            &state,
+            41_233 + index as u32,
+            vec![(
+                SurfaceScope::Generation {
+                    fence: active_generation.fence.clone(),
+                },
+                SurfaceEvent::Assistant(AssistantPatch::Delta {
+                    stream_id: stream_id.clone(),
+                    offset: ByteOffset::new(offset),
+                    text: DisplayText::new(delta),
+                }),
+            )],
+        );
+        state = applied(reduce_batch(SurfaceReduceMode::Live, &state, &update));
+        replayed = applied(reduce_batch(
+            SurfaceReduceMode::Rematerialization,
+            &replayed,
+            &update,
+        ));
+        expected.push_str(delta);
+        offset += delta.len() as u64;
+    }
+
+    let stream = &state.snapshot().assistant_streams[0];
+    assert_eq!(stream.text.as_str(), expected);
+    assert_eq!(stream.next_offset.get(), expected.len() as u64);
+    assert_eq!(
+        expected.len() - "hello \u{4e16}\u{754c} \u{1f680}".len(),
+        10_000
+    );
+    assert!(replayed.snapshot() == state.snapshot());
+}
+
+#[test]
 fn capability_call_rejects_fence_from_a_different_generation_than_its_tool() {
     let (initial, owning_generation) = active_generation_state();
     let mut cross_generation = owning_generation.clone();

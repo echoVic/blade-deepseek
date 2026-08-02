@@ -336,11 +336,11 @@ git commit -m "fix(runtime): cancel foreground task trees"
 - Modify: crates/orca-runtime/src/runtime_surface/reducer.rs
 - Test: crates/orca-runtime/tests/runtime_surface_reducer.rs
 
-- [ ] **Step 1: Write offset and work-bound tests**
+- [x] **Step 1: Write offset and work-bound tests**
 
 Feed mixed Unicode deltas and 1,000 ten-byte ASCII deltas. Add a cfg(test) appended-byte counter and assert exactly 10,000 bytes of append work.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 cargo test -p orca-runtime --test runtime_surface_reducer assistant_delta_append_is_linear -- --nocapture
@@ -348,15 +348,15 @@ cargo test -p orca-runtime --test runtime_surface_reducer assistant_delta_append
 
 Expected: FAIL because append semantics and work counter do not exist.
 
-- [ ] **Step 3: Add append semantics**
+- [x] **Step 3: Add append semantics**
 
 Add crate-private DisplayText::push_str using String::push_str. Preserve byte-offset validation, then replace the format-based accumulated-string rebuild with push_str.
 
-- [ ] **Step 4: Prove replay equivalence**
+- [x] **Step 4: Prove replay equivalence**
 
 Replay the Unicode stream through live and persisted reducers. Compare snapshots exactly and retain duplicate/out-of-order rejection tests.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
 ~~~sh
 cargo test -p orca-runtime --test runtime_surface_reducer assistant_delta -- --nocapture

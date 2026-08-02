@@ -8,6 +8,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{Ordering, compiler_fence};
 
+#[cfg(test)]
+thread_local! {
+    static DISPLAY_TEXT_APPENDED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub const SAFE_DIAGNOSTIC_TEXT_BYTE_LIMIT: usize = 4_096;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -48,6 +53,23 @@ impl DisplayText {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub(crate) fn push_str(&mut self, value: &str) {
+        #[cfg(test)]
+        DISPLAY_TEXT_APPENDED_BYTES
+            .with(|bytes| bytes.set(bytes.get().saturating_add(value.len())));
+        self.0.push_str(value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_appended_byte_count() {
+        DISPLAY_TEXT_APPENDED_BYTES.with(|bytes| bytes.set(0));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn appended_byte_count() -> usize {
+        DISPLAY_TEXT_APPENDED_BYTES.with(std::cell::Cell::get)
     }
 }
 
