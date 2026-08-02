@@ -2,11 +2,10 @@
 pub enum SlashCommand {
     Model(Option<String>),
     Compact,
-    ResumeOperation,
+    Resume,
     CancelOperation,
     Cost,
     ConfigShow,
-    History,
     Mode(Option<String>),
     Plan(Option<String>),
     Goal(GoalSlashCommand),
@@ -90,11 +89,10 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
             parts.next().map(|name| name.to_string()),
         )),
         "compact" => Some(SlashCommand::Compact),
-        "resume" => Some(SlashCommand::ResumeOperation),
+        "resume" => Some(SlashCommand::Resume),
         "cancel-operation" => Some(SlashCommand::CancelOperation),
         "cost" => Some(SlashCommand::Cost),
         "config" if parts.next() == Some("show") => Some(SlashCommand::ConfigShow),
-        "history" => Some(SlashCommand::History),
         "mode" => Some(SlashCommand::Mode(
             parts.next().map(|mode| mode.to_string()),
         )),
@@ -137,7 +135,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
     &[
         ("/model", "Switch model and reasoning effort"),
         ("/compact", "Compress conversation context"),
-        ("/resume", "Resume a recoverable operation"),
+        ("/resume", "Resume a saved conversation"),
         ("/cancel-operation", "Cancel a recoverable operation"),
         ("/cost", "Show session cost"),
         ("/config show", "Show merged config"),
@@ -149,7 +147,6 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/agents", "Show workflow agent dashboard"),
         ("/skills", "List available skills"),
         ("/remember", "Save a note to memory"),
-        ("/history", "Browse session history"),
         ("/trust", "Manage folder trust for the OS sandbox"),
     ]
 }
@@ -301,8 +298,22 @@ mod tests {
     }
 
     #[test]
-    fn parses_recovery_commands() {
-        assert_eq!(parse("/resume"), Some(SlashCommand::ResumeOperation));
+    fn resume_is_the_only_saved_session_slash_command() {
+        assert!(parse("/resume").is_some());
+        assert_eq!(parse("/history"), None);
+        let commands = all_commands();
+        assert_eq!(
+            commands
+                .iter()
+                .find(|(command, _)| *command == "/resume")
+                .map(|(_, description)| *description),
+            Some("Resume a saved conversation")
+        );
+        assert!(!commands.iter().any(|(command, _)| *command == "/history"));
+    }
+
+    #[test]
+    fn parses_operation_cancellation_command() {
         assert_eq!(
             parse("/cancel-operation"),
             Some(SlashCommand::CancelOperation)

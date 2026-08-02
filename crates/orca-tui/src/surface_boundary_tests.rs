@@ -59,7 +59,7 @@ const TUI_ENTRYPOINTS: [&str; 38] = [
     "slash.dynamic_skill",
     "slash.remember",
     "slash.compact",
-    "slash.history",
+    "slash.resume",
     "slash.trust_show",
     "slash.trust_mutation",
     "slash_menu.discovery",

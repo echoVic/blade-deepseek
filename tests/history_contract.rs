@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
@@ -12,8 +13,58 @@ fn trust_project(home: &std::path::Path, project: &std::path::Path) {
     .expect("trust project");
 }
 
+fn session_documents(home: &Path) -> Vec<(PathBuf, Vec<Value>)> {
+    fn collect(path: &Path, files: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, files);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+                files.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect(&home.join("sessions"), &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| {
+            let records = std::fs::read_to_string(&path)
+                .expect("read saved conversation")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("valid saved conversation record"))
+                .collect();
+            (path, records)
+        })
+        .collect()
+}
+
+fn saved_conversation_text(home: &Path) -> String {
+    session_documents(home)
+        .into_iter()
+        .map(|(path, _)| std::fs::read_to_string(path).expect("read saved conversation"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
-fn exec_saves_history_and_history_commands_can_read_it() {
+fn history_subcommand_is_not_exposed() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args(["history", "list"])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand 'history'"));
+}
+
+#[test]
+fn exec_saves_conversation_transcript() {
     let home = TempDir::new().expect("temp home");
 
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
@@ -24,28 +75,10 @@ fn exec_saves_history_and_history_commands_can_read_it() {
 
     assert_eq!(output.status.code(), Some(0));
 
-    let list = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "list"])
-        .output()
-        .expect("list history");
-
-    assert_eq!(list.status.code(), Some(0));
-    let list_stdout = String::from_utf8_lossy(&list.stdout);
-    assert!(list_stdout.contains("remember this"));
-    assert!(list_stdout.contains("mock"));
-
-    let show = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "show", "latest"])
-        .output()
-        .expect("show history");
-
-    assert_eq!(show.status.code(), Some(0));
-    let show_stdout = String::from_utf8_lossy(&show.stdout);
-    assert!(show_stdout.contains("[user]"));
-    assert!(show_stdout.contains("remember this"));
-    assert!(show_stdout.contains("[assistant]"));
+    let transcript = saved_conversation_text(home.path());
+    assert!(transcript.contains("remember this"));
+    assert!(transcript.contains("mock"));
+    assert!(transcript.contains("conversation.message"));
 }
 
 #[test]
@@ -70,17 +103,10 @@ fn exec_preserves_unbound_at_tokens_as_literal_history() {
 
     assert_eq!(output.status.code(), Some(0));
 
-    let show = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "show", "latest"])
-        .output()
-        .expect("show history");
-
-    assert_eq!(show.status.code(), Some(0));
-    let show_stdout = String::from_utf8_lossy(&show.stdout);
-    assert!(show_stdout.contains("summarize @notes.txt#L2 @oai/sky还能逆向吗"));
-    assert!(!show_stdout.contains("<file"));
-    assert!(!show_stdout.contains("beta</file>"));
+    let transcript = saved_conversation_text(home.path());
+    assert!(transcript.contains("summarize @notes.txt#L2 @oai/sky还能逆向吗"));
+    assert!(!transcript.contains("<file"));
+    assert!(!transcript.contains("beta</file>"));
 }
 
 #[test]
@@ -95,16 +121,15 @@ fn exec_persists_usage_in_history() {
 
     assert_eq!(output.status.code(), Some(0));
 
-    let show = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "show", "latest"])
-        .output()
-        .expect("show history");
-
-    assert_eq!(show.status.code(), Some(0));
-    let show_stdout = String::from_utf8_lossy(&show.stdout);
-    assert!(show_stdout.contains("Usage: input=120 output=30 cache=10 total=150"));
-    assert!(show_stdout.contains("Estimated cost: $"));
+    let usage = session_documents(home.path())
+        .into_iter()
+        .flat_map(|(_, records)| records)
+        .find(|record| record["type"] == "session.usage")
+        .expect("persisted usage record");
+    assert_eq!(usage["input_tokens"], 120);
+    assert_eq!(usage["output_tokens"], 30);
+    assert_eq!(usage["cache_tokens"], 10);
+    assert!(usage["estimated_cost_usd"].as_f64().is_some());
 }
 
 #[test]
@@ -174,17 +199,10 @@ fn exec_injects_project_instructions_into_system_prompt() {
 
     assert_eq!(output.status.code(), Some(0));
 
-    let show = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "show", "latest"])
-        .output()
-        .expect("show history");
-
-    assert_eq!(show.status.code(), Some(0));
-    let show_stdout = String::from_utf8_lossy(&show.stdout);
-    assert!(show_stdout.contains("<project-instructions>"));
-    assert!(show_stdout.contains("Always prefer contract tests."));
-    assert!(show_stdout.contains("Keep user-facing output concise."));
+    let transcript = saved_conversation_text(home.path());
+    assert!(transcript.contains("<project-instructions>"));
+    assert!(transcript.contains("Always prefer contract tests."));
+    assert!(transcript.contains("Keep user-facing output concise."));
 }
 
 #[test]
@@ -213,24 +231,17 @@ fn exec_does_not_persist_explicitly_mentioned_skill_in_system_prompt() {
 
     assert_eq!(output.status.code(), Some(0));
 
-    let show = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "show", "latest"])
-        .output()
-        .expect("show history");
-
-    assert_eq!(show.status.code(), Some(0));
-    let show_stdout = String::from_utf8_lossy(&show.stdout);
+    let transcript = saved_conversation_text(home.path());
     assert!(
-        !show_stdout.contains("<skills>"),
+        !transcript.contains("<skills>"),
         "explicit skills should ride the model-only volatile overlay, not the persisted system prompt"
     );
     assert!(
-        !show_stdout.contains(r#"<skill id="debugging""#),
+        !transcript.contains(r#"<skill id=\"debugging\""#),
         "explicit skill metadata should not be persisted into history"
     );
     assert!(
-        !show_stdout.contains("Use logs first."),
+        !transcript.contains("Use logs first."),
         "explicit skill body should not be persisted into history"
     );
 }
@@ -259,16 +270,9 @@ fn exec_injects_user_instructions_before_project_instructions() {
 
     assert_eq!(output.status.code(), Some(0));
 
-    let show = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "show", "latest"])
-        .output()
-        .expect("show history");
-
-    assert_eq!(show.status.code(), Some(0));
-    let show_stdout = String::from_utf8_lossy(&show.stdout);
-    let global = show_stdout.find("Global instruction").expect("global");
-    let project = show_stdout.find("Project instruction").expect("project");
+    let transcript = saved_conversation_text(home.path());
+    let global = transcript.find("Global instruction").expect("global");
+    let project = transcript.find("Project instruction").expect("project");
     assert!(global < project);
 }
 
@@ -308,58 +312,6 @@ fn exec_continue_alias_resumes_latest_conversation() {
 }
 
 #[test]
-fn history_archive_and_delete_manage_lifecycle() {
-    let home = TempDir::new().expect("temp home");
-
-    let first = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["exec", "--provider", "mock", "archive me"])
-        .output()
-        .expect("run orca");
-    assert_eq!(first.status.code(), Some(0));
-
-    let archive = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "archive", "latest"])
-        .output()
-        .expect("archive history");
-    assert_eq!(archive.status.code(), Some(0));
-
-    let active_list = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "list"])
-        .output()
-        .expect("list active history");
-    assert_eq!(active_list.status.code(), Some(0));
-    assert!(!String::from_utf8_lossy(&active_list.stdout).contains("archive me"));
-
-    let all_list = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "list", "--all"])
-        .output()
-        .expect("list all history");
-    assert_eq!(all_list.status.code(), Some(0));
-    let all_stdout = String::from_utf8_lossy(&all_list.stdout);
-    assert!(all_stdout.contains("archive me"));
-    assert!(all_stdout.contains("archived"));
-
-    let delete = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "delete", "latest"])
-        .output()
-        .expect("delete history");
-    assert_eq!(delete.status.code(), Some(0));
-
-    let empty_all = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "list", "--all"])
-        .output()
-        .expect("list all after delete");
-    assert_eq!(empty_all.status.code(), Some(0));
-    assert!(!String::from_utf8_lossy(&empty_all.stdout).contains("archive me"));
-}
-
-#[test]
 fn exec_fork_creates_child_with_parent_metadata() {
     let home = TempDir::new().expect("temp home");
 
@@ -370,13 +322,12 @@ fn exec_fork_creates_child_with_parent_metadata() {
         .expect("run parent orca");
     assert_eq!(first.status.code(), Some(0));
 
-    let parent_show = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "show", "latest"])
-        .output()
-        .expect("show parent");
-    assert_eq!(parent_show.status.code(), Some(0));
-    let parent_id = extract_field(&parent_show.stdout, "Session").expect("parent id");
+    let parent_records = session_documents(home.path());
+    assert_eq!(parent_records.len(), 1);
+    let parent_id = parent_records[0].1[0]["session_id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
 
     let fork = Command::new(env!("CARGO_BIN_EXE_orca"))
         .env("ORCA_HOME", home.path())
@@ -392,72 +343,16 @@ fn exec_fork_creates_child_with_parent_metadata() {
         .expect("run fork");
     assert_eq!(fork.status.code(), Some(0));
 
-    let child_show = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "show", "latest"])
-        .output()
-        .expect("show fork");
-    assert_eq!(child_show.status.code(), Some(0));
-    let child_stdout = String::from_utf8_lossy(&child_show.stdout);
-    assert!(child_stdout.contains(&format!("Parent: {parent_id}")));
-    assert!(child_stdout.contains("Forked: true"));
-    assert!(child_stdout.contains("fork parent prompt"));
-    assert!(child_stdout.contains("mock_history_echo"));
-}
-
-#[test]
-fn history_rename_search_and_compress_work_for_latest() {
-    let home = TempDir::new().expect("temp home");
-
-    let first = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["exec", "--provider", "mock", "searchable zstd prompt"])
-        .output()
-        .expect("run orca");
-    assert_eq!(first.status.code(), Some(0));
-
-    let rename = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "rename", "latest", "renamed transcript"])
-        .output()
-        .expect("rename history");
-    assert_eq!(rename.status.code(), Some(0));
-
-    let search = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "search", "searchable zstd"])
-        .output()
-        .expect("search history");
-    assert_eq!(search.status.code(), Some(0));
-    let search_stdout = String::from_utf8_lossy(&search.stdout);
-    assert!(search_stdout.contains("renamed transcript"));
-    assert!(search_stdout.contains("searchable zstd prompt"));
-
-    let compress = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "compress", "latest"])
-        .output()
-        .expect("compress history");
-    assert_eq!(compress.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&compress.stdout).contains(".jsonl.zst"));
-
-    let show = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "show", "latest"])
-        .output()
-        .expect("show compressed history");
-    assert_eq!(show.status.code(), Some(0));
-    let show_stdout = String::from_utf8_lossy(&show.stdout);
-    assert!(show_stdout.contains("Title: renamed transcript"));
-    assert!(show_stdout.contains("searchable zstd prompt"));
-
-    let compressed_search = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .args(["history", "search", "searchable zstd"])
-        .output()
-        .expect("search compressed history");
-    assert_eq!(compressed_search.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&compressed_search.stdout).contains(".jsonl.zst"));
+    let conversations = session_documents(home.path());
+    assert_eq!(conversations.len(), 2);
+    let (_, child_records) = conversations
+        .iter()
+        .find(|(_, records)| records[0]["parent_id"] == parent_id)
+        .expect("forked conversation");
+    assert_eq!(child_records[0]["forked"], true);
+    let child_text = serde_json::to_string(child_records).expect("serialize child records");
+    assert!(child_text.contains("fork parent prompt"));
+    assert!(child_text.contains("mock_history_echo"));
 }
 
 fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
@@ -465,11 +360,4 @@ fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
         .collect()
-}
-
-fn extract_field(stdout: &[u8], field: &str) -> Option<String> {
-    let prefix = format!("{field}: ");
-    String::from_utf8_lossy(stdout)
-        .lines()
-        .find_map(|line| line.strip_prefix(&prefix).map(str::to_string))
 }

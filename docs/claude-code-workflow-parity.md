@@ -1054,7 +1054,7 @@ Decision:
 
 ### Risk: Slash Command Collision
 
-Saved workflow names can collide with built-in commands like `/model` or `/history`.
+Saved workflow names can collide with built-in commands like `/model` or `/resume`.
 
 Decision:
 

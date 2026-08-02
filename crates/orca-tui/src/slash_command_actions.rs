@@ -7,7 +7,7 @@ use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::commands::{self, GoalSlashCommand, SlashCommand, TrustSlashCommand};
 use crate::surface_actions::TuiHostActions;
-use crate::types::{AppState, ChatMessage, TuiMemoryScope, UserAction};
+use crate::types::{AppState, AppStatus, ChatMessage, TuiMemoryScope, UserAction};
 
 pub(crate) enum SlashOutcome {
     Continue,
@@ -170,14 +170,24 @@ pub(crate) fn handle_slash_command(
             state.enter_running();
             let _ = action_tx.send(UserAction::Compact);
         }
-        SlashCommand::ResumeOperation => {
+        SlashCommand::Resume => {
             if let Some(operation_id) = state.recoverable_operation_id.clone() {
                 state.enter_running();
                 let _ = action_tx.send(UserAction::ResumeOperation { operation_id });
             } else {
-                state.push_message(ChatMessage::Error(
-                    "no recoverable operation is available".to_string(),
-                ));
+                match RuntimeSurfaceHostHandle::list_saved_sessions(20) {
+                    Ok(sessions) if !sessions.is_empty() => {
+                        state.reset_queued_user_messages();
+                        state.session_picker_sessions = sessions;
+                        state.session_picker_selected = 0;
+                        state.status = AppStatus::SessionPicker;
+                    }
+                    Ok(_) => state
+                        .push_message(ChatMessage::System("No saved conversations.".to_string())),
+                    Err(error) => state.push_message(ChatMessage::Error(format!(
+                        "failed to list saved conversations: {error}"
+                    ))),
+                }
             }
         }
         SlashCommand::CancelOperation => {
@@ -190,29 +200,6 @@ pub(crate) fn handle_slash_command(
                 ));
             }
         }
-        SlashCommand::History => match RuntimeSurfaceHostHandle::list_saved_sessions(10) {
-            Ok(sessions) if sessions.is_empty() => {
-                state.push_message(ChatMessage::System("No saved sessions.".to_string()))
-            }
-            Ok(sessions) => {
-                let summary = sessions
-                    .into_iter()
-                    .map(|session| {
-                        format!(
-                            "{}  {}  {}",
-                            session.session_id,
-                            session.updated_at.format("%Y-%m-%d %H:%M"),
-                            session.title
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                state.push_message(ChatMessage::System(format!("Recent sessions:\n{summary}")));
-            }
-            Err(error) => state.push_message(ChatMessage::Error(format!(
-                "failed to list history: {error}"
-            ))),
-        },
         SlashCommand::Trust(trust_command) => match trust_command {
             TrustSlashCommand::Show => {
                 if TuiHostActions::folder_is_trusted(&cwd) {

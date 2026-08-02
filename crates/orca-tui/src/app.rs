@@ -1,5 +1,5 @@
 use crossbeam_channel as mpsc;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -65,6 +65,30 @@ use crate::workspace_status;
 enum PendingInsertEscapeRouting {
     Continue,
     Consumed,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TuiExit {
+    code: i32,
+    session_id: Option<String>,
+}
+
+fn exit_resume_hint(session_id: Option<&str>) -> Option<String> {
+    session_id.map(|session_id| format!("Resume this session with:\norca --resume {session_id}\n"))
+}
+
+fn exit_session_id(
+    active_session_id: Option<String>,
+    history_mode: &HistoryMode,
+) -> Option<String> {
+    if let HistoryMode::Resume(selector) = history_mode {
+        RuntimeSurfaceHostHandle::load_saved_session(selector)
+            .ok()
+            .map(|transcript| transcript.meta.session_id)
+            .or(active_session_id)
+    } else {
+        active_session_id
+    }
 }
 
 fn refresh_after_insert_escape_flush(
@@ -133,7 +157,12 @@ fn flush_expired_insert_escape(
 
 pub fn run_tui(config: RunConfig) -> i32 {
     match run_tui_inner(config) {
-        Ok(code) => code,
+        Ok(exit) => {
+            if let Some(hint) = exit_resume_hint(exit.session_id.as_deref()) {
+                let _ = io::stdout().lock().write_all(hint.as_bytes());
+            }
+            exit.code
+        }
         Err(e) => {
             eprintln!("TUI error: {e}");
             1
@@ -141,7 +170,7 @@ pub fn run_tui(config: RunConfig) -> i32 {
     }
 }
 
-fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
+fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     let pending_input_runtime = InputRuntime::start(InputRuntimeOptions {
         theme: config.theme,
         focus_events: config.terminal_notifications,
@@ -291,6 +320,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     terminal.clear()?;
 
     let resources = (terminal, presentation, terminal_input);
+    let mut active_session_id = None;
     let exit_code = with_terminal_presentation_cleanup(
         resources,
         |(terminal, presentation, _terminal_input)| {
@@ -550,6 +580,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                     mention_search.consume_catalog_dirty(generation, &mut state);
                                 }
                                 TuiEvent::MentionRuntimeReady(thread) => {
+                                    active_session_id = thread.session_id().map(ToOwned::to_owned);
                                     mention_search
                                         .install_runtime_actions(TuiSurfaceActions::new(thread));
                                 }
@@ -642,7 +673,10 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     drop(event_rx);
     agent_runtime.shutdown()?;
 
-    Ok(exit_code)
+    Ok(TuiExit {
+        code: exit_code,
+        session_id: exit_session_id(active_session_id, &config.history_mode),
+    })
 }
 
 fn resume_terminal_render(
@@ -1071,6 +1105,54 @@ mod tests {
     use crossterm::event::KeyCode;
     use orca_core::approval_types::ApprovalMode;
     use orca_core::model::ModelSelection;
+
+    #[test]
+    fn exit_resume_hint_matches_claude_code_style() {
+        assert_eq!(
+            exit_resume_hint(Some("a11864d0-9e08-487a-b148-da0012879b66")),
+            Some(
+                "Resume this session with:\n\
+                 orca --resume a11864d0-9e08-487a-b148-da0012879b66\n"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn exit_resume_hint_is_absent_without_a_persisted_session() {
+        assert_eq!(exit_resume_hint(None), None);
+    }
+
+    #[test]
+    fn exit_session_id_resolves_a_picker_selection_without_a_live_thread() {
+        with_orca_home(|home| {
+            let meta = history::create_meta(home, "mock", None, "resume after picker");
+            let expected = meta.session_id.clone();
+            history::SessionWriter::start_from_meta(meta).expect("saved session");
+
+            assert_eq!(
+                exit_session_id(None, &HistoryMode::Resume("latest".to_string())),
+                Some(expected)
+            );
+        });
+    }
+
+    #[test]
+    fn exit_session_id_prefers_the_current_picker_selection() {
+        with_orca_home(|home| {
+            let meta = history::create_meta(home, "mock", None, "selected session");
+            let expected = meta.session_id.clone();
+            history::SessionWriter::start_from_meta(meta).expect("saved session");
+
+            assert_eq!(
+                exit_session_id(
+                    Some("11111111-1111-1111-1111-111111111111".to_string()),
+                    &HistoryMode::Resume("latest".to_string())
+                ),
+                Some(expected)
+            );
+        });
+    }
     use tui_textarea::TextArea;
 
     use crate::approval_actions::resolve_approval_option;
@@ -6688,7 +6770,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_menu_tab_opens_history_picker_like_enter() {
+    fn slash_menu_tab_opens_resume_picker_like_enter() {
         with_orca_home(|home| {
             orca_runtime::history::SessionWriter::start(
                 home,
@@ -6730,7 +6812,7 @@ mod tests {
                     .collect(),
                 selected: commands::all_commands()
                     .iter()
-                    .position(|(command, _)| *command == "/history")
+                    .position(|(command, _)| *command == "/resume")
                     .unwrap(),
                 sub_menu: None,
             });

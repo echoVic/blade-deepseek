@@ -4540,20 +4540,19 @@
       "typed_operation_result"
     ],
     [
-      "slash.history",
+      "slash.resume",
       [
-        "crates/orca-tui/src/slash_command_actions.rs:203",
-        "crates/orca-tui/src/slash_menu_actions.rs:275"
+        "crates/orca-tui/src/slash_command_actions.rs:173"
       ],
       "session_read_and_transition",
-      "direct_list_and_later_direct_load",
-      "List/Search+Detach+Open/Load+Attach",
+      "direct_list_and_picker_resume",
+      "List+Detach+Open/Load+Attach",
       [
         "SurfaceBoundCaller",
         "ThreadOwnerEpoch"
       ],
       "typed command result consumer",
-      "delete_history_store_access"
+      "route_resume_through_typed_session_surface"
     ],
     [
       "slash.trust_show",

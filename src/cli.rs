@@ -9,8 +9,8 @@ use orca_core::config::{OutputFormat, ProviderKind};
 #[command(version)]
 #[command(about = "A DeepSeek-native coding agent.")]
 pub struct Cli {
-    /// Resume a saved conversation in TUI mode by ID, prefix, or 'latest'.
-    #[arg(long)]
+    /// Resume a saved conversation in TUI mode; omit the selector to open the picker.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
     resume: Option<String>,
 
     /// Fork a saved conversation in TUI mode by ID, prefix, or 'latest'.
@@ -22,7 +22,7 @@ pub struct Cli {
     continue_latest: bool,
 
     /// Show the TUI session picker at startup.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     session_picker: bool,
 
     /// Model to use (overrides config file and ORCA_MODEL env).
@@ -60,8 +60,6 @@ pub struct Cli {
 enum Command {
     /// Run a task and emit events.
     Exec(ExecArgs),
-    /// Inspect saved conversation history.
-    History(HistoryArgs),
     /// Run and inspect local workflows.
     Workflow(WorkflowArgs),
     /// Inspect or update folder trust.
@@ -105,11 +103,11 @@ struct ExecArgs {
     #[arg(long)]
     max_budget: Option<f64>,
 
-    /// Resume a saved history session by ID, prefix, or 'latest'.
+    /// Resume a saved conversation by ID, prefix, or 'latest'.
     #[arg(long)]
     resume: Option<String>,
 
-    /// Fork a saved history session by ID, prefix, or 'latest'.
+    /// Fork a saved conversation by ID, prefix, or 'latest'.
     #[arg(long, alias = "fork-session")]
     fork: Option<String>,
 
@@ -131,12 +129,6 @@ struct ExecArgs {
 
     /// Prompt to execute.
     prompt: Vec<String>,
-}
-
-#[derive(Debug, Parser)]
-struct HistoryArgs {
-    #[command(subcommand)]
-    command: HistoryCommand,
 }
 
 #[derive(Debug, Parser)]
@@ -392,55 +384,6 @@ struct SubagentWorkerArgs {
     worktree_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Subcommand)]
-enum HistoryCommand {
-    /// List saved conversation sessions, newest first.
-    List {
-        /// Maximum number of sessions to print.
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-
-        /// Include archived sessions.
-        #[arg(long)]
-        all: bool,
-    },
-    /// Show a saved conversation transcript.
-    Show {
-        /// Session ID, prefix, or 'latest'.
-        session: String,
-    },
-    /// Archive an active conversation transcript.
-    Archive {
-        /// Session ID, prefix, or 'latest'.
-        session: String,
-    },
-    /// Delete a saved or archived conversation transcript.
-    Delete {
-        /// Session ID, prefix, or 'latest'.
-        session: String,
-    },
-    /// Rename a conversation transcript.
-    Rename {
-        /// Session ID, prefix, or 'latest'.
-        session: String,
-        /// New title.
-        title: String,
-    },
-    /// Search saved conversation transcripts.
-    Search {
-        /// Text to search for.
-        query: String,
-        /// Include archived sessions.
-        #[arg(long)]
-        all: bool,
-    },
-    /// Compress a transcript with zstd.
-    Compress {
-        /// Session ID, prefix, or 'latest'.
-        session: String,
-    },
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormatArg {
     Jsonl,
@@ -475,24 +418,6 @@ impl From<ExecArgs> for orca_runtime::command::exec::ExecCommandRequest {
             save_history: args.save_history,
             provider: args.provider,
             prompt: args.prompt,
-        }
-    }
-}
-
-impl From<HistoryArgs> for orca_runtime::command::history::HistoryCommandRequest {
-    fn from(args: HistoryArgs) -> Self {
-        use orca_runtime::command::history::HistoryCommandRequest;
-
-        match args.command {
-            HistoryCommand::List { limit, all } => HistoryCommandRequest::List { limit, all },
-            HistoryCommand::Show { session } => HistoryCommandRequest::Show { session },
-            HistoryCommand::Archive { session } => HistoryCommandRequest::Archive { session },
-            HistoryCommand::Delete { session } => HistoryCommandRequest::Delete { session },
-            HistoryCommand::Rename { session, title } => {
-                HistoryCommandRequest::Rename { session, title }
-            }
-            HistoryCommand::Search { query, all } => HistoryCommandRequest::Search { query, all },
-            HistoryCommand::Compress { session } => HistoryCommandRequest::Compress { session },
         }
     }
 }
@@ -536,6 +461,22 @@ impl From<SubagentWorkerArgs> for orca_runtime::command::launch::SubagentWorkerL
 pub fn run() -> i32 {
     let cli = Cli::parse();
 
+    let retired_history_command = matches!(
+        cli.prompt.as_slice(),
+        [group, action, ..]
+            if group == "history"
+                && matches!(
+                    action.as_str(),
+                    "list" | "show" | "archive" | "delete" | "rename" | "search" | "compress"
+                )
+    );
+    if cli.command.is_none() && retired_history_command {
+        eprintln!(
+            "error: unrecognized subcommand 'history'\n\nUse `orca --resume` to choose a saved conversation or `orca --resume <SESSION>` to resume one directly."
+        );
+        return 2;
+    }
+
     if matches!(cli.mode.as_deref(), Some("server")) {
         return orca_runtime::command::launch::run_protocol(protocol_request(
             cli,
@@ -551,19 +492,19 @@ pub fn run() -> i32 {
 
     match cli.command {
         Some(Command::Exec(args)) => orca_runtime::command::exec::run(args.into()),
-        Some(Command::History(args)) => orca_runtime::command::history::run(args.into()),
         Some(Command::Workflow(args)) => orca_runtime::workflow::command::run(args.into()),
         Some(Command::Trust(args)) => orca_runtime::command::trust::run(args.into()),
         Some(Command::SubagentWorker(args)) => {
             orca_runtime::command::launch::run_subagent_worker(args.into())
         }
         None => {
+            let resume_without_selector = cli.resume.as_deref() == Some("");
             let request = orca_runtime::command::launch::InteractiveLaunchRequest {
                 app_version: env!("CARGO_PKG_VERSION").to_string(),
-                resume: cli.resume,
+                resume: cli.resume.filter(|selector| !selector.is_empty()),
                 fork: cli.fork,
                 continue_latest: cli.continue_latest,
-                session_picker: cli.session_picker,
+                session_picker: cli.session_picker || resume_without_selector,
                 cwd: cli.cwd,
                 model: cli.model,
                 mode: cli.mode,

@@ -22,7 +22,6 @@ fn root_cli_is_only_argument_parsing_conversion_and_forwarding() {
     }
     for facade in [
         "orca_runtime::command::exec",
-        "orca_runtime::command::history",
         "orca_runtime::command::trust",
         "orca_runtime::workflow::command",
         "orca_runtime::command::launch",

@@ -110,7 +110,7 @@ const copy = {
       },
       {
         title: "Resumable history",
-        body: "Local JSONL transcripts support list, search, --resume, --fork, archive, and optional zstd compression.",
+        body: "Local JSONL transcripts support --resume for continuation and --fork for branching.",
       },
     ],
     cacheCard: {
@@ -205,7 +205,7 @@ const copy = {
     codeTabs: {
       exec: "orca exec",
       goal: "Persistent goal",
-      history: "History / resume",
+      history: "Resume",
       config: "Config",
     },
     code: {
@@ -218,9 +218,9 @@ const copy = {
       goalPause: "stop auto-continuation",
       goalResume: "continue when idle",
       goalStored: "  Stored by session id in ~/.orca/goals_1.json — survives restarts.",
-      historyBrowse: "Browse, search, and resume transcripts",
+      historyBrowse: "Resume or branch a saved conversation",
       historyStored:
-        "  Stored under ~/.orca/sessions/YYYY/MM/DD/; large runs can be zstd-compressed.",
+        "  Stored under ~/.orca/sessions/YYYY/MM/DD/ for future resume.",
       configMainLoop: "main loop v4-pro, aux tasks v4-flash",
       configReasoning: "max reasoning effort",
       configPriority: "Priority: env vars > CLI args > config file > defaults",
@@ -265,7 +265,7 @@ const copy = {
         },
         {
           q: "Will my session history be lost?",
-          a: "No. Orca stores local JSONL transcripts under ~/.orca/sessions/ and supports list, search, --resume, --fork, archive, and compression.",
+          a: "No. Orca stores local JSONL transcripts under ~/.orca/sessions/ and supports --resume and --fork.",
         },
         {
           q: "Can I keep control over edits and shell commands?",
@@ -383,7 +383,7 @@ const copy = {
       },
       {
         title: "可恢复历史",
-        body: "本地 JSONL 会话支持 list、search、--resume、--fork、archive，以及可选 zstd 压缩。",
+        body: "本地 JSONL 会话支持用 --resume 继续，也支持用 --fork 分支。",
       },
     ],
     cacheCard: {
@@ -478,7 +478,7 @@ const copy = {
     codeTabs: {
       exec: "orca exec",
       goal: "持久 goal",
-      history: "历史 / 恢复",
+      history: "恢复会话",
       config: "配置",
     },
     code: {
@@ -491,8 +491,8 @@ const copy = {
       goalPause: "停止自动继续",
       goalResume: "空闲时继续",
       goalStored: "  按 session id 存在 ~/.orca/goals_1.json — 重启后仍保留。",
-      historyBrowse: "浏览、搜索和恢复会话记录",
-      historyStored: "  存放在 ~/.orca/sessions/YYYY/MM/DD/；大型运行可用 zstd 压缩。",
+      historyBrowse: "恢复或分支一个已保存会话",
+      historyStored: "  存放在 ~/.orca/sessions/YYYY/MM/DD/，供后续恢复。",
       configMainLoop: "主循环 v4-pro，辅助任务 v4-flash",
       configReasoning: "max 推理强度",
       configPriority: "优先级：环境变量 > CLI 参数 > 配置文件 > 默认值",
@@ -537,7 +537,7 @@ const copy = {
         },
         {
           q: "会话历史会不会丢？",
-          a: "不会。Orca 在 ~/.orca/sessions/ 下保存本地 JSONL transcript，并支持 list、search、--resume、--fork、archive 和压缩。",
+          a: "不会。Orca 在 ~/.orca/sessions/ 下保存本地 JSONL transcript，并支持 --resume 和 --fork。",
         },
         {
           q: "我能控制文件修改和 shell 命令吗？",
@@ -833,9 +833,9 @@ function renderCodeTab(tab: CodeTab, t: (typeof copy)[Locale]) {
       <pre>
         <span className="k-com"># {c.historyBrowse}</span>
         {"\n"}
-        <span className="k-cmd">orca</span> history list
+        <span className="k-cmd">orca</span> <span className="k-flag">--resume</span>
         {"\n"}
-        <span className="k-cmd">orca</span> history search <span className="k-str">"needle"</span>
+        <span className="k-cmd">orca</span> <span className="k-flag">--resume</span> latest
         {"\n"}
         <span className="k-cmd">orca</span> exec <span className="k-flag">--resume</span> latest{" "}
         <span className="k-str">"continue the refactor"</span>

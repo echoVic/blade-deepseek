@@ -350,7 +350,7 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
   ["slash.dynamic_skill", /skill alias|SlashCommand::SkillRun/],
   ["slash.remember", /SlashCommand::Remember/],
   ["slash.compact", /SlashCommand::Compact/],
-  ["slash.history", /SlashCommand::History|"\/history"/],
+  ["slash.resume", /SlashCommand::Resume|"\/resume"/],
   ["slash.trust_show", /TrustSlashCommand::Show/],
   ["slash.trust_mutation", /TrustSlashCommand::Add|TrustSlashCommand::Remove/],
   ["slash_menu.discovery", /update_slash_menu|available_commands|discover_saved_workflows/],

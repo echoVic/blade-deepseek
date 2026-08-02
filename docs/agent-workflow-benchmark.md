@@ -92,7 +92,7 @@ All 8 agents were launched concurrently via `Promise.all()` in the `research` ph
 
 | Question | Answer | Source Evidence |
 |----------|--------|-----------------|
-| Slash commands | 11: /model, /compact, /cost, /config show, /history, /mode, /plan, /goal, /workflows, /agents, /remember | `commands/mod.rs` — `all_commands()` |
+| Slash commands | `/resume` is the single saved-conversation entry; `/history` is not exposed | `commands/mod.rs` — `all_commands()` |
 | Workflow-specific commands | `/workflows` shows workflow tasks; `/agents` shows workflow-agent dashboard rows | `commands/mod.rs` — `WorkflowList` and `AgentDashboard` variants |
 | Agent view / team dashboard | **Present** | `/workflows` renders selected workflow per-agent rows; `/agents` renders all workflow agents across runs with status, team label from `agent(..., { team })`, attempt/max-attempt, retry/failure detail, token usage, and cost |
 | Running subagent inspection | **Present** | `subagent_status` can query current or persisted async handles with lifecycle timestamps, output/error, and usage; `/workflows` shows async subagent rows with elapsed time. Rich step-level control remains a future enhancement, not a benchmark blocker |

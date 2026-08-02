@@ -5,16 +5,13 @@ use crossterm::event::{Event, KeyCode, KeyEvent};
 use tui_textarea::{Input, TextArea};
 
 use orca_core::config::{ReasoningEffort, RunConfig};
-use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::commands;
 use crate::composer_textarea::{make_textarea, make_textarea_with_text, textarea_text};
 use crate::slash_command_actions::encode_settings_intent;
 use crate::slash_command_actions::{SlashOutcome, handle_slash_command, parse_approval_mode};
 use crate::theme::Theme;
-use crate::types::{
-    AppState, AppStatus, ChatMessage, SlashMenu, SlashMenuItem, SubMenu, UserAction,
-};
+use crate::types::{AppState, SlashMenu, SlashMenuItem, SubMenu, UserAction};
 use crate::vim::VimState;
 
 pub(crate) fn update_slash_menu(textarea: &TextArea, state: &mut AppState, config: &RunConfig) {
@@ -258,24 +255,6 @@ fn select_slash_menu_command(
         "/remember" => {
             *textarea = make_textarea_with_text("/remember ", vim_state, theme);
             state.slash_menu = None;
-        }
-        "/history" => {
-            state.slash_menu = None;
-            *textarea = make_textarea(vim_state, theme);
-            match RuntimeSurfaceHostHandle::list_saved_sessions(20) {
-                Ok(sessions) if !sessions.is_empty() => {
-                    state.reset_queued_user_messages();
-                    state.session_picker_sessions = sessions;
-                    state.session_picker_selected = 0;
-                    state.status = AppStatus::SessionPicker;
-                }
-                Ok(_) => {
-                    state.push_message(ChatMessage::System("No saved sessions.".to_string()));
-                }
-                Err(e) => {
-                    state.push_message(ChatMessage::Error(format!("failed to list history: {e}")));
-                }
-            }
         }
         _ => {
             *textarea = make_textarea_with_text(&selected_cmd, vim_state, theme);

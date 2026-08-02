@@ -60,9 +60,9 @@ On Windows PowerShell, set the key with `$env:DEEPSEEK_API_KEY = "sk-..."`;
 the `orca` commands are the same.
 
 In the TUI, `@` searches files, skills, plugins, and MCP resources. Use
-`/plan` for read-only planning, `/goal` for a persistent objective,
-`/workflows` for background work, and `/trust` to manage the current folder's
-sandbox permissions.
+`/plan` for read-only planning, `/goal` for a persistent objective, `/resume`
+to reopen a saved conversation, `/workflows` for background work, and `/trust`
+to manage the current folder's sandbox permissions.
 
 ## What it does
 
@@ -72,8 +72,8 @@ sandbox permissions.
   the result with a command you choose.
 - Gates risky actions with `suggest`, sandboxed `auto-edit`, full-access
   `full-auto`, and read-only `plan` modes, plus per-folder trust.
-- Saves local conversation history with resume, fork, search, rename, archive,
-  and compression support.
+- Saves local conversations with `--resume` for continuation and `--fork` for
+  branching.
 - Runs persistent goals without a fixed turn ceiling, plus subagents and
   JavaScript workflows for longer tasks that need continuation or parallel work.
 - Loads project instructions, skills, plugins, custom tools, MCP tools, and MCP
