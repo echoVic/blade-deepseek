@@ -17,12 +17,15 @@ pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiE
         EventType::AssistantMessageDelta => Some(TuiEvent::MessageDelta(
             event.payload["text"].as_str()?.to_string(),
         )),
-        EventType::UsageUpdated => Some(TuiEvent::UsageUpdated(UsageTotals {
-            input_tokens: event.payload["input_tokens"].as_u64()?,
-            output_tokens: event.payload["output_tokens"].as_u64()?,
-            cache_tokens: event.payload["cache_tokens"].as_u64().unwrap_or_default(),
-            estimated_cost_usd: event.payload["estimated_cost_usd"].as_f64()?,
-        })),
+        EventType::UsageUpdated => Some(TuiEvent::UsageUpdated {
+            revision: event.seq,
+            usage: UsageTotals {
+                input_tokens: event.payload["input_tokens"].as_u64()?,
+                output_tokens: event.payload["output_tokens"].as_u64()?,
+                cache_tokens: event.payload["cache_tokens"].as_u64().unwrap_or_default(),
+                estimated_cost_usd: event.payload["estimated_cost_usd"].as_f64()?,
+            },
+        }),
         EventType::ContextUpdated => Some(TuiEvent::ContextUpdated {
             used_tokens: event.payload["used_tokens"].as_u64()? as usize,
             limit_tokens: event.payload["limit_tokens"].as_u64()? as usize,
@@ -629,11 +632,12 @@ mod tests {
             .expect("completion event");
 
         match usage {
-            TuiEvent::UsageUpdated(totals) => {
-                assert_eq!(totals.input_tokens, 10);
-                assert_eq!(totals.output_tokens, 5);
-                assert_eq!(totals.cache_tokens, 2);
-                assert_eq!(totals.estimated_cost_usd, 0.001);
+            TuiEvent::UsageUpdated { revision, usage } => {
+                assert_eq!(revision, 0);
+                assert_eq!(usage.input_tokens, 10);
+                assert_eq!(usage.output_tokens, 5);
+                assert_eq!(usage.cache_tokens, 2);
+                assert_eq!(usage.estimated_cost_usd, 0.001);
             }
             other => panic!("expected usage event, got {other:?}"),
         }

@@ -407,11 +407,11 @@ git commit -m "perf(tui): index projected tool calls"
 - Modify: crates/orca-tui/src/surface_projection.rs
 - Test: crates/orca-tui/src/types.rs
 
-- [ ] **Step 1: Write compaction and stale-order tests**
+- [x] **Step 1: Write compaction and stale-order tests**
 
 Apply revision 10 with 50,000 current-context tokens, revision 11 with 8,000, then revision 9 with 60,000. Assert current context remains 8,000 and lifetime totals equal revision 11.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 cargo test -p orca-tui usage_update_allows_compaction_drop_and_rejects_stale_revision --lib
@@ -419,7 +419,7 @@ cargo test -p orca-tui usage_update_allows_compaction_drop_and_rejects_stale_rev
 
 Expected: FAIL because UsageUpdated has no revision and merges with max.
 
-- [ ] **Step 3: Add a sequenced event**
+- [x] **Step 3: Add a sequenced event**
 
 Use:
 
@@ -432,7 +432,7 @@ TuiEvent::UsageUpdated {
 
 Add usage_revision to AppState. Apply only newer revisions, assigning the authoritative UsageTotals. Derive revision from the runtime-surface cursor.
 
-- [ ] **Step 4: Run GREEN and commit**
+- [x] **Step 4: Run GREEN and commit**
 
 ~~~sh
 cargo test -p orca-tui usage_update --lib

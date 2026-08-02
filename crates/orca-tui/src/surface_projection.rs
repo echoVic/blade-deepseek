@@ -600,13 +600,16 @@ impl TuiSurfaceProjection {
                         .collect(),
                 }),
                 SurfaceEvent::Usage(usage) => {
-                    projected.push(TuiEvent::UsageUpdated(UsageTotals {
-                        input_tokens: usage.thread_total.input_tokens,
-                        output_tokens: usage.thread_total.output_tokens,
-                        cache_tokens: usage.thread_total.cache_tokens,
-                        estimated_cost_usd: usage.thread_total.estimated_cost_usd_micros as f64
-                            / 1_000_000.0,
-                    }));
+                    projected.push(TuiEvent::UsageUpdated {
+                        revision: usage.revision.get(),
+                        usage: UsageTotals {
+                            input_tokens: usage.thread_total.input_tokens,
+                            output_tokens: usage.thread_total.output_tokens,
+                            cache_tokens: usage.thread_total.cache_tokens,
+                            estimated_cost_usd: usage.thread_total.estimated_cost_usd_micros as f64
+                                / 1_000_000.0,
+                        },
+                    });
                 }
                 SurfaceEvent::Context(context) => {
                     projected.push(TuiEvent::ContextUpdated {
@@ -1295,7 +1298,9 @@ mod tests {
         SurfaceIncarnation, SurfaceInputCorrelationId, SurfaceItemId, SurfaceScope,
         SurfaceThreadId, SurfaceTurnId, ThreadOwnerEpoch,
     };
-    use orca_runtime::unstable_surface::SurfaceGenerationId;
+    use orca_runtime::unstable_surface::{
+        SurfaceGenerationId, SurfaceUsageSnapshot, UsageRevision,
+    };
 
     fn uuid_v7_bytes(seed: u8) -> [u8; 16] {
         let mut bytes = [seed; 16];
@@ -1437,6 +1442,58 @@ mod tests {
             projection.reduce_typed_batch(&batch),
             Err(SurfaceProjectionError::UnknownAssistantStream { stream_id: observed })
                 if observed == stream_id
+        ));
+    }
+
+    #[test]
+    fn typed_usage_projection_preserves_usage_revision() {
+        let before = cursor(0, 1);
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: ThreadOwnerEpoch::new(1),
+            durable_revision: DurableRevision::try_new(2).unwrap(),
+            commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(4)).unwrap(),
+        };
+        let event = SurfaceEventEnvelope {
+            ordinal: 0,
+            event_id: SurfaceEventId::try_from_bytes(uuid_v7_bytes(5)).unwrap(),
+            commit_class: commit_class.clone(),
+            scope: SurfaceScope::Thread,
+            event: SurfaceEvent::Usage(SurfaceUsageSnapshot {
+                revision: UsageRevision::try_new(17).unwrap(),
+                thread_total: orca_runtime::surface::UsageTotals {
+                    input_tokens: 8_000,
+                    output_tokens: 900,
+                    cache_tokens: 450,
+                    estimated_cost_usd_micros: 35_000,
+                },
+                active_operation: None,
+                goal: None,
+                workflow: Vec::new(),
+            }),
+        };
+        let batch = SurfaceCommitBatch {
+            cursor_before: before.clone(),
+            cursor_after: SurfaceCursor {
+                next_seq: SequenceNumber::new(1),
+                source_revision: CursorSourceRevision::Recorded {
+                    durable_revision: DurableRevision::try_new(2).unwrap(),
+                },
+                ..before.clone()
+            },
+            commit_class,
+            event_count: 1,
+            batch_digest: Sha256Digest::new([0; 32]),
+            events: NonEmptyVec::try_new(vec![event]).unwrap(),
+        };
+        let mut projection = TuiSurfaceProjection::from_snapshot(before, &[]);
+
+        assert!(matches!(
+            projection.reduce_typed_batch(&batch).unwrap().as_slice(),
+            [TuiEvent::UsageUpdated { revision: 17, usage }]
+                if usage.input_tokens == 8_000
+                    && usage.output_tokens == 900
+                    && usage.cache_tokens == 450
+                    && usage.estimated_cost_usd == 0.035
         ));
     }
 

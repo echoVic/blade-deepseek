@@ -433,7 +433,10 @@ pub enum TuiEvent {
     },
     OperationRejected(String),
     Error(String),
-    UsageUpdated(UsageTotals),
+    UsageUpdated {
+        revision: u64,
+        usage: UsageTotals,
+    },
     ContextUpdated {
         used_tokens: usize,
         limit_tokens: usize,
@@ -873,6 +876,7 @@ pub struct AppState {
     pub session_picker_phase: SessionPickerPhase,
     pub session_picker_error: Option<String>,
     pub usage: UsageTotals,
+    usage_revision: Option<u64>,
     pub context_used_tokens: usize,
     pub context_limit_tokens: usize,
     pub slash_menu: Option<SlashMenu>,
@@ -1032,6 +1036,7 @@ impl AppState {
             session_picker_phase: SessionPickerPhase::Browsing,
             session_picker_error: None,
             usage: UsageTotals::default(),
+            usage_revision: None,
             context_used_tokens: 0,
             context_limit_tokens: 0,
             slash_menu: None,
@@ -2424,6 +2429,7 @@ impl AppState {
                 self.recoverable_operation_id = None;
                 self.recovery_prompt_visible = false;
                 self.usage = UsageTotals::default();
+                self.usage_revision = None;
                 self.context_used_tokens = 0;
                 self.context_limit_tokens = 0;
                 self.approval_dialog = None;
@@ -2987,12 +2993,14 @@ impl AppState {
             TuiEvent::MentionSearchDirty { .. }
             | TuiEvent::MentionCatalogDirty { .. }
             | TuiEvent::MentionRuntimeReady(_) => {}
-            TuiEvent::UsageUpdated(usage) => {
-                self.usage.input_tokens = self.usage.input_tokens.max(usage.input_tokens);
-                self.usage.output_tokens = self.usage.output_tokens.max(usage.output_tokens);
-                self.usage.cache_tokens = self.usage.cache_tokens.max(usage.cache_tokens);
-                self.usage.estimated_cost_usd =
-                    self.usage.estimated_cost_usd.max(usage.estimated_cost_usd);
+            TuiEvent::UsageUpdated { revision, usage } => {
+                if self
+                    .usage_revision
+                    .is_none_or(|current_revision| revision > current_revision)
+                {
+                    self.usage = usage;
+                    self.usage_revision = Some(revision);
+                }
             }
             TuiEvent::ContextUpdated {
                 used_tokens,
@@ -5473,25 +5481,41 @@ mod tests {
     }
 
     #[test]
-    fn usage_updates_merge_monotonically_across_out_of_order_events() {
+    fn usage_update_allows_compaction_drop_and_rejects_stale_revision() {
         let mut state = state();
-        state.update(TuiEvent::UsageUpdated(UsageTotals {
-            input_tokens: 300,
-            output_tokens: 80,
-            cache_tokens: 40,
-            estimated_cost_usd: 0.003,
-        }));
-        state.update(TuiEvent::UsageUpdated(UsageTotals {
-            input_tokens: 200,
-            output_tokens: 120,
-            cache_tokens: 20,
-            estimated_cost_usd: 0.002,
-        }));
+        let before_compaction = UsageTotals {
+            input_tokens: 50_000,
+            output_tokens: 800,
+            cache_tokens: 400,
+            estimated_cost_usd: 0.03,
+        };
+        let after_compaction = UsageTotals {
+            input_tokens: 8_000,
+            output_tokens: 900,
+            cache_tokens: 450,
+            estimated_cost_usd: 0.035,
+        };
+        let stale = UsageTotals {
+            input_tokens: 60_000,
+            output_tokens: 700,
+            cache_tokens: 350,
+            estimated_cost_usd: 0.025,
+        };
 
-        assert_eq!(state.usage.input_tokens, 300);
-        assert_eq!(state.usage.output_tokens, 120);
-        assert_eq!(state.usage.cache_tokens, 40);
-        assert_eq!(state.usage.estimated_cost_usd, 0.003);
+        state.update(TuiEvent::UsageUpdated {
+            revision: 10,
+            usage: before_compaction,
+        });
+        state.update(TuiEvent::UsageUpdated {
+            revision: 11,
+            usage: after_compaction.clone(),
+        });
+        state.update(TuiEvent::UsageUpdated {
+            revision: 9,
+            usage: stale,
+        });
+
+        assert_eq!(state.usage, after_compaction);
     }
 
     #[test]
