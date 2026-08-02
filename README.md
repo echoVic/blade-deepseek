@@ -59,10 +59,12 @@ orca --mode=acp                           # connect an ACP client
 On Windows PowerShell, set the key with `$env:DEEPSEEK_API_KEY = "sk-..."`;
 the `orca` commands are the same.
 
-In the TUI, `@` searches files, skills, plugins, and MCP resources. Use
-`/plan` for read-only planning, `/goal` for a persistent objective, `/resume`
-to reopen a saved conversation, `/workflows` for background work, and `/trust`
-to manage the current folder's sandbox permissions.
+In the TUI, `@` searches files, skills, plugins, and MCP resources. Use `/new`
+to start a fresh recorded conversation (`/clear` is an alias), `/resume` to
+reopen a saved conversation, `/plan` for read-only planning, `/goal` for a
+persistent objective, `/workflows` for background work, and `/trust` to manage
+the current folder's sandbox permissions. `Ctrl+L` clears only the displayed
+transcript and terminal scrollback; it keeps the current conversation context.
 
 ## What it does
 

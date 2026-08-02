@@ -335,6 +335,7 @@ const TRANSITION_STATE_SETS = {
 };
 
 const TUI_ENTRYPOINT_ANCHORS = new Map([
+  ["slash.new", /SlashCommand::New|UserAction::NewSession/],
   ["slash.model_write", /SlashCommand::Model\(Some|KeyCode::(?:Tab|Enter)/],
   ["slash.model_read", /SlashCommand::Model\(None/],
   [
@@ -1174,11 +1175,11 @@ function invariantRegistry() {
       },
     ],
     [
-      "closed_inventory.current_tui_user_actions has exactly 21 unique variants matching UserAction at baseline",
+      "closed_inventory.current_tui_user_actions has exactly 23 unique variants matching UserAction at baseline",
       (manifest) => {
         assertCondition(
-          manifest.closed_inventory.current_tui_user_actions.length === 21,
-          "current_tui_user_actions must contain 21 variants",
+          manifest.closed_inventory.current_tui_user_actions.length === 23,
+          "current_tui_user_actions must contain 23 variants",
         );
         assertUnique(
           manifest.closed_inventory.current_tui_user_actions,

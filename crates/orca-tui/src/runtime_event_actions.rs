@@ -78,6 +78,7 @@ pub(crate) fn handle_runtime_event(
         } => state.queued_submission_matches_id(*id),
         _ => false,
     };
+    let new_session_started = matches!(&tui_event, TuiEvent::NewSessionStarted { .. });
     let restored_prompt = match &tui_event {
         TuiEvent::Backtracked { prompt } => Some(prompt.clone()),
         TuiEvent::SubmissionRejected { prompt, .. } if !queued_submission_rejected => {
@@ -118,6 +119,11 @@ pub(crate) fn handle_runtime_event(
         vim_state.flush_pending_insert_escape(textarea);
         vim_state.reset_insert(textarea, theme);
         *textarea = make_textarea_with_text(&prompt, vim_state, theme);
+    }
+    if new_session_started {
+        vim_state.flush_pending_insert_escape(textarea);
+        vim_state.reset_insert(textarea, theme);
+        *textarea = make_textarea_with_text("", vim_state, theme);
     }
     if workflow_notification_turn_boundary {
         drain_pending_workflow_notifications(state, pending_workflow_notifications);
@@ -730,6 +736,39 @@ mod tests {
 
             assert_eq!(presentation.pending_len_for_test(), expected_pending);
         }
+    }
+
+    #[test]
+    fn new_session_started_clears_the_composer() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let pending = bridge::PendingWorkflowNotifications::new();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut presentation = test_presentation();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.enter_running();
+        let mut textarea = make_textarea_with_text("stale composer", &VimState::new(false), &theme);
+        let mut vim = VimState::new(false);
+
+        handle_runtime_event(
+            TuiEvent::NewSessionStarted {
+                session_id: "019f8a00-0000-7000-8000-000000000123".to_string(),
+            },
+            &mut state,
+            &action_tx,
+            &pending,
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut presentation,
+        );
+
+        assert!(textarea_text(&textarea).is_empty());
+        assert_eq!(state.status, AppStatus::Idle);
     }
 
     #[test]

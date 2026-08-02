@@ -584,6 +584,20 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
                                     mention_search
                                         .install_runtime_actions(TuiSurfaceActions::new(thread));
                                 }
+                                TuiEvent::NewSessionStarted { session_id } => {
+                                    config.history_mode = HistoryMode::Record;
+                                    active_session_id = Some(session_id.clone());
+                                    handle_runtime_event(
+                                        TuiEvent::NewSessionStarted { session_id },
+                                        &mut state,
+                                        &action_tx,
+                                        &pending_workflow_notifications,
+                                        &mut textarea,
+                                        &mut vim_state,
+                                        &theme,
+                                        presentation,
+                                    );
+                                }
                                 TuiEvent::SettingsUpdated {
                                     model,
                                     reasoning_effort,
@@ -3619,6 +3633,105 @@ mod tests {
     }
 
     #[test]
+    fn hosted_tui_new_session_preserves_old_history_and_starts_with_empty_context() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("old conversation prompt".to_string()));
+            let old_session_id = match harness
+                .recv_until(|event| matches!(event, TuiEvent::MentionRuntimeReady(_)))
+            {
+                TuiEvent::MentionRuntimeReady(thread) => thread
+                    .session_id()
+                    .expect("old recorded session id")
+                    .to_string(),
+                _ => unreachable!(),
+            };
+            harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+
+            harness.send(UserAction::NewSession);
+            let new_session_id = match harness
+                .recv_until(|event| matches!(event, TuiEvent::NewSessionStarted { .. }))
+            {
+                TuiEvent::NewSessionStarted { session_id } => session_id,
+                _ => unreachable!(),
+            };
+
+            assert_ne!(new_session_id, old_session_id);
+            assert!(matches!(
+                harness.config.lock().unwrap().history_mode,
+                HistoryMode::Record
+            ));
+            let old_transcript = history::load_session(&old_session_id)
+                .expect("old session remains resumable after /new");
+            assert!(old_transcript.messages.iter().any(|message| {
+                matches!(message, Message::User { content, .. } if content == "old conversation prompt")
+            }));
+            assert_eq!(
+                history::load_session("latest")
+                    .expect("new conversation is the latest resumable session")
+                    .meta
+                    .session_id,
+                new_session_id
+            );
+
+            harness.send(UserAction::Submit("mock_history_echo".to_string()));
+            let echo = harness.recv_until(|event| {
+                matches!(event, TuiEvent::MessageDelta(text) if text.contains("Mock history users:"))
+            });
+            let TuiEvent::MessageDelta(echo) = echo else {
+                unreachable!()
+            };
+            assert_eq!(echo, "Mock history users: mock_history_echo");
+            harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn hosted_tui_new_session_rejects_active_background_work() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("mock_stream_delay_ms 3000".to_string()));
+            harness.recv_until(|event| {
+                matches!(event, TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started."))
+            });
+
+            harness.send(UserAction::BackgroundCurrentTurn);
+            let task = loop {
+                let event = harness
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("backgrounded task update");
+                if let Some(task) = matching_task_update(event, |task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                        && task.status == orca_core::task_types::TaskStatus::Running
+                        && task.is_backgrounded
+                }) {
+                    break task;
+                }
+            };
+
+            harness.send(UserAction::NewSession);
+            let rejected = harness.recv_until(|event| {
+                matches!(event, TuiEvent::OperationRejected(message) if message.contains("active work"))
+            });
+            assert!(matches!(rejected, TuiEvent::OperationRejected(_)));
+
+            harness.send(UserAction::StopTask {
+                task_id: task.id.clone(),
+            });
+            harness.recv_until(|event| {
+                matching_task_update(event.clone(), |candidate| {
+                    candidate.id == task.id
+                        && candidate.status == orca_core::task_types::TaskStatus::Cancelled
+                })
+                .is_some()
+            });
+            harness.shutdown();
+        });
+    }
+
+    #[test]
     fn hosted_tui_background_handoff_failure_publishes_terminal_after_operation_join() {
         with_orca_home(|_| {
             let mut harness = HostedTuiHarness::start_with_background_capacity(
@@ -4097,6 +4210,39 @@ mod tests {
                 if operation_id == cancel_operation_id
         ));
         assert_eq!(cancel_state.status, AppStatus::Running);
+    }
+
+    #[test]
+    fn new_and_clear_slash_commands_dispatch_the_same_session_action() {
+        for command in ["/new", "/clear"] {
+            let mut config = test_config(HistoryMode::Record);
+            let shared_config = Arc::new(Mutex::new(config.clone()));
+            let (mut state, _) = test_state();
+            let (action_tx, action_rx) = mpsc::unbounded();
+
+            handle_slash_command(command, &mut config, &shared_config, &mut state, &action_tx);
+
+            assert!(matches!(action_rx.try_recv(), Ok(UserAction::NewSession)));
+            assert_eq!(state.status, AppStatus::Running);
+        }
+    }
+
+    #[test]
+    fn new_slash_command_is_rejected_while_waiting_for_user_input() {
+        let mut config = test_config(HistoryMode::Record);
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let (mut state, _) = test_state();
+        state.status = AppStatus::WaitingUserInput;
+        let (action_tx, action_rx) = mpsc::unbounded();
+
+        handle_slash_command("/new", &mut config, &shared_config, &mut state, &action_tx);
+
+        assert!(action_rx.try_recv().is_err());
+        assert_eq!(state.status, AppStatus::WaitingUserInput);
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::Error(message)) if message.contains("finish or cancel")
+        ));
     }
 
     #[test]
@@ -7479,6 +7625,24 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
             action_rx.recv()
         };
         match action {
+            Ok(UserAction::NewSession) => {
+                match start_new_hosted_session(
+                    &mut thread,
+                    &host,
+                    &config,
+                    &preloaded,
+                    &mcp_registry,
+                    &pending_workflow_notifications,
+                    &event_tx,
+                ) {
+                    Ok(session_id) => {
+                        let _ = event_tx.send(TuiEvent::NewSessionStarted { session_id });
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                    }
+                }
+            }
             Ok(UserAction::Submit(prompt)) => handle_hosted_submitted_turn(
                 SubmittedTurn::user(prompt),
                 &config,
@@ -7959,6 +8123,88 @@ fn ensure_hosted_thread(
         *thread = Some(started);
     }
     Ok(())
+}
+
+fn start_new_hosted_session(
+    thread: &mut Option<RuntimeThreadHandle>,
+    host: &RuntimeHostHandle,
+    config: &Arc<Mutex<RunConfig>>,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    mcp_registry: &orca_mcp::McpRegistry,
+    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<String, String> {
+    if let Some(current) = thread.as_ref() {
+        let snapshot = TuiSurfaceActions::new(current.typed_surface())
+            .read_snapshot()
+            .map_err(|error| format!("failed to inspect the current conversation: {error}"))?;
+        let has_non_terminal_task = snapshot.tasks.iter().any(|task| {
+            !matches!(
+                task.status,
+                orca_runtime::surface::SurfaceTaskStatus::Stopped
+                    | orca_runtime::surface::SurfaceTaskStatus::Completed
+                    | orca_runtime::surface::SurfaceTaskStatus::Failed
+                    | orca_runtime::surface::SurfaceTaskStatus::Cancelled
+            )
+        });
+        let has_non_terminal_workflow = snapshot.workflows.iter().any(|workflow| {
+            !matches!(
+                workflow.status,
+                orca_runtime::surface::SurfaceWorkflowStatus::Stopped
+                    | orca_runtime::surface::SurfaceWorkflowStatus::Completed
+                    | orca_runtime::surface::SurfaceWorkflowStatus::Failed
+                    | orca_runtime::surface::SurfaceWorkflowStatus::Cancelled
+            )
+        });
+        let has_active_goal = snapshot.goal.as_ref().is_some_and(|goal| {
+            matches!(goal.state, orca_runtime::surface::SurfaceGoalState::Active)
+        });
+        if snapshot.foreground_operation.is_some()
+            || !snapshot.queued_operations.is_empty()
+            || !snapshot.background_operations.is_empty()
+            || has_non_terminal_task
+            || has_non_terminal_workflow
+            || has_active_goal
+        {
+            return Err(
+                "cannot start a new conversation while the current session has active work"
+                    .to_string(),
+            );
+        }
+    }
+
+    let mut next_config = config.lock().unwrap().clone();
+    next_config.history_mode = HistoryMode::Record;
+    next_config.prompt.clear();
+    next_config.show_session_picker = false;
+    let request = RuntimeThreadStartRequest::new(next_config.clone(), "New conversation");
+    #[cfg(test)]
+    let request = request.with_mcp_registry(mcp_registry.clone());
+    #[cfg(not(test))]
+    let _ = mcp_registry;
+    let started = host
+        .start_thread_with_request(request)
+        .map_err(|error| format!("failed to start a new conversation: {error}"))?;
+    let session_id = started
+        .session_id()
+        .ok_or_else(|| "new conversation did not create a resumable session".to_string())?
+        .to_string();
+
+    if let Some(current) = thread.as_ref()
+        && let Err(error) = current.shutdown()
+    {
+        let _ = started.shutdown();
+        return Err(format!(
+            "failed to close the current conversation before switching: {error}"
+        ));
+    }
+
+    *config.lock().unwrap() = next_config;
+    *preloaded.lock().unwrap() = None;
+    pending_workflow_notifications.clear();
+    announce_runtime_ready(&started, event_tx);
+    *thread = Some(started);
+    Ok(session_id)
 }
 
 fn announce_runtime_ready(thread: &RuntimeThreadHandle, event_tx: &mpsc::Sender<TuiEvent>) {

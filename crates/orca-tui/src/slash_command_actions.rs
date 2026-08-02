@@ -28,6 +28,17 @@ pub(crate) fn handle_slash_command(
     let command = commands::parse_with_cwd(text, &cwd)?;
     let mut pending_settings_action = None;
     match command {
+        SlashCommand::New => {
+            if state.status == AppStatus::Idle {
+                state.enter_running();
+                let _ = action_tx.send(UserAction::NewSession);
+            } else {
+                state.push_message(ChatMessage::Error(
+                    "finish or cancel the current work before starting a new conversation"
+                        .to_string(),
+                ));
+            }
+        }
         SlashCommand::Model(Some(model)) => match commands::validate_model(&model) {
             Ok(()) => {
                 pending_settings_action = Some(UserAction::SetModel(model));

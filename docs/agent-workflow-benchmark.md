@@ -92,7 +92,7 @@ All 8 agents were launched concurrently via `Promise.all()` in the `research` ph
 
 | Question | Answer | Source Evidence |
 |----------|--------|-----------------|
-| Slash commands | `/resume` is the single saved-conversation entry; `/history` is not exposed | `commands/mod.rs` — `all_commands()` |
+| Slash commands | `/new` starts a fresh recorded conversation, `/clear` is its non-menu alias, and `/resume` is the single saved-conversation entry; `/history` is not exposed. `Ctrl+L` only clears the displayed transcript and terminal scrollback | `commands/mod.rs` — `all_commands()`; `global_actions.rs` — `GlobalShortcut::ClearScreen` |
 | Workflow-specific commands | `/workflows` shows workflow tasks; `/agents` shows workflow-agent dashboard rows | `commands/mod.rs` — `WorkflowList` and `AgentDashboard` variants |
 | Agent view / team dashboard | **Present** | `/workflows` renders selected workflow per-agent rows; `/agents` renders all workflow agents across runs with status, team label from `agent(..., { team })`, attempt/max-attempt, retry/failure detail, token usage, and cost |
 | Running subagent inspection | **Present** | `subagent_status` can query current or persisted async handles with lifecycle timestamps, output/error, and usage; `/workflows` shows async subagent rows with elapsed time. Rich step-level control remains a future enhancement, not a benchmark blocker |
@@ -176,7 +176,7 @@ All Phase 1 findings above were **cross-validated by the orchestrator** against 
 | Subagent tool supports sync and async modes | ✅ Confirmed | `subagent.rs` parses `mode`; `controller.rs` launches headless async worker processes; `bridge.rs` keeps TUI async work session-local |
 | 29 event types including workflow events | ✅ Confirmed | `event_schema.rs:20-96` |
 | MCP registry available to workflow children | ✅ Confirmed | `runner.rs` tests — `workflow_child_runtime_parts` |
-| 11 slash commands with `/workflows` and `/agents` | ✅ Confirmed | `commands/mod.rs` |
+| 16 built-in slash menu entries with `/new`, `/resume`, `/workflows`, and `/agents` | ✅ Confirmed | `commands/mod.rs` |
 | History supports resume/fork with parent_id | ✅ Confirmed | `history.rs:24-34` |
 | Approval has 4 modes + glob permission rules | ✅ Confirmed | `policy.rs:84-111`, `approval_rules.rs` |
 

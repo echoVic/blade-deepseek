@@ -257,7 +257,8 @@ fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
                 message,
             });
         }
-        UserAction::SubmitWorkflowNotification(_)
+        UserAction::NewSession
+        | UserAction::SubmitWorkflowNotification(_)
         | UserAction::RunWorkflow { .. }
         | UserAction::Compact
         | UserAction::GoalShow

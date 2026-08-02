@@ -19,7 +19,8 @@ const SLASH_MENU_ACTIONS: &str = include_str!("slash_menu_actions.rs");
 const SESSION_PICKER_ACTIONS: &str = include_str!("session_picker_actions.rs");
 const SETUP_ACTIONS: &str = include_str!("setup_actions.rs");
 
-const CURRENT_ACTIONS: [(&str, &str); 22] = [
+const CURRENT_ACTIONS: [(&str, &str); 23] = [
+    ("NewSession", "host_session_lifecycle_mutation"),
     ("Submit", "runtime_mutation"),
     ("SubmitWithMentions", "runtime_mutation"),
     ("SubmitQueued", "runtime_mutation"),
@@ -46,7 +47,8 @@ const CURRENT_ACTIONS: [(&str, &str); 22] = [
 
 const FUTURE_ACTIONS: [&str; 2] = ["ResumeOperation", "CancelOperation"];
 
-const TUI_ENTRYPOINTS: [&str; 38] = [
+const TUI_ENTRYPOINTS: [&str; 39] = [
+    "slash.new",
     "slash.model_write",
     "slash.model_read",
     "slash.mode_plan_and_backtab",

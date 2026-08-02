@@ -1,5 +1,6 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlashCommand {
+    New,
     Model(Option<String>),
     Compact,
     Resume,
@@ -85,6 +86,7 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
     let mut parts = rest.split_whitespace();
     let command = parts.next()?;
     match command {
+        "new" | "clear" => Some(SlashCommand::New),
         "model" => Some(SlashCommand::Model(
             parts.next().map(|name| name.to_string()),
         )),
@@ -133,6 +135,7 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
 
 pub fn all_commands() -> &'static [(&'static str, &'static str)] {
     &[
+        ("/new", "Start a new conversation"),
         ("/model", "Switch model and reasoning effort"),
         ("/compact", "Compress conversation context"),
         ("/resume", "Resume a saved conversation"),
@@ -181,14 +184,16 @@ pub fn available_commands(cwd: &Path) -> Vec<(String, String)> {
 }
 
 fn builtin_command_names() -> std::collections::BTreeSet<&'static str> {
-    all_commands()
+    let mut names = all_commands()
         .iter()
         .filter_map(|(command, _)| {
             command
                 .strip_prefix('/')
                 .and_then(|name| name.split([' ', ':']).next())
         })
-        .collect()
+        .collect::<std::collections::BTreeSet<_>>();
+    names.insert("clear");
+    names
 }
 
 fn discover_saved_workflows(cwd: &Path) -> Vec<(String, &'static str)> {
@@ -310,6 +315,30 @@ mod tests {
             Some("Resume a saved conversation")
         );
         assert!(!commands.iter().any(|(command, _)| *command == "/history"));
+    }
+
+    #[test]
+    fn new_and_clear_resolve_to_the_same_new_conversation_command() {
+        assert_eq!(parse("/new"), Some(SlashCommand::New));
+        assert_eq!(parse("/clear"), Some(SlashCommand::New));
+    }
+
+    #[test]
+    fn slash_menu_exposes_new_without_duplicate_clear_alias() {
+        let commands = all_commands();
+        assert_eq!(
+            commands
+                .iter()
+                .find(|(command, _)| *command == "/new")
+                .map(|(_, description)| *description),
+            Some("Start a new conversation")
+        );
+        assert!(!commands.iter().any(|(command, _)| *command == "/clear"));
+    }
+
+    #[test]
+    fn clear_alias_is_reserved_from_dynamic_command_collisions() {
+        assert!(builtin_command_names().contains("clear"));
     }
 
     #[test]
@@ -491,7 +520,6 @@ mod tests {
     #[test]
     fn removed_terminal_aliases_are_not_slash_commands() {
         assert_eq!(parse("/help"), None);
-        assert_eq!(parse("/clear"), None);
         assert_eq!(parse("/exit"), None);
 
         let command_names = all_commands()

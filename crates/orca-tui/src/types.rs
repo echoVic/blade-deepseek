@@ -262,6 +262,12 @@ impl PendingWorkflowNotificationQueue {
             .unwrap_or(true)
     }
 
+    pub fn clear(&self) {
+        if let Ok(mut queue) = self.inner.lock() {
+            queue.clear();
+        }
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.inner
@@ -389,6 +395,9 @@ pub enum TuiEvent {
         plan: Option<(Option<String>, Vec<PlanItem>)>,
         label: String,
     },
+    NewSessionStarted {
+        session_id: String,
+    },
     Notice(String),
     MentionSearchDirty {
         generation: SessionGeneration,
@@ -445,6 +454,7 @@ pub enum TuiMemoryScope {
 
 #[derive(Debug, Clone)]
 pub enum UserAction {
+    NewSession,
     Submit(String),
     SubmitWithMentions {
         prompt: String,
@@ -2233,6 +2243,41 @@ impl AppState {
 
     pub fn update(&mut self, event: TuiEvent) {
         match event {
+            TuiEvent::NewSessionStarted { .. } => {
+                self.clear_messages();
+                self.current_plan = None;
+                self.proposed_plan_parser = ProposedPlanStreamParser::default();
+                self.plan_update_failed = false;
+                self.current_goal = None;
+                self.recoverable_operation_id = None;
+                self.usage = UsageTotals::default();
+                self.context_used_tokens = 0;
+                self.context_limit_tokens = 0;
+                self.approval_dialog = None;
+                self.pending_input = None;
+                self.approval_allowlist.clear();
+                self.session_picker_sessions.clear();
+                self.session_picker_selected = 0;
+                self.session_picker_query.clear();
+                self.slash_menu = None;
+                self.mention = MentionPopupState::default();
+                self.mention_bindings.clear();
+                self.pending_pastes.clear();
+                self.reset_history_navigation();
+                self.last_ctrl_c = None;
+                self.panel_mode = PanelMode::Conversation;
+                self.workflow_panel = WorkflowPanelState::default();
+                self.pending_workflow_notifications.clear();
+                self.suppress_background_main_session_output = false;
+                self.last_completed_at = None;
+                self.pending_clipboard_copy = None;
+                self.last_left_click = None;
+                self.copy_notice = None;
+                self.composer_mouse_selecting = false;
+                self.scroll_offset = 0;
+                self.auto_scroll = true;
+                self.set_status(AppStatus::Idle);
+            }
             TuiEvent::HistoryLoaded {
                 messages,
                 plan,
@@ -3829,6 +3874,63 @@ mod tests {
             Some("resume plan")
         );
         assert_eq!(state.status, AppStatus::Idle);
+    }
+
+    #[test]
+    fn new_session_started_resets_conversation_state_and_preserves_runtime_settings() {
+        let mut state = state();
+        state.push_message(ChatMessage::User("old prompt".to_string()));
+        state.current_plan = Some((
+            Some("old plan".to_string()),
+            vec![PlanItem {
+                step: "old step".to_string(),
+                status: PlanStatus::InProgress,
+            }],
+        ));
+        state.usage.input_tokens = 42;
+        state.context_used_tokens = 21;
+        state.context_limit_tokens = 100;
+        state.approval_allowlist.insert("bash".to_string());
+        state.model_name = "deepseek-v4-pro".to_string();
+        state.reasoning_effort = orca_core::config::ReasoningEffort::High;
+        state.approval_mode = ApprovalMode::FullAuto;
+        state.history_cursor = Some(0);
+        state.draft_before_history = Some("old draft".to_string());
+        state.last_ctrl_c = Some(Instant::now());
+        state.pending_clipboard_copy = Some("old selection".to_string());
+        state.copy_notice = Some(CopyNotice {
+            chars: 13,
+            at: Instant::now(),
+            local_only: false,
+        });
+        state.last_left_click = Some((Instant::now(), 1, 1, 1));
+        state.composer_mouse_selecting = true;
+        state.enter_running();
+
+        state.update(TuiEvent::NewSessionStarted {
+            session_id: "019f8a00-0000-7000-8000-000000000123".to_string(),
+        });
+
+        assert!(state.messages.is_empty());
+        assert!(state.current_plan.is_none());
+        assert_eq!(state.usage, UsageTotals::default());
+        assert_eq!(state.context_used_tokens, 0);
+        assert_eq!(state.context_limit_tokens, 0);
+        assert!(state.approval_allowlist.is_empty());
+        assert_eq!(state.status, AppStatus::Idle);
+        assert_eq!(state.model_name, "deepseek-v4-pro");
+        assert_eq!(
+            state.reasoning_effort,
+            orca_core::config::ReasoningEffort::High
+        );
+        assert_eq!(state.approval_mode, ApprovalMode::FullAuto);
+        assert!(state.history_cursor.is_none());
+        assert!(state.draft_before_history.is_none());
+        assert!(state.last_ctrl_c.is_none());
+        assert!(state.pending_clipboard_copy.is_none());
+        assert!(state.copy_notice.is_none());
+        assert!(state.last_left_click.is_none());
+        assert!(!state.composer_mouse_selecting);
     }
 
     fn session(id: &str, title: &str) -> SessionSummary {
@@ -5656,6 +5758,13 @@ mod tests {
         assert!(queue.is_empty());
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "notification-1");
+
+        assert!(queue.push_unique(PendingWorkflowNotification {
+            id: "stale-notification".to_string(),
+            prompt: "<task-notification>stale</task-notification>".to_string(),
+        }));
+        queue.clear();
+        assert!(queue.is_empty());
 
         assert!(queue.push_unique(PendingWorkflowNotification {
             id: "notification-2".to_string(),

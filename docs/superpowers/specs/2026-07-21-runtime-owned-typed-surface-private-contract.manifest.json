@@ -218,8 +218,10 @@
       "ShutdownHost"
     ],
     "current_tui_user_actions": [
+      "NewSession",
       "Submit",
       "SubmitWithMentions",
+      "SubmitQueued",
       "SubmitWorkflowNotification",
       "RunWorkflow",
       "SetModel",
@@ -3814,6 +3816,30 @@
   ],
   "tui_actions": [
     [
+      "NewSession",
+      "current",
+      [
+        "crates/orca-tui/src/types.rs:457",
+        "crates/orca-tui/src/slash_command_actions.rs:31",
+        "crates/orca-tui/src/app.rs:7596",
+        "crates/orca-tui/src/app.rs:8096"
+      ],
+      "host_session_lifecycle_mutation",
+      "UserAction::NewSession",
+      "StartThread(HistoryMode::Record)+CloseThread(current)",
+      "StartThread(HistoryMode::Record)+CloseThread(current)",
+      [
+        "ManageSessionLifecycle"
+      ],
+      [
+        "HostIncarnation",
+        "ThreadOwnerEpoch"
+      ],
+      "TuiEvent::NewSessionStarted{session_id}|OperationRejected",
+      "TUI installs the fresh thread and clears conversation state",
+      "move_session_switch_behind_typed_host_command"
+    ],
+    [
       "Submit",
       "current",
       [
@@ -4366,6 +4392,21 @@
     "phase_3_disposition"
   ],
   "tui_entrypoints": [
+    [
+      "slash.new",
+      [
+        "crates/orca-tui/src/slash_command_actions.rs:31"
+      ],
+      "host_session_lifecycle_mutation",
+      "UserAction_NewSession",
+      "StartThread(HistoryMode::Record)+CloseThread(current)",
+      [
+        "HostIncarnation",
+        "ThreadOwnerEpoch"
+      ],
+      "TuiEvent::NewSessionStarted or OperationRejected",
+      "route_new_session_through_typed_host_surface"
+    ],
     [
       "slash.model_write",
       [
@@ -6877,7 +6918,7 @@
   ],
   "phase_0a_manifest_invariants": [
     "source_facts has exactly 53 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 21 unique variants matching UserAction at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 23 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",
