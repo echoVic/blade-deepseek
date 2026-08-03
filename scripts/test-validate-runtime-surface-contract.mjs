@@ -1223,6 +1223,19 @@ for (const [relativePath, minimumOccurrences] of [
 }
 
 {
+  const attributes = readFileSync(path.join(repoRoot, ".gitattributes"), "utf8");
+  for (const rule of [
+    "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-* text eol=lf",
+    "docs/superpowers/plans/2026-07-21-runtime-owned-typed-surface-implementation.md text eol=lf",
+  ]) {
+    assert.ok(
+      attributes.split(/\r?\n/).includes(rule),
+      `reviewed artifact bytes require ${rule}`,
+    );
+  }
+}
+
+{
   const workflow = readFileSync(
     path.join(repoRoot, ".github/workflows/runtime-contract.yml"),
     "utf8",
