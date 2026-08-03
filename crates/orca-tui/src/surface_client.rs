@@ -1358,7 +1358,7 @@ pub(crate) fn launch_workflow(
                         });
                         let workflow_terminal =
                             batch_contains_workflow_terminal(&batch, &monitor_workflow_run_id);
-                        match projection.reduce_typed_batch(&batch) {
+                        match projection.project_typed_batch(&batch) {
                             Ok(events) => {
                                 for event in events {
                                     let _ = monitor_events.send(event);
@@ -2017,7 +2017,7 @@ fn drain_operation_with_boundary(
                             }
                         }
                     }
-                    match projection.reduce_typed_batch(&batch) {
+                    match projection.project_typed_batch(&batch) {
                         Ok(events) => {
                             for event in events {
                                 if matches!(event, TuiEvent::SessionCompleted { .. }) {
@@ -2293,11 +2293,15 @@ fn monitor_background_presentation(
                                 if &record.operation_id == operation_id
                         )
                     });
-                    projection.reduce_typed_batch(&batch).map_err(|error| {
-                        io::Error::other(format!(
-                            "background presentation projection failed: {error:?}"
-                        ))
-                    })?;
+                    let projection_events =
+                        projection.project_typed_batch(&batch).map_err(|error| {
+                            io::Error::other(format!(
+                                "background presentation projection failed: {error:?}"
+                            ))
+                        })?;
+                    let projection_sync = projection_events
+                        .into_iter()
+                        .find(|event| matches!(event, TuiEvent::SurfaceProjectionSynced(_)));
                     let current_task =
                         projection.background_task_summary_for_operation(operation_id);
                     if last_task.as_ref() != Some(&current_task) {
@@ -2312,6 +2316,16 @@ fn monitor_background_presentation(
                             break false;
                         }
                         last_task = Some(current_task);
+                    }
+                    if let Some(event) = projection_sync
+                        && !send_background_presentation_event(
+                            event_tx,
+                            controller,
+                            cancellation,
+                            event,
+                        )
+                    {
+                        break false;
                     }
                     if terminal {
                         break false;
@@ -2625,6 +2639,17 @@ mod tests {
         assert!(events.iter().any(
             |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
         ));
+        let projection = events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                TuiEvent::SurfaceProjectionSynced(projection) => Some(projection.as_ref()),
+                _ => None,
+            })
+            .expect("typed projection must finish each batch with a reducer snapshot");
+        assert_eq!(projection.title, "typed TUI turn");
+        assert!(projection.usage_revision > 0);
+        assert!(projection.foreground_operation_id.is_none());
         assert!(controller.current_id().is_none());
         assert!(!controller.has_surface_active());
 
@@ -2854,7 +2879,9 @@ mod tests {
         assert!(
             background_monitor_events.iter().all(|event| matches!(
                 event,
-                TuiEvent::WorkflowTasksUpdated { .. } | TuiEvent::Notice(_)
+                TuiEvent::WorkflowTasksUpdated { .. }
+                    | TuiEvent::Notice(_)
+                    | TuiEvent::SurfaceProjectionSynced(_)
             )),
             "background observer must not project a later foreground operation: \
              {background_monitor_events:?}"

@@ -21,7 +21,7 @@ use orca_runtime::surface::{
     SurfaceWorkflowStatus, ToolPatch, UnixMillis,
 };
 
-use crate::types::{TuiEvent, TuiTaskLifecycle};
+use crate::types::{SurfaceProjectionState, TuiEvent, TuiTaskLifecycle};
 
 pub(crate) fn history_messages_from_surface_snapshot(
     snapshot: &orca_runtime::surface::SurfaceSnapshot,
@@ -155,6 +155,7 @@ pub(crate) enum SurfaceProjectionError {
     ReducerRejected {
         code: SurfaceReducerErrorCode,
     },
+    MissingReducerSnapshot,
     InvalidDeliveryWatermark {
         stream_id: SurfaceStreamId,
         offset: ByteOffset,
@@ -162,6 +163,33 @@ pub(crate) enum SurfaceProjectionError {
 }
 
 pub(crate) type TuiStreamDeliveryWatermark = BTreeMap<SurfaceStreamId, ByteOffset>;
+
+impl SurfaceProjectionState {
+    fn from_surface_snapshot(snapshot: &orca_runtime::surface::SurfaceSnapshot) -> Self {
+        Self {
+            session_id: surface_thread_id_text(&snapshot.thread.thread_id),
+            title: snapshot.thread.title.as_str().to_string(),
+            usage_revision: snapshot.usage.revision.get(),
+            usage: core_usage_totals(&snapshot.usage.thread_total),
+            context_used_tokens: usize::try_from(snapshot.context.used_tokens)
+                .unwrap_or(usize::MAX),
+            context_limit_tokens: usize::try_from(snapshot.context.limit_tokens)
+                .unwrap_or(usize::MAX),
+            workflow_tasks: workflow_task_summaries(snapshot),
+            current_goal: snapshot.goal.as_ref().map(|goal| {
+                thread_goal_from_surface(
+                    goal,
+                    snapshot.thread.created_at,
+                    snapshot.thread.updated_at,
+                )
+            }),
+            foreground_operation_id: snapshot
+                .foreground_operation
+                .as_ref()
+                .map(|operation| operation.operation_id.clone()),
+        }
+    }
+}
 
 pub(crate) struct TuiSurfaceProjection {
     cursor: SurfaceCursor,
@@ -768,6 +796,27 @@ impl TuiSurfaceProjection {
         self.goal = goal;
         self.reducer_state = next_reducer_state;
         self.cursor = batch.cursor_after.clone();
+        Ok(projected)
+    }
+
+    /// Projects one committed batch and appends the canonical reducer snapshot
+    /// used to reconcile TUI-owned derived state at the batch boundary.
+    pub(crate) fn project_typed_batch(
+        &mut self,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<Vec<TuiEvent>, SurfaceProjectionError> {
+        if self.reducer_state.is_none() {
+            return Err(SurfaceProjectionError::MissingReducerSnapshot);
+        }
+        let mut projected = self.reduce_typed_batch(batch)?;
+        let Some(state) = self
+            .reducer_state
+            .as_ref()
+            .map(|state| SurfaceProjectionState::from_surface_snapshot(state.snapshot()))
+        else {
+            return Err(SurfaceProjectionError::MissingReducerSnapshot);
+        };
+        projected.push(TuiEvent::SurfaceProjectionSynced(Box::new(state)));
         Ok(projected)
     }
 
@@ -1483,7 +1532,7 @@ mod tests {
             batch_digest: Sha256Digest::new([0; 32]),
             events: NonEmptyVec::try_new(vec![event]).unwrap(),
         };
-        let mut projection = TuiSurfaceProjection::from_snapshot(before, &[]);
+        let mut projection = TuiSurfaceProjection::from_snapshot(before.clone(), &[]);
 
         assert!(matches!(
             projection.reduce_typed_batch(&batch).unwrap().as_slice(),
@@ -1493,6 +1542,13 @@ mod tests {
                     && usage.cache_tokens == 450
                     && usage.estimated_cost_usd == 0.035
         ));
+
+        let mut projection = TuiSurfaceProjection::from_snapshot(before.clone(), &[]);
+        assert!(matches!(
+            projection.project_typed_batch(&batch),
+            Err(SurfaceProjectionError::MissingReducerSnapshot)
+        ));
+        assert_eq!(projection.cursor(), &before);
     }
 
     #[test]

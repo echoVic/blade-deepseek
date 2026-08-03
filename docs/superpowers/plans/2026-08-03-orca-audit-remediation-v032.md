@@ -1069,13 +1069,13 @@ git commit -m "refactor(runtime): own root MCP registry"
 - Modify: crates/orca-tui/src/types.rs
 - Modify: crates/orca-tui/src/surface_projection.rs
 - Test: crates/orca-tui/src/types.rs
-- Test: crates/orca-runtime/tests/jsonl_surface_differential.rs
+- Test: tests/jsonl_surface_differential.rs
 
-- [ ] **Step 1: Add consistency assertion**
+- [x] **Step 1: Add consistency assertion**
 
 Create AppState::assert_surface_projection_consistent covering usage/context, tasks/workflows, identity, tool index, goal, and operation state. Run after every projected batch in test/debug builds.
 
-- [ ] **Step 2: Run RED and record mismatches**
+- [x] **Step 2: Run RED and record mismatches**
 
 ~~~sh
 cargo test -p orca-tui surface_projection_consistency --lib -- --nocapture
@@ -1083,16 +1083,16 @@ cargo test -p orca-tui surface_projection_consistency --lib -- --nocapture
 
 Expected: mismatches identify retained shadow-state divergence. Record each before fixing.
 
-- [ ] **Step 3: Centralize derivation**
+- [x] **Step 3: Centralize derivation**
 
 Derive from the reducer snapshot at read time or update in one named projection function. Reset every session shadow with SessionProjectionReset under the active attachment.
 
-- [ ] **Step 4: Run GREEN and commit**
+- [x] **Step 4: Run GREEN and commit**
 
 ~~~sh
 cargo test -p orca-tui surface_projection_consistency --lib -- --nocapture
-cargo test -p orca-runtime --test jsonl_surface_differential -- --test-threads=1
-git add crates/orca-tui/src/types.rs crates/orca-tui/src/surface_projection.rs crates/orca-runtime/tests/jsonl_surface_differential.rs docs/reports/2026-08-03-orca-audit-remediation-evidence.md
+cargo test --test jsonl_surface_differential -- --test-threads=1
+git add crates/orca-tui/src/types.rs crates/orca-tui/src/surface_projection.rs crates/orca-tui/src/surface_client.rs tests/jsonl_surface_differential.rs docs/reports/2026-08-03-orca-audit-remediation-evidence.md docs/superpowers/plans/2026-08-03-orca-audit-remediation-v032.md
 git commit -m "test(tui): enforce projection consistency"
 ~~~
 

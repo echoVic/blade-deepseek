@@ -317,6 +317,22 @@ pub struct AttachedTuiEvent {
     pub(crate) event: TuiEvent,
 }
 
+/// Runtime-derived values that the TUI must keep in lockstep with the
+/// authoritative surface reducer after each projected batch.
+#[derive(Clone, Debug, PartialEq)]
+#[doc(hidden)]
+pub struct SurfaceProjectionState {
+    pub(crate) session_id: String,
+    pub(crate) title: String,
+    pub(crate) usage_revision: u64,
+    pub(crate) usage: UsageTotals,
+    pub(crate) context_used_tokens: usize,
+    pub(crate) context_limit_tokens: usize,
+    pub(crate) workflow_tasks: Vec<BackgroundTaskSummary>,
+    pub(crate) current_goal: Option<ThreadGoal>,
+    pub(crate) foreground_operation_id: Option<SurfaceOperationId>,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum TuiEvent {
@@ -324,6 +340,8 @@ pub enum TuiEvent {
     Attached(Box<AttachedTuiEvent>),
     #[doc(hidden)]
     SessionAttachmentActivated,
+    #[doc(hidden)]
+    SurfaceProjectionSynced(Box<SurfaceProjectionState>),
     TurnStarted {
         turn: u32,
         task: Option<TuiTaskLifecycle>,
@@ -923,6 +941,7 @@ pub struct AppState {
     /// showing outdated statuses. Cleared by the next successful update.
     pub plan_update_failed: bool,
     pub current_goal: Option<ThreadGoal>,
+    active_surface_operation_id: Option<SurfaceOperationId>,
     pub recoverable_operation_id: Option<SurfaceOperationId>,
     pub recovery_prompt_visible: bool,
     pub recovery_prompt_selected: usize,
@@ -1082,6 +1101,7 @@ impl AppState {
             assistant_stream_tail: None,
             plan_update_failed: false,
             current_goal: None,
+            active_surface_operation_id: None,
             recoverable_operation_id: None,
             recovery_prompt_visible: false,
             recovery_prompt_selected: 0,
@@ -1701,6 +1721,48 @@ impl AppState {
     #[cfg(not(any(test, debug_assertions)))]
     fn assert_tool_call_index_consistent(&self) {}
 
+    fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) {
+        self.current_session_id = Some(projection.session_id.clone());
+        self.current_session_title = Some(projection.title.clone());
+        self.usage = projection.usage.clone();
+        self.usage_revision = Some(projection.usage_revision);
+        self.context_used_tokens = projection.context_used_tokens;
+        self.context_limit_tokens = projection.context_limit_tokens;
+        self.current_goal = projection.current_goal.clone();
+        self.active_surface_operation_id = projection.foreground_operation_id.clone();
+        self.apply_workflow_tasks_update(projection.workflow_tasks.clone());
+        self.assert_surface_projection_consistent(&projection);
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn assert_surface_projection_consistent(&self, projection: &SurfaceProjectionState) {
+        debug_assert_eq!(
+            self.current_session_id.as_deref(),
+            Some(projection.session_id.as_str())
+        );
+        debug_assert_eq!(
+            self.current_session_title.as_deref(),
+            Some(projection.title.as_str())
+        );
+        debug_assert_eq!(self.usage, projection.usage);
+        debug_assert_eq!(self.usage_revision, Some(projection.usage_revision));
+        debug_assert_eq!(self.context_used_tokens, projection.context_used_tokens);
+        debug_assert_eq!(self.context_limit_tokens, projection.context_limit_tokens);
+        debug_assert_eq!(
+            self.workflow_panel.tasks,
+            sort_workflow_tasks_for_panel(projection.workflow_tasks.clone())
+        );
+        debug_assert_eq!(self.current_goal, projection.current_goal);
+        debug_assert_eq!(
+            self.active_surface_operation_id,
+            projection.foreground_operation_id
+        );
+        self.assert_tool_call_index_consistent();
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    fn assert_surface_projection_consistent(&self, _projection: &SurfaceProjectionState) {}
+
     pub(crate) fn push_message(&mut self, message: ChatMessage) {
         self.reconcile_message_tracking();
         if let ChatMessage::ToolCall { id, .. } = &message {
@@ -1765,6 +1827,7 @@ impl AppState {
         self.proposed_plan_parser = ProposedPlanStreamParser::default();
         self.plan_update_failed = false;
         self.current_goal = None;
+        self.active_surface_operation_id = None;
         self.recoverable_operation_id = None;
         self.recovery_prompt_visible = false;
         self.usage = UsageTotals::default();
@@ -2498,6 +2561,9 @@ impl AppState {
                 unreachable!("attached TUI events must be fenced before AppState reduction")
             }
             TuiEvent::SessionAttachmentActivated => {}
+            TuiEvent::SurfaceProjectionSynced(projection) => {
+                self.apply_surface_projection_state(*projection);
+            }
             TuiEvent::NewSessionStarted { session_id } => {
                 self.reset_session_projection(session_id, "New conversation".to_string());
             }
@@ -5556,6 +5622,82 @@ mod tests {
         });
 
         assert_eq!(state.usage, after_compaction);
+    }
+
+    #[test]
+    fn surface_projection_consistency_reconciles_session_scoped_state() {
+        let mut state = state();
+        state.update(TuiEvent::SessionProjectionReset {
+            session_id: "stale-session".to_string(),
+            title: "stale title".to_string(),
+        });
+        state.update(TuiEvent::ToolRequested {
+            id: "tool-1".to_string(),
+            name: "shell".to_string(),
+            target: None,
+        });
+
+        let operation_id = SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1,
+        ])
+        .expect("valid surface operation id");
+        let goal = ThreadGoal {
+            session_id: "canonical-session".to_string(),
+            objective: "keep the projection canonical".to_string(),
+            status: orca_core::goal_types::ThreadGoalStatus::Active,
+            token_budget: Some(10_000),
+            tokens_used: 42,
+            time_used_seconds: 3,
+            created_at: 1,
+            updated_at: 2,
+        };
+        let expected = SurfaceProjectionState {
+            session_id: "canonical-session".to_string(),
+            title: "canonical title".to_string(),
+            usage_revision: 7,
+            usage: UsageTotals {
+                input_tokens: 700,
+                output_tokens: 70,
+                cache_tokens: 7,
+                estimated_cost_usd: 0.007,
+            },
+            context_used_tokens: 700,
+            context_limit_tokens: 1_000,
+            workflow_tasks: vec![workflow_task_summary("task-1", "Canonical task")],
+            current_goal: Some(goal),
+            foreground_operation_id: Some(operation_id),
+        };
+
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            expected.clone(),
+        )));
+
+        assert_eq!(
+            state.current_session_id.as_deref(),
+            Some("canonical-session")
+        );
+        assert_eq!(
+            state.current_session_title.as_deref(),
+            Some("canonical title")
+        );
+        assert_eq!(state.usage, expected.usage);
+        assert_eq!(state.context_used_tokens, expected.context_used_tokens);
+        assert_eq!(state.context_limit_tokens, expected.context_limit_tokens);
+        assert_eq!(state.workflow_panel.tasks, expected.workflow_tasks);
+        assert_eq!(state.current_goal, expected.current_goal);
+        assert_eq!(
+            state.active_surface_operation_id,
+            expected.foreground_operation_id
+        );
+        state.assert_surface_projection_consistent(&expected);
+
+        state.update(TuiEvent::SessionProjectionReset {
+            session_id: "next-session".to_string(),
+            title: "next title".to_string(),
+        });
+        assert!(state.active_surface_operation_id.is_none());
+        assert!(state.current_goal.is_none());
+        assert!(state.workflow_panel.tasks.is_empty());
     }
 
     #[test]
