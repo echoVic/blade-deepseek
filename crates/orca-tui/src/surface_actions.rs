@@ -244,6 +244,22 @@ impl TuiSurfaceActions {
         crate::surface_client::resume_goal_and_run(&self.thread, prompt, control, event_tx)
     }
 
+    pub(crate) fn resume_goal_and_run_with_started(
+        &self,
+        prompt: String,
+        control: &TuiSurfaceTaskControl,
+        event_tx: &mpsc::Sender<TuiEvent>,
+        started: impl FnOnce(),
+    ) -> io::Result<TuiHostedOperationOutcome> {
+        crate::surface_client::resume_goal_and_run_with_started(
+            &self.thread,
+            prompt,
+            control,
+            event_tx,
+            started,
+        )
+    }
+
     pub(crate) fn recoverable_background_approval_projection(
         &self,
     ) -> Result<(Vec<BackgroundTaskSummary>, Vec<String>), String> {

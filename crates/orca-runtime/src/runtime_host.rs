@@ -3244,21 +3244,22 @@ impl RuntimeThreadHandle {
     }
 
     pub fn shutdown(&self) -> Result<(), RuntimeHostError> {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        send_thread_shutdown(
-            &self.command_tx,
-            ThreadCommand::ShutdownThread {
-                reply: Some(reply_tx),
-                reason: surface::SurfaceShutdownReason::ThreadClose,
-            },
-        )?;
-        match receive_reply(reply_rx, "runtime thread")? {
-            ThreadShutdownAck::Complete => Ok(()),
-            ThreadShutdownAck::Retry => Err(RuntimeHostError::ThreadStartFailed {
-                message: "runtime thread shutdown is retrying a prepared terminalization"
-                    .to_string(),
-            }),
-            ThreadShutdownAck::Failed(error) => Err(error),
+        loop {
+            let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+            send_thread_shutdown(
+                &self.command_tx,
+                ThreadCommand::ShutdownThread {
+                    reply: Some(reply_tx),
+                    reason: surface::SurfaceShutdownReason::ThreadClose,
+                },
+            )?;
+            match receive_reply(reply_rx, "runtime thread")? {
+                ThreadShutdownAck::Complete => return Ok(()),
+                ThreadShutdownAck::Retry => {
+                    thread::sleep(SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL);
+                }
+                ThreadShutdownAck::Failed(error) => return Err(error),
+            }
         }
     }
 
@@ -8721,6 +8722,7 @@ const GOAL_COMPLETION_CAPACITY: usize = 8;
 
 type GoalBlockingSettlement = Box<dyn FnOnce(&mut ThreadActor) + Send + 'static>;
 type ThreadGoalBlockingCompletion = GoalBlockingCompletion<GoalBlockingSettlement>;
+type PendingGoalPauseSettlement = Result<Option<PendingGoalPauseEvent>, RuntimeHostError>;
 
 #[derive(Clone, Copy)]
 enum GoalBlockingCompletionKind {
@@ -8756,7 +8758,7 @@ struct ThreadActor {
         PendingSurfaceGoalCompletionRecovery,
         ThreadGoalBlockingCompletion,
         ActiveGoalControl,
-        PendingGoalPauseEvent,
+        PendingGoalPauseSettlement,
     >,
     usage_ledger: RuntimeUsageLedger,
     resident_surface: ResidentSurfaceSlot,
@@ -31043,13 +31045,9 @@ impl ThreadActor {
             GoalBlockingCompletion::Pause {
                 operation_id,
                 result,
-            } => match result {
-                Ok(Some(event)) => self
-                    .goal_controller
-                    .schedule_pause_event(operation_id, event),
-                Ok(None) => {}
-                Err(error) => eprintln!("orca: asynchronous Goal pause failed: {error}"),
-            },
+            } => self
+                .goal_controller
+                .schedule_pause_settlement(operation_id, result),
             GoalBlockingCompletion::SurfaceMutation { settlement }
             | GoalBlockingCompletion::PauseResume { settlement }
             | GoalBlockingCompletion::PreviewCommit { settlement }
@@ -31165,6 +31163,12 @@ impl ThreadActor {
                                     surface::SurfaceSubscriptionSealReason::ThreadClosed
                                 }
                             };
+                            if self.goal_controller.is_blocking() {
+                                if let Some(reply) = reply {
+                                    let _ = reply.send(ThreadShutdownAck::Retry);
+                                }
+                                continue;
+                            }
                             let bounded_goal_recovery =
                                 self.has_pending_goal_completion_recovery_owner();
                             let bounded_workflow_recovery =
@@ -31414,6 +31418,13 @@ impl ThreadActor {
                                     surface::SurfaceSubscriptionSealReason::ThreadClosed
                                 }
                             };
+                            if self.goal_controller.is_blocking() {
+                                if let Some(reply) = reply {
+                                    let _ = reply.send(ThreadShutdownAck::Retry);
+                                }
+                                self.active = Some(active);
+                                continue;
+                            }
                             if active.surface_manual_compaction_prepared.is_some() {
                                 if let Some(reply) = reply {
                                     let _ = reply.send(ThreadShutdownAck::Retry);
@@ -31510,11 +31521,19 @@ impl ThreadActor {
                                         })
                                 });
                             if current_interrupt_is_durable {
-                                command_rx.close();
                                 let pause_result = self.pause_active_goal(
                                     &mut active,
                                     "goal run paused during runtime shutdown",
                                 );
+                                if pause_result.is_ok() && self.goal_controller.is_blocking() {
+                                    active.generation.cancel.cancel();
+                                    if let Some(reply) = reply {
+                                        let _ = reply.send(ThreadShutdownAck::Retry);
+                                    }
+                                    self.active = Some(active);
+                                    continue;
+                                }
+                                command_rx.close();
                                 active.generation.cancel.cancel();
                                 Self::drain_closed_thread_commands(&mut command_rx);
                                 let generation_result = (&mut active.generation.join).await;
@@ -31577,11 +31596,19 @@ impl ThreadActor {
                                 self.active = Some(active);
                                 continue;
                             }
-                            command_rx.close();
                             let pause_result = self.pause_active_goal(
                                 &mut active,
                                 "goal run paused during runtime shutdown",
                             );
+                            if pause_result.is_ok() && self.goal_controller.is_blocking() {
+                                active.generation.cancel.cancel();
+                                if let Some(reply) = reply {
+                                    let _ = reply.send(ThreadShutdownAck::Retry);
+                                }
+                                self.active = Some(active);
+                                continue;
+                            }
+                            command_rx.close();
                             active.generation.cancel.cancel();
                             Self::drain_closed_thread_commands(&mut command_rx);
                             let result = (&mut active.generation.join).await;
@@ -33818,6 +33845,12 @@ impl ThreadActor {
         if active.request.surface_goal_owned {
             return Ok(());
         }
+        if let Some(settlement) = self
+            .goal_controller
+            .pending_pause_settlement(active.operation_id)
+        {
+            return settlement.as_ref().map(|_| ()).map_err(Clone::clone);
+        }
         self.dispatch_goal_pause(active.operation_id, message)
     }
 
@@ -33825,9 +33858,15 @@ impl ThreadActor {
         &mut self,
         state: &mut ThreadActorState,
         active: &mut ActiveOperation,
-    ) {
-        let Some(event) = self.goal_controller.take_pause_event(active.operation_id) else {
-            return;
+    ) -> Result<(), RuntimeHostError> {
+        let Some(settlement) = self
+            .goal_controller
+            .take_pause_settlement(active.operation_id)
+        else {
+            return Ok(());
+        };
+        let Some(event) = settlement? else {
+            return Ok(());
         };
         let observer = active.request.event_observer();
         observe_runtime_event(
@@ -33849,6 +33888,7 @@ impl ThreadActor {
                 &event.message,
             ),
         );
+        Ok(())
     }
 
     fn publish_goal_recovery_records(
@@ -34429,7 +34469,7 @@ impl ThreadActor {
                 }
                 surface_usage = result.usage_delta;
                 self.usage_ledger.add(result.usage_delta);
-                self.publish_pending_goal_pause_event(&mut result.state, &mut active);
+                self.publish_pending_goal_pause_event(&mut result.state, &mut active)?;
                 // Terminal owner for a lost generation. The in-task settlement
                 // is skipped when the task unwinds, so settle here — outside the
                 // supervised task and before the continuation gate — to keep a

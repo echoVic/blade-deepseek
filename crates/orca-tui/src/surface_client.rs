@@ -1089,20 +1089,26 @@ pub(crate) fn set_goal_and_run(
     controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
-    run_goal_mutation(thread, controller, event_tx, move |snapshot| {
-        let objective = NonEmptyText::try_new(objective)
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        Ok(GoalMutationAction::SetAndRun {
-            expected_goal: snapshot
-                .goal
-                .as_ref()
-                .map(|goal| ExpectedGoal::Exact(goal_fence(goal)))
-                .unwrap_or(ExpectedGoal::None),
-            token_budget: snapshot.goal.as_ref().and_then(|goal| goal.token_budget),
-            input: supplied_goal_input(objective.as_str())?,
-            objective,
-        })
-    })
+    run_goal_mutation(
+        thread,
+        controller,
+        event_tx,
+        || {},
+        move |snapshot| {
+            let objective = NonEmptyText::try_new(objective)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            Ok(GoalMutationAction::SetAndRun {
+                expected_goal: snapshot
+                    .goal
+                    .as_ref()
+                    .map(|goal| ExpectedGoal::Exact(goal_fence(goal)))
+                    .unwrap_or(ExpectedGoal::None),
+                token_budget: snapshot.goal.as_ref().and_then(|goal| goal.token_budget),
+                input: supplied_goal_input(objective.as_str())?,
+                objective,
+            })
+        },
+    )
 }
 
 pub(crate) fn resume_goal_and_run(
@@ -1111,7 +1117,32 @@ pub(crate) fn resume_goal_and_run(
     controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
-    run_goal_mutation(thread, controller, event_tx, move |snapshot| {
+    run_goal_mutation(
+        thread,
+        controller,
+        event_tx,
+        || {},
+        move |snapshot| {
+            let goal = snapshot
+                .goal
+                .as_ref()
+                .ok_or_else(|| io::Error::other("no goal is currently set"))?;
+            Ok(GoalMutationAction::ResumeAndRun {
+                fence: goal_fence(goal),
+                input: supplied_goal_input(&prompt)?,
+            })
+        },
+    )
+}
+
+pub(crate) fn resume_goal_and_run_with_started(
+    thread: &RuntimeSurfaceThreadHandle,
+    prompt: String,
+    controller: &TuiSurfaceTaskControl,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    started: impl FnOnce(),
+) -> io::Result<TuiHostedOperationOutcome> {
+    run_goal_mutation(thread, controller, event_tx, started, move |snapshot| {
         let goal = snapshot
             .goal
             .as_ref()
@@ -1127,6 +1158,7 @@ fn run_goal_mutation(
     thread: &RuntimeSurfaceThreadHandle,
     controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
+    started: impl FnOnce(),
     action: impl FnOnce(&SurfaceSnapshot) -> io::Result<GoalMutationAction>,
 ) -> io::Result<TuiHostedOperationOutcome> {
     let mut activation = SurfaceActivationGuard::begin(controller)?;
@@ -1160,6 +1192,7 @@ fn run_goal_mutation(
         operation_id.clone(),
         goal_fence(goal),
     )?;
+    started();
     activation.disarm();
     guard.controller_installed();
     let result = drain_operation(

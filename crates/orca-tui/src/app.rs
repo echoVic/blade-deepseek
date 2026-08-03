@@ -9658,16 +9658,18 @@ fn resume_latest_active_goal_hosted(
     if let Ok(mut shared) = config.lock() {
         shared.history_mode = cfg.history_mode.clone();
     }
-    let _ = event_tx.send(TuiEvent::GoalUpdated(active_goal.clone()));
-    let _ = event_tx.send(TuiEvent::Notice(
-        "Resumed latest active goal in a restored session.".to_string(),
-    ));
     if let Some(runtime_thread) = thread.as_ref() {
         let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-        if let Err(error) = actions.resume_goal_and_run(
+        if let Err(error) = actions.resume_goal_and_run_with_started(
             goal_continuation_prompt(&active_goal.objective, 1),
             control,
             event_tx,
+            || {
+                let _ = event_tx.send(TuiEvent::GoalUpdated(active_goal.clone()));
+                let _ = event_tx.send(TuiEvent::Notice(
+                    "Resumed latest active goal in a restored session.".to_string(),
+                ));
+            },
         ) {
             emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);
         }

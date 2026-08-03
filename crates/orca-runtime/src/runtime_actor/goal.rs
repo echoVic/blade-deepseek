@@ -89,7 +89,7 @@ pub(crate) struct GoalOperationController<
     deferred_commands: VecDeque<Command>,
     pending_recovery: Option<PendingRecovery>,
     active_control: Option<(OperationId, ActiveControl, Option<GoalTurnContext>)>,
-    pending_pause_event: Option<(OperationId, PauseEvent)>,
+    pending_pause_settlement: Option<(OperationId, PauseEvent)>,
 }
 
 impl<Command, PendingRecovery, Completion, ActiveControl, PauseEvent>
@@ -104,7 +104,7 @@ impl<Command, PendingRecovery, Completion, ActiveControl, PauseEvent>
             deferred_commands: VecDeque::new(),
             pending_recovery: None,
             active_control: None,
-            pending_pause_event: None,
+            pending_pause_settlement: None,
         }
     }
 
@@ -161,7 +161,7 @@ impl<Command, PendingRecovery, Completion, ActiveControl, PauseEvent>
     ) {
         debug_assert!(control.is_some() || turn.is_none());
         self.active_control = control.map(|control| (operation_id, control, turn));
-        self.pending_pause_event = None;
+        self.pending_pause_settlement = None;
     }
 
     pub(crate) fn active_control(&self, operation_id: OperationId) -> Option<&ActiveControl> {
@@ -197,23 +197,36 @@ impl<Command, PendingRecovery, Completion, ActiveControl, PauseEvent>
         self.active_control(operation_id).is_some()
     }
 
-    pub(crate) fn schedule_pause_event(&mut self, operation_id: OperationId, event: PauseEvent) {
-        if self.pending_pause_event.is_none() && self.has_active_control(operation_id) {
-            self.pending_pause_event = Some((operation_id, event));
+    pub(crate) fn schedule_pause_settlement(
+        &mut self,
+        operation_id: OperationId,
+        settlement: PauseEvent,
+    ) {
+        if self.pending_pause_settlement.is_none() && self.has_active_control(operation_id) {
+            self.pending_pause_settlement = Some((operation_id, settlement));
         }
     }
 
-    pub(crate) fn has_pending_pause_event(&self, operation_id: OperationId) -> bool {
-        self.pending_pause_event
+    pub(crate) fn pending_pause_settlement(
+        &self,
+        operation_id: OperationId,
+    ) -> Option<&PauseEvent> {
+        self.pending_pause_settlement
             .as_ref()
-            .is_some_and(|(active_id, _)| *active_id == operation_id)
+            .filter(|(active_id, _)| *active_id == operation_id)
+            .map(|(_, settlement)| settlement)
     }
 
-    pub(crate) fn take_pause_event(&mut self, operation_id: OperationId) -> Option<PauseEvent> {
-        if !self.has_pending_pause_event(operation_id) {
+    pub(crate) fn take_pause_settlement(
+        &mut self,
+        operation_id: OperationId,
+    ) -> Option<PauseEvent> {
+        if self.pending_pause_settlement(operation_id).is_none() {
             return None;
         }
-        self.pending_pause_event.take().map(|(_, event)| event)
+        self.pending_pause_settlement
+            .take()
+            .map(|(_, settlement)| settlement)
     }
 
     pub(crate) fn clear_active(&mut self, operation_id: OperationId) {
@@ -224,8 +237,8 @@ impl<Command, PendingRecovery, Completion, ActiveControl, PauseEvent>
         {
             self.active_control = None;
         }
-        if self.has_pending_pause_event(operation_id) {
-            self.pending_pause_event = None;
+        if self.pending_pause_settlement(operation_id).is_some() {
+            self.pending_pause_settlement = None;
         }
     }
 
@@ -236,7 +249,7 @@ impl<Command, PendingRecovery, Completion, ActiveControl, PauseEvent>
             self.deferred_commands.len(),
             self.pending_recovery.is_some(),
             self.active_control.is_some(),
-            self.pending_pause_event.is_some(),
+            self.pending_pause_settlement.is_some(),
         )
     }
 }
@@ -248,7 +261,7 @@ struct GoalControllerTrace {
     deferred_commands: usize,
     pending_recovery: bool,
     active_control: bool,
-    pending_pause_event: bool,
+    pending_pause_settlement: bool,
 }
 
 #[cfg(test)]
@@ -258,14 +271,14 @@ impl GoalControllerTrace {
         deferred_commands: usize,
         pending_recovery: bool,
         active_control: bool,
-        pending_pause_event: bool,
+        pending_pause_settlement: bool,
     ) -> Self {
         Self {
             blocking_in_flight,
             deferred_commands,
             pending_recovery,
             active_control,
-            pending_pause_event,
+            pending_pause_settlement,
         }
     }
 }
@@ -315,11 +328,11 @@ mod tests {
         controller.bind_active(first, Some(50), None);
         assert_eq!(controller.active_control(first), Some(&50));
         assert_eq!(controller.active_control(second), None);
-        controller.schedule_pause_event(second, 60);
-        assert!(!controller.has_pending_pause_event(first));
-        controller.schedule_pause_event(first, 70);
-        assert_eq!(controller.take_pause_event(second), None);
-        assert_eq!(controller.take_pause_event(first), Some(70));
+        controller.schedule_pause_settlement(second, 60);
+        assert_eq!(controller.pending_pause_settlement(first), None);
+        controller.schedule_pause_settlement(first, 70);
+        assert_eq!(controller.take_pause_settlement(second), None);
+        assert_eq!(controller.take_pause_settlement(first), Some(70));
         controller.clear_active(first);
         assert_eq!(controller.active_control(first), None);
     }
