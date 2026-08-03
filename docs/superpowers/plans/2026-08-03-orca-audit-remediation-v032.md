@@ -660,11 +660,11 @@ git commit -m "fix(tui): honor session lifecycle contract"
 - Modify: .github/workflows/release.yml
 - Modify: .github/workflows/windows-ci.yml
 
-- [ ] **Step 1: Add scanner and inventory regressions**
+- [x] **Step 1: Add scanner and inventory regressions**
 
 Add the current cfg/test syntax that triggers the unterminated-body failure. Add a fixture with 30 current actions and 23 closed inventory rows and assert validation lists the seven missing actions.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 node --test scripts/test-validate-runtime-surface-contract.mjs
@@ -672,19 +672,19 @@ node --test scripts/test-validate-runtime-surface-contract.mjs
 
 Expected: FAIL with the scanner exception.
 
-- [ ] **Step 3: Repair scanner**
+- [x] **Step 3: Repair scanner**
 
 Handle attributes, raw strings, nested macro tokens, comments, lifetimes/char literals, and cfg-gated test modules. Each fixture asserts its exact discovered function set.
 
-- [ ] **Step 4: Replace commit-trailer trust**
+- [x] **Step 4: Replace commit-trailer trust**
 
 Create a digest JSON with algorithm sha256 and hashes for the private contract, manifest, and implementation plan. The validator recomputes current checkout files. Remove the requirement that the latest manifest commit carry private/manifest/plan sha trailers.
 
-- [ ] **Step 5: Synchronize inventory**
+- [x] **Step 5: Synchronize inventory**
 
 Add the exact seven current session actions to closed_inventory. Rust boundary tests deserialize current and closed sets and compare exactly.
 
-- [ ] **Step 6: Run GREEN**
+- [x] **Step 6: Run GREEN**
 
 ~~~sh
 node --test scripts/test-validate-runtime-surface-contract.mjs
@@ -692,11 +692,11 @@ node scripts/validate-runtime-surface-contract.mjs
 cargo test -p orca-tui runtime_surface_contract --lib
 ~~~
 
-- [ ] **Step 7: Wire workflows**
+- [x] **Step 7: Wire workflows**
 
 runtime-contract.yml runs on relevant pull requests/main pushes and executes Node tests, validator, Rust inventory test, and dependency gates. Run the same portable Node gates before tests in release.yml and both Windows jobs.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ~~~sh
 git add scripts/validate-runtime-surface-contract.mjs scripts/test-validate-runtime-surface-contract.mjs docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.digest.json crates/orca-tui/src/surface_boundary_tests.rs .github/workflows/runtime-contract.yml .github/workflows/release.yml .github/workflows/windows-ci.yml docs/reports/2026-08-03-orca-audit-remediation-evidence.md
