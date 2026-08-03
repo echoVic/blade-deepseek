@@ -11,7 +11,6 @@ orca-core = { path = "../orca-core" }
 orca-platform = { path = "../orca-platform" }
 orca-mcp = { path = "../orca-mcp" }
 orca-tools = { path = "../orca-tools" }
-orca-provider = { path = "../orca-provider" }
 orca-approval = { path = "../orca-approval" }
 orca-runtime = { path = "../orca-runtime" }
 orca-file-search = { path = "../orca-file-search" }

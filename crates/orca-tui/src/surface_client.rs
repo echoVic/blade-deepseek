@@ -2566,12 +2566,9 @@ mod tests {
     }
     use orca_core::config::HistoryMode;
     use orca_runtime::runtime_host::{RuntimeHost, RuntimeThreadHandle};
-    use std::sync::Mutex;
     use std::time::Instant;
 
     use crate::types::TuiTaskLifecycle;
-
-    static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn run_through_dispatch(
         thread: &RuntimeThreadHandle,
@@ -2586,7 +2583,7 @@ mod tests {
 
     #[test]
     fn typed_ordinary_turn_projects_terminal_and_assistant_output() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -2641,7 +2638,7 @@ mod tests {
 
     #[test]
     fn typed_manual_compaction_projects_durable_lifecycle() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -2692,7 +2689,7 @@ mod tests {
 
     #[test]
     fn typed_ordinary_turn_interrupt_uses_surface_cancel() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -2748,7 +2745,7 @@ mod tests {
 
     #[test]
     fn typed_ordinary_turn_backgrounds_only_after_durable_surface_handoff() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -2899,7 +2896,7 @@ mod tests {
 
     #[test]
     fn sessionless_foreground_preserves_legacy_task_control() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let mut config = crate::test_support::test_run_config();
         config.cwd = Some(home.path().to_path_buf());
@@ -2932,7 +2929,7 @@ mod tests {
 
     #[test]
     fn foreground_after_background_before_first_delta_hydrates_typed_output_and_terminal() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3078,7 +3075,7 @@ mod tests {
 
     #[test]
     fn foregrounded_provider_can_be_backgrounded_again_without_changing_execution_owner() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3236,7 +3233,7 @@ mod tests {
 
     #[test]
     fn typed_background_approval_suspends_original_operation_and_requests_bound_interaction() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3370,7 +3367,7 @@ mod tests {
         if !orca_runtime::workflow::host::WorkflowHost::node_available() {
             return;
         }
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let workflow_dir = cwd.path().join(".orca").join("workflows");
@@ -3481,7 +3478,7 @@ mod tests {
 
     #[test]
     fn typed_late_interrupt_does_not_cancel_next_turn() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3536,7 +3533,7 @@ mod tests {
 
     #[test]
     fn typed_failed_prearmed_activation_does_not_cancel_next_turn() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3596,7 +3593,7 @@ mod tests {
 
     #[test]
     fn typed_ordinary_turn_routes_tool_approval_through_runtime_surface() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3661,7 +3658,7 @@ mod tests {
 
     #[test]
     fn typed_ordinary_turn_routes_permission_through_runtime_surface() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3726,7 +3723,7 @@ mod tests {
 
     #[test]
     fn typed_ordinary_turn_routes_user_input_through_runtime_surface() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3791,7 +3788,7 @@ mod tests {
 
     #[test]
     fn typed_ordinary_turn_reloads_and_runs_after_runtime_restart() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3864,7 +3861,7 @@ mod tests {
 
     #[test]
     fn typed_background_owner_is_terminalized_before_restart_reopens_the_thread() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3958,7 +3955,7 @@ mod tests {
 
     #[test]
     fn typed_cancelled_turn_restarts_and_next_turn_commits() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };

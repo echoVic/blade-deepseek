@@ -71,7 +71,9 @@ pub use app::run_tui;
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::ffi::OsString;
     use std::io;
+    use std::path::Path;
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::Duration;
 
@@ -98,6 +100,44 @@ pub(crate) mod test_support {
         PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) struct OrcaHomeGuard {
+        _lock: MutexGuard<'static, ()>,
+        home: tempfile::TempDir,
+        previous: Option<OsString>,
+    }
+
+    impl OrcaHomeGuard {
+        pub(crate) fn path(&self) -> &Path {
+            self.home.path()
+        }
+    }
+
+    impl Drop for OrcaHomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var("ORCA_HOME", previous);
+                } else {
+                    std::env::remove_var("ORCA_HOME");
+                }
+            }
+        }
+    }
+
+    pub(crate) fn isolate_orca_home() -> OrcaHomeGuard {
+        let lock = lock_process_env();
+        let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe {
+            std::env::set_var("ORCA_HOME", home.path());
+        }
+        OrcaHomeGuard {
+            _lock: lock,
+            home,
+            previous,
+        }
     }
 
     struct HostedControlExecutor {

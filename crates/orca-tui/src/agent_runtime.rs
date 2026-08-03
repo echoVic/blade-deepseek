@@ -186,6 +186,7 @@ mod tests {
 
     #[test]
     fn shutdown_cancels_current_operation_and_joins_agent_thread() {
+        let _home = crate::test_support::isolate_orca_home();
         let (_action_tx, action_rx) = crossbeam_channel::bounded(1);
         let (event_tx, _event_rx) = crossbeam_channel::unbounded();
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
@@ -201,6 +202,7 @@ mod tests {
 
     #[test]
     fn drop_uses_the_same_cancel_and_join_path() {
+        let _home = crate::test_support::isolate_orca_home();
         let (_action_tx, action_rx) = crossbeam_channel::bounded(1);
         let (event_tx, _event_rx) = crossbeam_channel::unbounded();
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
@@ -216,6 +218,7 @@ mod tests {
 
     #[test]
     fn shutdown_does_not_wait_for_capacity_in_full_action_mailbox() {
+        let _home = crate::test_support::isolate_orca_home();
         let (action_tx, action_rx) = crossbeam_channel::bounded(1);
         let (event_tx, _event_rx) = crossbeam_channel::unbounded();
         let operation_events = event_tx.clone();

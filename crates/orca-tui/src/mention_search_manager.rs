@@ -39,8 +39,6 @@ pub(crate) struct MentionSearchManager {
     roots: Vec<PathBuf>,
     catalog: MentionCatalog,
     catalog_actions: Option<TuiSurfaceActions>,
-    #[cfg(test)]
-    catalog_registry: Option<orca_mcp::McpRegistry>,
     catalog_generation: u64,
     catalog_result_tx: mpsc::Sender<CatalogDiscoveryResult>,
     catalog_result_rx: mpsc::Receiver<CatalogDiscoveryResult>,
@@ -72,22 +70,19 @@ impl MentionSearchManager {
     }
 
     pub(crate) fn new_roots(roots: Vec<PathBuf>, event_tx: mpsc::Sender<TuiEvent>) -> Self {
-        Self::new_roots_with_catalog(roots, event_tx, MentionCatalog::default(), None)
+        Self::new_roots_with_catalog(roots, event_tx, MentionCatalog::default())
     }
 
     fn new_roots_with_catalog(
         roots: Vec<PathBuf>,
         event_tx: mpsc::Sender<TuiEvent>,
         catalog: MentionCatalog,
-        _catalog_registry: Option<orca_mcp::McpRegistry>,
     ) -> Self {
         let (catalog_result_tx, catalog_result_rx) = mpsc::bounded(CATALOG_RESULT_CAPACITY);
         Self {
             roots: normalize_roots(roots),
             catalog,
             catalog_actions: None,
-            #[cfg(test)]
-            catalog_registry: _catalog_registry,
             catalog_generation: 0,
             catalog_result_tx,
             catalog_result_rx,
@@ -128,12 +123,6 @@ impl MentionSearchManager {
 
     pub(crate) fn install_runtime_actions(&mut self, actions: TuiSurfaceActions) {
         self.catalog_actions = Some(actions);
-        self.refresh_catalog_async();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn install_registry(&mut self, registry: orca_mcp::McpRegistry) {
-        self.catalog_registry = Some(registry);
         self.refresh_catalog_async();
     }
 
@@ -314,12 +303,9 @@ impl MentionSearchManager {
     }
 
     fn refresh_catalog_async(&mut self) {
-        #[cfg(not(test))]
         let Some(actions) = self.catalog_actions.clone() else {
             return;
         };
-        #[cfg(test)]
-        let registry = self.catalog_registry.clone();
         self.catalog_generation = self.catalog_generation.wrapping_add(1);
         let generation = self.catalog_generation;
         let roots = self.roots.clone();
@@ -328,14 +314,7 @@ impl MentionSearchManager {
         let worker = std::thread::Builder::new()
             .name("orca-mention-catalog".to_string())
             .spawn(move || {
-                #[cfg(not(test))]
                 let catalog = actions.discover_mention_catalog(&roots);
-                #[cfg(test)]
-                let Some(registry) = registry else {
-                    return;
-                };
-                #[cfg(test)]
-                let catalog = MentionCatalog::discover(&roots, &registry);
                 if result_tx
                     .send(CatalogDiscoveryResult {
                         generation,
@@ -522,7 +501,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{MentionCandidate, MentionSearchManager, TokenIdentity};
-    use crate::types::{AppState, AppStatus, PanelMode, TuiEvent};
+    use crate::types::{AppState, AppStatus, PanelMode};
 
     fn state() -> AppState {
         let (action_tx, _action_rx) = mpsc::unbounded();
@@ -795,45 +774,5 @@ mod tests {
                 second.path().canonicalize().unwrap(),
             ]
         );
-    }
-
-    #[test]
-    fn registry_install_discovers_catalog_in_background_and_requeries_active_token() {
-        let root = tempdir().unwrap();
-        let plugin_dir = root.path().join(".orca/plugins/github/.codex-plugin");
-        fs::create_dir_all(&plugin_dir).unwrap();
-        fs::write(
-            plugin_dir.join("plugin.json"),
-            r#"{"name":"github","description":"GitHub workflows","interface":{"displayName":"GitHub"}}"#,
-        )
-        .unwrap();
-        let (event_tx, event_rx) = mpsc::unbounded();
-        let mut manager = MentionSearchManager::new(root.path().to_path_buf(), event_tx);
-        let mut state = state();
-        manager.sync("@git", true, &mut state, Instant::now());
-        let initial_generation = manager.session.as_ref().unwrap().generation();
-
-        manager.install_registry(orca_mcp::McpRegistry::default());
-        let catalog_generation = loop {
-            match event_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
-                TuiEvent::MentionCatalogDirty { generation } => break generation,
-                TuiEvent::MentionSearchDirty { .. } => {}
-                other => panic!("unexpected event: {other:?}"),
-            }
-        };
-        manager.consume_catalog_dirty(catalog_generation, &mut state);
-
-        assert!(
-            manager
-                .catalog
-                .candidates()
-                .iter()
-                .any(|candidate| candidate.display == "GitHub")
-        );
-        assert_ne!(
-            manager.session.as_ref().unwrap().generation(),
-            initial_generation
-        );
-        manager.shutdown();
     }
 }

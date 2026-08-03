@@ -81,6 +81,17 @@ fn provider_does_not_depend_on_tools() {
 }
 
 #[test]
+fn tui_does_not_depend_on_provider() {
+    let metadata = cargo_metadata();
+    let tui = package(&metadata, "orca-tui");
+
+    assert!(
+        !normal_dependencies(tui).contains("orca-provider"),
+        "TUI must depend on runtime facades, not provider adapters"
+    );
+}
+
+#[test]
 fn cargo_metadata_enforces_binary_and_library_target_ownership() {
     let metadata = cargo_metadata();
     let root = package(&metadata, "blade-deepseek");

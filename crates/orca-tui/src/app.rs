@@ -331,7 +331,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     let agent_preloaded = Arc::clone(&preloaded_transcript);
     let agent_event_tx = event_tx.clone();
     let agent_workflow_notifications = pending_workflow_notifications.clone();
-    let agent_mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
     let agent_controller = TuiOperationController::hosted(TuiInteractionBroker::default());
 
     let mut agent_runtime = match TuiAgentRuntime::spawn_hosted(
@@ -347,7 +346,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
                 command_rx,
                 agent_controller,
                 agent_workflow_notifications,
-                agent_mcp_registry,
                 host,
             );
         },
@@ -1123,13 +1121,11 @@ fn spawn_hosted_tui_test_runtime_with_background_capacity(
 ) -> TuiAgentRuntime {
     let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
     let pending = bridge::PendingWorkflowNotifications::new();
-    let registry = orca_mcp::initialize_registry(&[]);
     let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
     let agent_config = Arc::clone(&config);
     let agent_preloaded = Arc::clone(&preloaded);
     let agent_events = event_tx.clone();
     let agent_pending = pending.clone();
-    let agent_registry = registry.clone();
     TuiAgentRuntime::spawn_hosted(
         action_rx,
         event_tx,
@@ -1143,7 +1139,6 @@ fn spawn_hosted_tui_test_runtime_with_background_capacity(
                 commands,
                 controller,
                 agent_pending,
-                agent_registry,
                 host,
             );
         },
@@ -1160,7 +1155,6 @@ fn spawn_legacy_feature_test_runtime(
 ) -> TuiAgentRuntime {
     let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
     let pending = bridge::PendingWorkflowNotifications::new();
-    let registry = orca_mcp::initialize_registry(&[]);
     let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
     let agent_config = Arc::clone(&config);
     let agent_preloaded = Arc::clone(&preloaded);
@@ -1179,7 +1173,6 @@ fn spawn_legacy_feature_test_runtime(
                 commands,
                 control,
                 pending,
-                registry,
                 host,
                 OrdinaryTurnRunner::Legacy(legacy_controller),
             );
@@ -1929,6 +1922,174 @@ mod tests {
             terminal_notifications: false,
             auto_memory: false,
         }
+    }
+
+    #[cfg(unix)]
+    fn stdio_mcp_server(
+        name: &str,
+        script: &std::path::Path,
+        pid_file: &std::path::Path,
+    ) -> orca_core::mcp_types::McpServerConfig {
+        orca_core::mcp_types::McpServerConfig {
+            name: name.to_string(),
+            command: Some("/bin/sh".to_string()),
+            args: vec![
+                script.to_string_lossy().into_owned(),
+                pid_file.to_string_lossy().into_owned(),
+            ],
+            startup_timeout_ms: Some(2_000),
+            tool_timeout_ms: Some(2_000),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_mcp_pid(pid_file: &std::path::Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(pid_file) {
+                let pid = pid.trim().to_string();
+                if !pid.is_empty() {
+                    return pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "MCP fixture did not record a process id at {}",
+                pid_file.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn mcp_process_is_alive(pid: &str) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    fn wait_for_mcp_process_exit(pid: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mcp_process_is_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "MCP fixture process {pid} was not reaped before the deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_replaces_root_mcp_registry_and_reaps_replaced_stdio_process() {
+        with_orca_home(|_| {
+            let fixture = tempdir().expect("MCP fixture directory");
+            let script = fixture.path().join("lifecycle_mcp.sh");
+            let first_pid_file = fixture.path().join("first.pid");
+            let second_pid_file = fixture.path().join("second.pid");
+            std::fs::write(
+                &script,
+                r#"marker=$1
+printf '%s\n' "$$" > "$marker"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"lifecycle","version":"1"}}}\n'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"heartbeat","description":"lifecycle fixture","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
+      ;;
+  esac
+done
+"#,
+            )
+            .expect("write MCP fixture");
+            let mut first_config = test_config(HistoryMode::Record);
+            first_config.mcp_servers =
+                vec![stdio_mcp_server("first-session", &script, &first_pid_file)];
+            let config = Arc::new(Mutex::new(first_config));
+            let preloaded = Arc::new(Mutex::new(None));
+            let event_tx = mpsc::unbounded().0;
+            let pending = test_pending_workflow_notifications();
+            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let host_handle = host.handle();
+            let mut thread = None;
+
+            ensure_hosted_thread(
+                &mut thread,
+                &host_handle,
+                &config.lock().unwrap().clone(),
+                &preloaded,
+                "First MCP session",
+                &event_tx,
+            )
+            .expect("first hosted session");
+
+            let first_pid = wait_for_mcp_pid(&first_pid_file);
+            let first_registry = thread
+                .as_ref()
+                .expect("first runtime thread")
+                .mcp_registry();
+            assert!(
+                first_registry.errors().is_empty(),
+                "runtime must construct the first session registry from its RunConfig: {:?}",
+                first_registry.errors()
+            );
+            assert!(
+                first_registry
+                    .tools()
+                    .iter()
+                    .any(|tool| tool.server == "first_session" && tool.name == "heartbeat"),
+                "runtime must expose the first session's MCP tools"
+            );
+            drop(first_registry);
+
+            config.lock().unwrap().mcp_servers =
+                vec![stdio_mcp_server("next-session", &script, &second_pid_file)];
+            start_new_hosted_session(&mut thread, &host_handle, &config, &preloaded, &pending)
+                .expect("replacement hosted session");
+
+            let second_pid = wait_for_mcp_pid(&second_pid_file);
+            let next_registry = thread
+                .as_ref()
+                .expect("replacement runtime thread")
+                .mcp_registry();
+            assert!(
+                next_registry.errors().is_empty(),
+                "replacement registry must initialize cleanly: {:?}",
+                next_registry.errors()
+            );
+            assert!(
+                next_registry
+                    .tools()
+                    .iter()
+                    .any(|tool| tool.server == "next_session" && tool.name == "heartbeat"),
+                "runtime must construct a replacement registry from the new session's RunConfig"
+            );
+            assert!(
+                !next_registry
+                    .tools()
+                    .iter()
+                    .any(|tool| tool.server == "first_session"),
+                "the replacement session must not retain the previous registry"
+            );
+            drop(next_registry);
+
+            wait_for_mcp_process_exit(&first_pid);
+
+            thread
+                .take()
+                .expect("replacement runtime thread")
+                .shutdown()
+                .expect("replacement thread shutdown");
+            wait_for_mcp_process_exit(&second_pid);
+            host.shutdown().expect("runtime host shutdown");
+        });
     }
 
     fn test_state() -> (AppState, mpsc::Receiver<UserAction>) {
@@ -3483,24 +3644,8 @@ mod tests {
     }
 
     fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let _guard = crate::test_support::lock_process_env();
-        let home = tempdir().unwrap();
-        let previous = std::env::var_os("ORCA_HOME");
-        unsafe {
-            std::env::set_var("ORCA_HOME", home.path());
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(home.path())));
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var("ORCA_HOME", previous);
-            } else {
-                std::env::remove_var("ORCA_HOME");
-            }
-        }
-        match result {
-            Ok(result) => result,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
+        let home = crate::test_support::isolate_orca_home();
+        f(home.path())
     }
 
     struct HostedTuiHarness {
@@ -3571,13 +3716,11 @@ mod tests {
             let (event_tx, event_rx) = mpsc::unbounded();
             let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
             let (action_tx, action_rx) = mpsc::unbounded();
-            let registry = orca_mcp::initialize_registry(&[]);
             let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
             let agent_config = Arc::clone(&config);
             let agent_preloaded = Arc::clone(&preloaded);
             let agent_events = event_tx.clone();
             let agent_pending = pending.clone();
-            let agent_registry = registry.clone();
             let mut runtime = TuiAgentRuntime::spawn_hosted(
                 action_rx,
                 event_tx,
@@ -3591,7 +3734,6 @@ mod tests {
                         commands,
                         controller,
                         agent_pending,
-                        agent_registry,
                         host,
                     );
                 },
@@ -4420,7 +4562,6 @@ mod tests {
             let (event_tx, event_rx) = mpsc::unbounded();
             let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
             let (action_tx, action_rx) = mpsc::unbounded();
-            let registry = orca_mcp::initialize_registry(&[]);
             let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
             let mut runtime = TuiAgentRuntime::spawn_hosted(
                 action_rx,
@@ -4429,7 +4570,7 @@ mod tests {
                 controller,
                 move |controller, commands, host| {
                     hosted_tui_controller_loop(
-                        config, preloaded, event_tx, commands, controller, pending, registry, host,
+                        config, preloaded, event_tx, commands, controller, pending, host,
                     );
                 },
             )
@@ -4460,7 +4601,6 @@ mod tests {
             let (event_tx, event_rx) = mpsc::unbounded();
             let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
             let pending = test_pending_workflow_notifications();
-            let registry = orca_mcp::initialize_registry(&[]);
             let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
             let host_handle = host.handle();
             host.shutdown().unwrap();
@@ -4474,7 +4614,6 @@ mod tests {
                 &event_tx,
                 &controller.surface_task_control(),
                 &pending,
-                &registry,
                 &host_handle,
                 &OrdinaryTurnRunner::Typed,
             );
@@ -4506,7 +4645,6 @@ mod tests {
             config.cwd = Some(home.to_path_buf());
             let preloaded = Arc::new(Mutex::new(None));
             let event_tx = mpsc::unbounded().0;
-            let registry = orca_mcp::initialize_registry(&[]);
             let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
             let host_handle = host.handle();
             let mut thread = None;
@@ -4517,7 +4655,6 @@ mod tests {
                 &config,
                 &preloaded,
                 "remembered context",
-                &registry,
                 &event_tx,
             )
             .expect("runtime-owned thread starts for remember");
@@ -4818,7 +4955,6 @@ mod tests {
             let (event_tx, event_rx) = mpsc::unbounded();
             let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
             let (action_tx, action_rx) = mpsc::unbounded();
-            let registry = orca_mcp::initialize_registry(&[]);
             let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
             let mut runtime = TuiAgentRuntime::spawn_hosted(
                 action_rx,
@@ -4827,7 +4963,7 @@ mod tests {
                 controller,
                 move |controller, commands, host| {
                     hosted_tui_controller_loop(
-                        config, preloaded, event_tx, commands, controller, pending, registry, host,
+                        config, preloaded, event_tx, commands, controller, pending, host,
                     );
                 },
             )
@@ -7941,7 +8077,6 @@ fn hosted_tui_controller_loop(
     action_rx: mpsc::Receiver<UserAction>,
     control: TuiSurfaceTaskControl,
     pending_workflow_notifications: bridge::PendingWorkflowNotifications,
-    mcp_registry: orca_mcp::McpRegistry,
     host: RuntimeHostHandle,
 ) {
     hosted_tui_controller_loop_with_ordinary_turn_runner(
@@ -7951,7 +8086,6 @@ fn hosted_tui_controller_loop(
         action_rx,
         control,
         pending_workflow_notifications,
-        mcp_registry,
         host,
         OrdinaryTurnRunner::Typed,
     );
@@ -7965,7 +8099,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
     action_rx: mpsc::Receiver<UserAction>,
     control: TuiSurfaceTaskControl,
     pending_workflow_notifications: bridge::PendingWorkflowNotifications,
-    mcp_registry: orca_mcp::McpRegistry,
     host: RuntimeHostHandle,
     ordinary_turn_runner: OrdinaryTurnRunner,
 ) {
@@ -7983,22 +8116,14 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
         };
         let title = format!("Restored session {selector}");
         let thread_was_missing = thread.is_none();
-        let result = ensure_hosted_thread(
-            &mut thread,
-            &host,
-            &cfg,
-            &preloaded,
-            &title,
-            &mcp_registry,
-            &event_tx,
-        )
-        .and_then(|_| {
-            emit_typed_history_snapshot(
-                thread.as_ref().expect("startup hosted thread"),
-                &startup_history_mode,
-                &event_tx,
-            )
-        });
+        let result = ensure_hosted_thread(&mut thread, &host, &cfg, &preloaded, &title, &event_tx)
+            .and_then(|_| {
+                emit_typed_history_snapshot(
+                    thread.as_ref().expect("startup hosted thread"),
+                    &startup_history_mode,
+                    &event_tx,
+                )
+            });
         if let Err(error) = result {
             if !cfg.prompt.trim().is_empty() {
                 emit_empty_history_snapshot(&event_tx, "Unable to restore saved conversation.");
@@ -8027,7 +8152,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &host,
                     &config,
                     &preloaded,
-                    &mcp_registry,
                     &pending_workflow_notifications,
                 ) {
                     Ok(session_id) => {
@@ -8053,7 +8177,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &host,
                     &config,
                     &preloaded,
-                    &mcp_registry,
                     &pending_workflow_notifications,
                     title,
                 ) {
@@ -8125,7 +8248,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &host,
                     &config,
                     &preloaded,
-                    &mcp_registry,
                     &pending_workflow_notifications,
                     HistoryMode::Resume(session_id),
                     None,
@@ -8167,7 +8289,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &host,
                     &config,
                     &preloaded,
-                    &mcp_registry,
                     &pending_workflow_notifications,
                     HistoryMode::Fork(session_id),
                     None,
@@ -8279,7 +8400,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                 &event_tx,
                 &control,
                 &pending_workflow_notifications,
-                &mcp_registry,
                 &host,
                 &ordinary_turn_runner,
             ),
@@ -8292,7 +8412,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &event_tx,
                     &control,
                     &pending_workflow_notifications,
-                    &mcp_registry,
                     &host,
                     &ordinary_turn_runner,
                 );
@@ -8310,7 +8429,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &event_tx,
                     &control,
                     &pending_workflow_notifications,
-                    &mcp_registry,
                     &host,
                     &ordinary_turn_runner,
                 );
@@ -8324,7 +8442,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &event_tx,
                     &control,
                     &pending_workflow_notifications,
-                    &mcp_registry,
                     &host,
                     &ordinary_turn_runner,
                 );
@@ -8338,7 +8455,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &cfg,
                     &preloaded,
                     &format!("Run saved workflow `{name}`"),
-                    &mcp_registry,
                     &event_tx,
                 ) {
                     send_hosted_action_failure(&event_tx, error);
@@ -8413,7 +8529,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                         &cfg,
                         &preloaded,
                         "Remembered context",
-                        &mcp_registry,
                         &event_tx,
                     ) {
                         let _ = event_tx.send(TuiEvent::Error(error));
@@ -8515,7 +8630,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &cfg,
                     &preloaded,
                     &objective,
-                    &mcp_registry,
                     &event_tx,
                 ) {
                     send_hosted_action_failure(&event_tx, error);
@@ -8555,7 +8669,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                         &cfg,
                         &preloaded,
                         &objective,
-                        &mcp_registry,
                         &event_tx,
                     ) {
                         send_hosted_action_failure(&event_tx, error);
@@ -8601,7 +8714,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                         &cfg,
                         &preloaded,
                         "clear Goal",
-                        &mcp_registry,
                         &event_tx,
                     ) {
                         send_hosted_action_failure(&event_tx, error);
@@ -8643,7 +8755,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                         &cfg,
                         &preloaded,
                         "pause Goal",
-                        &mcp_registry,
                         &event_tx,
                     ) {
                         send_hosted_action_failure(&event_tx, error);
@@ -8675,7 +8786,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                         &host,
                         &config,
                         &preloaded,
-                        &mcp_registry,
                         &event_tx,
                         &control,
                         &pending_workflow_notifications,
@@ -8724,13 +8834,10 @@ fn ensure_hosted_thread(
     config: &RunConfig,
     _preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     title: &str,
-    _mcp_registry: &orca_mcp::McpRegistry,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<(), String> {
     if thread.is_none() {
         let request = RuntimeThreadStartRequest::new(config.clone(), title);
-        #[cfg(test)]
-        let request = request.with_mcp_registry(_mcp_registry.clone());
         #[cfg(test)]
         let request = if let Some(transcript) = _preloaded.lock().unwrap().clone() {
             request.with_preloaded(transcript)
@@ -8758,7 +8865,6 @@ fn start_new_hosted_session(
     host: &RuntimeHostHandle,
     config: &Arc<Mutex<RunConfig>>,
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
-    mcp_registry: &orca_mcp::McpRegistry,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
 ) -> Result<String, String> {
     ensure_current_session_switchable(thread.as_ref())?;
@@ -8768,10 +8874,6 @@ fn start_new_hosted_session(
     next_config.prompt.clear();
     next_config.show_session_picker = false;
     let request = RuntimeThreadStartRequest::new(next_config.clone(), "New conversation");
-    #[cfg(test)]
-    let request = request.with_mcp_registry(mcp_registry.clone());
-    #[cfg(not(test))]
-    let _ = mcp_registry;
     let started = host
         .start_thread_with_request(request)
         .map_err(|error| format!("failed to start a new conversation: {error}"))?;
@@ -8872,7 +8974,6 @@ fn start_forked_hosted_session(
     host: &RuntimeHostHandle,
     config: &Arc<Mutex<RunConfig>>,
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
-    mcp_registry: &orca_mcp::McpRegistry,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     title: Option<String>,
 ) -> Result<(HistoryMode, String, String), String> {
@@ -8889,10 +8990,6 @@ fn start_forked_hosted_session(
     next_config.prompt.clear();
     next_config.show_session_picker = false;
     let request = RuntimeThreadStartRequest::new(next_config.clone(), fork_title.clone());
-    #[cfg(test)]
-    let request = request.with_mcp_registry(mcp_registry.clone());
-    #[cfg(not(test))]
-    let _ = mcp_registry;
     let started = host
         .start_thread_with_request(request)
         .map_err(|error| format!("failed to fork conversation: {error}"))?;
@@ -8918,7 +9015,6 @@ fn switch_saved_hosted_session(
     host: &RuntimeHostHandle,
     config: &Arc<Mutex<RunConfig>>,
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
-    mcp_registry: &orca_mcp::McpRegistry,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     mode: HistoryMode,
     title: Option<String>,
@@ -8943,10 +9039,6 @@ fn switch_saved_hosted_session(
     next_config.show_session_picker = false;
     let request = RuntimeThreadStartRequest::new(next_config.clone(), switch_title)
         .with_preloaded(transcript);
-    #[cfg(test)]
-    let request = request.with_mcp_registry(mcp_registry.clone());
-    #[cfg(not(test))]
-    let _ = mcp_registry;
     let started = host
         .start_thread_with_request(request)
         .map_err(|error| format!("failed to switch saved conversation: {error}"))?;
@@ -9105,7 +9197,6 @@ fn handle_hosted_submitted_turn(
     event_tx: &mpsc::Sender<TuiEvent>,
     control: &TuiSurfaceTaskControl,
     _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
-    mcp_registry: &orca_mcp::McpRegistry,
     host: &RuntimeHostHandle,
     ordinary_turn_runner: &OrdinaryTurnRunner,
 ) {
@@ -9118,15 +9209,7 @@ fn handle_hosted_submitted_turn(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let title_seed = submitted_turn.title_seed(submitted_turn.prompt());
-    if let Err(error) = ensure_hosted_thread(
-        thread,
-        host,
-        &cfg,
-        preloaded,
-        &title_seed,
-        mcp_registry,
-        event_tx,
-    ) {
+    if let Err(error) = ensure_hosted_thread(thread, host, &cfg, preloaded, &title_seed, event_tx) {
         send_submission_error(event_tx, queued_id, rejection_prompt.as_deref(), error);
         return;
     }
@@ -9503,7 +9586,6 @@ fn resume_latest_active_goal_hosted(
     host: &RuntimeHostHandle,
     config: &Arc<Mutex<RunConfig>>,
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
-    mcp_registry: &orca_mcp::McpRegistry,
     event_tx: &mpsc::Sender<TuiEvent>,
     control: &TuiSurfaceTaskControl,
     _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
@@ -9535,9 +9617,8 @@ fn resume_latest_active_goal_hosted(
     };
     let mut cfg = config.lock().unwrap().clone();
     cfg.history_mode = HistoryMode::Resume(goal.session_id.clone());
-    let request = RuntimeThreadStartRequest::new(cfg.clone(), &goal.objective)
-        .with_preloaded(transcript)
-        .with_mcp_registry(mcp_registry.clone());
+    let request =
+        RuntimeThreadStartRequest::new(cfg.clone(), &goal.objective).with_preloaded(transcript);
     let resumed = match host.start_thread_with_request(request) {
         Ok(thread) => thread,
         Err(error) => {
