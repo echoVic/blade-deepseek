@@ -712,23 +712,23 @@ git commit -m "ci: enforce runtime surface contract"
 - Create: tests/dependency_architecture_contract.rs
 - Modify: behavior-specific runtime test modules
 
-- [ ] **Step 1: Inventory all 282 sites**
+- [x] **Step 1: Inventory all 282 sites**
 
 Record containing test and classify each as behavior, dependency/import, exact byte fixture, or obsolete. Baseline must show 254 runtime lib sites and 28 TUI/tests sites.
 
-- [ ] **Step 2: Add structured boundary tests**
+- [x] **Step 2: Add structured boundary tests**
 
 Use cargo metadata JSON for crate edges and target ownership. Use compile visibility tests for private APIs. Do not replace one source string scanner with another source string scanner.
 
-- [ ] **Step 3: Replace behavioral assertions**
+- [x] **Step 3: Replace behavioral assertions**
 
 For each source assertion, write or identify a direct behavioral/differential test, run it green against current behavior, then remove the string assertion.
 
-- [ ] **Step 4: Retain only exact byte fixtures**
+- [x] **Step 4: Retain only exact byte fixtures**
 
 Keep include_str only where fixture bytes are consumed as a public contract, such as JSONL or workflow JavaScript. Add a comment naming that contract. No retained test asserts private Rust spelling or file placement.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 ~~~sh
 rg -n 'include_str!' crates/orca-runtime/src/lib.rs crates/orca-tui/src tests
@@ -739,7 +739,7 @@ cargo test -p orca-tui --lib --no-run
 
 Expected: zero Rust source-layout assertions; retained fixture inclusions are documented.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ~~~sh
 git add crates/orca-runtime/src/lib.rs crates/orca-tui/src/surface_boundary_tests.rs tests/cli_architecture_contract.rs tests/dependency_architecture_contract.rs crates/orca-runtime/src docs/reports/2026-08-03-orca-audit-remediation-evidence.md
