@@ -60,6 +60,13 @@
       "windows-test-portability"
     ],
     [
+      "tui-stdio-guard-unix-flags",
+      "crates/orca-tui/src/stdio_guard.rs",
+      "unix_libc_process",
+      11,
+      "conpty-tui-plan"
+    ],
+    [
       "verification-unix-command-api",
       "crates/orca-core/src/verification.rs",
       "unix_std_api",
