@@ -6,14 +6,51 @@ use tokio::sync::mpsc;
 use orca_core::cancel::OperationId;
 
 use crate::goal_actor::{GoalRuntimeHandle, GoalTurnContext};
-use crate::goal_store::GoalRecoveryRecord;
+use crate::goal_store::{GoalRecoveryRecord, GoalSurfaceMutationRecord};
 use crate::runtime_host::RuntimeHostError;
 
-pub(crate) enum GoalBlockingCompletion {
+pub(crate) enum GoalBlockingCompletion<Settlement> {
     RuntimeOpened {
         reply: SyncSender<Result<GoalRuntimeHandle, RuntimeHostError>>,
         result: Result<OpenedGoalRuntime, RuntimeHostError>,
     },
+    SetGoal {
+        reply: SyncSender<Result<orca_core::goal_types::ThreadGoal, RuntimeHostError>>,
+        result: Result<GoalSurfaceWorkerResult, RuntimeHostError>,
+    },
+    EditGoal {
+        reply: SyncSender<Result<Option<orca_core::goal_types::ThreadGoal>, RuntimeHostError>>,
+        result: Result<GoalSurfaceWorkerResult, RuntimeHostError>,
+    },
+    ClearGoal {
+        reply: SyncSender<Result<(), RuntimeHostError>>,
+        result: Result<GoalSurfaceWorkerResult, RuntimeHostError>,
+    },
+    Pause {
+        operation_id: OperationId,
+        result: Result<Option<PendingGoalPauseEvent>, RuntimeHostError>,
+    },
+    SurfaceMutation {
+        settlement: Settlement,
+    },
+    PauseResume {
+        settlement: Settlement,
+    },
+    PreviewCommit {
+        settlement: Settlement,
+    },
+    FinishVerify {
+        settlement: Settlement,
+    },
+    Recovery {
+        settlement: Settlement,
+    },
+}
+
+pub(crate) struct GoalSurfaceWorkerResult {
+    pub(crate) runtime: GoalRuntimeHandle,
+    pub(crate) mutations: Vec<GoalSurfaceMutationRecord>,
+    pub(crate) projected_goal: Option<orca_core::goal_types::ThreadGoal>,
 }
 
 pub(crate) struct OpenedGoalRuntime {
@@ -201,77 +238,6 @@ impl<Command, PendingRecovery, Completion, ActiveControl, PauseEvent>
             self.active_control.is_some(),
             self.pending_pause_event.is_some(),
         )
-    }
-}
-
-impl<Command, PendingRecovery, Completion>
-    GoalOperationController<
-        Command,
-        PendingRecovery,
-        Completion,
-        ActiveGoalControl,
-        PendingGoalPauseEvent,
-    >
-{
-    pub(crate) fn pause_active(
-        &mut self,
-        operation_id: OperationId,
-        message: &str,
-    ) -> Result<(), RuntimeHostError> {
-        let Some(control) = self.active_control(operation_id).cloned() else {
-            return Ok(());
-        };
-        let previous = control.runtime.read(&control.session_id).map_err(|error| {
-            RuntimeHostError::GoalControlFailed {
-                message: error.to_string(),
-            }
-        })?;
-        control
-            .runtime
-            .pause(
-                &control.session_id,
-                orca_core::goal_runtime::GoalPauseReason::User,
-                message,
-                chrono::Utc::now().timestamp(),
-            )
-            .map_err(|error| RuntimeHostError::GoalControlFailed {
-                message: error.to_string(),
-            })?;
-        let next = control.runtime.read(&control.session_id).map_err(|error| {
-            RuntimeHostError::GoalControlFailed {
-                message: error.to_string(),
-            }
-        })?;
-        if !self.has_pending_pause_event(operation_id)
-            && let (Some(previous), Some(next)) = (previous, next)
-            && previous.state != next.state
-            && let orca_core::goal_runtime::GoalState::Paused { reason, message } = &next.state
-        {
-            self.schedule_pause_event(
-                operation_id,
-                PendingGoalPauseEvent {
-                    goal_id: next.goal_id.clone(),
-                    goal_run_id: previous
-                        .current_run
-                        .as_ref()
-                        .map(|run| run.goal_run_id.clone()),
-                    outer_turn_id: previous
-                        .current_run
-                        .as_ref()
-                        .and_then(|run| run.outer_turn_id.clone()),
-                    previous_state: previous.state,
-                    next_state: next.state.clone(),
-                    reason: *reason,
-                    message: message.clone(),
-                    reason_code: next
-                        .last_transition
-                        .as_ref()
-                        .map(|transition| transition.reason_code.clone())
-                        .unwrap_or_else(|| "paused".to_string()),
-                },
-            );
-        }
-        Ok(())
     }
 }
 

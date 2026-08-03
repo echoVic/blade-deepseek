@@ -164,10 +164,10 @@ git commit -m "fix(runtime): bound goal actor replies"
 
 **Files:**
 - Modify: crates/orca-runtime/src/runtime_host.rs
-- Test: crates/orca-runtime/tests/runtime_host.rs
+- Test: crates/orca-runtime/src/runtime_host.rs
 - Modify: docs/reports/2026-08-03-orca-audit-remediation-evidence.md
 
-- [ ] **Step 1: Write actor responsiveness regression**
+- [x] **Step 1: Write actor responsiveness regression**
 
 Use a test goal handle whose next request blocks on a barrier. Submit the goal command, then issue a read-only thread snapshot and require it to settle within 100 ms.
 
@@ -179,31 +179,31 @@ let snapshot = tokio::time::timeout(
 assert!(snapshot.is_ok());
 ~~~
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
-cargo test -p orca-runtime --test runtime_host goal_store_wait_does_not_block_thread_actor -- --nocapture
+cargo test -p orca-runtime goal_store_wait_does_not_block_thread_actor --lib -- --nocapture --test-threads=1
 ~~~
 
 Expected: FAIL by timeout while ThreadActor calls the synchronous handle inline.
 
-- [ ] **Step 3: Add typed goal completion events**
+- [x] **Step 3: Add typed goal completion events**
 
 Add a bounded Tokio completion channel to ThreadActor::run. Define explicit completion variants for set/edit/clear, pause/resume, preview/commit, and finish/verify. Clone GoalRuntimeHandle, call it in tokio::task::spawn_blocking, and send the typed completion. The command branch must return to select without awaiting the blocking join.
 
 Each completion carries its existing surface request or operation fence. Ignore it after terminalization or fence replacement. Preserve the actor's serialized GoalRuntimeHandle and do not create a second SQLite owner.
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 ~~~sh
-cargo test -p orca-runtime --test runtime_host goal_store_wait_does_not_block_thread_actor -- --nocapture
-cargo test -p orca-runtime runtime_surface_goal --lib -- --test-threads=1
+cargo test -p orca-runtime goal_store_wait_does_not_block_thread_actor --lib --locked -j 1 -- --nocapture --test-threads=1
+cargo test -p orca-runtime goal --lib --locked -j 1 -- --nocapture --test-threads=1
 ~~~
 
-- [ ] **Step 5: Update C1 and commit**
+- [x] **Step 5: Update C1 and commit**
 
 ~~~sh
-git add crates/orca-runtime/src/runtime_host.rs crates/orca-runtime/tests/runtime_host.rs docs/reports/2026-08-03-orca-audit-remediation-evidence.md
+git add crates/orca-runtime/src/goal_actor.rs crates/orca-runtime/src/runtime_actor/goal.rs crates/orca-runtime/src/runtime_host.rs docs/superpowers/plans/2026-08-03-orca-audit-remediation-v032.md docs/reports/2026-08-03-orca-audit-remediation-evidence.md
 git commit -m "fix(runtime): isolate goal store waits"
 ~~~
 

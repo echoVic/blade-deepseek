@@ -836,6 +836,26 @@ impl GoalRuntimeHandle {
         Ok(Self::spawn_with_lease(store, Some(lease), recoveries))
     }
 
+    #[cfg(test)]
+    pub(crate) fn delay_for_test(
+        &self,
+        duration: Duration,
+    ) -> Result<thread::JoinHandle<()>, GoalActorError> {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.sender
+            .send(GoalActorCommand::DelayForTest {
+                duration,
+                started: started_tx,
+                reply: reply_tx,
+            })
+            .map_err(|_| GoalActorError::Closed)?;
+        started_rx.recv().map_err(|_| GoalActorError::Closed)?;
+        Ok(thread::spawn(move || {
+            let _ = reply_rx.recv();
+        }))
+    }
+
     pub fn read(&self, session_id: &str) -> Result<Option<GoalRecord>, GoalActorError> {
         self.request(|reply| GoalActorCommand::Read {
             session_id: session_id.to_string(),
