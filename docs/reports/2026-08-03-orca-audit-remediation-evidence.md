@@ -43,14 +43,22 @@ is an explicit incomplete state, not evidence of success.
 
 ## Verification Snapshot
 
-Pre-version verification on 2026-08-04 completed with exit 0 for every command in
-Task 23 Step 3. The TUI serial profile ran 1,023/1,023 tests. The workspace
-profile ran 2,490/2,490 tests with zero failures and zero skipped tests; nextest
-reported one leaky test process, with no flaky retry or test failure. The SEO
-check passed after the v0.3.3 site version/date assets were updated. Cargo,
+Pre-version verification on 2026-08-04 completed every command in Task 23 Step
+3. The TUI serial profile ran 1,023/1,023 tests. The workspace profile ran
+2,490/2,490 tests with zero failures and zero skipped tests; nextest reported
+one leaky test process, with no flaky retry or test failure. The only nonzero
+exit was the expected SEO date-alignment check, which passed after the v0.3.3
+site version/date assets were updated. Cargo,
 Cargo.lock, npm, site, changelog, and release-note version sync passed for
 0.3.3; the workspace check, npm staging test, and site production build also
 exited 0.
+
+Post-version verification on commit `7749b824b` reran the complete Task 23
+matrix. The TUI serial profile passed 1,023/1,023 with zero skipped tests, and
+the workspace profile passed 2,490/2,490 with zero skipped tests, zero failures,
+zero flaky retries, and no leaky-process report. Formatting, clippy, both
+validator self-tests and live gates, version sync, npm staging, published
+artifact verifier self-tests, site build, SEO, and diff checks all exited 0.
 
 The release is incomplete until all table rows are closed and the following are
 independently visible:

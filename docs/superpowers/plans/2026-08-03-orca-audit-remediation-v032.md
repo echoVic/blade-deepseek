@@ -1155,9 +1155,12 @@ git add Cargo.toml Cargo.lock npm/orca/package.json docs README.md README.zh-CN.
 git commit -m "release: prepare Orca v0.3.3"
 ~~~
 
-- [ ] **Step 6: Rerun complete release matrix**
+- [x] **Step 6: Rerun complete release matrix**
 
-Repeat Step 3 after the version commit. Record date, exit, and test counts; commit the final evidence update.
+Repeat Step 3 after the version commit. Record date, exit, and test counts;
+commit the final evidence update. On 2026-08-04, every command exited 0: the
+TUI profile passed 1,023/1,023 and the workspace profile passed 2,490/2,490
+with zero skipped tests, failures, flaky retries, or leaky-process reports.
 
 - [ ] **Step 7: Push and integrate**
 
