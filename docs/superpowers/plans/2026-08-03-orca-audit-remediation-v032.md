@@ -449,39 +449,39 @@ git commit -m "fix(tui): sequence usage projection"
 - Modify: crates/orca-tui/src/ui.rs
 - Test: same files
 
-- [ ] **Step 1: Write unchanged-frame search test**
+- [x] **Step 1: Write unchanged-frame search test**
 
 Open search on 5,000 messages, render 100 unchanged frames, and assert the scan counter increases once. Append one streaming change and assert only that entry is rescanned.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 cargo test -p orca-tui transcript_search_ignores_unchanged_render_frames --lib
 ~~~
 
-Expected: FAIL because ui.rs initiates refresh each frame.
+Observed: FAIL because one changed entry still visited all 5,000 searchable lines (`left: 5000`, `right: 1`).
 
-- [ ] **Step 3: Add per-entry search generations**
+- [x] **Step 3: Add per-entry search generations**
 
 Track query_revision and indexed message revisions. Query edits rebuild once; transcript changes update matches only for changed revisions. Rendering only consumes prepared matches.
 
-- [ ] **Step 4: Write reflow budget test**
+- [x] **Step 4: Write reflow budget test**
 
 Change width for 5,000 cached messages. With a test budget of 32, assert each prepare visits at most 32 off-screen dirty entries plus visible entries, preserves viewport anchor, and repeated calls converge with an unlimited rebuild.
 
-- [ ] **Step 5: Run RED**
+- [x] **Step 5: Run RED**
 
 ~~~sh
 cargo test -p orca-tui transcript_reflow_is_budgeted_and_converges --lib
 ~~~
 
-Expected: FAIL because width/theme invalidation rebuilds all entries in one call.
+Observed: FAIL at compile time because the reflow window, deterministic budget, adjusted-scroll outcome, and pending-schedule APIs did not exist.
 
-- [ ] **Step 6: Implement viewport-first scheduled reflow**
+- [x] **Step 6: Implement viewport-first scheduled reflow**
 
 Add a ReflowSchedule carrying generation, pending indices, and viewport anchor. Queue visible entries first. Consume a five-millisecond production budget or deterministic test entry budget. Keep old lines until replaced and adjust scroll from the anchor.
 
-- [ ] **Step 7: Run GREEN and commit**
+- [x] **Step 7: Run GREEN and commit**
 
 ~~~sh
 cargo test -p orca-tui transcript_search --lib

@@ -788,7 +788,7 @@ pub(crate) fn render_live_messages(
         return;
     }
 
-    let requested_scroll = if state.auto_scroll {
+    let mut requested_scroll = if state.auto_scroll {
         usize::MAX
     } else {
         state.scroll_offset
@@ -799,10 +799,14 @@ pub(crate) fn render_live_messages(
     let highlights = &state.applied_diff_highlights;
     {
         let cache = &mut state.transcript_render_cache;
-        cache.prepare(
+        let outcome = cache.prepare(
             messages,
             revisions,
-            TranscriptRenderContext::new(theme, width, state.tick, false),
+            TranscriptRenderContext::new(theme, width, state.tick, false).with_reflow_window(
+                live_start,
+                requested_scroll,
+                visible_height,
+            ),
             |index, message, theme, width, tick, force_expand| {
                 let refined = AppState::refined_diff_styles_for_message(
                     revisions, highlights, index, message,
@@ -810,6 +814,7 @@ pub(crate) fn render_live_messages(
                 build_lines_for_message(message, theme, width, tick, force_expand, refined)
             },
         );
+        requested_scroll = outcome.adjusted_scroll.unwrap_or(requested_scroll);
     }
     state.refresh_transcript_search();
     let viewport =

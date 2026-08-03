@@ -1,8 +1,10 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::{
+    cell::RefCell,
     collections::{BTreeSet, VecDeque},
     mem,
+    time::{Duration, Instant},
 };
 
 use ratatui::layout::Alignment;
@@ -270,6 +272,7 @@ impl From<&Theme> for ThemeIdentity {
 
 #[derive(Clone, Debug)]
 struct CachedMessage {
+    search_generation: u64,
     revision: u64,
     width: usize,
     theme: ThemeIdentity,
@@ -284,6 +287,43 @@ struct CachedMessage {
 struct SearchableLogicalLine {
     text: String,
     boundaries: Vec<(usize, SelectionPos)>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedSearchEntry {
+    generation: u64,
+    matches: Vec<TranscriptSearchMatch>,
+}
+
+#[derive(Debug, Default)]
+struct TranscriptSearchIndex {
+    query: Option<SearchQuery>,
+    entries: Vec<Option<CachedSearchEntry>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReflowWindow {
+    first_retained_message: usize,
+    requested_scroll: usize,
+    visible_height: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReflowAnchor {
+    message_index: usize,
+    row_within_message: usize,
+}
+
+#[derive(Debug)]
+struct ReflowSchedule {
+    generation: u64,
+    pending_indices: BTreeSet<usize>,
+    anchor: Option<ReflowAnchor>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TranscriptPrepareOutcome {
+    pub(crate) adjusted_scroll: Option<usize>,
 }
 
 impl CachedMessage {
@@ -360,6 +400,10 @@ pub(crate) struct TranscriptRenderCache {
     prepared_force_expand: Option<bool>,
     prepared_spinner_phase: Option<u8>,
     content_generation: u64,
+    next_search_generation: u64,
+    search_index: RefCell<TranscriptSearchIndex>,
+    reflow_generation: u64,
+    reflow_schedule: Option<ReflowSchedule>,
     #[cfg(test)]
     last_prepare_visited: usize,
     #[cfg(test)]
@@ -373,6 +417,8 @@ pub(crate) struct TranscriptRenderContext<'a> {
     syntax_theme_revision: u64,
     tick: u64,
     force_expand: bool,
+    reflow_window: Option<ReflowWindow>,
+    reflow_entry_budget: Option<usize>,
 }
 
 impl<'a> TranscriptRenderContext<'a> {
@@ -383,7 +429,29 @@ impl<'a> TranscriptRenderContext<'a> {
             syntax_theme_revision: theme.syntax_theme_revision,
             tick,
             force_expand,
+            reflow_window: None,
+            reflow_entry_budget: None,
         }
+    }
+
+    pub(crate) fn with_reflow_window(
+        mut self,
+        first_retained_message: usize,
+        requested_scroll: usize,
+        visible_height: usize,
+    ) -> Self {
+        self.reflow_window = Some(ReflowWindow {
+            first_retained_message,
+            requested_scroll,
+            visible_height,
+        });
+        self
+    }
+
+    #[cfg(test)]
+    fn with_reflow_entry_budget(mut self, entry_budget: usize) -> Self {
+        self.reflow_entry_budget = Some(entry_budget);
+        self
     }
 
     #[cfg(test)]
@@ -466,52 +534,81 @@ impl TranscriptRenderCache {
         if query.is_empty() {
             return Vec::new();
         }
+        let mut search_index = self.search_index.borrow_mut();
+        if search_index.query.as_ref() != Some(query) {
+            search_index.query = Some(query.clone());
+            search_index.entries.clear();
+        }
+        search_index
+            .entries
+            .resize_with(self.entries.len(), || None);
+
         let mut matches = Vec::new();
         for message_index in first_retained_message.min(self.entries.len())..self.entries.len() {
             let Some(cached) = self.entries[message_index].as_ref() else {
+                search_index.entries[message_index] = None;
                 continue;
             };
+            let needs_scan = search_index.entries[message_index]
+                .as_ref()
+                .is_none_or(|entry| entry.generation != cached.search_generation);
+            if needs_scan {
+                let mut entry_matches = Vec::new();
+                for (line_index, wrapped) in cached.wrapped_lines.iter().enumerate() {
+                    #[cfg(test)]
+                    self.last_search_lines_visited
+                        .set(self.last_search_lines_visited.get() + 1);
+                    let line_start = cached
+                        .line_cumulative_heights
+                        .get(line_index)
+                        .copied()
+                        .unwrap_or_default();
+                    let searchable = searchable_logical_line(
+                        wrapped,
+                        line_start,
+                        line_index == 0 && cached.spinner_phase.is_some(),
+                    );
+                    for byte_range in query.find_ranges(&searchable.text) {
+                        let Ok(start_index) = searchable
+                            .boundaries
+                            .binary_search_by_key(&byte_range.start, |(byte, _)| *byte)
+                        else {
+                            continue;
+                        };
+                        let Ok(end_index) = searchable
+                            .boundaries
+                            .binary_search_by_key(&byte_range.end, |(byte, _)| *byte)
+                        else {
+                            continue;
+                        };
+                        entry_matches.push(TranscriptSearchMatch::new(
+                            searchable.boundaries[start_index].1,
+                            searchable.boundaries[end_index].1,
+                            TranscriptLineIdentity {
+                                message_revision: cached.revision,
+                                line_index,
+                            },
+                            byte_range,
+                        ));
+                    }
+                }
+                search_index.entries[message_index] = Some(CachedSearchEntry {
+                    generation: cached.search_generation,
+                    matches: entry_matches,
+                });
+            }
+
             let message_start = self
                 .cumulative_heights
                 .get(message_index)
                 .copied()
                 .unwrap_or_default();
-            for (line_index, wrapped) in cached.wrapped_lines.iter().enumerate() {
-                #[cfg(test)]
-                self.last_search_lines_visited
-                    .set(self.last_search_lines_visited.get() + 1);
-                let line_start = cached
-                    .line_cumulative_heights
-                    .get(line_index)
-                    .copied()
-                    .unwrap_or_default();
-                let searchable = searchable_logical_line(
-                    wrapped,
-                    message_start.saturating_add(line_start),
-                    line_index == 0 && cached.spinner_phase.is_some(),
-                );
-                for byte_range in query.find_ranges(&searchable.text) {
-                    let Ok(start_index) = searchable
-                        .boundaries
-                        .binary_search_by_key(&byte_range.start, |(byte, _)| *byte)
-                    else {
-                        continue;
-                    };
-                    let Ok(end_index) = searchable
-                        .boundaries
-                        .binary_search_by_key(&byte_range.end, |(byte, _)| *byte)
-                    else {
-                        continue;
-                    };
-                    matches.push(TranscriptSearchMatch::new(
-                        searchable.boundaries[start_index].1,
-                        searchable.boundaries[end_index].1,
-                        TranscriptLineIdentity {
-                            message_revision: cached.revision,
-                            line_index,
-                        },
-                        byte_range,
-                    ));
+            if let Some(entry) = search_index.entries[message_index].as_ref() {
+                for found in &entry.matches {
+                    let mut found = found.clone();
+                    found.start.row = found.start.row.saturating_add(message_start);
+                    found.end.row = found.end.row.saturating_add(message_start);
+                    matches.push(found);
                 }
             }
         }
@@ -564,6 +661,7 @@ impl TranscriptRenderCache {
             self.entries.truncate(len);
             self.dirty_indices.retain(|index| *index < len);
             self.spinner_indices.retain(|index| *index < len);
+            self.reset_reflow_after_structural_change();
             self.rebuild_cumulative_heights();
             return;
         }
@@ -584,6 +682,9 @@ impl TranscriptRenderCache {
         self.entries.truncate(len);
         self.dirty_indices.retain(|index| *index < len);
         self.spinner_indices.retain(|index| *index < len);
+        if changed {
+            self.reset_reflow_after_structural_change();
+        }
         self.rebuild_cumulative_heights();
         if changed {
             self.bump_content_generation();
@@ -610,6 +711,9 @@ impl TranscriptRenderCache {
             }
             self.entries.push(entry);
         }
+        if self.entries.len() != original_len {
+            self.reset_reflow_after_structural_change();
+        }
         self.rebuild_cumulative_heights();
         if self.entries.len() != original_len {
             self.bump_content_generation();
@@ -628,7 +732,8 @@ impl TranscriptRenderCache {
         revisions: &[u64],
         context: TranscriptRenderContext<'_>,
         mut build_message: F,
-    ) where
+    ) -> TranscriptPrepareOutcome
+    where
         F: FnMut(usize, &ChatMessage, &Theme, usize, u64, bool) -> Vec<Line<'static>>,
     {
         let TranscriptRenderContext {
@@ -637,16 +742,31 @@ impl TranscriptRenderCache {
             syntax_theme_revision,
             tick,
             force_expand,
+            reflow_window,
+            reflow_entry_budget,
         } = context;
         let width = width.max(1);
         let theme_identity = ThemeIdentity::from(theme);
         self.reconcile_len(messages.len());
-        if self.prepared_width != Some(width)
+        let layout_changed = self.prepared_width != Some(width)
             || self.prepared_theme != Some(theme_identity)
             || self.prepared_syntax_theme_revision != Some(syntax_theme_revision)
-            || self.prepared_force_expand != Some(force_expand)
-        {
-            self.dirty_indices.extend(0..messages.len());
+            || self.prepared_force_expand != Some(force_expand);
+        if layout_changed {
+            let can_schedule = self.prepared_width.is_some()
+                && self.entries.iter().any(Option::is_some)
+                && reflow_window.is_some();
+            if can_schedule {
+                self.reflow_generation = next_generation(self.reflow_generation);
+                self.reflow_schedule = Some(ReflowSchedule {
+                    generation: self.reflow_generation,
+                    pending_indices: (0..messages.len()).collect(),
+                    anchor: reflow_window.and_then(|window| self.reflow_anchor(window)),
+                });
+            } else {
+                self.dirty_indices.extend(0..messages.len());
+                self.reflow_schedule = None;
+            }
             self.prepared_width = Some(width);
             self.prepared_theme = Some(theme_identity);
             self.prepared_syntax_theme_revision = Some(syntax_theme_revision);
@@ -658,7 +778,17 @@ impl TranscriptRenderCache {
                 .extend(self.spinner_indices.iter().copied());
             self.prepared_spinner_phase = Some(spinner_phase);
         }
-        let dirty_indices = mem::take(&mut self.dirty_indices);
+        let mut immediate_indices = mem::take(&mut self.dirty_indices);
+        if let (Some(schedule), Some(window)) = (&self.reflow_schedule, reflow_window) {
+            debug_assert_eq!(schedule.generation, self.reflow_generation);
+            let visible = self.visible_message_range(window);
+            immediate_indices.extend(
+                schedule
+                    .pending_indices
+                    .range(visible.0..visible.1)
+                    .copied(),
+            );
+        }
         let mut first_height_change: Option<usize> = None;
         let mut rebuilt_any = false;
         #[cfg(test)]
@@ -666,87 +796,74 @@ impl TranscriptRenderCache {
             self.last_prepare_visited = 0;
         }
 
-        for index in dirty_indices {
-            let Some(message) = messages.get(index) else {
-                continue;
-            };
-            #[cfg(test)]
-            {
-                self.last_prepare_visited += 1;
-            }
-            let revision = revisions.get(index).copied().unwrap_or_default();
-            let spinner_phase = message_spinner_phase(message, tick);
-            if self.entries[index].as_mut().is_some_and(|cached| {
-                cached.patch_spinner(
-                    revision,
-                    width,
-                    theme_identity,
-                    syntax_theme_revision,
-                    force_expand,
-                    spinner_phase,
-                )
-            }) {
-                continue;
-            }
-            let matches = self.entries[index].as_ref().is_some_and(|cached| {
-                cached.matches(
-                    revision,
-                    width,
-                    theme_identity,
-                    syntax_theme_revision,
-                    force_expand,
-                    spinner_phase,
-                )
-            });
-            if matches {
-                continue;
-            }
-
-            let lines = build_message(index, message, theme, width, tick, force_expand);
-            rebuilt_any = true;
-            let ratatui_width = width.min(u16::MAX as usize) as u16;
-            let wrapped_lines = lines
-                .iter()
-                .map(|line| wrap_line_ratatui_compatible(line, ratatui_width))
-                .collect::<Vec<_>>();
-            let mut line_cumulative_heights: Vec<usize> =
-                Vec::with_capacity(wrapped_lines.len() + 1);
-            line_cumulative_heights.push(0);
-            for line in &wrapped_lines {
-                let next = line_cumulative_heights
-                    .last()
-                    .copied()
-                    .unwrap_or_default()
-                    .saturating_add(line.row_count());
-                line_cumulative_heights.push(next);
-            }
-            let visual_height = line_cumulative_heights.last().copied().unwrap_or_default();
-            if spinner_phase.is_some() {
-                self.spinner_indices.insert(index);
-            } else {
-                self.spinner_indices.remove(&index);
-            }
-            if self.entries[index]
-                .as_ref()
-                .is_none_or(|cached| cached.visual_height != visual_height)
-            {
+        for index in immediate_indices {
+            let (height_changed, rebuilt) = self.prepare_entry(
+                index,
+                messages,
+                revisions,
+                theme,
+                width,
+                syntax_theme_revision,
+                tick,
+                force_expand,
+                theme_identity,
+                &mut build_message,
+            );
+            if height_changed {
                 first_height_change = Some(
                     first_height_change
                         .map(|earliest| earliest.min(index))
                         .unwrap_or(index),
                 );
             }
-            self.entries[index] = Some(CachedMessage {
-                revision,
+            rebuilt_any |= rebuilt;
+            if let Some(schedule) = &mut self.reflow_schedule {
+                schedule.pending_indices.remove(&index);
+            }
+        }
+
+        let reflow_started = Instant::now();
+        let mut budgeted_entries = 0usize;
+        loop {
+            if reflow_entry_budget.is_some_and(|budget| budgeted_entries >= budget)
+                || (reflow_window.is_some()
+                    && reflow_entry_budget.is_none()
+                    && budgeted_entries > 0
+                    && reflow_started.elapsed() >= Duration::from_millis(5))
+            {
+                break;
+            }
+            let Some(index) = self
+                .reflow_schedule
+                .as_ref()
+                .and_then(|schedule| schedule.pending_indices.first().copied())
+            else {
+                break;
+            };
+            let (height_changed, rebuilt) = self.prepare_entry(
+                index,
+                messages,
+                revisions,
+                theme,
                 width,
-                theme: theme_identity,
                 syntax_theme_revision,
+                tick,
                 force_expand,
-                spinner_phase,
-                wrapped_lines,
-                line_cumulative_heights,
-                visual_height,
-            });
+                theme_identity,
+                &mut build_message,
+            );
+            if height_changed {
+                first_height_change = Some(
+                    first_height_change
+                        .map(|earliest| earliest.min(index))
+                        .unwrap_or(index),
+                );
+            }
+            rebuilt_any |= rebuilt;
+            budgeted_entries += 1;
+            if let Some(schedule) = &mut self.reflow_schedule {
+                schedule.pending_indices.remove(&index);
+            }
         }
 
         if self.cumulative_heights.len() != self.entries.len() + 1 {
@@ -757,6 +874,210 @@ impl TranscriptRenderCache {
         }
         if rebuilt_any {
             self.bump_content_generation();
+        }
+        let adjusted_scroll = self
+            .reflow_schedule
+            .as_ref()
+            .and_then(|schedule| schedule.anchor)
+            .and_then(|anchor| reflow_window.map(|window| self.scroll_for_anchor(window, anchor)));
+        if self
+            .reflow_schedule
+            .as_ref()
+            .is_some_and(|schedule| schedule.pending_indices.is_empty())
+        {
+            self.reflow_schedule = None;
+        }
+        TranscriptPrepareOutcome { adjusted_scroll }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_entry<F>(
+        &mut self,
+        index: usize,
+        messages: &[ChatMessage],
+        revisions: &[u64],
+        theme: &Theme,
+        width: usize,
+        syntax_theme_revision: u64,
+        tick: u64,
+        force_expand: bool,
+        theme_identity: ThemeIdentity,
+        build_message: &mut F,
+    ) -> (bool, bool)
+    where
+        F: FnMut(usize, &ChatMessage, &Theme, usize, u64, bool) -> Vec<Line<'static>>,
+    {
+        let Some(message) = messages.get(index) else {
+            return (false, false);
+        };
+        #[cfg(test)]
+        {
+            self.last_prepare_visited += 1;
+        }
+        let revision = revisions.get(index).copied().unwrap_or_default();
+        let spinner_phase = message_spinner_phase(message, tick);
+        if self.entries[index].as_mut().is_some_and(|cached| {
+            cached.patch_spinner(
+                revision,
+                width,
+                theme_identity,
+                syntax_theme_revision,
+                force_expand,
+                spinner_phase,
+            )
+        }) {
+            return (false, false);
+        }
+        if self.entries[index].as_ref().is_some_and(|cached| {
+            cached.matches(
+                revision,
+                width,
+                theme_identity,
+                syntax_theme_revision,
+                force_expand,
+                spinner_phase,
+            )
+        }) {
+            return (false, false);
+        }
+
+        let lines = build_message(index, message, theme, width, tick, force_expand);
+        let ratatui_width = width.min(u16::MAX as usize) as u16;
+        let wrapped_lines = lines
+            .iter()
+            .map(|line| wrap_line_ratatui_compatible(line, ratatui_width))
+            .collect::<Vec<_>>();
+        let mut line_cumulative_heights: Vec<usize> = Vec::with_capacity(wrapped_lines.len() + 1);
+        line_cumulative_heights.push(0);
+        for line in &wrapped_lines {
+            let next = line_cumulative_heights
+                .last()
+                .copied()
+                .unwrap_or_default()
+                .saturating_add(line.row_count());
+            line_cumulative_heights.push(next);
+        }
+        let visual_height = line_cumulative_heights.last().copied().unwrap_or_default();
+        if spinner_phase.is_some() {
+            self.spinner_indices.insert(index);
+        } else {
+            self.spinner_indices.remove(&index);
+        }
+        let height_changed = self.entries[index]
+            .as_ref()
+            .is_none_or(|cached| cached.visual_height != visual_height);
+        self.next_search_generation = next_generation(self.next_search_generation);
+        self.entries[index] = Some(CachedMessage {
+            search_generation: self.next_search_generation,
+            revision,
+            width,
+            theme: theme_identity,
+            syntax_theme_revision,
+            force_expand,
+            spinner_phase,
+            wrapped_lines,
+            line_cumulative_heights,
+            visual_height,
+        });
+        (height_changed, true)
+    }
+
+    fn visible_message_range(&self, window: ReflowWindow) -> (usize, usize) {
+        let message_count = self.entries.len();
+        let live_start = window.first_retained_message.min(message_count);
+        if live_start == message_count || window.visible_height == 0 {
+            return (live_start, live_start);
+        }
+        let base_height = self
+            .cumulative_heights
+            .get(live_start)
+            .copied()
+            .unwrap_or_default();
+        let absolute_total = self.cumulative_heights.last().copied().unwrap_or_default();
+        let total_height = absolute_total.saturating_sub(base_height);
+        let scroll_offset = window
+            .requested_scroll
+            .min(total_height.saturating_sub(window.visible_height));
+        let absolute_scroll = base_height.saturating_add(scroll_offset);
+        let absolute_end = absolute_scroll
+            .saturating_add(window.visible_height)
+            .min(absolute_total);
+        let first_visible = self.cumulative_heights[..message_count]
+            .partition_point(|height| *height <= absolute_scroll)
+            .saturating_sub(1)
+            .max(live_start)
+            .min(message_count - 1);
+        let last_visible = self.cumulative_heights[..message_count]
+            .partition_point(|height| *height < absolute_end)
+            .max(first_visible + 1)
+            .min(message_count);
+        (first_visible, last_visible)
+    }
+
+    fn reflow_anchor(&self, window: ReflowWindow) -> Option<ReflowAnchor> {
+        if window.requested_scroll == usize::MAX {
+            return None;
+        }
+        let (message_index, _) = self.visible_message_range(window);
+        let cached = self.entries.get(message_index)?.as_ref()?;
+        let live_start = window.first_retained_message.min(self.entries.len());
+        let base_height = self
+            .cumulative_heights
+            .get(live_start)
+            .copied()
+            .unwrap_or_default();
+        let absolute_total = self.cumulative_heights.last().copied().unwrap_or_default();
+        let total_height = absolute_total.saturating_sub(base_height);
+        let scroll_offset = window
+            .requested_scroll
+            .min(total_height.saturating_sub(window.visible_height));
+        let absolute_scroll = base_height.saturating_add(scroll_offset);
+        Some(ReflowAnchor {
+            message_index,
+            row_within_message: absolute_scroll
+                .saturating_sub(self.cumulative_heights[message_index])
+                .min(cached.visual_height.saturating_sub(1)),
+        })
+    }
+
+    fn scroll_for_anchor(&self, window: ReflowWindow, anchor: ReflowAnchor) -> usize {
+        let live_start = window.first_retained_message.min(self.entries.len());
+        let base_height = self
+            .cumulative_heights
+            .get(live_start)
+            .copied()
+            .unwrap_or_default();
+        let message_start = self
+            .cumulative_heights
+            .get(anchor.message_index)
+            .copied()
+            .unwrap_or(base_height);
+        let row_within = self
+            .entries
+            .get(anchor.message_index)
+            .and_then(Option::as_ref)
+            .map(|cached| {
+                anchor
+                    .row_within_message
+                    .min(cached.visual_height.saturating_sub(1))
+            })
+            .unwrap_or_default();
+        message_start
+            .saturating_add(row_within)
+            .saturating_sub(base_height)
+    }
+
+    #[cfg(test)]
+    fn reflow_pending_for_test(&self) -> bool {
+        self.reflow_schedule
+            .as_ref()
+            .is_some_and(|schedule| !schedule.pending_indices.is_empty())
+    }
+
+    fn reset_reflow_after_structural_change(&mut self) {
+        if let Some(schedule) = &mut self.reflow_schedule {
+            schedule.pending_indices = (0..self.entries.len()).collect();
+            schedule.anchor = None;
         }
     }
 
@@ -2213,6 +2534,57 @@ mod tests {
     }
 
     #[test]
+    fn transcript_search_ignores_unchanged_render_frames_and_rescans_only_changed_entries() {
+        let messages = (0..5_000)
+            .map(|index| ChatMessage::System(format!("message {index} needle")))
+            .collect::<Vec<_>>();
+        let mut revisions = (1..=5_000).collect::<Vec<u64>>();
+        let mut cache = TranscriptRenderCache::default();
+        let theme = theme();
+        cache.prepare(
+            &messages,
+            &revisions,
+            TranscriptRenderContext::new(&theme, 80, 0, false),
+            |_, message, _, _, _, _| match message {
+                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                _ => unreachable!(),
+            },
+        );
+
+        let mut search = TranscriptSearchState::default();
+        search.open_new();
+        search.replace_query("needle");
+        search.refresh_with(cache.content_generation(), 0, |query| {
+            cache.search(0, query)
+        });
+        assert_eq!(cache.last_search_lines_visited(), 5_000);
+
+        for _ in 0..100 {
+            search.refresh_with(cache.content_generation(), 0, |_| unreachable!());
+        }
+        assert_eq!(search.scan_count_for_test(), 1);
+
+        revisions[4_999] += 1;
+        cache.invalidate(4_999);
+        cache.prepare(
+            &messages,
+            &revisions,
+            TranscriptRenderContext::new(&theme, 80, 0, false),
+            |_, message, _, _, _, _| match message {
+                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                _ => unreachable!(),
+            },
+        );
+        search.refresh_with(cache.content_generation(), 0, |query| {
+            cache.search(0, query)
+        });
+
+        assert_eq!(cache.last_search_lines_visited(), 1);
+        assert_eq!(search.scan_count_for_test(), 2);
+        assert_eq!(search.match_count(), 5_000);
+    }
+
+    #[test]
     fn thousand_streaming_blocks_rebuild_only_the_active_tail() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = AppState::new(
@@ -2713,5 +3085,84 @@ mod tests {
         assert_eq!(parses.get(), 1);
         assert!(narrow.total_height > wide_height);
         assert_eq!(narrow.scroll_offset, narrow.total_height.saturating_sub(5));
+    }
+
+    #[test]
+    fn transcript_reflow_is_budgeted_and_converges() {
+        let messages = (0..5_000)
+            .map(|index| {
+                ChatMessage::System(format!(
+                    "message {index}: {}",
+                    "content that changes wrapped height ".repeat(3)
+                ))
+            })
+            .collect::<Vec<_>>();
+        let revisions = (1..=5_000).collect::<Vec<u64>>();
+        let theme = theme();
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(
+            &messages,
+            &revisions,
+            TranscriptRenderContext::new(&theme, 80, 0, false),
+            |_, message, _, _, _, _| match message {
+                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                _ => unreachable!(),
+            },
+        );
+
+        let visible_height = 12;
+        let mut requested_scroll = cache.cumulative_heights[2_500];
+        let anchor_message = cache
+            .viewport(0, requested_scroll, visible_height)
+            .first_message;
+        let mut calls = 0;
+        loop {
+            let visible_before = cache
+                .viewport(0, requested_scroll, visible_height)
+                .rendered_message_count;
+            let adjusted = cache.prepare(
+                &messages,
+                &revisions,
+                TranscriptRenderContext::new(&theme, 20, 0, false)
+                    .with_reflow_window(0, requested_scroll, visible_height)
+                    .with_reflow_entry_budget(32),
+                |_, message, _, _, _, _| match message {
+                    ChatMessage::System(text) => vec![Line::from(text.clone())],
+                    _ => unreachable!(),
+                },
+            );
+            requested_scroll = adjusted.adjusted_scroll.unwrap_or(requested_scroll);
+            assert!(
+                cache.last_prepare_visited() <= visible_before + 32,
+                "visited {} entries with {visible_before} visible",
+                cache.last_prepare_visited()
+            );
+            assert_eq!(
+                cache
+                    .viewport(0, requested_scroll, visible_height)
+                    .first_message,
+                anchor_message
+            );
+            calls += 1;
+            if !cache.reflow_pending_for_test() {
+                break;
+            }
+            assert!(calls < 200, "budgeted reflow did not converge");
+        }
+
+        let mut unlimited = TranscriptRenderCache::default();
+        unlimited.prepare(
+            &messages,
+            &revisions,
+            TranscriptRenderContext::new(&theme, 20, 0, false),
+            |_, message, _, _, _, _| match message {
+                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                _ => unreachable!(),
+            },
+        );
+        assert_eq!(
+            cache.viewport(0, 0, usize::MAX).total_height,
+            unlimited.viewport(0, 0, usize::MAX).total_height
+        );
     }
 }
