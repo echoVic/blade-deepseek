@@ -912,11 +912,11 @@ git commit -m "refactor(runtime): extract capability and goal controllers"
 - Test: crates/orca-runtime/tests/runtime_host.rs
 - Test: crates/orca-runtime/tests/runtime_surface_commit.rs
 
-- [ ] **Step 1: Add traces**
+- [x] **Step 1: Add traces**
 
 Trace background admission/completion/stop, workflow updates, commit prepare/settle/retry, injected failures, cancellation, and terminalization. Capture typed outputs and durable records.
 
-- [ ] **Step 2: Define owned shapes**
+- [x] **Step 2: Define owned shapes**
 
 ~~~rust
 pub(crate) struct BackgroundOperationController {
@@ -930,22 +930,22 @@ pub(crate) struct SurfaceCommitController {
 }
 ~~~
 
-- [ ] **Step 3: Move background ownership**
+- [x] **Step 3: Move background ownership**
 
 Move background methods and associated pending fields. TaskRegistry remains canonical; the component owns actor-side pending state and effects.
 
-- [ ] **Step 4: Move commit ownership**
+- [x] **Step 4: Move commit ownership**
 
 Move commit preparation, waiter settlement, retry, terminalization, and pending fields. Storage writes stay behind the surface commit boundary.
 
-- [ ] **Step 5: Verify parity**
+- [x] **Step 5: Verify parity**
 
 ~~~sh
 cargo test -p orca-runtime --test runtime_host background_controller_trace_equivalence -- --nocapture
 cargo test -p orca-runtime --test runtime_surface_commit commit_controller_trace_equivalence -- --nocapture
 ~~~
 
-- [ ] **Step 6: Measure and commit**
+- [x] **Step 6: Measure and commit**
 
 Record production method/field/line counts in the evidence ledger without making the approximate 8k-line target a correctness gate.
 
