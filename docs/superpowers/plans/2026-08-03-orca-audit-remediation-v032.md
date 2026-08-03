@@ -609,11 +609,11 @@ pass.
 - Test: crates/orca-tui/src/app.rs
 - Test: tests/history_contract.rs
 
-- [ ] **Step 1: Write rename persistence/projection tests**
+- [x] **Step 1: Write rename persistence/projection tests**
 
 Rename a live session, invoke announce_runtime_ready, and assert surface snapshot, disk, AppState, and terminal title retain the new value. Inject disk failure and assert visible title remains old.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 cargo test -p orca-tui hosted_rename_updates_surface_and_survives_runtime_ready --lib -- --test-threads=1
@@ -621,23 +621,23 @@ cargo test -p orca-tui hosted_rename_updates_surface_and_survives_runtime_ready 
 
 Expected: FAIL because rename currently updates only saved storage.
 
-- [ ] **Step 3: Implement revision-checked rename**
+- [x] **Step 3: Implement revision-checked rename**
 
 Read metadata revision, submit SessionMetadataPatch::SetTitle with Exact precondition, then persist through RuntimeSurfaceHostHandle. On disk failure, use a revision-checked compensating patch restoring the old title. Emit success only after both authorities agree.
 
-- [ ] **Step 4: Filter destructive picker actions**
+- [x] **Step 4: Filter destructive picker actions**
 
 Make picker actions a pure function of selected and active IDs. Archive/Delete are absent when IDs match, so confirmation cannot be entered.
 
-- [ ] **Step 5: Add phase/status rendering tests**
+- [x] **Step 5: Add phase/status rendering tests**
 
 Render Browsing, Actions, Renaming, ConfirmArchive, ConfirmDelete, and complete/unknown status at 80x24 and 40x12 with TestBackend. Assert expected text and no overflow.
 
-- [ ] **Step 6: Add durable archive/delete coverage**
+- [x] **Step 6: Add durable archive/delete coverage**
 
 In isolated Orca home, archive and delete non-active sessions, reload the store, and assert persistence plus captured-ID targeting.
 
-- [ ] **Step 7: Run GREEN and commit**
+- [x] **Step 7: Run GREEN and commit**
 
 ~~~sh
 cargo test -p orca-tui rename --lib -- --test-threads=1
