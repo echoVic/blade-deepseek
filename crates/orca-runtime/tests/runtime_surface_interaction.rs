@@ -34,8 +34,8 @@ use orca_runtime::runtime_host::{
     ThreadOperationOutcome,
 };
 use orca_runtime::runtime_permission::{RuntimePermissionRequest, RuntimePermissionResponse};
+use orca_runtime::surface::*;
 use orca_runtime::thread::RuntimeThread;
-use orca_runtime::unstable_surface::*;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);

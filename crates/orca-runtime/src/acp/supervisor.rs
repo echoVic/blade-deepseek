@@ -3601,7 +3601,7 @@ mod tests {
             assert_eq!(read_request["params"]["limit"], 3);
             let written_before_response = persisted_capability_is_written(
                 &transcript_path,
-                crate::unstable_surface::SurfaceCapabilityCallKind::ReadTextFile,
+                crate::surface::SurfaceCapabilityCallKind::ReadTextFile,
             );
             let read_id = read_request["id"].as_i64().expect("reverse request id");
             write_raw_response(
@@ -3951,7 +3951,7 @@ mod tests {
             assert_eq!(output_request["params"]["terminalId"], "terminal-observe");
             assert_persisted_capability_written(
                 &transcript_path,
-                crate::unstable_surface::SurfaceCapabilityCallKind::TerminalOutput,
+                crate::surface::SurfaceCapabilityCallKind::TerminalOutput,
             );
             assert!(
                 outcome_rx.try_recv().is_err(),
@@ -3977,11 +3977,11 @@ mod tests {
             assert_eq!(wait_request["params"]["terminalId"], "terminal-observe");
             assert_persisted_capability_written(
                 &transcript_path,
-                crate::unstable_surface::SurfaceCapabilityCallKind::TerminalWaitForExit,
+                crate::surface::SurfaceCapabilityCallKind::TerminalWaitForExit,
             );
             assert_persisted_terminal_observation(
                 &transcript_path,
-                crate::unstable_surface::SurfaceCapabilityCallKind::TerminalOutput,
+                crate::surface::SurfaceCapabilityCallKind::TerminalOutput,
             );
             assert!(
                 outcome_rx.try_recv().is_err(),
@@ -4002,7 +4002,7 @@ mod tests {
             };
             assert_persisted_terminal_observation(
                 &transcript_path,
-                crate::unstable_surface::SurfaceCapabilityCallKind::TerminalWaitForExit,
+                crate::surface::SurfaceCapabilityCallKind::TerminalWaitForExit,
             );
             write_raw_response(
                 &mut client_write,
@@ -4049,7 +4049,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local.block_on(&runtime, async {
             let at_limit = terminal_wait_signal_for_canonical_len(
-                crate::unstable_surface::ACP_CAPABILITY_RESULT_CANONICAL_BYTE_LIMIT as usize,
+                crate::surface::ACP_CAPABILITY_RESULT_CANONICAL_BYTE_LIMIT as usize,
             );
             let over_limit = format!("{at_limit}x");
             run_terminal_wait_boundary_case(at_limit, true).await;
@@ -4181,10 +4181,10 @@ mod tests {
     }
 
     fn terminal_wait_signal_for_canonical_len(target: usize) -> String {
-        let sample = crate::unstable_surface::CapabilityCallResult::TerminalExitObserved {
-            exit_status: crate::unstable_surface::SurfaceTerminalExitStatus {
+        let sample = crate::surface::CapabilityCallResult::TerminalExitObserved {
+            exit_status: crate::surface::SurfaceTerminalExitStatus {
                 exit_code: Some(0),
-                signal: Some(crate::unstable_surface::NonEmptyText::try_new("x").unwrap()),
+                signal: Some(crate::surface::NonEmptyText::try_new("x").unwrap()),
             },
         };
         let sample_len = serde_json::to_vec(&sample).unwrap().len();
@@ -4192,12 +4192,10 @@ mod tests {
             .checked_sub(sample_len - 1)
             .expect("canonical capability target exceeds fixed encoding overhead");
         let signal = "x".repeat(signal_len);
-        let result = crate::unstable_surface::CapabilityCallResult::TerminalExitObserved {
-            exit_status: crate::unstable_surface::SurfaceTerminalExitStatus {
+        let result = crate::surface::CapabilityCallResult::TerminalExitObserved {
+            exit_status: crate::surface::SurfaceTerminalExitStatus {
                 exit_code: Some(0),
-                signal: Some(
-                    crate::unstable_surface::NonEmptyText::try_new(signal.clone()).unwrap(),
-                ),
+                signal: Some(crate::surface::NonEmptyText::try_new(signal.clone()).unwrap()),
             },
         };
         assert_eq!(serde_json::to_vec(&result).unwrap().len(), target);
@@ -4349,7 +4347,7 @@ mod tests {
             );
             assert_persisted_terminal_cleanup_ambiguous(
                 &transcript_path,
-                crate::unstable_surface::ExternalEffectKind::TerminalRelease,
+                crate::surface::ExternalEffectKind::TerminalRelease,
                 &unresolved_terminal,
             );
             let _ = client_write.shutdown().await;
@@ -4457,14 +4455,14 @@ mod tests {
                             crate::surface::SurfaceEvent::Tool(
                                 crate::surface::ToolPatch::CapabilityCallChanged {
                                     call:
-                                        crate::unstable_surface::SurfaceCapabilityCall {
+                                        crate::surface::SurfaceCapabilityCall {
                                             call_id,
                                             kind:
-                                                crate::unstable_surface::SurfaceCapabilityCallKind::TerminalKill,
+                                                crate::surface::SurfaceCapabilityCallKind::TerminalKill,
                                             state:
-                                                crate::unstable_surface::SurfaceCapabilityCallState::Prepared
-                                                | crate::unstable_surface::SurfaceCapabilityCallState::DeliveryPossible
-                                                | crate::unstable_surface::SurfaceCapabilityCallState::WrittenAwaitingResponse,
+                                                crate::surface::SurfaceCapabilityCallState::Prepared
+                                                | crate::surface::SurfaceCapabilityCallState::DeliveryPossible
+                                                | crate::surface::SurfaceCapabilityCallState::WrittenAwaitingResponse,
                                             ..
                                         },
                                 },
@@ -4494,8 +4492,8 @@ mod tests {
                             crate::surface::ToolPatch::CapabilityCallChanged { call },
                         ) if matches!(
                             call.kind,
-                            crate::unstable_surface::SurfaceCapabilityCallKind::TerminalKill
-                                | crate::unstable_surface::SurfaceCapabilityCallKind::TerminalRelease
+                            crate::surface::SurfaceCapabilityCallKind::TerminalKill
+                                | crate::surface::SurfaceCapabilityCallKind::TerminalRelease
                         ) =>
                         {
                             Some(format!("call:{:?}:{:?}", call.call_id, call.state))
@@ -4529,9 +4527,9 @@ mod tests {
                     crate::surface::SurfaceEvent::Tool(
                         crate::surface::ToolPatch::RemoteTerminalLeaseChanged {
                             lease:
-                                crate::unstable_surface::SurfaceRemoteTerminalLease {
+                                crate::surface::SurfaceRemoteTerminalLease {
                                     state:
-                                        crate::unstable_surface::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
+                                        crate::surface::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
                                             terminal_id: Some(terminal_id),
                                             ..
                                         },
@@ -4552,7 +4550,7 @@ mod tests {
                         crate::surface::SurfaceEvent::Tool(
                             crate::surface::ToolPatch::Completed {
                                 result:
-                                    crate::unstable_surface::SurfaceToolResult {
+                                    crate::surface::SurfaceToolResult {
                                         tool_call_id,
                                         ..
                                     },
@@ -4568,9 +4566,9 @@ mod tests {
                     .filter(|event| matches!(
                         event,
                         crate::surface::SurfaceEvent::Item(
-                            crate::unstable_surface::ItemPatch::Added {
+                            crate::surface::ItemPatch::Added {
                                 item:
-                                    crate::unstable_surface::SurfaceItem::ToolResultMessage {
+                                    crate::surface::SurfaceItem::ToolResultMessage {
                                         tool_call_id,
                                         ..
                                     },
@@ -4691,7 +4689,7 @@ mod tests {
             );
             assert_persisted_terminal_cleanup_ambiguous(
                 &transcript_path,
-                crate::unstable_surface::ExternalEffectKind::TerminalKill,
+                crate::surface::ExternalEffectKind::TerminalKill,
                 "terminal-shutdown",
             );
             let _ = client_write.shutdown().await;
@@ -4793,9 +4791,9 @@ mod tests {
                             crate::surface::SurfaceEvent::Tool(
                                 crate::surface::ToolPatch::RemoteTerminalLeaseChanged {
                                     lease:
-                                        crate::unstable_surface::SurfaceRemoteTerminalLease {
+                                        crate::surface::SurfaceRemoteTerminalLease {
                                             state:
-                                                crate::unstable_surface::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
+                                                crate::surface::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
                                                     terminal_id: Some(terminal_id),
                                                     ..
                                                 },
@@ -4823,7 +4821,7 @@ mod tests {
             );
             assert_persisted_terminal_cleanup_ambiguous(
                 &transcript_path,
-                crate::unstable_surface::ExternalEffectKind::TerminalKill,
+                crate::surface::ExternalEffectKind::TerminalKill,
                 "terminal-live-shutdown",
             );
             let _ = client_write.shutdown().await;
@@ -4927,9 +4925,9 @@ mod tests {
                             crate::surface::SurfaceEvent::Tool(
                                 crate::surface::ToolPatch::RemoteTerminalLeaseChanged {
                                     lease:
-                                        crate::unstable_surface::SurfaceRemoteTerminalLease {
+                                        crate::surface::SurfaceRemoteTerminalLease {
                                             state:
-                                                crate::unstable_surface::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
+                                                crate::surface::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
                                                     terminal_id: Some(terminal_id),
                                                     ..
                                                 },
@@ -4970,7 +4968,7 @@ mod tests {
                         crate::surface::SurfaceEvent::Tool(
                             crate::surface::ToolPatch::Completed {
                                 result:
-                                    crate::unstable_surface::SurfaceToolResult {
+                                    crate::surface::SurfaceToolResult {
                                         tool_call_id,
                                         ..
                                     },
@@ -4985,9 +4983,9 @@ mod tests {
                     matches!(
                         event,
                         crate::surface::SurfaceEvent::Item(
-                            crate::unstable_surface::ItemPatch::Added {
+                            crate::surface::ItemPatch::Added {
                                 item:
-                                    crate::unstable_surface::SurfaceItem::ToolResultMessage {
+                                    crate::surface::SurfaceItem::ToolResultMessage {
                                         tool_call_id,
                                         ..
                                     },
@@ -5103,9 +5101,9 @@ mod tests {
                     }
                 };
                 assert_eq!(release_request["params"]["terminalId"], "terminal-loss");
-                crate::unstable_surface::ExternalEffectKind::TerminalRelease
+                crate::surface::ExternalEffectKind::TerminalRelease
             } else {
-                crate::unstable_surface::ExternalEffectKind::TerminalKill
+                crate::surface::ExternalEffectKind::TerminalKill
             };
             client_write.shutdown().await.unwrap();
             tokio::time::timeout(TEST_TIMEOUT, connection)
@@ -5343,13 +5341,13 @@ mod tests {
                 event,
                 crate::surface::SurfaceEvent::Tool(
                     crate::surface::ToolPatch::CapabilityCallChanged {
-                        call: crate::unstable_surface::SurfaceCapabilityCall {
+                        call: crate::surface::SurfaceCapabilityCall {
                             kind:
-                                crate::unstable_surface::SurfaceCapabilityCallKind::TerminalKill,
+                                crate::surface::SurfaceCapabilityCallKind::TerminalKill,
                             state:
-                                crate::unstable_surface::SurfaceCapabilityCallState::Completed {
+                                crate::surface::SurfaceCapabilityCallState::Completed {
                                     result:
-                                        crate::unstable_surface::CapabilityCallResult::TerminalKillAcknowledged,
+                                        crate::surface::CapabilityCallResult::TerminalKillAcknowledged,
                                     ..
                                 },
                             ..
@@ -5361,11 +5359,11 @@ mod tests {
                 event,
                 crate::surface::SurfaceEvent::Tool(
                     crate::surface::ToolPatch::CapabilityCallChanged {
-                        call: crate::unstable_surface::SurfaceCapabilityCall {
+                        call: crate::surface::SurfaceCapabilityCall {
                             state:
-                                crate::unstable_surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                                crate::surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
                                     effect_kind:
-                                        crate::unstable_surface::ExternalEffectKind::TerminalKill,
+                                        crate::surface::ExternalEffectKind::TerminalKill,
                                     ..
                                 },
                             ..
@@ -5375,7 +5373,7 @@ mod tests {
             )));
             assert_persisted_terminal_cleanup_ambiguous(
                 &transcript_path,
-                crate::unstable_surface::ExternalEffectKind::TerminalRelease,
+                crate::surface::ExternalEffectKind::TerminalRelease,
                 "terminal-flush-race",
             );
         });
@@ -6118,7 +6116,7 @@ mod tests {
             );
             assert_persisted_terminal_observation(
                 &transcript_path,
-                crate::unstable_surface::SurfaceCapabilityCallKind::TerminalOutput,
+                crate::surface::SurfaceCapabilityCallKind::TerminalOutput,
             );
 
             client_write.shutdown().await.unwrap();
@@ -6248,9 +6246,9 @@ mod tests {
             matches!(
                 event,
                 crate::surface::SurfaceEvent::Tool(crate::surface::ToolPatch::Completed {
-                    result: crate::unstable_surface::SurfaceToolResult {
-                        terminal: crate::unstable_surface::SurfaceToolTerminal {
-                            kind: crate::unstable_surface::SurfaceToolResultKind::ExternalEffectAmbiguous,
+                    result: crate::surface::SurfaceToolResult {
+                        terminal: crate::surface::SurfaceToolTerminal {
+                            kind: crate::surface::SurfaceToolResultKind::ExternalEffectAmbiguous,
                             ..
                         },
                         ..
@@ -6264,8 +6262,8 @@ mod tests {
                 crate::surface::SurfaceEvent::Operation(
                     crate::surface::OperationPatch::GenerationStopped {
                         reason:
-                            crate::unstable_surface::GenerationStopReason::ExecutionFailed {
-                                class: crate::unstable_surface::GenerationExecutionFailureClass::ExternalEffectAmbiguous,
+                            crate::surface::GenerationStopReason::ExecutionFailed {
+                                class: crate::surface::GenerationExecutionFailureClass::ExternalEffectAmbiguous,
                                 ..
                             },
                         ..
@@ -6277,7 +6275,7 @@ mod tests {
             matches!(
                 event,
                 crate::surface::SurfaceEvent::Operation(crate::surface::OperationPatch::Terminal {
-                    record: crate::unstable_surface::OperationTerminalRecord {
+                    record: crate::surface::OperationTerminalRecord {
                         terminal: crate::surface::OperationTerminal::Failed {
                             class: crate::surface::FailureClass::ExternalEffectAmbiguous,
                             ..
@@ -6296,13 +6294,13 @@ mod tests {
                 event,
                 crate::surface::SurfaceEvent::Tool(
                     crate::surface::ToolPatch::CapabilityCallChanged {
-                        call: crate::unstable_surface::SurfaceCapabilityCall {
+                        call: crate::surface::SurfaceCapabilityCall {
                             kind:
-                                crate::unstable_surface::SurfaceCapabilityCallKind::TerminalCreate,
+                                crate::surface::SurfaceCapabilityCallKind::TerminalCreate,
                             state:
-                                crate::unstable_surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                                crate::surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
                                     effect_kind:
-                                        crate::unstable_surface::ExternalEffectKind::TerminalCreate,
+                                        crate::surface::ExternalEffectKind::TerminalCreate,
                                     ..
                                 },
                             ..
@@ -6311,14 +6309,15 @@ mod tests {
                 )
             )
         }));
-        assert!(events.iter().any(|event| {
-            matches!(
+        assert!(
+            events.iter().any(|event| {
+                matches!(
                 event,
                 crate::surface::SurfaceEvent::Tool(
                     crate::surface::ToolPatch::RemoteTerminalLeaseChanged {
-                        lease: crate::unstable_surface::SurfaceRemoteTerminalLease {
+                        lease: crate::surface::SurfaceRemoteTerminalLease {
                             state:
-                                crate::unstable_surface::SurfaceRemoteTerminalLeaseState::IdentityUnknown {
+                                crate::surface::SurfaceRemoteTerminalLeaseState::IdentityUnknown {
                                     ..
                                 },
                             ..
@@ -6326,13 +6325,14 @@ mod tests {
                     },
                 )
             )
-        }));
+            })
+        );
         assert_persisted_external_effect_ambiguity(path);
     }
 
     fn assert_persisted_terminal_observation(
         path: &std::path::Path,
-        expected_kind: crate::unstable_surface::SurfaceCapabilityCallKind,
+        expected_kind: crate::surface::SurfaceCapabilityCallKind,
     ) {
         let events = persisted_surface_events(path);
         assert!(events.iter().any(|event| {
@@ -6340,13 +6340,13 @@ mod tests {
                 event,
                 crate::surface::SurfaceEvent::Tool(
                     crate::surface::ToolPatch::CapabilityCallChanged {
-                        call: crate::unstable_surface::SurfaceCapabilityCall {
+                        call: crate::surface::SurfaceCapabilityCall {
                             kind,
                             state:
-                                crate::unstable_surface::SurfaceCapabilityCallState::Completed {
+                                crate::surface::SurfaceCapabilityCallState::Completed {
                                     ..
                                 }
-                                | crate::unstable_surface::SurfaceCapabilityCallState::ObservationUnavailable {
+                                | crate::surface::SurfaceCapabilityCallState::ObservationUnavailable {
                                     ..
                                 },
                             ..
@@ -6364,9 +6364,9 @@ mod tests {
                 event,
                 crate::surface::SurfaceEvent::Tool(
                     crate::surface::ToolPatch::CapabilityCallChanged {
-                        call: crate::unstable_surface::SurfaceCapabilityCall {
-                            kind: crate::unstable_surface::SurfaceCapabilityCallKind::TerminalWaitForExit,
-                            state: crate::unstable_surface::SurfaceCapabilityCallState::Completed { .. },
+                        call: crate::surface::SurfaceCapabilityCall {
+                            kind: crate::surface::SurfaceCapabilityCallKind::TerminalWaitForExit,
+                            state: crate::surface::SurfaceCapabilityCallState::Completed { .. },
                             ..
                         },
                     },
@@ -6376,11 +6376,11 @@ mod tests {
                     event,
                     crate::surface::SurfaceEvent::Tool(
                         crate::surface::ToolPatch::CapabilityCallChanged {
-                            call: crate::unstable_surface::SurfaceCapabilityCall {
-                                kind: crate::unstable_surface::SurfaceCapabilityCallKind::TerminalWaitForExit,
+                            call: crate::surface::SurfaceCapabilityCall {
+                                kind: crate::surface::SurfaceCapabilityCallKind::TerminalWaitForExit,
                                 state:
-                                    crate::unstable_surface::SurfaceCapabilityCallState::Completed { .. }
-                                    | crate::unstable_surface::SurfaceCapabilityCallState::ObservationUnavailable { .. },
+                                    crate::surface::SurfaceCapabilityCallState::Completed { .. }
+                                    | crate::surface::SurfaceCapabilityCallState::ObservationUnavailable { .. },
                                 ..
                             },
                         },
@@ -6391,14 +6391,14 @@ mod tests {
 
     fn assert_persisted_capability_written(
         path: &std::path::Path,
-        expected_kind: crate::unstable_surface::SurfaceCapabilityCallKind,
+        expected_kind: crate::surface::SurfaceCapabilityCallKind,
     ) {
         assert!(persisted_capability_is_written(path, expected_kind));
     }
 
     fn persisted_capability_is_written(
         path: &std::path::Path,
-        expected_kind: crate::unstable_surface::SurfaceCapabilityCallKind,
+        expected_kind: crate::surface::SurfaceCapabilityCallKind,
     ) -> bool {
         let events = persisted_surface_events(path);
         events.iter().any(|event| {
@@ -6406,10 +6406,10 @@ mod tests {
                 event,
                 crate::surface::SurfaceEvent::Tool(
                     crate::surface::ToolPatch::CapabilityCallChanged {
-                        call: crate::unstable_surface::SurfaceCapabilityCall {
+                        call: crate::surface::SurfaceCapabilityCall {
                             kind,
                             state:
-                                crate::unstable_surface::SurfaceCapabilityCallState::WrittenAwaitingResponse,
+                                crate::surface::SurfaceCapabilityCallState::WrittenAwaitingResponse,
                             ..
                         },
                     },
@@ -6425,13 +6425,13 @@ mod tests {
                 event,
                 crate::surface::SurfaceEvent::Tool(
                     crate::surface::ToolPatch::CapabilityCallChanged {
-                        call: crate::unstable_surface::SurfaceCapabilityCall {
+                        call: crate::surface::SurfaceCapabilityCall {
                             kind:
-                                crate::unstable_surface::SurfaceCapabilityCallKind::TerminalCreate,
+                                crate::surface::SurfaceCapabilityCallKind::TerminalCreate,
                             state:
-                                crate::unstable_surface::SurfaceCapabilityCallState::Completed {
+                                crate::surface::SurfaceCapabilityCallState::Completed {
                                     result:
-                                        crate::unstable_surface::CapabilityCallResult::TerminalCreated {
+                                        crate::surface::CapabilityCallResult::TerminalCreated {
                                             terminal_id,
                                         },
                                     ..
@@ -6447,9 +6447,9 @@ mod tests {
                 event,
                 crate::surface::SurfaceEvent::Tool(
                     crate::surface::ToolPatch::RemoteTerminalLeaseChanged {
-                        lease: crate::unstable_surface::SurfaceRemoteTerminalLease {
+                        lease: crate::surface::SurfaceRemoteTerminalLease {
                             state:
-                                crate::unstable_surface::SurfaceRemoteTerminalLeaseState::Live {
+                                crate::surface::SurfaceRemoteTerminalLeaseState::Live {
                                     terminal_id,
                                     ..
                                 },
@@ -6464,9 +6464,8 @@ mod tests {
                 event,
                 crate::surface::SurfaceEvent::Tool(
                     crate::surface::ToolPatch::RemoteTerminalLeaseChanged {
-                        lease: crate::unstable_surface::SurfaceRemoteTerminalLease {
-                            state:
-                                crate::unstable_surface::SurfaceRemoteTerminalLeaseState::Released,
+                        lease: crate::surface::SurfaceRemoteTerminalLease {
+                            state: crate::surface::SurfaceRemoteTerminalLeaseState::Released,
                             ..
                         },
                     },
@@ -6477,7 +6476,7 @@ mod tests {
 
     fn assert_persisted_terminal_cleanup_ambiguous(
         path: &std::path::Path,
-        expected_effect: crate::unstable_surface::ExternalEffectKind,
+        expected_effect: crate::surface::ExternalEffectKind,
         expected_terminal_id: &str,
     ) {
         let events = persisted_surface_events(path);
@@ -6486,9 +6485,9 @@ mod tests {
                 event,
                 crate::surface::SurfaceEvent::Tool(
                     crate::surface::ToolPatch::CapabilityCallChanged {
-                        call: crate::unstable_surface::SurfaceCapabilityCall {
+                        call: crate::surface::SurfaceCapabilityCall {
                             state:
-                                crate::unstable_surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                                crate::surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
                                     effect_kind,
                                     ..
                                 },
@@ -6503,9 +6502,9 @@ mod tests {
                 event,
                 crate::surface::SurfaceEvent::Tool(
                     crate::surface::ToolPatch::RemoteTerminalLeaseChanged {
-                        lease: crate::unstable_surface::SurfaceRemoteTerminalLease {
+                        lease: crate::surface::SurfaceRemoteTerminalLease {
                             state:
-                                crate::unstable_surface::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
+                                crate::surface::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
                                     terminal_id: Some(terminal_id),
                                     ..
                                 },

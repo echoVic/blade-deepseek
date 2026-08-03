@@ -1298,9 +1298,7 @@ mod tests {
         SurfaceIncarnation, SurfaceInputCorrelationId, SurfaceItemId, SurfaceScope,
         SurfaceThreadId, SurfaceTurnId, ThreadOwnerEpoch,
     };
-    use orca_runtime::unstable_surface::{
-        SurfaceGenerationId, SurfaceUsageSnapshot, UsageRevision,
-    };
+    use orca_runtime::surface::{SurfaceGenerationId, SurfaceUsageSnapshot, UsageRevision};
 
     fn uuid_v7_bytes(seed: u8) -> [u8; 16] {
         let mut bytes = [seed; 16];

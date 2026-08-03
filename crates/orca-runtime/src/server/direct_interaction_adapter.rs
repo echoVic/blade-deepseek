@@ -8,7 +8,7 @@ use super::opaque_permission_router::{
     JsonlRequestTombstone, JsonlResponseDigest, JsonlRetiredRequestOwner,
     JsonlRetiredRequestSettlement, jsonl_response_digest,
 };
-use crate::unstable_surface::{
+use crate::surface::{
     DeferredMutation, MutationReply, RuntimeSurfaceClientHandle, SurfaceClientInteractionAnswer,
     SurfaceInteractionId, SurfaceMcpElicitationDecision, SurfaceRequestId,
     SurfaceUserInputDecision,
@@ -57,8 +57,8 @@ enum JsonlDirectPublicationState {
 enum JsonlDirectInteractionState {
     Routed,
     CommittedPending {
-        request_id: crate::unstable_surface::SurfaceRequestId,
-        commit_id: crate::unstable_surface::SurfaceCommitId,
+        request_id: crate::surface::SurfaceRequestId,
+        commit_id: crate::surface::SurfaceCommitId,
         response_digest: JsonlResponseDigest,
     },
 }
@@ -210,8 +210,8 @@ impl<T: Clone> JsonlDirectInteractionAdapter<T> {
     fn mark_committed_pending_witness(
         &self,
         request_id: &str,
-        mutation_request_id: crate::unstable_surface::SurfaceRequestId,
-        commit_id: crate::unstable_surface::SurfaceCommitId,
+        mutation_request_id: crate::surface::SurfaceRequestId,
+        commit_id: crate::surface::SurfaceCommitId,
         response_digest: JsonlResponseDigest,
     ) -> io::Result<()> {
         let mut routes = self.routes.lock().map_err(lock_error)?;
@@ -452,7 +452,7 @@ mod tests {
 
     fn admission() -> JsonlConnectionAdmission {
         JsonlConnectionAdmission::new(
-            crate::unstable_surface::SurfaceConnectionId::try_from_bytes([
+            crate::surface::SurfaceConnectionId::try_from_bytes([
                 1, 159, 161, 19, 220, 41, 112, 211, 145, 70, 17, 0, 120, 212, 79, 247,
             ])
             .unwrap(),
@@ -472,8 +472,8 @@ mod tests {
         adapter
             .mark_committed_pending_witness(
                 "user-input",
-                crate::unstable_surface::SurfaceRequestId::new(),
-                crate::unstable_surface::SurfaceCommitId::try_from_bytes([
+                crate::surface::SurfaceRequestId::new(),
+                crate::surface::SurfaceCommitId::try_from_bytes([
                     1, 159, 161, 19, 220, 41, 112, 211, 145, 70, 17, 0, 120, 212, 79, 248,
                 ])
                 .unwrap(),

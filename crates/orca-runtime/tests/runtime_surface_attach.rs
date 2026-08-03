@@ -1,4 +1,4 @@
-use orca_runtime::unstable_surface::*;
+use orca_runtime::surface::*;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::thread;

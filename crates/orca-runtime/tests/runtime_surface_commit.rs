@@ -1,4 +1,4 @@
-use orca_runtime::unstable_surface::*;
+use orca_runtime::surface::*;
 use sha2::Digest;
 
 const MANIFEST: &str = include_str!(concat!(

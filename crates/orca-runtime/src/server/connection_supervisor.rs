@@ -2,9 +2,7 @@ use std::io;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::unstable_surface::{
-    JSONL_COMMITTED_REPAIR_DRAIN_DEADLINE_MS, JSONL_SUPERVISOR_JOIN_DEADLINE_MS,
-};
+use crate::surface::{JSONL_COMMITTED_REPAIR_DRAIN_DEADLINE_MS, JSONL_SUPERVISOR_JOIN_DEADLINE_MS};
 
 use super::JsonlSurfaceAdapter;
 use super::command_exec_manager::CommandExecManager;

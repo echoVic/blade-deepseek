@@ -11,6 +11,8 @@ const {
   assertNoProductionRuntimeSurfaceSiblingGlobs,
   parseManifestText,
   parseRuntimeSurfacePublicExports,
+  parseSurfaceFacadeExports,
+  unstableSurfaceReferenceLines,
   validateArtifactBundle,
   validateArtifactDigest,
   validateCurrentInventories,
@@ -68,6 +70,17 @@ assert.deepEqual(
 assert.deepEqual(parseRuntimeSurfacePublicExports("pub use host::RuntimeHost;"), {
   host: ["RuntimeHost"],
 });
+assert.deepEqual(
+  parseSurfaceFacadeExports(
+    "pub mod surface { pub use crate::runtime_surface::{SurfaceCursor, SurfaceEvent}; }",
+  ),
+  ["SurfaceCursor", "SurfaceEvent"],
+);
+expectFailure(
+  "wildcard surface facade exports are rejected",
+  () => parseSurfaceFacadeExports("pub use crate::runtime_surface::*;"),
+  /facade exports must be explicit/,
+);
 
 expectFailure(
   "production sibling globs are rejected",
@@ -79,6 +92,13 @@ assert.doesNotThrow(() =>
     "#[cfg(test)]\nmod tests { use super::*; }",
     "commands",
   ),
+);
+
+assert.deepEqual(
+  unstableSurfaceReferenceLines(
+    "// unstable_surface in a comment\nconst NAME: &str = \"unstable_surface\";\nuse crate::unstable_surface::SurfaceCursor;",
+  ),
+  [3],
 );
 
 function appSourceOverride(extraSource) {

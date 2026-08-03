@@ -55,6 +55,8 @@ pub(crate) mod runtime_special;
 pub mod runtime_state;
 mod runtime_steer;
 mod runtime_subagent_call;
+// The reviewed contract includes surface types exercised by external consumers and fixtures.
+#[allow(dead_code, unused_imports)]
 mod runtime_surface;
 
 /// Curated public access to runtime-owned surface types.
@@ -64,53 +66,234 @@ mod runtime_surface;
 /// ```compile_fail
 /// use orca_runtime::runtime_surface::SurfaceCursor;
 /// ```
+///
+/// Authority-bearing values intentionally keep construction, fields, and debug output
+/// private:
+///
+/// ```compile_fail
+/// fn requires_debug<T: std::fmt::Debug>() {}
+/// requires_debug::<orca_runtime::surface::AuthorityFingerprint>();
+/// ```
+///
+/// ```compile_fail
+/// fn leak(value: &orca_runtime::surface::AuthorityFingerprint) {
+///     let _ = &value.operation_id;
+/// }
+/// ```
+///
+/// Reservation leases can be decoded and inspected but not minted by consumers:
+///
+/// ```compile_fail
+/// let _ = orca_runtime::surface::ReservationLease::new;
+/// ```
 pub mod surface {
     pub use crate::runtime_surface::{
-        AcpRequestId, AdmissionOutput, AssistantChannel, AssistantPatch, AttachResult,
-        BackgroundTarget, ByteCount, ByteOffset, CancelOperationOutput, CanonicalMime,
-        CanonicalPath, CanonicalUri, CommitClass, CompactionReason, CompactionState,
-        ContextRevision, CursorSourceRevision, DeferredCommandValue, DetachRequest, DetachResult,
-        DisplayText, DurableRevision, ExpectedGoal, FailureClass, FreshAttachRequest,
-        FreshSurfaceAttachment, GoalMutationAction, GoalMutationOutput, GoalPatch, GoalRunInput,
-        GoalTokenBudgetUpdate, InteractionPatch, LegacyTurnId, MaintenanceOperationOutput,
-        MutationDisposition, MutationReply, NonEmptyText, NonEmptyVec, NotAdmittedReason,
-        OperationBudget, OperationIngressCorrelation, OperationKind, OperationPatch,
-        OperationRequestIntent, OperationSettingsPreparation, OperationTerminal,
-        PermissionGrantScope, PinnedContextAction, PinnedContextMutationOutput, PinnedContextPatch,
-        PinnedContextRevision, PinnedContextSourceRevision, PinnedUserRevision,
-        ProviderReplayHealth, ReplayabilityRequest, RuntimeSettingsPatch,
-        RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceHostHandle,
-        RuntimeSurfaceThreadHandle, SequenceNumber, SessionMetadataPatch,
-        SessionMetadataPrecondition, Set, Sha256Digest, SnapshotAtCursor, SurfaceAllowDeny,
-        SurfaceApprovalMode, SurfaceAssistantStream, SurfaceAssistantStreamState,
-        SurfaceAttachmentId, SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId,
-        SurfaceClientCommandError, SurfaceClientInteractionAnswer, SurfaceCommitBatch,
-        SurfaceCommitId, SurfaceCompletedModelResponse, SurfaceConnectionId,
+        ACP_CAPABILITY_CALL_DEADLINE_MS, ACP_CAPABILITY_IDENTIFIER_BYTE_LIMIT,
+        ACP_CAPABILITY_RESULT_CANONICAL_BYTE_LIMIT, ACP_CAPABILITY_TEXT_BYTE_LIMIT,
+        ACP_INGRESS_BYTE_LIMIT, ACP_INGRESS_MESSAGE_LIMIT, ACP_LOAD_GATE_BYTE_LIMIT,
+        ACP_LOAD_GATE_MESSAGE_LIMIT, ACP_MAX_INBOUND_LINE_BYTES, ACP_MAX_OUTBOUND_FRAME_BYTES,
+        ACP_OUTGOING_BYTE_LIMIT, ACP_OUTGOING_MESSAGE_LIMIT, ACP_PROMPT_GATE_BYTE_LIMIT,
+        ACP_PROMPT_GATE_MESSAGE_LIMIT, ACP_REVERSE_REQUEST_DEADLINE_MS,
+        ACP_SUPERVISOR_JOIN_DEADLINE_MS, ACP_TERMINAL_KILL_DEADLINE_MS,
+        ACP_TERMINAL_RELEASE_DEADLINE_MS, ACP_TOMBSTONE_LIMIT, ACP_TOMBSTONE_TTL_MS,
+        ACP_WRITE_FLUSH_DEADLINE_MS, AcpCapabilityIdentifier, AcpCapabilityText, AcpRequestId,
+        AcpStandardCapabilitySet, AdmissionOutput, AdmissionRejectionReason, AdmittedInput,
+        ApplicableAuthorityFingerprint, AssistantChannel, AssistantDiscardReason, AssistantPatch,
+        AttachDeniedReason, AttachResult, AuthorityFingerprint, BackgroundTarget,
+        BootstrapCredentialRevision, BoundInteractionResponse, BrokerInteractionAnswerPolicy,
+        BrokerInteractionRequestRecord, BrokerInteractionResponseRecord,
+        BrokerInteractionResponseRoute, BrokerInteractionWaitResult, BrokerResponsePayload,
+        BusyDisposition, ByteCount, ByteOffset, CancelOperationOutput, CancelReason,
+        CancelSessionCurrentResult, CanonicalDomainName, CanonicalMime, CanonicalPath,
+        CanonicalUri, CapabilityCallResult, CapabilityRevision, CloseThreadOutput,
+        ClosedThreadReceipt, CommitClass, CommitFailedMutationError, CommitProbe,
+        CommittedMutation, CompactionReason, CompactionState, ContextRevision,
+        CreateThreadMaterialization, CreateThreadOutput, CursorAttachRequest, CursorSourceRevision,
+        CursorSurfaceAttachment, DeferredCommandValue, DeferredMutation, DeferredMutationState,
+        DeferredRepair, Denied, DetachRequest, DetachResult, DetachRevocationReceipt,
+        DiscardedContinuation, DisplayText, DurableBatchReceipt, DurableFinalizeIntent,
+        DurableRevision, DurationMillis, EphemeralBatchReceipt, EphemeralThreadPersistence,
+        ExclusiveOwnerLease, ExpectedAbsentSubagentRevision, ExpectedGoal, ExternalEffectKind,
+        ExternalSettlementStore, FailureClass, FileChangeKind, FinalizationDegradedCause,
+        FinalizationStartedAtCursor, FinalizerPhaseClass, FinalizingDegradedState, FiniteF64,
+        FirstOperationCompletionPolicy, FolderTrustLevel, FolderTrustMutationOutput,
+        FolderTrustRead, ForkThreadMaterialization, ForkThreadOutput, FreshAttachRequest,
+        FreshSurfaceAttachment, GenerationAttempt, GenerationCompletionStatus,
+        GenerationExecutionFailureClass, GenerationInputState, GenerationPhase, GenerationRecord,
+        GenerationStartedWitness, GenerationStopReason, GoalCatalogRevision,
+        GoalContinuationAdmitReason, GoalContinuationDecision, GoalContinuationStopReason,
+        GoalIntentRejectionCode, GoalMutationAction, GoalMutationOutput, GoalObjectiveRevision,
+        GoalOuterTurnNextAction, GoalOuterTurnOrigin, GoalOuterTurnStatus, GoalOwnerEpoch,
+        GoalPatch, GoalPatchEnvelope, GoalPredecessorStatus, GoalRevision, GoalRunInput,
+        GoalTokenBudget, GoalTokenBudgetUpdate, GoalUsage, HostDomainKind, HostDomainReceipt,
+        HostIncarnation, HostLifecycleRevision, HostMonotonicClockId, HostReceiptAckRequirement,
+        HostReceiptIdentityPair, HostReceiptRequirementIdentity, HostRevisionWitness,
+        ImmutableShutdownLedger, InMemorySurfaceCommitLedger, InjectedRuntimeClock,
+        InputCatalogContext, InputCatalogCursor, InputCatalogQuery, InputCatalogRevision,
+        InputResolutionErrorCode, InteractionCancelReason, InteractionExpiryAuthorityFailure,
+        InteractionExpiryDeadline, InteractionPatch, InteractionRevision, InteractionSelector,
+        InteractionUnavailableDisposition, InterruptOutput, InterruptSettlement, InvalidCursor,
+        InvalidCursorReason, InvalidMutationError, ItemPatch, ItemRemovalReason,
+        JSONL_COMMITTED_REPAIR_DRAIN_DEADLINE_MS, JSONL_LIVE_REQUEST_LIMIT,
+        JSONL_REPAIR_AUTHORITY_LIMIT, JSONL_REQUEST_TOMBSTONE_LIMIT,
+        JSONL_REQUEST_TOMBSTONE_TTL_MS, JSONL_SUPERVISOR_JOIN_DEADLINE_MS,
+        JsonlIdleTurnControlStatus, JsonlIdleTurnControlWireEcho, JsonlResolvedTurnControlStatus,
+        JsonlResolvedTurnControlWireEcho, JsonlSurfaceCommitLedger, JsonlSurfaceControlLedger,
+        JsonlTurnControlAction, JsonlTurnControlResult, JsonlTurnControlWireAction,
+        JsonlTurnControlledOutput, LastUserTurn, LegacyJsonlPageCursor, LegacyTurnId,
+        LegacyVisibility, LiveCapsuleStatus, LiveOnly, LiveOperationCapsule, LiveRevision,
+        LoadThreadMaterialization, LoadThreadOutput, LoadThreadRecovery,
+        MaintenanceOperationOutput, ManualCompactionReason, MaterializationCause, McpCatalogCursor,
+        McpCatalogFamily, McpCatalogPage, McpCatalogPageValues, McpCatalogPatch, McpCatalogQuery,
+        McpCatalogRevision, MemoryMutationOutput, MemoryPinPendingState, MemoryPinResult,
+        MemoryRevision, MemoryScope, MissingFinalizationDeferredState, MonotonicInstant,
+        MonotonicTick, MutationAckRequirement, MutationCommitAck, MutationDegradedState,
+        MutationDisposition, MutationMemoryScope, MutationReply, MutationTarget, NegativeI64,
+        NonEmptySet, NonEmptyText, NonEmptyVec, NonReplayableReason, NotAdmittedReason,
+        NotStartedReason, OpaqueToken, OpenThreadMaterialization, OpenThreadMode, OpenThreadOutput,
+        OperationBudget, OperationFinalizationCause, OperationFinalizationRecord,
+        OperationFinalizerSource, OperationIngressCorrelation, OperationIntent,
+        OperationJoinSettlementSource, OperationKind, OperationOrigin, OperationPatch,
+        OperationPhase, OperationRecord, OperationRequestIntent, OperationSettingsPreparation,
+        OperationSettingsPreparationReceipt, OperationTerminal, OperationTerminalAckRequirement,
+        OperationTerminalAtCursor, OperationTerminalRecord, OperationWaiterHandle,
+        OptionalProcessLocalCancel, OwnerAckPendingState, OwnerLeaseError, OwnerLeaseKind,
+        PauseGoalOperationOutput, PauseGoalOutput, PendingControlIntent, PermissionGrantScope,
+        PinnedContextAction, PinnedContextMutationOutput, PinnedContextPatch,
+        PinnedContextRevision, PinnedContextSourceRevision, PinnedFileRevision,
+        PinnedSystemRevision, PinnedUserRevision, PlanRevision, PolicyEpoch, PolicyOwnerLease,
+        PolicyRevocationBarrierPlan, PolicyRevocationPendingState, PolicyRevocationSubject,
+        PreparedSurfaceCommit, ProcessLeaseWitness, ProjectRootMemoryRevision,
+        ProjectionDegradedState, ProviderReplayHealth, ReadSessionMetadataOutput,
+        ReconcileFolderTrustRevocationToken, ReconcileHostMutationOutput,
+        ReconcileHostMutationToken, ReconcileHostSettlementToken, ReconcileMemoryMutationToken,
+        ReconcileMutationToken, ReconcileShutdownToken, RecoveredSurfaceBatches, RecoveryAction,
+        RecoveryDegradedCause, RecoveryMaterialization, RecoveryReplayability, RecoverySourcePhase,
+        Replayability, ReplayabilityClass, ReplayabilityRequest, ReservationFinalizerReason,
+        ReservationFinalizerSource, ReservationLease, ReservedOperationOutput,
+        ResolveRunningThreadOutput, RespondInteractionDisposition, RespondInteractionOutput,
+        ResponseRouteEpoch, ResumeLatestGoalOutput, ResumeOperationOutput, ResumeSourceWitness,
+        ResumeTransitionReceipt, ResumeTransitionRole, RetainedMutationReplay,
+        RetainedShutdownOutput, RetryFinalizationToken, RetryLocalProjectionToken,
+        RetryProjectionSelector, RetryProjectionToken, RetryRemoteProjectionToken,
+        RetryStartCommitToken, Revision, Rfc3339Timestamp, RunningSurfaceSubagent,
+        RuntimeCommitCoordinator, RuntimeProviderResponseIngress, RuntimeSettingsExpectedRevision,
+        RuntimeSettingsMutationOutput, RuntimeSettingsPatch, RuntimeSettingsRead,
+        RuntimeSettingsTarget, RuntimeSurfaceClientHandle, RuntimeSurfaceHandle,
+        RuntimeSurfaceHostHandle, RuntimeSurfaceMutationResult, RuntimeSurfaceThreadHandle,
+        RuntimeWorkflowFinished, RuntimeWorkflowIngressReceipt, RuntimeWorkflowLifecycleIngress,
+        RuntimeWorkflowOutcome, RuntimeWorkflowStarted, SAFE_DIAGNOSTIC_TEXT_BYTE_LIMIT,
+        SURFACE_COMMIT_BATCH_BYTE_LIMIT, SURFACE_COMMIT_BATCH_EVENT_LIMIT,
+        SURFACE_RESERVATION_LEASE_MS, SURFACE_RETAINED_BYTE_LIMIT, SURFACE_RETAINED_EVENT_LIMIT,
+        SURFACE_SUBSCRIBER_BYTE_LIMIT, SURFACE_SUBSCRIBER_EVENT_LIMIT, SafeDiagnosticText,
+        SecretReference, SequenceNumber, SessionCatalogCursor, SessionCatalogRevision,
+        SessionHealthRevision, SessionListArchiveFilter, SessionListFilter,
+        SessionMetadataMutationOutput, SessionMetadataPatch, SessionMetadataPrecondition,
+        SessionMetadataRevision, SessionPageRequest, SessionPatch, SessionReadToken,
+        SessionRelationFilter, SessionSearchArchiveFilter, SessionSearchRequest, SessionSetFilter,
+        SessionSortKey, Set, SettingsMutationOutput, SettingsPatch, SettingsRevision,
+        SettlementError, Sha256Digest, ShutdownBarrierPlan, ShutdownBarrierRecord,
+        ShutdownBarrierState, ShutdownDeferredState, ShutdownHostOutput, ShutdownMissing,
+        ShutdownOperationPlan, ShutdownOperationSourcePhase, ShutdownPlanError,
+        ShutdownRequestCause, ShutdownScope, ShutdownSelectedCause, ShutdownThreadPlan,
+        ShutdownThreadRequirement, SnapshotAtCursor, SnapshotRequired, SnapshotRequiredReason,
+        SortDirection, StaleLiveCapsuleDescriptor, StaleMutationError, StartCommitDegradedState,
+        SteerOutput, StoreProviderCredential, StoreProviderCredentialError,
+        StoreProviderCredentialResult, SubagentPatch, SubagentRevision,
+        SurfaceActivePermissionProfile, SurfaceAdditionalWorkingDirectory, SurfaceAdmissionLeaseId,
+        SurfaceAgentLoopTurn, SurfaceAllowDeny, SurfaceApprovalMode, SurfaceAssistantMessageItem,
+        SurfaceAssistantPlanItem, SurfaceAssistantReasoningItem, SurfaceAssistantStream,
+        SurfaceAssistantStreamState, SurfaceAttachAuthority, SurfaceAttachmentCapabilities,
+        SurfaceAttachmentGrant, SurfaceAttachmentId, SurfaceAttachmentRole, SurfaceBackgroundFence,
+        SurfaceBackgroundOperation, SurfaceBackgroundOwnerToken, SurfaceBatchReceipt,
+        SurfaceBlocker, SurfaceBlockerKind, SurfaceBoundCaller, SurfaceCapability,
+        SurfaceCapabilityCall, SurfaceCapabilityCallId, SurfaceCapabilityCallKind,
+        SurfaceCapabilityCallState, SurfaceCatalogEntry, SurfaceCatalogEntryId,
+        SurfaceClientCommandError, SurfaceClientInteractionAnswer, SurfaceCommand,
+        SurfaceCommitApplied, SurfaceCommitBatch, SurfaceCommitBatchPreflightErrorCode,
+        SurfaceCommitBatchPreflightResult, SurfaceCommitError, SurfaceCommitId,
+        SurfaceCommitLedger, SurfaceCompletedModelResponse, SurfaceConnectionId,
+        SurfaceContextFragment, SurfaceContextFragmentKind, SurfaceContextFragmentOrigin,
         SurfaceContextSnapshot, SurfaceCursor, SurfaceDataProperty, SurfaceDataValue, SurfaceEvent,
-        SurfaceEventEnvelope, SurfaceEventId, SurfaceFileChange, SurfaceGoal, SurfaceGoalFence,
-        SurfaceGoalPauseReason, SurfaceGoalReceiptState, SurfaceGoalState,
-        SurfaceHistoryAssistantRole, SurfaceHistoryId, SurfaceHistoryMessage,
-        SurfaceHistorySystemRole, SurfaceHistoryToolRole, SurfaceHistoryUserRole,
-        SurfaceIncarnation, SurfaceInput, SurfaceInputBlock, SurfaceInputCorrelationId,
+        SurfaceEventEnvelope, SurfaceEventId, SurfaceEvidenceItem, SurfaceEvidenceKind,
+        SurfaceFactFamily, SurfaceFileChange, SurfaceFileSystemPermissionProfile,
+        SurfaceFinalizeIntentId, SurfaceFolderTrustReceipt, SurfaceGenerationId, SurfaceGoal,
+        SurfaceGoalCloseReason, SurfaceGoalClosedRunReceipt, SurfaceGoalFence, SurfaceGoalGap,
+        SurfaceGoalGenerationIdentity, SurfaceGoalId, SurfaceGoalIntent, SurfaceGoalIntentAck,
+        SurfaceGoalIntentId, SurfaceGoalNoLiveRun, SurfaceGoalOuterTurnId,
+        SurfaceGoalOuterTurnReceipt, SurfaceGoalOuterTurnReceiptOrigin, SurfaceGoalPauseReason,
+        SurfaceGoalReceiptState, SurfaceGoalRun, SurfaceGoalRunId, SurfaceGoalRunOrigin,
+        SurfaceGoalRunPhase, SurfaceGoalRunReceipt, SurfaceGoalState, SurfaceGoalStoreReceipt,
+        SurfaceGoalTransition, SurfaceGoalVerification, SurfaceHealthClearProof,
+        SurfaceHealthIssue, SurfaceHealthIssueId, SurfaceHistoryAssistantRole,
+        SurfaceHistoryFileChange, SurfaceHistoryId, SurfaceHistoryItem, SurfaceHistoryItemEntry,
+        SurfaceHistoryMessage, SurfaceHistoryRole, SurfaceHistoryRunningStatus,
+        SurfaceHistoryStatus, SurfaceHistorySystemRole, SurfaceHistoryTerminalStatus,
+        SurfaceHistoryToolKind, SurfaceHistoryToolRole, SurfaceHistoryTurn, SurfaceHistoryUserRole,
+        SurfaceHostBoundCaller, SurfaceHostCommand, SurfaceHostShutdownReceipt,
+        SurfaceHostShutdownStage, SurfaceHub, SurfaceHubBindError, SurfaceHubConfig,
+        SurfaceHubCreateError, SurfaceIncarnation, SurfaceInput, SurfaceInputBinding,
+        SurfaceInputBindingKind, SurfaceInputBindingRequest, SurfaceInputBlock,
+        SurfaceInputCatalogEntry, SurfaceInputCatalogPage, SurfaceInputCorrelationId,
         SurfaceInputPresentation, SurfaceInputRequest, SurfaceInputRequestBlock,
         SurfaceInteractionId, SurfaceInteractionKind, SurfaceInteractionLifecycle,
-        SurfaceInteractionRequest, SurfaceInteractionRoute, SurfaceInteractionView, SurfaceItem,
-        SurfaceItemId, SurfaceItemOrigin, SurfaceMcpElicitationDecision,
-        SurfaceMcpElicitationRequest, SurfaceOperationFence, SurfaceOperationId,
-        SurfacePermissionClientDecision, SurfacePermissionProfile, SurfacePinnedContextEntry,
-        SurfacePinnedContextKind, SurfacePlanStatus, SurfaceReasoningEffort,
-        SurfaceRecoverableOperation, SurfaceReduceMode, SurfaceReduceResult,
-        SurfaceReducerErrorCode, SurfaceReducerState, SurfaceRequestId, SurfaceResolvedInputFact,
-        SurfaceScope, SurfaceSettingsSnapshot, SurfaceShutdownReason, SurfaceSnapshot,
-        SurfaceStreamId, SurfaceSubscriptionHandle, SurfaceSubscriptionItem,
-        SurfaceSubscriptionReceiver, SurfaceTask, SurfaceTaskFence, SurfaceTaskId,
-        SurfaceTaskStatus, SurfaceTaskType, SurfaceThreadId, SurfaceToolAction, SurfaceToolRequest,
-        SurfaceToolResultKind, SurfaceTurnId, SurfaceUnavailableReason, SurfaceUserInputDecision,
-        SurfaceUserInputState, SurfaceWorkflow, SurfaceWorkflowAgentStatus, SurfaceWorkflowRunId,
-        SurfaceWorkflowStatus, TaskControlAction, TaskControlOutput, TaskPatch, ThreadOwnerEpoch,
-        ToolPatch, TransferBackgroundOutput, TurnRequestBudgetScope, UncommittedMutation,
-        UnixMillis, UsageTotals, WaitOperationTerminalResult, WorkflowCatalogRevision,
-        WorkflowControlAction, WorkflowControlOutput, WorkflowPatch, reduce_batch,
+        SurfaceInteractionRequest, SurfaceInteractionResolutionReceipt, SurfaceInteractionRoute,
+        SurfaceInteractionSafeProjection, SurfaceInteractionView, SurfaceInternalOriginPermit,
+        SurfaceItem, SurfaceItemId, SurfaceItemOrigin, SurfaceLedgerError,
+        SurfaceLegacyMentionKind, SurfaceLegacyMentionTarget, SurfaceLegacyPath, SurfaceLegacyUri,
+        SurfaceMcpCatalogDiagnostic, SurfaceMcpCatalogDiagnosticCode, SurfaceMcpCatalogEntryKind,
+        SurfaceMcpCatalogSnapshot, SurfaceMcpElicitationDecision, SurfaceMcpElicitationRequest,
+        SurfaceMcpResource, SurfaceMcpResourceTemplate, SurfaceMcpServerDeclaration,
+        SurfaceMcpServerStatus, SurfaceMcpTool, SurfaceMcpTransport, SurfaceMcpValue,
+        SurfaceMemoryReceipt, SurfaceMutationError, SurfaceMutationErrorCode,
+        SurfaceMutationRevision, SurfaceNetworkDomainAccess, SurfaceNetworkDomainPermission,
+        SurfaceNetworkPermissions, SurfaceOperationFence, SurfaceOperationId, SurfacePageLimit,
+        SurfacePermissionClientDecision, SurfacePermissionDecision, SurfacePermissionDomainPattern,
+        SurfacePermissionNetworkProfile, SurfacePermissionPathLabel, SurfacePermissionProfile,
+        SurfacePermissionRule, SurfacePermissionRuleSelector, SurfacePermissionRuleSet,
+        SurfacePermissionUpdate, SurfacePinnedContextEntry, SurfacePinnedContextKind,
+        SurfacePinnedContextSnapshot, SurfacePlanItem, SurfacePlanPriority, SurfacePlanSnapshot,
+        SurfacePlanStatus, SurfaceProjectionContext, SurfacePublisherPermit,
+        SurfacePublisherPermitId, SurfaceRawToolCall, SurfaceReadError, SurfaceReadErrorClass,
+        SurfaceReadErrorCode, SurfaceReadResult, SurfaceReadRevision, SurfaceReasoningEffort,
+        SurfaceRecoverableOperation, SurfaceReduceMode, SurfaceReduceResult, SurfaceReducerError,
+        SurfaceReducerErrorCode, SurfaceReducerErrorLocation, SurfaceReducerState,
+        SurfaceRemoteTerminalId, SurfaceRemoteTerminalLease, SurfaceRemoteTerminalLeaseState,
+        SurfaceRequestId, SurfaceResolvedInputFact, SurfaceResponseGrantToken, SurfaceResponseId,
+        SurfaceResponseReceiptId, SurfaceResponseToken, SurfaceRuntimeSettings,
+        SurfaceRuntimeSettingsReceipt, SurfaceSchema, SurfaceSchemaInteger, SurfaceSchemaProperty,
+        SurfaceScope, SurfaceSessionCatalogAction, SurfaceSessionCatalogReceipt,
+        SurfaceSessionHealth, SurfaceSessionMetadata, SurfaceSessionMetadataReceipt,
+        SurfaceSessionPageCursor, SurfaceSessionReadBundle, SurfaceSessionSearchHit,
+        SurfaceSessionSearchPage, SurfaceSessionSummary, SurfaceSessionSummaryPage,
+        SurfaceSettingsDestination, SurfaceSettingsSnapshot, SurfaceSettlementId,
+        SurfaceSettlementReceipt, SurfaceShellPermissionProfile, SurfaceShutdownReason,
+        SurfaceSnapshot, SurfaceStreamId, SurfaceSubagent, SurfaceSubagentId,
+        SurfaceSubagentStatus, SurfaceSubagentTerminalStatus, SurfaceSubscriptionHandle,
+        SurfaceSubscriptionItem, SurfaceSubscriptionReceiver, SurfaceSubscriptionSealReason,
+        SurfaceTask, SurfaceTaskFence, SurfaceTaskId, SurfaceTaskRunningStatus, SurfaceTaskStatus,
+        SurfaceTaskType, SurfaceTerminalExitStatus, SurfaceThreadCreateSpec, SurfaceThreadId,
+        SurfaceThreadPage, SurfaceThreadPageCursor, SurfaceThreadSnapshot, SurfaceToolAction,
+        SurfaceToolCallId, SurfaceToolRequest, SurfaceToolResult, SurfaceToolResultKind,
+        SurfaceToolTerminal, SurfaceToolView, SurfaceToolViewState, SurfaceTurnId,
+        SurfaceUnavailableReason, SurfaceUsageSnapshot, SurfaceUserInputDecision,
+        SurfaceUserInputState, SurfaceValueError, SurfaceVerificationResult, SurfaceWorkflow,
+        SurfaceWorkflowAgent, SurfaceWorkflowAgentStatus, SurfaceWorkflowFence,
+        SurfaceWorkflowPhase, SurfaceWorkflowResult, SurfaceWorkflowResultId,
+        SurfaceWorkflowResultStatus, SurfaceWorkflowRunId, SurfaceWorkflowStatus,
+        SuspendedFinalizationCause, SuspensionCause, TaskControlAction, TaskControlOutput,
+        TaskPatch, TaskRevision, TerminalProjectionDeferredState, TerminalizationCause,
+        ThreadCursorAckRequirement, ThreadItemTurnFilter, ThreadOwnerEpoch, ThreadOwnershipLease,
+        ThreadPageCursor, ThreadPageQuery, ThreadPersistence, ThreadSettingsReceipt,
+        ToolInvocationStarted, ToolPatch, ToolTerminalSource, TransferBackgroundOutput,
+        TrustRevision, TurnItemsView, TurnRequestBudgetScope, UnavailableMutationError,
+        UncommittedMutation, Unit, UnixMillis, UsageRevision, UsageTotals, Uuid, UuidV7,
+        ValidatedInteractionResponse, WaitOperationTerminalRequest, WaitOperationTerminalResult,
+        WorkflowCatalogRevision, WorkflowControlAction, WorkflowControlOutput, WorkflowPatch,
+        WorkflowRevision, ZeroizingProcessLocalSecret, canonical_batch_digest,
+        canonical_batch_encoded_bytes, canonical_event_digest, canonical_replayability_digest,
+        decide_post_materialization_recovery, preflight_batch, reconcile_finalize_intent,
+        reduce_batch, select_shutdown_cause,
     };
 }
 mod runtime_tool_actor;
@@ -145,31 +328,6 @@ pub mod update_check;
 pub mod workflow;
 pub mod workflow_execution;
 pub mod worktree;
-
-pub mod unstable_surface {
-    //! Compatibility access to runtime-surface types that are not in the curated facade.
-    //!
-    //! Authority-bearing values intentionally keep construction, fields, and debug output
-    //! private:
-    //!
-    //! ```compile_fail
-    //! fn requires_debug<T: std::fmt::Debug>() {}
-    //! requires_debug::<orca_runtime::unstable_surface::AuthorityFingerprint>();
-    //! ```
-    //!
-    //! ```compile_fail
-    //! fn leak(value: &orca_runtime::unstable_surface::AuthorityFingerprint) {
-    //!     let _ = &value.operation_id;
-    //! }
-    //! ```
-    //!
-    //! Reservation leases can be decoded and inspected but not minted by consumers:
-    //!
-    //! ```compile_fail
-    //! let _ = orca_runtime::unstable_surface::ReservationLease::new;
-    //! ```
-    pub use crate::runtime_surface::*;
-}
 
 #[cfg(test)]
 mod tests {

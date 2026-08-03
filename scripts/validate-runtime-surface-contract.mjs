@@ -28,6 +28,11 @@ const RUNTIME_SURFACE_MODULES = [
   "reducer",
   "store",
 ];
+const UNSTABLE_SURFACE_SOURCE_ROOTS = [
+  "crates/orca-runtime/src",
+  "crates/orca-runtime/tests",
+  "crates/orca-tui/src",
+];
 
 const TABLES = {
   source_fact_columns: "source_facts",
@@ -2499,6 +2504,31 @@ export function parseRuntimeSurfacePublicExports(source) {
   return exportsByModule;
 }
 
+export function parseSurfaceFacadeExports(source) {
+  const code = maskRustNonCode(source);
+  const declaration = /\bpub\s+use\s+crate::runtime_surface::\s*\{/.exec(code);
+  if (!declaration) {
+    if (/\bpub\s+use\s+crate::runtime_surface::\s*\*/.test(code)) {
+      fail("surface facade exports must be explicit");
+    }
+    fail("surface facade export declaration is missing");
+  }
+  const bodyStart = declaration.index + declaration[0].lastIndexOf("{");
+  const bodyEnd = matchingBraceEnd(code, bodyStart, "surface facade export");
+  const names = code
+    .slice(bodyStart + 1, bodyEnd - 1)
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+  for (const name of names) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      fail(`surface facade export ${name} is not an exact identifier`);
+    }
+  }
+  assertUnique(names, "surface facade exports");
+  return names;
+}
+
 export function assertNoProductionRuntimeSurfaceSiblingGlobs(source, moduleName) {
   const production = maskCfgTestItems(source);
   for (const declaration of rustUseDeclarations(production)) {
@@ -2533,8 +2563,7 @@ function validateSourceReference(repoRoot, reference, label, sourceOverrides) {
   };
 }
 
-function tuiRustSourcePaths(repoRoot) {
-  const sourceRoot = path.join(repoRoot, "crates/orca-tui/src");
+function rustSourcePaths(repoRoot, sourceRoots) {
   const paths = [];
   const visit = (directory) => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -2545,8 +2574,35 @@ function tuiRustSourcePaths(repoRoot) {
       }
     }
   };
-  visit(sourceRoot);
+  for (const sourceRoot of sourceRoots) visit(path.join(repoRoot, sourceRoot));
   return paths.sort();
+}
+
+function tuiRustSourcePaths(repoRoot) {
+  return rustSourcePaths(repoRoot, ["crates/orca-tui/src"]);
+}
+
+export function unstableSurfaceReferenceLines(source) {
+  const code = maskRustNonCode(source);
+  const references = [];
+  for (const match of code.matchAll(/\bunstable_surface\b/g)) {
+    references.push(code.slice(0, match.index).split("\n").length);
+  }
+  return references;
+}
+
+function validateNoUnstableSurfaceReferences(repoRoot, sourceOverrides) {
+  const references = [];
+  for (const relativePath of rustSourcePaths(repoRoot, UNSTABLE_SURFACE_SOURCE_ROOTS)) {
+    for (const line of unstableSurfaceReferenceLines(
+      readRepoSource(repoRoot, relativePath, sourceOverrides),
+    )) {
+      references.push(`${relativePath}:${line}`);
+    }
+  }
+  if (references.length > 0) {
+    fail(`unstable_surface references must be removed:\n${references.join("\n")}`);
+  }
 }
 
 function cfgPredicateTokens(predicate) {
@@ -3691,6 +3747,18 @@ function validateTuiMutationScan(repoRoot, sourceOverrides) {
 }
 
 export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides }) {
+  validateNoUnstableSurfaceReferences(repoRoot, sourceOverrides);
+
+  assertExactArray(
+    parseSurfaceFacadeExports(
+      readRepoSource(repoRoot, "crates/orca-runtime/src/lib.rs", sourceOverrides),
+    ),
+    RUNTIME_SURFACE_MODULES.flatMap(
+      (moduleName) => manifest.runtime_surface_public_exports[moduleName],
+    ).sort(),
+    "current surface facade exports",
+  );
+
   const runtimeSurfaceModulePath = "crates/orca-runtime/src/runtime_surface/mod.rs";
   const runtimeSurfaceExports = parseRuntimeSurfacePublicExports(
     readRepoSource(repoRoot, runtimeSurfaceModulePath, sourceOverrides),

@@ -73,19 +73,19 @@ fn run_user_input_respond<W: Write>(
     };
     let answered = answer.is_some();
     let decision = match answer {
-        Some(answer) => crate::unstable_surface::SurfaceUserInputDecision::Answer(
-            crate::unstable_surface::DisplayText::new(answer),
+        Some(answer) => crate::surface::SurfaceUserInputDecision::Answer(
+            crate::surface::DisplayText::new(answer),
         ),
-        None => crate::unstable_surface::SurfaceUserInputDecision::Cancel,
+        None => crate::surface::SurfaceUserInputDecision::Cancel,
     };
-    let response_request_id = crate::unstable_surface::SurfaceRequestId::new();
+    let response_request_id = crate::surface::SurfaceRequestId::new();
     match pending.0.respond_interaction_by_id(
         response_request_id,
         pending.1,
-        crate::unstable_surface::SurfaceClientInteractionAnswer::UserInput { decision },
+        crate::surface::SurfaceClientInteractionAnswer::UserInput { decision },
     ) {
-        Ok(crate::unstable_surface::MutationReply::Committed { .. }) => {}
-        Ok(crate::unstable_surface::MutationReply::Deferred { mutation, .. }) => {
+        Ok(crate::surface::MutationReply::Committed { .. }) => {}
+        Ok(crate::surface::MutationReply::Deferred { mutation, .. }) => {
             state.direct_interactions.mark_committed_pending(
                 request_id,
                 &mutation,
@@ -99,7 +99,7 @@ fn run_user_input_respond<W: Write>(
                 )),
             );
         }
-        Ok(crate::unstable_surface::MutationReply::Uncommitted { .. }) | Err(_) => {
+        Ok(crate::surface::MutationReply::Uncommitted { .. }) | Err(_) => {
             return protocol::write_server_event(
                 writer,
                 &id,
