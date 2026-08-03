@@ -76,8 +76,10 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.2":
+        "Fixes a crash when Orca is launched through the npm wrapper (node stdio:inherit sets O_NONBLOCK on inherited terminal fds). Orca now clears non-blocking flags at startup and wraps stdout with an EAGAIN/EINTR retry writer, eliminating os error 35 during rapid terminal resize on macOS. Also adds reasoning effort low for DeepSeek V4, with correct thinking configuration and default max_tokens in API requests.",
       "v0.3.1":
-        "Orca now has a complete session lifecycle in the TUI. /resume is the single saved-session entry point, with resume, fork, rename, archive, delete and session-ID copy actions in one picker. /new starts a clean conversation, /fork preserves the current context in a new durable session, /rename updates the active session, /status reports the current runtime state and /copy copies a finalized assistant response. Recoverable operations use an explicit Continue or Cancel prompt, and exit prints the exact orca --resume command for returning later.",
+        "Orca now has a complete session lifecycle in the TUI. /resume is the single saved-session entry point, with resume, fork, rename, archive, delete and session-ID copy actions in one picker. /new starts a clean conversation, /fork preserves the current context in a new durable session, /rename updates the active session, /status reports the current runtime state and /copy copies a finalized assistant response. Recoverable operations use an explicit Continue or Cancel prompt, and exit prints the exact orca --resume command for returning later. Reasoning effort now supports low alongside medium and high, matching DeepSeek V4 parameter requirements with correct thinking configuration and default max_tokens. The npm wrapper startup crash caused by inherited O_NONBLOCK terminal file descriptors is fixed: Orca clears non-blocking flags at startup and wraps stdout with an EAGAIN/EINTR retry writer.",
       "v0.3.0":
         "Orca now ships native Windows x64 and ARM64 support across the CLI, TUI, shell sessions, sandboxing, updates, persistence, npm packages and GitHub release archives. PowerShell 7, Windows PowerShell and cmd.exe resolve through explicit dialect-aware commands; ConPTY provides interactive terminal sessions; AltGr input, clipboard access, process-tree cleanup, atomic replacement and cross-process locks follow Windows semantics. The PowerShell installer verifies checksums, installs the runtime plus sandbox helpers and can provision, repair or remove the per-workspace sandbox capability. Native x64 and ARM64 CI run the platform contracts and full workspace tests before release.",
       "v0.2.56":
@@ -560,6 +562,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.2":
+        "修复通过 npm 包装器启动时的崩溃问题（node stdio:inherit 会在继承的终端 fd 上设置 O_NONBLOCK）。Orca 现在在启动时清除非阻塞标记，并为 stdout 添加 EAGAIN/EINTR 重试写入器，消除 macOS 上快速调整终端窗口大小时的 os error 35。同时新增 DeepSeek V4 低思考强度支持，正确发送 thinking 配置和默认 max_tokens。",
       "v0.3.1":
         "Orca 的 TUI 现在具备完整的会话生命周期交互。/resume 是唯一的已保存会话入口，同一个选择器内支持恢复、分叉、重命名、归档、删除和复制 Session ID；/new 开启空白会话，/fork 将当前上下文复制到新的持久化会话，/rename 修改当前会话名称，/status 查看运行状态，/copy 复制已完成的 Assistant 回复。可恢复任务改为显式 Continue 或 Cancel，退出时会打印可直接返回当前会话的 orca --resume 命令。",
       "v0.3.0":
