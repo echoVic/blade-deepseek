@@ -70,38 +70,9 @@ pub(crate) enum BackgroundRetryEffect<
     },
 }
 
-impl<WorkflowCompletion, ProviderPreparation, ProviderCompletion, ApprovalResolution, Control>
-    BackgroundRetryEffect<
-        WorkflowCompletion,
-        ProviderPreparation,
-        ProviderCompletion,
-        ApprovalResolution,
-        Control,
-    >
-{
-    pub(crate) fn key(&self) -> BackgroundRetryKey {
-        match self {
-            Self::WorkflowCompletion { operation_id, .. } => {
-                BackgroundRetryKey::WorkflowCompletion(operation_id.clone())
-            }
-            Self::ProviderPreparation { operation_id, .. } => {
-                BackgroundRetryKey::ProviderPreparation(operation_id.clone())
-            }
-            Self::ProviderCompletion { operation_id, .. } => {
-                BackgroundRetryKey::ProviderCompletion(operation_id.clone())
-            }
-            Self::ApprovalResolution { operation_id, .. } => {
-                BackgroundRetryKey::ApprovalResolution(operation_id.clone())
-            }
-            Self::Control { operation_id, .. } => BackgroundRetryKey::Control(operation_id.clone()),
-        }
-    }
-}
-
-pub(crate) enum BackgroundRetryResolution<Effect> {
+pub(crate) enum BackgroundRetryResolution {
     Settled,
     RetryAt(Instant),
-    Continue { effect: Effect, retry_at: Instant },
 }
 
 pub(crate) struct BackgroundOperationController<
@@ -190,24 +161,12 @@ where
         self.ensure_capacity(additional).is_ok()
     }
 
-    pub(crate) fn has_tasks(&self) -> bool {
-        !self.tasks.is_empty()
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.tasks.is_empty()
     }
 
     pub(crate) fn tasks(&self) -> impl Iterator<Item = &Task> {
         self.tasks.values()
-    }
-
-    pub(crate) fn update_task(&mut self, task_id: &str, update: impl FnOnce(&mut Task)) -> bool {
-        let Some(task) = self.tasks.get_mut(task_id) else {
-            return false;
-        };
-        update(task);
-        true
     }
 
     pub(crate) fn admit_task(
@@ -260,6 +219,7 @@ where
             .cloned()
     }
 
+    #[cfg(test)]
     pub(crate) fn provider_for_task(&self, task_id: &str) -> Option<Provider> {
         self.tasks
             .get(task_id)
@@ -267,6 +227,7 @@ where
             .cloned()
     }
 
+    #[cfg(test)]
     pub(crate) fn workflow_for_task(&self, task_id: &str) -> Option<Workflow> {
         self.tasks
             .get(task_id)
@@ -301,20 +262,13 @@ where
         self.completion_rx.recv().await
     }
 
-    pub(crate) fn has_pending_settlement(&self) -> bool {
-        !self.workflow_completions.is_empty()
-            || !self.provider_preparations.is_empty()
-            || !self.provider_completions.is_empty()
-            || !self.approval_resolutions.is_empty()
-            || !self.controls.is_empty()
-    }
-
     pub(crate) fn has_pending_completion(&self) -> bool {
         !self.workflow_completions.is_empty()
             || !self.provider_preparations.is_empty()
             || !self.provider_completions.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn has_pending_completion_operation(
         &self,
         operation_id: &surface::SurfaceOperationId,
@@ -347,14 +301,7 @@ where
         ids
     }
 
-    pub(crate) fn has_pending_operation(&self, operation_id: &surface::SurfaceOperationId) -> bool {
-        self.workflow_completions.contains_key(operation_id)
-            || self.provider_preparations.contains_key(operation_id)
-            || self.provider_completions.contains_key(operation_id)
-            || self.approval_resolutions.contains_key(operation_id)
-            || self.controls.contains_key(operation_id)
-    }
-
+    #[cfg(test)]
     pub(crate) fn pending_operation_ids(&self) -> Vec<surface::SurfaceOperationId> {
         let mut ids = self
             .workflow_completions
@@ -510,26 +457,11 @@ where
             ApprovalResolution,
             Control,
         >,
-        resolution: BackgroundRetryResolution<
-            BackgroundRetryEffect<
-                WorkflowCompletion,
-                ProviderPreparation,
-                ProviderCompletion,
-                ApprovalResolution,
-                Control,
-            >,
-        >,
+        resolution: BackgroundRetryResolution,
     ) {
         match resolution {
             BackgroundRetryResolution::Settled => {}
             BackgroundRetryResolution::RetryAt(retry_at) => {
-                Self::defer_effect(&mut effect, retry_at);
-                self.retain_effect(effect);
-            }
-            BackgroundRetryResolution::Continue {
-                mut effect,
-                retry_at,
-            } => {
                 Self::defer_effect(&mut effect, retry_at);
                 self.retain_effect(effect);
             }

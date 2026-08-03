@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::sync::mpsc::SyncSender;
 
 use tokio::time::Instant;
 
+use crate::runtime_actor::RuntimeActorEffect;
 use crate::runtime_surface as surface;
 
 pub(crate) trait ScheduledSurfaceCommit {
@@ -35,6 +37,7 @@ pub(crate) enum SurfaceCommitEffect<
     AdmissionTerminal(AdmissionTerminal),
 }
 
+#[cfg(test)]
 impl<Terminalization, AdmissionCommit, AdmissionRepair, AdmissionTerminal>
     SurfaceCommitEffect<Terminalization, AdmissionCommit, AdmissionRepair, AdmissionTerminal>
 where
@@ -64,6 +67,7 @@ where
 pub(crate) enum SurfaceCommitResolution {
     Committed,
     RetryAt(Instant),
+    #[cfg(test)]
     Aborted,
 }
 
@@ -72,23 +76,45 @@ pub(crate) struct SurfaceCommitController<
     AdmissionCommit,
     AdmissionRepair,
     AdmissionTerminal,
+    PendingTerminal,
 > {
+    terminals: HashMap<surface::SurfaceOperationId, surface::OperationTerminalAtCursor>,
+    pending_terminal_commits: HashMap<surface::SurfaceOperationId, PendingTerminal>,
+    terminal_waiters: HashMap<
+        surface::SurfaceOperationId,
+        Vec<
+            SyncSender<
+                Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
+            >,
+        >,
+    >,
     terminalization: Option<Terminalization>,
     admission_commits: HashMap<surface::SurfaceOperationId, AdmissionCommit>,
     admission_repairs: HashMap<surface::SurfaceOperationId, AdmissionRepair>,
     admission_terminals: HashMap<surface::SurfaceOperationId, AdmissionTerminal>,
 }
 
-impl<Terminalization, AdmissionCommit, AdmissionRepair, AdmissionTerminal>
-    SurfaceCommitController<Terminalization, AdmissionCommit, AdmissionRepair, AdmissionTerminal>
+impl<Terminalization, AdmissionCommit, AdmissionRepair, AdmissionTerminal, PendingTerminal>
+    SurfaceCommitController<
+        Terminalization,
+        AdmissionCommit,
+        AdmissionRepair,
+        AdmissionTerminal,
+        PendingTerminal,
+    >
 where
     Terminalization: ScheduledSurfaceCommit + Clone,
     AdmissionCommit: ScheduledSurfaceCommit + Clone,
     AdmissionRepair: ScheduledSurfaceCommit + GoalRecoverySurfaceCommit + Clone,
     AdmissionTerminal: ScheduledSurfaceCommit + GoalRecoverySurfaceCommit + Clone,
 {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(
+        terminals: HashMap<surface::SurfaceOperationId, surface::OperationTerminalAtCursor>,
+    ) -> Self {
         Self {
+            terminals,
+            pending_terminal_commits: HashMap::new(),
+            terminal_waiters: HashMap::new(),
             terminalization: None,
             admission_commits: HashMap::new(),
             admission_repairs: HashMap::new(),
@@ -96,12 +122,116 @@ where
         }
     }
 
-    pub(crate) fn has_terminalization(&self) -> bool {
-        self.terminalization.is_some()
+    pub(crate) fn terminal(
+        &self,
+        operation_id: &surface::SurfaceOperationId,
+    ) -> Option<&surface::OperationTerminalAtCursor> {
+        self.terminals.get(operation_id)
     }
 
-    pub(crate) fn terminalization(&self) -> Option<&Terminalization> {
-        self.terminalization.as_ref()
+    pub(crate) fn terminal_values(
+        &self,
+    ) -> impl Iterator<Item = &surface::OperationTerminalAtCursor> {
+        self.terminals.values()
+    }
+
+    pub(crate) fn cache_terminal(
+        &mut self,
+        operation_id: surface::SurfaceOperationId,
+        terminal: surface::OperationTerminalAtCursor,
+    ) -> Vec<RuntimeActorEffect> {
+        let result = surface::WaitOperationTerminalResult::Terminal {
+            value: terminal.clone(),
+        };
+        let waiter_operation_id = operation_id.clone();
+        self.terminals.insert(operation_id, terminal);
+        self.terminal_waiters
+            .remove(&waiter_operation_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|reply| RuntimeActorEffect::ReplyOperation {
+                reply,
+                result: Ok(result.clone()),
+                nonblocking: false,
+            })
+            .collect()
+    }
+
+    pub(crate) fn pending_terminal(
+        &self,
+        operation_id: &surface::SurfaceOperationId,
+    ) -> Option<&PendingTerminal> {
+        self.pending_terminal_commits.get(operation_id)
+    }
+
+    pub(crate) fn has_pending_terminal(&self, operation_id: &surface::SurfaceOperationId) -> bool {
+        self.pending_terminal_commits.contains_key(operation_id)
+    }
+
+    pub(crate) fn pending_terminals_empty(&self) -> bool {
+        self.pending_terminal_commits.is_empty()
+    }
+
+    pub(crate) fn retain_pending_terminal(
+        &mut self,
+        operation_id: surface::SurfaceOperationId,
+        terminal: PendingTerminal,
+    ) {
+        self.pending_terminal_commits.insert(operation_id, terminal);
+    }
+
+    pub(crate) fn register_terminal_waiter(
+        &mut self,
+        operation_id: surface::SurfaceOperationId,
+        waiter: SyncSender<
+            Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
+        >,
+    ) {
+        self.terminal_waiters
+            .entry(operation_id)
+            .or_default()
+            .push(waiter);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_waiter_count(
+        &self,
+        operation_id: &surface::SurfaceOperationId,
+    ) -> usize {
+        self.terminal_waiters.get(operation_id).map_or(0, Vec::len)
+    }
+
+    pub(crate) fn take_terminal_waiters(
+        &mut self,
+        operation_id: &surface::SurfaceOperationId,
+    ) -> Vec<
+        SyncSender<
+            Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
+        >,
+    > {
+        self.terminal_waiters
+            .remove(operation_id)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn settle_terminal_waiters(
+        &mut self,
+        operation_id: &surface::SurfaceOperationId,
+        result: Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
+        nonblocking: bool,
+    ) -> Vec<RuntimeActorEffect> {
+        self.take_terminal_waiters(operation_id)
+            .into_iter()
+            .map(|reply| RuntimeActorEffect::ReplyOperation {
+                reply,
+                result: result.clone(),
+                nonblocking,
+            })
+            .collect()
+    }
+
+    pub(crate) fn has_terminalization(&self) -> bool {
+        self.terminalization.is_some()
     }
 
     pub(crate) fn has_pending_admission(&self) -> bool {
@@ -114,6 +244,7 @@ where
         self.admission_repairs.contains_key(operation_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn admission_repair(
         &self,
         operation_id: &surface::SurfaceOperationId,
@@ -268,7 +399,9 @@ where
         SurfaceCommitEffect<Terminalization, AdmissionCommit, AdmissionRepair, AdmissionTerminal>,
     > {
         match resolution {
-            SurfaceCommitResolution::Committed | SurfaceCommitResolution::Aborted => Some(effect),
+            SurfaceCommitResolution::Committed => Some(effect),
+            #[cfg(test)]
+            SurfaceCommitResolution::Aborted => Some(effect),
             SurfaceCommitResolution::RetryAt(retry_at) => {
                 match &mut effect {
                     SurfaceCommitEffect::Terminalization(pending) => pending.defer_until(retry_at),
@@ -284,6 +417,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn inspect_terminalization<R>(
         &self,
         inspect: impl FnOnce(&Terminalization) -> R,
@@ -316,6 +450,9 @@ where
     #[cfg(test)]
     fn trace(&self) -> CommitControllerTrace {
         CommitControllerTrace {
+            terminals: self.terminals.len(),
+            pending_terminal_commits: self.pending_terminal_commits.len(),
+            waiter_operations: self.terminal_waiters.len(),
             terminalization: self.terminalization.is_some(),
             admission_commits: self.admission_commits.len(),
             admission_repairs: self.admission_repairs.len(),
@@ -327,6 +464,9 @@ where
 #[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
 struct CommitControllerTrace {
+    terminals: usize,
+    pending_terminal_commits: usize,
+    waiter_operations: usize,
     terminalization: bool,
     admission_commits: usize,
     admission_repairs: usize,
@@ -377,13 +517,21 @@ mod tests {
 
     #[test]
     fn commit_controller_trace_equivalence() {
-        let mut controller = SurfaceCommitController::<Pending, Pending, Pending, Pending>::new();
+        let mut controller =
+            SurfaceCommitController::<Pending, Pending, Pending, Pending, Pending>::new(
+                HashMap::new(),
+            );
         let terminalization = pending(1, false);
         let admission = pending(2, false);
         let repair = pending(3, true);
         let terminal = pending(4, true);
+        let pending_terminal = pending(5, false);
+        let pending_terminal_id = pending_terminal.operation_id.clone();
+        let (waiter_tx, waiter_rx) = std::sync::mpsc::sync_channel(1);
         let mut trace = vec![controller.trace()];
 
+        controller.retain_pending_terminal(pending_terminal_id.clone(), pending_terminal);
+        controller.register_terminal_waiter(pending_terminal_id.clone(), waiter_tx);
         let _initial_effect = controller.prepare_terminalization(terminalization.clone());
         controller.prepare_admission_commit(admission.clone());
         controller.prepare_admission_repair(repair.clone());
@@ -401,6 +549,38 @@ mod tests {
             controller.goal_recovery_operation_id(),
             Some(repair.operation_id.clone())
         );
+        assert!(controller.has_pending_terminal(&pending_terminal_id));
+        assert_eq!(
+            controller
+                .pending_terminal(&pending_terminal_id)
+                .map(|pending| pending.identity),
+            Some(5)
+        );
+
+        let effects = controller.settle_terminal_waiters(
+            &pending_terminal_id,
+            Ok(surface::WaitOperationTerminalResult::UnknownOperation {
+                operation_id: pending_terminal_id.clone(),
+            }),
+            true,
+        );
+        assert_eq!(effects.len(), 1);
+        match effects.into_iter().next().unwrap() {
+            RuntimeActorEffect::ReplyOperation {
+                reply,
+                result,
+                nonblocking,
+            } => {
+                assert!(nonblocking);
+                reply.send(result).unwrap();
+            }
+            _ => panic!("terminal waiter settlement must remain actor-applied"),
+        }
+        assert!(matches!(
+            waiter_rx.recv().unwrap().unwrap(),
+            surface::WaitOperationTerminalResult::UnknownOperation { operation_id }
+                if operation_id == pending_terminal_id
+        ));
 
         let retry_at = Instant::now() + std::time::Duration::from_secs(1);
         let effect = controller
@@ -452,18 +632,27 @@ mod tests {
             trace,
             vec![
                 CommitControllerTrace {
+                    terminals: 0,
+                    pending_terminal_commits: 0,
+                    waiter_operations: 0,
                     terminalization: false,
                     admission_commits: 0,
                     admission_repairs: 0,
                     admission_terminals: 0
                 },
                 CommitControllerTrace {
+                    terminals: 0,
+                    pending_terminal_commits: 1,
+                    waiter_operations: 1,
                     terminalization: true,
                     admission_commits: 1,
                     admission_repairs: 1,
                     admission_terminals: 1
                 },
                 CommitControllerTrace {
+                    terminals: 0,
+                    pending_terminal_commits: 1,
+                    waiter_operations: 0,
                     terminalization: false,
                     admission_commits: 0,
                     admission_repairs: 0,

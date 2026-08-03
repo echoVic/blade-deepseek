@@ -7811,13 +7811,13 @@ fn bind_runtime_surface(
         ResidentSurfaceState {
             coordinator,
             hub: hub.clone(),
-            capability: RuntimeCapabilityController::new(terminals),
+            capability: RuntimeCapabilityController::new(),
             interactions,
             operation_origin_attachments: HashMap::new(),
             pending_task_ownership: None,
             pending_detaches: HashMap::new(),
             pending_capability_losses: HashMap::new(),
-            commit: SurfaceCommitController::new(),
+            commit: SurfaceCommitController::new(terminals),
         },
     ))
 }
@@ -8746,11 +8746,8 @@ impl std::ops::DerefMut for ResidentSurfaceSlot {
     }
 }
 
-type ResidentCapabilityController = RuntimeCapabilityController<
-    ResidentSurfaceCapabilityCall,
-    PendingSurfaceCapabilityTransition,
-    PendingSurfaceTerminalCommit,
->;
+type ResidentCapabilityController =
+    RuntimeCapabilityController<ResidentSurfaceCapabilityCall, PendingSurfaceCapabilityTransition>;
 
 type ResidentBackgroundController = BackgroundOperationController<
     HostBackgroundTask,
@@ -8768,6 +8765,7 @@ type ResidentCommitController = SurfaceCommitController<
     PendingSurfaceAdmissionCommit,
     PendingSurfaceAdmissionRepair,
     PendingSurfaceAdmissionTerminal,
+    PendingSurfaceTerminalCommit,
 >;
 
 struct ResidentSurfaceState {
@@ -20783,7 +20781,7 @@ impl ThreadActor {
             let completed = completion.complete(terminal);
             debug_assert!(completed, "legacy terminal must complete exactly once");
         }
-        if self.resident_surface.capability.pending_terminals_empty() {
+        if self.resident_surface.commit.pending_terminals_empty() {
             self.surface_terminal_blocked = None;
         }
     }
@@ -20886,7 +20884,7 @@ impl ThreadActor {
             let completed = completion.complete(terminal);
             debug_assert!(completed, "legacy terminal must complete exactly once");
         }
-        if self.resident_surface.capability.pending_terminals_empty() {
+        if self.resident_surface.commit.pending_terminals_empty() {
             self.surface_terminal_blocked = None;
         }
     }
@@ -21493,7 +21491,7 @@ impl ThreadActor {
         surface::SurfaceClientCommandError,
     > {
         if self.pending_manual_compaction_completion.is_some()
-            || !self.resident_surface.capability.pending_terminals_empty()
+            || !self.resident_surface.commit.pending_terminals_empty()
             || self.resident_surface.commit.has_pending_admission()
             || self.surface_terminal_blocked.is_some()
         {
@@ -21891,7 +21889,7 @@ impl ThreadActor {
             || !self.resident_surface.interactions.is_empty()
             || !self.resident_surface.pending_detaches.is_empty()
             || !self.resident_surface.pending_capability_losses.is_empty()
-            || !self.resident_surface.capability.pending_terminals_empty()
+            || !self.resident_surface.commit.pending_terminals_empty()
             || self.resident_surface.commit.has_pending_admission()
             || self.surface_terminal_blocked.is_some()
         {
@@ -22913,9 +22911,7 @@ impl ThreadActor {
                 );
                 assert!(
                     self.background_controller
-                        .update_task(&launched_task_id, |task| {
-                            task.typed_workflow = Some(typed_workflow);
-                        }),
+                        .attach_workflow(&launched_task_id, typed_workflow),
                     "activated workflow background task was registered"
                 );
             }
@@ -23634,7 +23630,7 @@ impl ThreadActor {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
         if self.pending_manual_compaction_completion.is_some()
-            || !self.resident_surface.capability.pending_terminals_empty()
+            || !self.resident_surface.commit.pending_terminals_empty()
             || self.resident_surface.commit.has_pending_admission()
             || self.surface_terminal_blocked.is_some()
         {
@@ -24649,17 +24645,13 @@ impl ThreadActor {
             Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
         >,
     ) {
-        if let Some(value) = self.resident_surface.capability.terminal(&operation_id) {
+        if let Some(value) = self.resident_surface.commit.terminal(&operation_id) {
             let _ = reply.send(Ok(surface::WaitOperationTerminalResult::Terminal {
                 value: value.clone(),
             }));
             return;
         }
-        if let Some(pending) = self
-            .resident_surface
-            .capability
-            .pending_terminal(&operation_id)
-        {
+        if let Some(pending) = self.resident_surface.commit.pending_terminal(&operation_id) {
             let _ = reply.try_send(Ok(pending.failure.clone()));
             return;
         }
@@ -24702,7 +24694,7 @@ impl ThreadActor {
             return;
         }
         self.resident_surface
-            .capability
+            .commit
             .register_terminal_waiter(operation_id, reply);
     }
 
@@ -24712,7 +24704,7 @@ impl ThreadActor {
         self.live_input_capsules.remove(&operation_id);
         let effects = self
             .resident_surface
-            .capability
+            .commit
             .cache_terminal(operation_id, value);
         for effect in effects {
             apply_runtime_actor_reply_effect(effect);
@@ -24763,7 +24755,7 @@ impl ThreadActor {
             .is_err()
             && !self
                 .resident_surface
-                .capability
+                .commit
                 .has_pending_terminal(&expiry.operation_id)
         {
             self.ephemeral_reservation_expiry = Some(EphemeralReservationExpiry {
@@ -24779,13 +24771,12 @@ impl ThreadActor {
         self.surface_terminal_blocked =
             Some("typed surface terminal commit failed and requires cold recovery".to_string());
         self.resident_surface
-            .capability
+            .commit
             .retain_pending_terminal(operation_id.clone(), pending);
-        let effects = self.resident_surface.capability.settle_terminal_waiters(
-            &operation_id,
-            Ok(failure),
-            true,
-        );
+        let effects =
+            self.resident_surface
+                .commit
+                .settle_terminal_waiters(&operation_id, Ok(failure), true);
         for effect in effects {
             apply_runtime_actor_reply_effect(effect);
         }
@@ -24802,11 +24793,10 @@ impl ThreadActor {
         self.resident_surface
             .commit
             .prepare_admission_terminal(pending);
-        let effects = self.resident_surface.capability.settle_terminal_waiters(
-            &operation_id,
-            Ok(failure),
-            true,
-        );
+        let effects =
+            self.resident_surface
+                .commit
+                .settle_terminal_waiters(&operation_id, Ok(failure), true);
         for effect in effects {
             apply_runtime_actor_reply_effect(effect);
         }
@@ -24818,7 +24808,7 @@ impl ThreadActor {
     ) -> surface::MutationReply<surface::OperationTerminalAtCursor> {
         let exact_pending = self
             .resident_surface
-            .capability
+            .commit
             .pending_terminal(token.operation_id())
             .is_some_and(|pending| {
                 let exact = matches!(
@@ -26669,7 +26659,7 @@ impl ThreadActor {
     > {
         if self.pending_manual_compaction_completion.is_some()
             || !self.bind_surface_operation_controller(client, &operation_id)
-            || !self.resident_surface.capability.pending_terminals_empty()
+            || !self.resident_surface.commit.pending_terminals_empty()
             || self.resident_surface.commit.has_pending_admission()
             || self.surface_terminal_blocked.is_some()
         {
@@ -27190,7 +27180,7 @@ impl ThreadActor {
         }
         if let Some(terminal) = self
             .resident_surface
-            .capability
+            .commit
             .terminal(&operation_id)
             .cloned()
         {
@@ -28682,7 +28672,7 @@ impl ThreadActor {
         };
         let completion_visible =
             resident
-                .capability
+                .commit
                 .terminal_values()
                 .any(|terminal| match close_after {
                     surface::FirstOperationCompletionPolicy::Terminal => true,
@@ -29034,7 +29024,7 @@ impl ThreadActor {
                                 if let Some(operation_id) = goal_recovery_operation_id {
                                     for waiter in self
                                         .resident_surface
-                                        .capability
+                                        .commit
                                         .take_terminal_waiters(&operation_id)
                                     {
                                         let _ = waiter.try_send(Err(
@@ -29047,7 +29037,7 @@ impl ThreadActor {
                                 {
                                     for waiter in self
                                         .resident_surface
-                                        .capability
+                                        .commit
                                         .take_terminal_waiters(&operation_id)
                                     {
                                         let _ = waiter.try_send(Err(
@@ -29063,7 +29053,7 @@ impl ThreadActor {
                                         .expect("checked pending provider transfer");
                                     for waiter in self
                                         .resident_surface
-                                        .capability
+                                        .commit
                                         .take_terminal_waiters(&operation_id)
                                     {
                                         let _ = waiter.try_send(Err(
@@ -29078,7 +29068,7 @@ impl ThreadActor {
                                 for operation_id in background_control_operation_ids {
                                     for waiter in self
                                         .resident_surface
-                                        .capability
+                                        .commit
                                         .take_terminal_waiters(&operation_id)
                                     {
                                         let _ = waiter.try_send(Err(
@@ -30244,7 +30234,7 @@ impl ThreadActor {
                 let _ = reply.send(SurfaceActorTestProbe {
                     waiter_count: self
                         .resident_surface
-                        .capability
+                        .commit
                         .terminal_waiter_count(&operation_id),
                     legacy_completion: None,
                     pending_manual_compaction_completion: self
@@ -31394,7 +31384,7 @@ impl ThreadActor {
                 let _ = reply.send(SurfaceActorTestProbe {
                     waiter_count: self
                         .resident_surface
-                        .capability
+                        .commit
                         .terminal_waiter_count(&operation_id),
                     legacy_completion,
                     pending_manual_compaction_completion: self
@@ -32868,7 +32858,7 @@ impl ThreadActor {
                     .expect("guarded surface operation");
                 if self
                     .resident_surface
-                    .capability
+                    .commit
                     .has_pending_terminal(&operation_id)
                 {
                     return Ok(());

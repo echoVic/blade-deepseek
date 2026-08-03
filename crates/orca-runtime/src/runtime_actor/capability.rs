@@ -212,137 +212,17 @@ pub(crate) struct CapabilityCommitResolution {
     pub(crate) retained_for_retry: bool,
 }
 
-pub(crate) struct RuntimeCapabilityController<Call, Transition, PendingTerminal> {
-    terminals: HashMap<surface::SurfaceOperationId, surface::OperationTerminalAtCursor>,
-    pending_terminal_commits: HashMap<surface::SurfaceOperationId, PendingTerminal>,
-    waiters: HashMap<
-        surface::SurfaceOperationId,
-        Vec<
-            SyncSender<
-                Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
-            >,
-        >,
-    >,
+pub(crate) struct RuntimeCapabilityController<Call, Transition> {
     capability_calls: HashMap<surface::SurfaceCapabilityCallId, Call>,
     pending_capability_transitions: HashMap<surface::SurfaceCapabilityCallId, Transition>,
 }
 
-impl<Call, Transition, PendingTerminal>
-    RuntimeCapabilityController<Call, Transition, PendingTerminal>
-{
-    pub(crate) fn new(
-        terminals: HashMap<surface::SurfaceOperationId, surface::OperationTerminalAtCursor>,
-    ) -> Self {
+impl<Call, Transition> RuntimeCapabilityController<Call, Transition> {
+    pub(crate) fn new() -> Self {
         Self {
-            terminals,
-            pending_terminal_commits: HashMap::new(),
-            waiters: HashMap::new(),
             capability_calls: HashMap::new(),
             pending_capability_transitions: HashMap::new(),
         }
-    }
-
-    pub(crate) fn terminal(
-        &self,
-        operation_id: &surface::SurfaceOperationId,
-    ) -> Option<&surface::OperationTerminalAtCursor> {
-        self.terminals.get(operation_id)
-    }
-
-    pub(crate) fn terminal_values(
-        &self,
-    ) -> impl Iterator<Item = &surface::OperationTerminalAtCursor> {
-        self.terminals.values()
-    }
-
-    pub(crate) fn cache_terminal(
-        &mut self,
-        operation_id: surface::SurfaceOperationId,
-        terminal: surface::OperationTerminalAtCursor,
-    ) -> Vec<RuntimeActorEffect> {
-        let result = surface::WaitOperationTerminalResult::Terminal {
-            value: terminal.clone(),
-        };
-        let waiter_operation_id = operation_id.clone();
-        self.terminals.insert(operation_id, terminal);
-        self.waiters
-            .remove(&waiter_operation_id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|reply| RuntimeActorEffect::ReplyOperation {
-                reply,
-                result: Ok(result.clone()),
-                nonblocking: false,
-            })
-            .collect()
-    }
-
-    pub(crate) fn pending_terminal(
-        &self,
-        operation_id: &surface::SurfaceOperationId,
-    ) -> Option<&PendingTerminal> {
-        self.pending_terminal_commits.get(operation_id)
-    }
-
-    pub(crate) fn has_pending_terminal(&self, operation_id: &surface::SurfaceOperationId) -> bool {
-        self.pending_terminal_commits.contains_key(operation_id)
-    }
-
-    pub(crate) fn pending_terminals_empty(&self) -> bool {
-        self.pending_terminal_commits.is_empty()
-    }
-
-    pub(crate) fn retain_pending_terminal(
-        &mut self,
-        operation_id: surface::SurfaceOperationId,
-        terminal: PendingTerminal,
-    ) {
-        self.pending_terminal_commits.insert(operation_id, terminal);
-    }
-
-    pub(crate) fn register_terminal_waiter(
-        &mut self,
-        operation_id: surface::SurfaceOperationId,
-        waiter: SyncSender<
-            Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
-        >,
-    ) {
-        self.waiters.entry(operation_id).or_default().push(waiter);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn terminal_waiter_count(
-        &self,
-        operation_id: &surface::SurfaceOperationId,
-    ) -> usize {
-        self.waiters.get(operation_id).map_or(0, Vec::len)
-    }
-
-    pub(crate) fn take_terminal_waiters(
-        &mut self,
-        operation_id: &surface::SurfaceOperationId,
-    ) -> Vec<
-        SyncSender<
-            Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
-        >,
-    > {
-        self.waiters.remove(operation_id).unwrap_or_default()
-    }
-
-    pub(crate) fn settle_terminal_waiters(
-        &mut self,
-        operation_id: &surface::SurfaceOperationId,
-        result: Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
-        nonblocking: bool,
-    ) -> Vec<RuntimeActorEffect> {
-        self.take_terminal_waiters(operation_id)
-            .into_iter()
-            .map(|reply| RuntimeActorEffect::ReplyOperation {
-                reply,
-                result: result.clone(),
-                nonblocking,
-            })
-            .collect()
     }
 
     pub(crate) fn register_call(&mut self, call_id: surface::SurfaceCapabilityCallId, call: Call) {
@@ -369,19 +249,12 @@ impl<Call, Transition, PendingTerminal>
         CapabilityControllerTrace::new(
             self.capability_calls.len(),
             self.pending_capability_transitions.len(),
-            self.terminals.len(),
-            self.pending_terminal_commits.len(),
-            self.waiters.len(),
         )
     }
 }
 
-impl<PendingTerminal>
-    RuntimeCapabilityController<
-        ResidentSurfaceCapabilityCall,
-        PendingSurfaceCapabilityTransition,
-        PendingTerminal,
-    >
+impl
+    RuntimeCapabilityController<ResidentSurfaceCapabilityCall, PendingSurfaceCapabilityTransition>
 {
     pub(crate) fn durable_calls<'a>(
         &'a self,
@@ -808,34 +681,20 @@ impl<PendingTerminal>
 struct CapabilityControllerTrace {
     capability_calls: usize,
     pending_capability_transitions: usize,
-    terminals: usize,
-    pending_terminal_commits: usize,
-    waiter_operations: usize,
 }
 
 #[cfg(test)]
 impl CapabilityControllerTrace {
-    const fn new(
-        capability_calls: usize,
-        pending_capability_transitions: usize,
-        terminals: usize,
-        pending_terminal_commits: usize,
-        waiter_operations: usize,
-    ) -> Self {
+    const fn new(capability_calls: usize, pending_capability_transitions: usize) -> Self {
         Self {
             capability_calls,
             pending_capability_transitions,
-            terminals,
-            pending_terminal_commits,
-            waiter_operations,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use crate::runtime_actor::RuntimeActorEffect;
     use crate::surface;
 
@@ -847,7 +706,7 @@ mod tests {
 
     #[test]
     fn capability_controller_trace_equivalence() {
-        let mut controller = RuntimeCapabilityController::<u8, u8, u8>::new(HashMap::new());
+        let mut controller = RuntimeCapabilityController::<u8, u8>::new();
         let call_id =
             surface::SurfaceCapabilityCallId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .unwrap();
@@ -873,11 +732,11 @@ mod tests {
         assert_eq!(
             trace,
             vec![
-                CapabilityControllerTrace::new(0, 0, 0, 0, 0),
-                CapabilityControllerTrace::new(1, 0, 0, 0, 0),
-                CapabilityControllerTrace::new(1, 1, 0, 0, 0),
-                CapabilityControllerTrace::new(2, 0, 0, 0, 0),
-                CapabilityControllerTrace::new(1, 0, 0, 0, 0),
+                CapabilityControllerTrace::new(0, 0),
+                CapabilityControllerTrace::new(1, 0),
+                CapabilityControllerTrace::new(1, 1),
+                CapabilityControllerTrace::new(2, 0),
+                CapabilityControllerTrace::new(1, 0),
             ]
         );
 
@@ -888,8 +747,7 @@ mod tests {
         let mut controller = RuntimeCapabilityController::<
             ResidentSurfaceCapabilityCall,
             PendingSurfaceCapabilityTransition,
-            u8,
-        >::new(HashMap::new());
+        >::new();
         controller.capability_calls.insert(
             call_id.clone(),
             ResidentSurfaceCapabilityCall {
@@ -905,7 +763,6 @@ mod tests {
             Some(RuntimeCapabilityController::<
                 ResidentSurfaceCapabilityCall,
                 PendingSurfaceCapabilityTransition,
-                u8,
             >::read_waiter_outcome(Ok("settled".to_string()))),
             false,
         );

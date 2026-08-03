@@ -620,7 +620,7 @@ impl SurfaceCommitLedger for FakeLedger {
 }
 
 #[test]
-fn runtime_commit_coordinator_trace_equivalence() {
+fn commit_controller_trace_equivalence() {
     let (_owner_dir, owner) = test_owner_lease();
     let mut coordinator = RuntimeCommitCoordinator::new_with_owner_lease(
         FakeLedger {
