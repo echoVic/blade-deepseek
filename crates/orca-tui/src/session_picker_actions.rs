@@ -6,7 +6,44 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::types::{AppState, AppStatus, SessionPickerPhase, UserAction};
 
-const SESSION_ACTION_COUNT: usize = 6;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionPickerAction {
+    Resume,
+    Fork,
+    Rename,
+    Archive,
+    Delete,
+    CopySessionId,
+}
+
+impl SessionPickerAction {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Resume => "Resume",
+            Self::Fork => "Fork",
+            Self::Rename => "Rename",
+            Self::Archive => "Archive",
+            Self::Delete => "Delete",
+            Self::CopySessionId => "Copy session ID",
+        }
+    }
+}
+
+pub(crate) fn available_session_actions(
+    active_session_id: Option<&str>,
+    selected_session_id: &str,
+) -> Vec<SessionPickerAction> {
+    let mut actions = vec![
+        SessionPickerAction::Resume,
+        SessionPickerAction::Fork,
+        SessionPickerAction::Rename,
+    ];
+    if active_session_id != Some(selected_session_id) {
+        actions.extend([SessionPickerAction::Archive, SessionPickerAction::Delete]);
+    }
+    actions.push(SessionPickerAction::CopySessionId);
+    actions
+}
 
 pub(crate) fn handle_session_picker_key<F>(
     key: &KeyEvent,
@@ -48,7 +85,10 @@ where
                 };
             }
             KeyCode::Down => {
-                selected = (selected + 1).min(SESSION_ACTION_COUNT - 1);
+                let action_count =
+                    available_session_actions(state.current_session_id.as_deref(), &session_id)
+                        .len();
+                selected = (selected + 1).min(action_count.saturating_sub(1));
                 state.session_picker_phase = SessionPickerPhase::Actions {
                     session_id,
                     selected,
@@ -186,30 +226,37 @@ fn activate_action<F>(
 where
     F: FnOnce() -> io::Result<()>,
 {
-    match selected {
-        0 => {
+    let Some(action) = available_session_actions(state.current_session_id.as_deref(), &session_id)
+        .get(selected)
+        .copied()
+    else {
+        state.session_picker_phase = SessionPickerPhase::Browsing;
+        return Ok(());
+    };
+    match action {
+        SessionPickerAction::Resume => {
             clear_terminal()?;
             state.enter_running();
             let _ = action_tx.send(UserAction::ResumeSavedSession { session_id });
         }
-        1 => {
+        SessionPickerAction::Fork => {
             state.enter_running();
             let _ = action_tx.send(UserAction::ForkSavedSession { session_id });
         }
-        2 => {
+        SessionPickerAction::Rename => {
             state.session_picker_phase = SessionPickerPhase::Renaming {
                 session_id,
                 value: String::new(),
             };
         }
-        3 | 4 => {
+        SessionPickerAction::Archive | SessionPickerAction::Delete => {
             let title = state
                 .session_picker_sessions
                 .iter()
                 .find(|session| session.session_id == session_id)
                 .map(|session| session.title.clone())
                 .unwrap_or_else(|| session_id.clone());
-            state.session_picker_phase = if selected == 3 {
+            state.session_picker_phase = if action == SessionPickerAction::Archive {
                 SessionPickerPhase::ConfirmArchive {
                     session_id,
                     title,
@@ -223,11 +270,10 @@ where
                 }
             };
         }
-        5 => {
+        SessionPickerAction::CopySessionId => {
             state.stage_clipboard_copy(session_id, Instant::now());
             state.session_picker_phase = SessionPickerPhase::Browsing;
         }
-        _ => {}
     }
     Ok(())
 }
@@ -324,5 +370,36 @@ mod tests {
             rx.try_recv(),
             Ok(UserAction::DeleteSavedSession { session_id }) if session_id == "two"
         ));
+    }
+
+    #[test]
+    fn current_session_actions_exclude_archive_and_delete() {
+        assert_eq!(
+            available_session_actions(Some("two"), "two"),
+            vec![
+                SessionPickerAction::Resume,
+                SessionPickerAction::Fork,
+                SessionPickerAction::Rename,
+                SessionPickerAction::CopySessionId,
+            ]
+        );
+
+        let (mut state, rx) = state();
+        state.current_session_id = Some("two".to_string());
+        press(KeyCode::Tab, &mut state);
+        for _ in 0..8 {
+            press(KeyCode::Down, &mut state);
+        }
+        assert_eq!(
+            state.session_picker_phase,
+            SessionPickerPhase::Actions {
+                session_id: "two".to_string(),
+                selected: 3,
+            }
+        );
+        press(KeyCode::Enter, &mut state);
+
+        assert_eq!(state.session_picker_phase, SessionPickerPhase::Browsing);
+        assert!(rx.try_recv().is_err());
     }
 }

@@ -14,8 +14,9 @@ use orca_runtime::surface::{
     NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationPatch,
     OperationRequestIntent, OperationSettingsPreparation, OperationTerminal, PinnedContextAction,
     PinnedContextSourceRevision, PinnedUserRevision, ReplayabilityRequest, RuntimeSettingsPatch,
-    RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle, Sha256Digest,
-    SurfaceAllowDeny, SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId,
+    RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle,
+    SessionMetadataPatch, SessionMetadataPrecondition, Sha256Digest, SurfaceAllowDeny,
+    SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId,
     SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceGoal, SurfaceGoalFence,
     SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
     SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
@@ -360,6 +361,62 @@ pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<S
     let snapshot = (*attachment.baseline.snapshot).clone();
     detach(&surface, &attachment.client);
     Ok(snapshot)
+}
+
+pub(crate) fn update_session_metadata(
+    thread: &RuntimeSurfaceThreadHandle,
+    precondition: SessionMetadataPrecondition,
+    patch: SessionMetadataPatch,
+) -> io::Result<()> {
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::ManageThreadSettings,
+        ]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        AttachResult::Denied { reason } => {
+            return Err(io::Error::other(format!(
+                "typed TUI metadata attachment denied: {reason:?}"
+            )));
+        }
+        AttachResult::Unavailable { reason } => {
+            return Err(io::Error::other(format!(
+                "typed TUI metadata attachment unavailable: {reason:?}"
+            )));
+        }
+        AttachResult::ThreadClosed { .. } => {
+            return Err(io::Error::other("typed TUI metadata thread is closed"));
+        }
+        AttachResult::CursorAttached { .. }
+        | AttachResult::SnapshotRequired { .. }
+        | AttachResult::InvalidCursor { .. } => {
+            return Err(io::Error::other(
+                "typed TUI metadata attachment returned an invalid fresh-attach result",
+            ));
+        }
+    };
+    let result =
+        attachment
+            .client
+            .update_session_metadata(SurfaceRequestId::new(), precondition, patch);
+    detach(&surface, &attachment.client);
+    let result = result.map_err(|error| {
+        io::Error::other(format!("typed TUI metadata update failed: {error:?}"))
+    })?;
+    match result {
+        MutationReply::Committed { .. } => Ok(()),
+        MutationReply::Uncommitted { mutation } => Err(io::Error::other(format!(
+            "typed TUI metadata update did not commit: {mutation:?}"
+        ))),
+        MutationReply::Deferred { .. } => {
+            Err(io::Error::other("typed TUI metadata update deferred"))
+        }
+    }
 }
 
 pub(crate) fn stop_task(

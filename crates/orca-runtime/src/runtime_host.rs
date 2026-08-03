@@ -3745,6 +3745,13 @@ enum ThreadCommand {
             >,
         >,
     },
+    SurfaceUpdateSessionMetadata {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        precondition: surface::SessionMetadataPrecondition,
+        patch: surface::SessionMetadataPatch,
+        reply: SyncSender<Result<surface::MutationReply<()>, surface::SurfaceClientCommandError>>,
+    },
     SurfacePinnedContextMutation {
         client: surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
@@ -5163,6 +5170,22 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
             client,
             request_id,
             expected_thread_revision,
+            patch,
+            reply,
+        })
+    }
+
+    fn update_session_metadata(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        precondition: surface::SessionMetadataPrecondition,
+        patch: surface::SessionMetadataPatch,
+    ) -> Result<surface::MutationReply<()>, surface::SurfaceClientCommandError> {
+        self.dispatch(|reply| ThreadCommand::SurfaceUpdateSessionMetadata {
+            client,
+            request_id,
+            precondition,
             patch,
             reply,
         })
@@ -23517,6 +23540,87 @@ impl ThreadActor {
         )))
     }
 
+    fn update_surface_session_metadata(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        precondition: surface::SessionMetadataPrecondition,
+        patch: surface::SessionMetadataPatch,
+    ) -> Result<surface::MutationReply<()>, surface::SurfaceClientCommandError> {
+        if !self.admits_surface_client(client, surface::SurfaceCapability::ManageThreadSettings) {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let current = snapshot.thread.clone();
+        if let surface::SessionMetadataPrecondition::Exact { revision } = precondition
+            && revision != current.metadata_revision
+        {
+            return Ok(surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Stale {
+                    request_id,
+                    target: Some(surface::MutationTarget::SessionMetadata {
+                        thread_id: current.thread_id.clone(),
+                    }),
+                    error: surface::StaleMutationError::new(surface::SurfaceMutationError {
+                        code: surface::SurfaceMutationErrorCode::StaleRevision,
+                        message: surface::DisplayText::new("session metadata revision is stale"),
+                        winning_request_id: None,
+                        current_revision: Some(surface::SurfaceMutationRevision::Thread {
+                            cursor: snapshot.cursor.clone(),
+                        }),
+                    }),
+                },
+            });
+        }
+        let surface::SessionMetadataPatch::SetTitle { title } = patch;
+        let next_revision = surface::SessionMetadataRevision::try_new(
+            current
+                .metadata_revision
+                .get()
+                .checked_add(1)
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+        )
+        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let updated_at = surface::UnixMillis::new(
+            chrono::Utc::now()
+                .timestamp_millis()
+                .max(current.updated_at.get()),
+        );
+        let batch = self.surface_event_batch_with_commit_id(
+            vec![(
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Session(surface::SessionPatch::MetadataChanged {
+                    previous_revision: current.metadata_revision,
+                    next_revision,
+                    title: title.clone(),
+                    updated_at,
+                }),
+            )],
+            None,
+        );
+        self.commit_surface_actor_batch_with_retry(&batch)?;
+        let event = &batch.events.as_slice()[0];
+        Ok(surface::MutationReply::Committed {
+            mutation: surface::CommittedMutation {
+                request_id,
+                target: surface::MutationTarget::SessionMetadata {
+                    thread_id: current.thread_id,
+                },
+                disposition: surface::MutationDisposition::Accepted,
+                acknowledgements: surface::NonEmptyVec::try_new(vec![
+                    surface::MutationCommitAck::ThreadLocalCursor {
+                        cursor: batch.cursor_after.clone(),
+                        family: surface::SurfaceFactFamily::Session,
+                        event_id: event.event_id.clone(),
+                        commit_class: batch.commit_class.clone(),
+                    },
+                ])
+                .expect("session metadata commit has one acknowledgement"),
+            },
+            value: (),
+        })
+    }
+
     fn update_surface_settings(
         &mut self,
         client: &surface::RuntimeSurfaceClientHandle,
@@ -29731,6 +29835,9 @@ impl ThreadActor {
                 ThreadCommand::SurfaceUpdateSettings { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
+                ThreadCommand::SurfaceUpdateSessionMetadata { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
                 ThreadCommand::SurfacePinnedContextMutation { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
@@ -30191,6 +30298,17 @@ impl ThreadActor {
                     patch,
                     false,
                 );
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceUpdateSessionMetadata {
+                client,
+                request_id,
+                precondition,
+                patch,
+                reply,
+            } => {
+                let result =
+                    self.update_surface_session_metadata(&client, request_id, precondition, patch);
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfacePinnedContextMutation {
@@ -31049,6 +31167,17 @@ impl ThreadActor {
                     patch,
                     true,
                 );
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceUpdateSessionMetadata {
+                client,
+                request_id,
+                precondition,
+                patch,
+                reply,
+            } => {
+                let result =
+                    self.update_surface_session_metadata(&client, request_id, precondition, patch);
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfacePinnedContextMutation { reply, .. } => {

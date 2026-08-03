@@ -4109,16 +4109,24 @@ mod tests {
         with_orca_home(|_| {
             let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit("release notes".to_string()));
-            let session_id = match harness
+            let (session_id, surface) = match harness
                 .recv_until(|event| matches!(event, TuiEvent::MentionRuntimeReady(_)))
             {
-                TuiEvent::MentionRuntimeReady(thread) => thread
-                    .session_id()
-                    .expect("recorded session id")
-                    .to_string(),
+                TuiEvent::MentionRuntimeReady(thread) => (
+                    thread
+                        .session_id()
+                        .expect("recorded session id")
+                        .to_string(),
+                    thread,
+                ),
                 _ => unreachable!(),
             };
             harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+            let stale_revision = TuiSurfaceActions::new(surface.clone())
+                .read_snapshot()
+                .expect("initial typed surface")
+                .thread
+                .metadata_revision;
 
             harness.send(UserAction::RenameCurrentSession {
                 title: "Release triage".to_string(),
@@ -4139,6 +4147,90 @@ mod tests {
                     .meta
                     .title,
                 "Release triage"
+            );
+            assert_eq!(
+                TuiSurfaceActions::new(surface.clone())
+                    .read_snapshot()
+                    .expect("renamed typed surface")
+                    .thread
+                    .title
+                    .as_str(),
+                "Release triage"
+            );
+            assert!(
+                crate::surface_client::update_session_metadata(
+                    &surface,
+                    orca_runtime::surface::SessionMetadataPrecondition::Exact {
+                        revision: stale_revision,
+                    },
+                    orca_runtime::surface::SessionMetadataPatch::SetTitle {
+                        title: orca_runtime::surface::DisplayText::new("stale title"),
+                    },
+                )
+                .is_err()
+            );
+            assert_eq!(
+                TuiSurfaceActions::new(surface)
+                    .read_snapshot()
+                    .expect("typed surface after stale patch")
+                    .thread
+                    .title
+                    .as_str(),
+                "Release triage"
+            );
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn hosted_tui_rename_restores_runtime_projection_when_durable_write_fails() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("original title".to_string()));
+            let (session_id, surface) = match harness
+                .recv_until(|event| matches!(event, TuiEvent::MentionRuntimeReady(_)))
+            {
+                TuiEvent::MentionRuntimeReady(thread) => (
+                    thread
+                        .session_id()
+                        .expect("recorded session id")
+                        .to_string(),
+                    thread,
+                ),
+                _ => unreachable!(),
+            };
+            harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+            let original_title = TuiSurfaceActions::new(surface.clone())
+                .read_snapshot()
+                .expect("original typed surface")
+                .thread
+                .title
+                .as_str()
+                .to_string();
+
+            crate::surface_actions::inject_rename_saved_session_failure_once();
+            harness.send(UserAction::RenameCurrentSession {
+                title: "must not stick".to_string(),
+            });
+            let rejected = harness
+                .recv_until(|event| matches!(event, TuiEvent::OperationRejected(message) if message.contains("failed to persist conversation rename")));
+
+            assert!(matches!(rejected, TuiEvent::OperationRejected(_)));
+            assert_eq!(
+                history::load_session(&session_id)
+                    .expect("unchanged durable session")
+                    .meta
+                    .title,
+                original_title
+            );
+            assert_eq!(
+                TuiSurfaceActions::new(surface)
+                    .read_snapshot()
+                    .expect("compensated typed surface")
+                    .thread
+                    .title
+                    .as_str(),
+                original_title
             );
             harness.shutdown();
         });
@@ -8172,7 +8264,18 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     ));
                     continue;
                 };
-                match TuiHostActions::rename_saved_session(&session_id, &title) {
+                let rename_result = thread
+                    .as_ref()
+                    .map(|runtime_thread| {
+                        TuiSurfaceActions::new(runtime_thread.typed_surface())
+                            .rename_current_session(&session_id, &title)
+                    })
+                    .unwrap_or_else(|| {
+                        Err(std::io::Error::other(
+                            "current conversation surface is unavailable",
+                        ))
+                    });
+                match rename_result {
                     Ok(()) => {
                         let _ = event_tx.send(TuiEvent::SessionRenamed { session_id, title });
                     }

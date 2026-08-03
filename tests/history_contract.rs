@@ -4,6 +4,27 @@ use std::process::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 
+static ORCA_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn with_process_orca_home<T>(home: &Path, run: impl FnOnce() -> T) -> T {
+    let _guard = ORCA_HOME_LOCK.lock().expect("ORCA_HOME lock");
+    let previous = std::env::var_os("ORCA_HOME");
+    unsafe {
+        std::env::set_var("ORCA_HOME", home);
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+    unsafe {
+        match previous {
+            Some(previous) => std::env::set_var("ORCA_HOME", previous),
+            None => std::env::remove_var("ORCA_HOME"),
+        }
+    }
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 fn trust_project(home: &std::path::Path, project: &std::path::Path) {
     orca_core::config::folder_trust::set_trust_with_config_dir(
         project,
@@ -253,6 +274,61 @@ fn session_fork_copies_history_and_keeps_source_durable() {
         .map(|(path, _)| std::fs::read_to_string(path).expect("read source after fork"))
         .expect("source document after fork");
     assert_eq!(source_after, source_before);
+}
+
+#[test]
+fn session_archive_and_delete_update_the_durable_catalog() {
+    let home = TempDir::new().expect("temp home");
+    for prompt in ["archive this conversation", "delete this conversation"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+            .env("ORCA_HOME", home.path())
+            .args(["exec", "--provider", "mock", prompt])
+            .output()
+            .expect("run saved conversation");
+        assert_eq!(output.status.code(), Some(0));
+    }
+    let documents = session_documents(home.path());
+    let session_ids = documents
+        .iter()
+        .filter_map(|(_, records)| {
+            records
+                .iter()
+                .find(|record| record["type"] == "session.meta")
+                .and_then(|record| record["session_id"].as_str())
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(session_ids.len(), 2);
+
+    with_process_orca_home(home.path(), || {
+        let archived_path =
+            orca_runtime::surface::RuntimeSurfaceHostHandle::archive_saved_session(&session_ids[0])
+                .expect("archive saved conversation");
+        assert!(archived_path.starts_with(home.path().join("archive")));
+        assert!(archived_path.exists());
+        assert!(
+            orca_runtime::surface::RuntimeSurfaceHostHandle::list_saved_sessions(10)
+                .expect("list active conversations")
+                .iter()
+                .all(|session| session.session_id != session_ids[0])
+        );
+
+        let deleted_archive =
+            orca_runtime::surface::RuntimeSurfaceHostHandle::delete_saved_session(&session_ids[0])
+                .expect("delete archived conversation");
+        assert_eq!(deleted_archive, archived_path);
+        assert!(!deleted_archive.exists());
+
+        let deleted_active =
+            orca_runtime::surface::RuntimeSurfaceHostHandle::delete_saved_session(&session_ids[1])
+                .expect("delete active conversation");
+        assert!(!deleted_active.exists());
+        assert!(
+            orca_runtime::surface::RuntimeSurfaceHostHandle::list_saved_sessions(10)
+                .expect("list empty conversation catalog")
+                .is_empty()
+        );
+    });
 }
 
 #[test]

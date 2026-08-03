@@ -498,6 +498,14 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         patch: NonEmptyVec<RuntimeSettingsPatch>,
     ) -> Result<MutationReply<SettingsMutationOutput>, SurfaceClientCommandError>;
 
+    fn update_session_metadata(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        precondition: SessionMetadataPrecondition,
+        patch: SessionMetadataPatch,
+    ) -> Result<MutationReply<()>, SurfaceClientCommandError>;
+
     fn pinned_context_mutation(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -893,6 +901,18 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .update_settings(self.clone(), request_id, expected_thread_revision, patch)
+    }
+
+    pub fn update_session_metadata(
+        &self,
+        request_id: SurfaceRequestId,
+        precondition: SessionMetadataPrecondition,
+        patch: SessionMetadataPatch,
+    ) -> Result<MutationReply<()>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .update_session_metadata(self.clone(), request_id, precondition, patch)
     }
 
     pub fn pinned_context_mutation(

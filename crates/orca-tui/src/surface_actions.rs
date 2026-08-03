@@ -16,6 +16,15 @@ use crate::hosted_runtime::TuiHostedOperationOutcome;
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::types::{TuiEvent, TuiMemoryScope};
 
+#[cfg(test)]
+static RENAME_SAVED_SESSION_FAILURES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn inject_rename_saved_session_failure_once() {
+    RENAME_SAVED_SESSION_FAILURES.store(1, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// The only TUI-facing entry point for thread-scoped runtime commands and
 /// authoritative reads. Presentation modules receive this facade instead of a
 /// runtime thread handle and cannot reach runtime-owned registries or stores.
@@ -40,6 +49,17 @@ impl TuiHostActions {
     }
 
     pub(crate) fn rename_saved_session(session_id: &str, title: &str) -> Result<(), String> {
+        #[cfg(test)]
+        if RENAME_SAVED_SESSION_FAILURES
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err("injected saved-session rename failure".to_string());
+        }
         orca_runtime::surface::RuntimeSurfaceHostHandle::rename_saved_session(session_id, title)
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -118,6 +138,43 @@ impl TuiSurfaceActions {
 
     pub(crate) fn read_snapshot(&self) -> io::Result<SurfaceSnapshot> {
         crate::surface_client::read_snapshot(&self.thread)
+    }
+
+    pub(crate) fn rename_current_session(&self, session_id: &str, title: &str) -> io::Result<()> {
+        let before = self.read_snapshot()?;
+        crate::surface_client::update_session_metadata(
+            &self.thread,
+            orca_runtime::surface::SessionMetadataPrecondition::Exact {
+                revision: before.thread.metadata_revision,
+            },
+            orca_runtime::surface::SessionMetadataPatch::SetTitle {
+                title: orca_runtime::surface::DisplayText::new(title),
+            },
+        )?;
+
+        if let Err(error) = TuiHostActions::rename_saved_session(session_id, title) {
+            let compensation = self
+                .read_snapshot()
+                .and_then(|after| {
+                    crate::surface_client::update_session_metadata(
+                        &self.thread,
+                        orca_runtime::surface::SessionMetadataPrecondition::Exact {
+                            revision: after.thread.metadata_revision,
+                        },
+                        orca_runtime::surface::SessionMetadataPatch::SetTitle {
+                            title: before.thread.title.clone(),
+                        },
+                    )
+                })
+                .err();
+            let detail = compensation
+                .map(|compensation| format!("; runtime compensation failed: {compensation}"))
+                .unwrap_or_default();
+            return Err(io::Error::other(format!(
+                "failed to persist conversation rename: {error}{detail}"
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn add_pinned_context(&self, note: &str) -> io::Result<()> {
