@@ -38,6 +38,11 @@ impl UpdatePromptChoice {
 }
 
 pub fn run(config: RunConfig) -> i32 {
+    // The npm wrapper (a Node process) may have flipped O_NONBLOCK on the tty
+    // fds we inherit; clearing it before any terminal I/O keeps reads/writes
+    // blocking so a resize redraw storm can't fail with EAGAIN (os error 35).
+    crate::stdio_guard::clear_stdio_nonblocking();
+
     match update_preflight(config.update_check, &config.app_version) {
         UpdatePreflight::Continue => {}
         UpdatePreflight::Prompt(info) => match prompt_for_update(&info) {

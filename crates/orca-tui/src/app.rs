@@ -52,6 +52,7 @@ use crate::runtime_interaction_adapter::{
 };
 use crate::slash_command_actions::{SettingsIntent, decode_settings_intent};
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
+use crate::stdio_guard::RetryWriter;
 use crate::submitted_turn::SubmittedTurn;
 use crate::surface_actions::{TuiHostActions, TuiSurfaceActions};
 use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
@@ -191,7 +192,14 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     const MAX_RUNTIME_EVENTS_PER_BATCH: usize = 256;
     const MAX_SUPERVISED_TUI_TASKS: usize = 32;
 
-    let backend = CapabilityBackend::new(CrosstermBackend::new(io::stdout()), theme.color_level);
+    // Wrap stdout in RetryWriter so a transient EAGAIN/WouldBlock (e.g. a
+    // resize redraw storm on a tty left non-blocking by the npm wrapper) is
+    // retried instead of aborting the draw. `clear_stdio_nonblocking` in
+    // `cli::run` is the primary defense; this is the belt-and-braces fallback.
+    let backend = CapabilityBackend::new(
+        CrosstermBackend::new(RetryWriter::new(io::stdout())),
+        theme.color_level,
+    );
 
     let workspace_root = syntax_workspace_root(&config);
     let (event_tx, pending_event_rx) = tui_event_channel();
@@ -922,7 +930,7 @@ fn configure_and_preload_tui_state(
     }
 }
 
-type InlineTerminal = Terminal<CapabilityBackend<CrosstermBackend<std::io::Stdout>>>;
+type InlineTerminal = Terminal<CapabilityBackend<CrosstermBackend<RetryWriter<std::io::Stdout>>>>;
 
 fn clear_terminal_scrollback_with<T>(
     target: &mut T,
