@@ -169,6 +169,93 @@ fn exec_resume_injects_prior_conversation() {
 }
 
 #[test]
+fn session_fork_copies_history_and_keeps_source_durable() {
+    let home = TempDir::new().expect("temp home");
+
+    let first = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args(["exec", "--provider", "mock", "fork source prompt"])
+        .output()
+        .expect("run source conversation");
+    assert_eq!(first.status.code(), Some(0));
+
+    let source_documents = session_documents(home.path());
+    let source_id = source_documents
+        .iter()
+        .flat_map(|(_, records)| records)
+        .find(|record| record["type"] == "session.meta")
+        .and_then(|record| record["session_id"].as_str())
+        .expect("source session metadata")
+        .to_string();
+    let source_path = source_documents
+        .iter()
+        .find(|(_, records)| {
+            records.iter().any(|record| {
+                record["type"] == "session.meta"
+                    && record["session_id"].as_str() == Some(source_id.as_str())
+            })
+        })
+        .map(|(path, _)| path)
+        .expect("source session document");
+    let source_before = std::fs::read_to_string(source_path).expect("read source document");
+
+    let forked = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--provider",
+            "mock",
+            "--fork",
+            &source_id,
+            "fork child prompt",
+        ])
+        .output()
+        .expect("run forked conversation");
+    assert_eq!(forked.status.code(), Some(0));
+
+    let documents = session_documents(home.path());
+    assert_eq!(
+        documents.len(),
+        2,
+        "source and fork must both remain durable"
+    );
+    let fork_records = documents
+        .iter()
+        .map(|(_, records)| records)
+        .find(|records| {
+            records.iter().any(|record| {
+                record["type"] == "session.meta"
+                    && record["parent_id"].as_str() == Some(source_id.as_str())
+            })
+        })
+        .expect("fork metadata with source parent");
+    let fork_id = fork_records
+        .iter()
+        .find(|record| record["type"] == "session.meta")
+        .and_then(|record| record["session_id"].as_str())
+        .expect("fork session id");
+    assert_ne!(fork_id, source_id);
+    let fork_text = fork_records
+        .iter()
+        .map(|record| record.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(fork_text.contains("fork source prompt"));
+    assert!(fork_text.contains("fork child prompt"));
+    let source_after = documents
+        .iter()
+        .find(|(_, records)| {
+            records.iter().any(|record| {
+                record["type"] == "session.meta"
+                    && record["session_id"].as_str() == Some(source_id.as_str())
+            })
+        })
+        .map(|(path, _)| std::fs::read_to_string(path).expect("read source after fork"))
+        .expect("source document after fork");
+    assert_eq!(source_after, source_before);
+}
+
+#[test]
 fn exec_injects_project_instructions_into_system_prompt() {
     let home = TempDir::new().expect("temp home");
     let project = TempDir::new().expect("temp project");

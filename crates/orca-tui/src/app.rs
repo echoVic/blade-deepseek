@@ -4051,6 +4051,60 @@ mod tests {
     }
 
     #[test]
+    fn picker_fork_replaces_source_transcript() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("source-only prompt".to_string()));
+            let source_id = match harness
+                .recv_until(|event| matches!(event, TuiEvent::MentionRuntimeReady(_)))
+            {
+                TuiEvent::MentionRuntimeReady(thread) => {
+                    thread.session_id().expect("source session id").to_string()
+                }
+                _ => unreachable!(),
+            };
+            harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+
+            harness.send(UserAction::NewSession);
+            let current_id = match harness
+                .recv_until(|event| matches!(event, TuiEvent::NewSessionStarted { .. }))
+            {
+                TuiEvent::NewSessionStarted { session_id } => session_id,
+                _ => unreachable!(),
+            };
+            harness.send(UserAction::Submit("current-only prompt".to_string()));
+            harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+
+            harness.send(UserAction::ForkSavedSession {
+                session_id: source_id.clone(),
+            });
+            let history =
+                harness.recv_until(|event| matches!(event, TuiEvent::HistoryLoaded { .. }));
+            let TuiEvent::HistoryLoaded { messages, .. } = history else {
+                unreachable!();
+            };
+            assert!(
+                messages.iter().any(|message| {
+                    matches!(message, ChatMessage::User(prompt) if prompt == "source-only prompt")
+                }),
+                "fork history messages: {messages:?}"
+            );
+            assert!(!messages.iter().any(|message| {
+                matches!(message, ChatMessage::User(prompt) if prompt == "current-only prompt")
+            }));
+
+            let fork_id =
+                match harness.recv_until(|event| matches!(event, TuiEvent::SessionForked { .. })) {
+                    TuiEvent::SessionForked { session_id, .. } => session_id,
+                    _ => unreachable!(),
+                };
+            assert_ne!(fork_id, source_id);
+            assert_ne!(fork_id, current_id);
+            harness.shutdown();
+        });
+    }
+
+    #[test]
     fn hosted_tui_rename_updates_durable_title_and_projection_event() {
         with_orca_home(|_| {
             let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
@@ -8078,16 +8132,28 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &pending_workflow_notifications,
                     title,
                 ) {
-                    Ok((_mode, session_id, title)) => {
+                    Ok((mode, session_id, title)) => {
                         rotate_attached_event_sender(
                             &root_event_tx,
                             &mut session_attachment,
                             &mut event_tx,
                         );
+                        let _ = event_tx.send(TuiEvent::SessionProjectionReset {
+                            session_id: session_id.clone(),
+                            title: title.clone(),
+                        });
                         announce_runtime_ready(
                             thread.as_ref().expect("forked hosted thread"),
                             &event_tx,
                         );
+                        if let Some(runtime_thread) = thread.as_ref()
+                            && let Err(error) =
+                                emit_typed_history_snapshot(runtime_thread, &mode, &event_tx)
+                        {
+                            let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                                "failed to project forked conversation: {error}"
+                            )));
+                        }
                         let _ = event_tx.send(TuiEvent::SessionForked { session_id, title });
                     }
                     Err(error) => {
@@ -8135,6 +8201,14 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                             &mut event_tx,
                         );
                         if let Some(runtime_thread) = thread.as_ref() {
+                            let session_id = runtime_thread
+                                .session_id()
+                                .map(ToOwned::to_owned)
+                                .unwrap_or_else(|| "restored-session".to_string());
+                            let _ = event_tx.send(TuiEvent::SessionProjectionReset {
+                                session_id,
+                                title: "Restored conversation".to_string(),
+                            });
                             announce_runtime_ready(runtime_thread, &event_tx);
                         }
                         if let Some(runtime_thread) = thread.as_ref()
@@ -8162,14 +8236,29 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     HistoryMode::Fork(session_id),
                     None,
                 ) {
-                    Ok(_) => {
+                    Ok(mode) => {
                         rotate_attached_event_sender(
                             &root_event_tx,
                             &mut session_attachment,
                             &mut event_tx,
                         );
                         if let Some(runtime_thread) = thread.as_ref() {
+                            let session_id = runtime_thread
+                                .session_id()
+                                .map(ToOwned::to_owned)
+                                .unwrap_or_else(|| "forked-session".to_string());
+                            let _ = event_tx.send(TuiEvent::SessionProjectionReset {
+                                session_id,
+                                title: "Forked conversation".to_string(),
+                            });
                             announce_runtime_ready(runtime_thread, &event_tx);
+                            if let Err(error) =
+                                emit_typed_history_snapshot(runtime_thread, &mode, &event_tx)
+                            {
+                                let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                                    "failed to project forked conversation: {error}"
+                                )));
+                            }
                             if let (Some(fork_id), Ok(snapshot)) = (
                                 runtime_thread.session_id(),
                                 TuiSurfaceActions::new(runtime_thread.typed_surface())
@@ -8755,19 +8844,14 @@ fn start_new_hosted_session(
         .ok_or_else(|| "new conversation did not create a resumable session".to_string())?
         .to_string();
 
-    if let Some(current) = thread.as_ref()
-        && let Err(error) = current.shutdown()
-    {
-        let _ = started.shutdown();
-        return Err(format!(
-            "failed to close the current conversation before switching: {error}"
-        ));
-    }
-
-    *config.lock().unwrap() = next_config;
-    *preloaded.lock().unwrap() = None;
-    pending_workflow_notifications.clear();
-    *thread = Some(started);
+    install_hosted_session(
+        thread,
+        started,
+        next_config,
+        config,
+        preloaded,
+        pending_workflow_notifications,
+    );
     Ok(session_id)
 }
 
@@ -8812,6 +8896,40 @@ fn ensure_current_session_switchable(current: Option<&RuntimeThreadHandle>) -> R
     Ok(())
 }
 
+fn reap_hosted_thread(thread: RuntimeThreadHandle) {
+    let fallback = thread.clone();
+    let result = std::thread::Builder::new()
+        .name("orca-tui-session-reaper".to_string())
+        .spawn(move || {
+            for _ in 0..32 {
+                if thread.shutdown().is_ok() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+    if result.is_err() {
+        let _ = fallback.shutdown();
+    }
+}
+
+fn install_hosted_session(
+    thread: &mut Option<RuntimeThreadHandle>,
+    started: RuntimeThreadHandle,
+    next_config: RunConfig,
+    config: &Arc<Mutex<RunConfig>>,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+) {
+    let previous = thread.replace(started);
+    *config.lock().unwrap() = next_config;
+    *preloaded.lock().unwrap() = None;
+    pending_workflow_notifications.clear();
+    if let Some(previous) = previous {
+        reap_hosted_thread(previous);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_forked_hosted_session(
     thread: &mut Option<RuntimeThreadHandle>,
@@ -8847,19 +8965,14 @@ fn start_forked_hosted_session(
         .ok_or_else(|| "fork did not create a resumable session".to_string())?
         .to_string();
 
-    if let Some(current) = thread.as_ref()
-        && let Err(error) = current.shutdown()
-    {
-        let _ = started.shutdown();
-        return Err(format!(
-            "failed to close the current conversation before switching: {error}"
-        ));
-    }
-
-    *config.lock().unwrap() = next_config;
-    *preloaded.lock().unwrap() = None;
-    pending_workflow_notifications.clear();
-    *thread = Some(started);
+    install_hosted_session(
+        thread,
+        started,
+        next_config,
+        config,
+        preloaded,
+        pending_workflow_notifications,
+    );
     Ok((mode, session_id, fork_title))
 }
 
@@ -8902,19 +9015,14 @@ fn switch_saved_hosted_session(
         .start_thread_with_request(request)
         .map_err(|error| format!("failed to switch saved conversation: {error}"))?;
 
-    if let Some(current) = thread.as_ref()
-        && let Err(error) = current.shutdown()
-    {
-        let _ = started.shutdown();
-        return Err(format!(
-            "failed to close the current conversation before switching: {error}"
-        ));
-    }
-
-    *config.lock().unwrap() = next_config;
-    *preloaded.lock().unwrap() = None;
-    pending_workflow_notifications.clear();
-    *thread = Some(started);
+    install_hosted_session(
+        thread,
+        started,
+        next_config,
+        config,
+        preloaded,
+        pending_workflow_notifications,
+    );
     Ok(mode)
 }
 
@@ -8960,8 +9068,8 @@ fn emit_typed_history_snapshot(
 ) -> Result<(), String> {
     let actions = TuiSurfaceActions::new(thread.typed_surface());
     let snapshot = actions.read_snapshot().map_err(|error| error.to_string())?;
-    let messages = crate::surface_projection::history_messages_from_surface_snapshot(&snapshot);
-    let plan = if snapshot.plan.items.is_empty() && snapshot.plan.explanation.is_none() {
+    let mut messages = crate::surface_projection::history_messages_from_surface_snapshot(&snapshot);
+    let mut plan = if snapshot.plan.items.is_empty() && snapshot.plan.explanation.is_none() {
         None
     } else {
         Some((
@@ -8989,6 +9097,19 @@ fn emit_typed_history_snapshot(
                 .collect(),
         ))
     };
+    if messages.is_empty()
+        && let HistoryMode::Resume(selector) | HistoryMode::Fork(selector) = mode
+        && let Ok(transcript) = RuntimeSurfaceHostHandle::load_saved_session(selector)
+    {
+        messages = transcript
+            .messages
+            .into_iter()
+            .filter_map(chat_message_from_history)
+            .collect();
+        if plan.is_none() {
+            plan = transcript.plan;
+        }
+    }
     let label = if matches!(mode, HistoryMode::Fork(_)) {
         "Forked saved conversation."
     } else {

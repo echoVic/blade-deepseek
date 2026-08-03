@@ -426,6 +426,10 @@ pub enum TuiEvent {
     NewSessionStarted {
         session_id: String,
     },
+    SessionProjectionReset {
+        session_id: String,
+        title: String,
+    },
     SessionIdentityUpdated {
         session_id: String,
         title: String,
@@ -1753,6 +1757,48 @@ impl AppState {
         self.invalidate_selection();
     }
 
+    pub(crate) fn reset_session_projection(&mut self, session_id: String, title: String) {
+        self.current_session_id = Some(session_id);
+        self.current_session_title = Some(title);
+        self.clear_messages();
+        self.current_plan = None;
+        self.proposed_plan_parser = ProposedPlanStreamParser::default();
+        self.plan_update_failed = false;
+        self.current_goal = None;
+        self.recoverable_operation_id = None;
+        self.recovery_prompt_visible = false;
+        self.usage = UsageTotals::default();
+        self.usage_revision = None;
+        self.context_used_tokens = 0;
+        self.context_limit_tokens = 0;
+        self.approval_dialog = None;
+        self.pending_input = None;
+        self.approval_allowlist.clear();
+        self.session_picker_sessions.clear();
+        self.session_picker_selected = 0;
+        self.session_picker_query.clear();
+        self.session_picker_phase = SessionPickerPhase::Browsing;
+        self.session_picker_error = None;
+        self.slash_menu = None;
+        self.mention = MentionPopupState::default();
+        self.mention_bindings.clear();
+        self.pending_pastes.clear();
+        self.reset_history_navigation();
+        self.last_ctrl_c = None;
+        self.panel_mode = PanelMode::Conversation;
+        self.workflow_panel = WorkflowPanelState::default();
+        self.pending_workflow_notifications.clear();
+        self.suppress_background_main_session_output = false;
+        self.last_completed_at = None;
+        self.pending_clipboard_copy = None;
+        self.last_left_click = None;
+        self.copy_notice = None;
+        self.composer_mouse_selecting = false;
+        self.scroll_offset = 0;
+        self.auto_scroll = true;
+        self.set_status(AppStatus::Idle);
+    }
+
     pub(crate) fn truncate_messages(&mut self, len: usize) {
         if self
             .assistant_stream_tail
@@ -2453,45 +2499,10 @@ impl AppState {
             }
             TuiEvent::SessionAttachmentActivated => {}
             TuiEvent::NewSessionStarted { session_id } => {
-                self.current_session_id = Some(session_id);
-                self.current_session_title = Some("New conversation".to_string());
-                self.clear_messages();
-                self.current_plan = None;
-                self.proposed_plan_parser = ProposedPlanStreamParser::default();
-                self.plan_update_failed = false;
-                self.current_goal = None;
-                self.recoverable_operation_id = None;
-                self.recovery_prompt_visible = false;
-                self.usage = UsageTotals::default();
-                self.usage_revision = None;
-                self.context_used_tokens = 0;
-                self.context_limit_tokens = 0;
-                self.approval_dialog = None;
-                self.pending_input = None;
-                self.approval_allowlist.clear();
-                self.session_picker_sessions.clear();
-                self.session_picker_selected = 0;
-                self.session_picker_query.clear();
-                self.session_picker_phase = SessionPickerPhase::Browsing;
-                self.session_picker_error = None;
-                self.slash_menu = None;
-                self.mention = MentionPopupState::default();
-                self.mention_bindings.clear();
-                self.pending_pastes.clear();
-                self.reset_history_navigation();
-                self.last_ctrl_c = None;
-                self.panel_mode = PanelMode::Conversation;
-                self.workflow_panel = WorkflowPanelState::default();
-                self.pending_workflow_notifications.clear();
-                self.suppress_background_main_session_output = false;
-                self.last_completed_at = None;
-                self.pending_clipboard_copy = None;
-                self.last_left_click = None;
-                self.copy_notice = None;
-                self.composer_mouse_selecting = false;
-                self.scroll_offset = 0;
-                self.auto_scroll = true;
-                self.set_status(AppStatus::Idle);
+                self.reset_session_projection(session_id, "New conversation".to_string());
+            }
+            TuiEvent::SessionProjectionReset { session_id, title } => {
+                self.reset_session_projection(session_id, title);
             }
             TuiEvent::SessionIdentityUpdated { session_id, title } => {
                 self.current_session_id = Some(session_id);

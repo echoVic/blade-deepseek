@@ -554,11 +554,11 @@ queued projection cannot mutate the newly active AppState.
 - Test: crates/orca-tui/src/app.rs
 - Test: tests/history_contract.rs
 
-- [ ] **Step 1: Reproduce picker fork leakage**
+- [x] **Step 1: Reproduce picker fork leakage**
 
 Create source and child histories with distinguishable messages, execute ForkSavedSession, reduce emitted events, and assert no source-only message remains after child identity is active.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 cargo test -p orca-tui picker_fork_replaces_source_transcript --lib -- --test-threads=1
@@ -566,26 +566,38 @@ cargo test -p orca-tui picker_fork_replaces_source_transcript --lib -- --test-th
 
 Expected: FAIL because picker fork emits SessionForked without history replacement.
 
-- [ ] **Step 3: Extract one switch transaction**
+- [x] **Step 3: Extract one switch transaction**
 
 Create install_hosted_session. Validate the new snapshot, allocate/install attachment, emit SessionProjectionReset, replay history, publish identity and ready under that attachment, then reap the prior handle. New, resume, current fork, and picker fork all use it.
 
-- [ ] **Step 4: Cover failure behavior**
+- [x] **Step 4: Cover failure behavior**
 
 Failed replacement startup leaves source authoritative. Failed old shutdown keeps the replacement authoritative, fences old events, and hands old cleanup to a reaper.
 
-- [ ] **Step 5: Add durable history coverage**
+- [x] **Step 5: Add durable history coverage**
 
 Prove child ID differs, copied history and title are durable, and source remains unchanged and loadable.
 
-- [ ] **Step 6: Run GREEN and commit**
+- [x] **Step 6: Run GREEN and commit**
 
 ~~~sh
 cargo test -p orca-tui hosted_session_switch --lib -- --test-threads=1
 cargo test --test history_contract session_fork -- --test-threads=1
+cargo test -p orca-tui picker_fork_replaces_source_transcript --lib -- --test-threads=1
+cargo test -p orca-tui hosted_tui_fork_preserves_source_and_projects_copied_history --lib -- --test-threads=1
+cargo test -p orca-tui hosted_tui_new_session_preserves_old_history_and_starts_with_empty_context --lib -- --test-threads=1
+cargo test -p orca-tui resumed_uuid_session_emits_typed_history_before_accepting_initial_turn --lib -- --test-threads=1
+cargo check -p orca-tui --all-targets
 git add crates/orca-tui/src/app.rs crates/orca-tui/src/types.rs tests/history_contract.rs docs/reports/2026-08-03-orca-audit-remediation-evidence.md
 git commit -m "fix(tui): replace projection on session switch"
 ~~~
+
+Evidence: `SessionProjectionReset` now clears all session-scoped AppState,
+replacement installation happens before bounded background cleanup of the old
+runtime, and saved history replay falls back to the selected durable transcript
+when a fresh typed surface has not materialized items yet. The focused picker,
+current-fork, new-session, and UUID-resume tests plus the TUI all-targets check
+pass.
 
 ### Task 13: Make Rename And Picker Actions Match The Contract
 
