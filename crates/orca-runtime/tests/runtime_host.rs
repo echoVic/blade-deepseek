@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -43,6 +43,12 @@ use orca_runtime::runtime_host::{
 };
 use orca_runtime::runtime_pending_interaction::{
     RuntimePendingInteractionRecord, RuntimePendingInteractionStore,
+};
+use orca_runtime::surface::{
+    AttachResult, CompactionState, FreshAttachRequest, MutationReply, OperationPatch,
+    OperationTerminal as SurfaceOperationTerminal, SurfaceAttachmentRole, SurfaceCapability,
+    SurfaceEvent, SurfaceInteractionKind, SurfaceRequestId, SurfaceSubscriptionItem,
+    WaitOperationTerminalResult,
 };
 use orca_runtime::thread::RuntimeThread;
 
@@ -3362,6 +3368,99 @@ fn goal_store_wait_does_not_block_thread_actor() {
 }
 
 #[test]
+fn capability_controller_trace_equivalence() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.history_mode = HistoryMode::Record;
+    let thread = host
+        .surface_handle()
+        .start_thread(config, "capability controller trace")
+        .expect("start typed runtime thread");
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::SubmitOperation,
+            SurfaceCapability::ControlBoundOperation,
+        ]),
+        interaction_capabilities: BTreeSet::<SurfaceInteractionKind>::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        _ => panic!("typed surface must accept a fresh attachment"),
+    };
+    let expected_context_revision = attachment.baseline.snapshot.context.revision;
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .expect("claim typed subscription");
+    let output = match attachment
+        .client
+        .manual_compact(SurfaceRequestId::new(), expected_context_revision)
+        .expect("commit manual compaction")
+    {
+        MutationReply::Committed { value, .. } => value,
+        _ => panic!("manual compaction must commit"),
+    };
+
+    let first_terminal = attachment
+        .client
+        .wait_operation_terminal(SurfaceRequestId::new(), output.operation_id.clone())
+        .expect("wait for committed terminal");
+    let cached_terminal = attachment
+        .client
+        .wait_operation_terminal(SurfaceRequestId::new(), output.operation_id.clone())
+        .expect("read cached terminal");
+    assert!(first_terminal == cached_terminal);
+    assert!(matches!(
+        first_terminal,
+        WaitOperationTerminalResult::Terminal { value }
+            if matches!(value.terminal, SurfaceOperationTerminal::Succeeded { .. })
+    ));
+
+    let mut trace = Vec::new();
+    while let Some(item) = subscription.try_recv() {
+        let SurfaceSubscriptionItem::Batch { batch } = item else {
+            continue;
+        };
+        for envelope in batch.events.as_slice() {
+            match &envelope.event {
+                SurfaceEvent::Context(context) => match &context.compaction {
+                    CompactionState::Running { operation_id, .. }
+                        if operation_id == &output.operation_id =>
+                    {
+                        trace.push("compaction_running");
+                    }
+                    CompactionState::Completed { operation_id, .. }
+                        if operation_id == &output.operation_id =>
+                    {
+                        trace.push("compaction_completed");
+                    }
+                    _ => {}
+                },
+                SurfaceEvent::Operation(OperationPatch::Terminal { record })
+                    if record.operation_id == output.operation_id =>
+                {
+                    trace.push("terminal_committed");
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        trace,
+        vec![
+            "compaction_running",
+            "compaction_completed",
+            "terminal_committed",
+        ]
+    );
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
 fn turn_with_goal_usage_tracking_accounts_tokens_and_flips_budget_limited() {
     with_orca_home(|_home| {
         let executor = Arc::new(ScriptedExecutor::new([
@@ -3511,7 +3610,7 @@ fn composite_goal_run_marks_automatic_outer_turn_as_continuation() {
 }
 
 #[test]
-fn active_goal_run_pause_is_runtime_owned_and_settles_usage_before_closing() {
+fn goal_controller_trace_equivalence() {
     with_orca_home(|home| {
         let gate = CancelJoinGate::new();
         let executor = Arc::new(ScriptedExecutor::new([
@@ -3594,6 +3693,80 @@ fn active_goal_run_pause_is_runtime_owned_and_settles_usage_before_closing() {
         assert_eq!(audit.usage_events, 1);
         assert_eq!(observer.count(EventType::GoalTransitioned), 1);
         assert_eq!(observer.count(EventType::GoalPaused), 1);
+
+        let resumed_at = chrono::Utc::now().timestamp() + 1;
+        assert!(matches!(
+            runtime
+                .resume(
+                    &session_id,
+                    orca_core::goal_runtime::GoalTurnOrigin::Resume,
+                    resumed_at,
+                )
+                .unwrap(),
+            orca_core::goal_runtime::GoalNextAction::Continue {
+                reason: orca_core::goal_runtime::GoalContinuationReason::Resume,
+            }
+        ));
+        runtime
+            .begin_outer_turn(
+                &session_id,
+                orca_core::goal_runtime::GoalTurnOrigin::Resume,
+                "goal-controller-verification",
+                resumed_at + 1,
+            )
+            .unwrap();
+        let intent = orca_core::goal_runtime::GoalUpdateIntent {
+            intent_id: orca_core::goal_runtime::IntentId::new(),
+            requested_state: orca_core::goal_runtime::GoalRequestedState::Complete,
+            reason: "controller trace verified".to_string(),
+            evidence: vec![orca_core::goal_runtime::EvidenceItem::observation(
+                "pause and resume state persisted",
+            )],
+            blocker: None,
+        };
+        assert!(matches!(
+            runtime
+                .submit_intent(&session_id, intent, resumed_at + 2)
+                .unwrap(),
+            orca_core::goal_runtime::GoalUpdateAck::DeferredToTurnEnd { .. }
+        ));
+        assert!(matches!(
+            runtime
+                .finish_outer_turn(
+                    &session_id,
+                    orca_core::goal_runtime::GoalTurnStatus::Success,
+                    orca_runtime::lifecycle::TurnEndReason::Unclassified,
+                    orca_core::goal_runtime::GoalUsage::default(),
+                    1,
+                    1,
+                    None,
+                    resumed_at + 3,
+                )
+                .unwrap(),
+            orca_core::goal_runtime::GoalNextAction::Verify { .. }
+        ));
+        assert!(matches!(
+            runtime
+                .verify(
+                    &session_id,
+                    orca_core::goal_runtime::GoalVerificationResult::Achieved {
+                        evidence: vec![orca_core::goal_runtime::EvidenceItem::observation(
+                            "controller trace terminalized",
+                        )],
+                    },
+                    resumed_at + 4,
+                )
+                .unwrap(),
+            orca_core::goal_runtime::GoalNextAction::Complete { .. }
+        ));
+        assert!(matches!(
+            runtime.read(&session_id).unwrap().unwrap().state,
+            orca_core::goal_runtime::GoalState::Complete { .. }
+        ));
+        let final_audit = store.audit_snapshot(&goal.goal_id).unwrap();
+        assert_eq!(final_audit.outer_turns, 2);
+        assert_eq!(final_audit.intents, 1);
+        assert_eq!(final_audit.in_flight_runs, 0);
 
         host.shutdown().expect("shutdown runtime host");
     });

@@ -1,0 +1,22 @@
+pub(super) mod capability;
+pub(super) mod goal;
+
+use capability::{CapabilityCommitEffect, CapabilityReply};
+
+pub(crate) enum RuntimeActorEffect {
+    CommitCapability(CapabilityCommitEffect),
+    ReplyCapability(CapabilityReply),
+    ReplyOperation {
+        reply: std::sync::mpsc::SyncSender<
+            Result<
+                crate::runtime_surface::WaitOperationTerminalResult,
+                crate::runtime_surface::SurfaceClientCommandError,
+            >,
+        >,
+        result: Result<
+            crate::runtime_surface::WaitOperationTerminalResult,
+            crate::runtime_surface::SurfaceClientCommandError,
+        >,
+        nonblocking: bool,
+    },
+}

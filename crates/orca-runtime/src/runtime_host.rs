@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -54,6 +54,17 @@ use crate::lifecycle::{
 };
 use crate::provider_stream::{
     RuntimeProviderSuspension, RuntimeProviderSuspensionControl, RuntimeProviderSuspensionEvent,
+};
+use crate::runtime_actor::RuntimeActorEffect;
+use crate::runtime_actor::capability::{
+    CapabilityCommitEffect, CapabilityReply, PendingSurfaceCapabilitySettlement,
+    PendingSurfaceCapabilityTransition, PendingSurfaceCapabilityWaiterOutcome,
+    ResidentSurfaceCapabilityCall, ResidentSurfaceCapabilityWaiter, ResidentTerminalCleanupLease,
+    RuntimeCapabilityController,
+};
+use crate::runtime_actor::goal::{
+    ActiveGoalControl, GoalBlockingCompletion, GoalOperationController, OpenedGoalRuntime,
+    PendingGoalPauseEvent,
 };
 use crate::runtime_pending_interaction::RuntimePendingInteractionStore;
 use crate::runtime_surface as surface;
@@ -1236,9 +1247,51 @@ impl RuntimeAcpTerminalHandle {
     }
 }
 
-enum RuntimeAcpTerminalObservation {
+pub(crate) enum RuntimeAcpTerminalObservation {
     Output(RuntimeAcpTerminalOutput),
     Exit(RuntimeAcpTerminalExitStatus),
+}
+
+fn apply_runtime_actor_reply_effect(effect: RuntimeActorEffect) {
+    match effect {
+        RuntimeActorEffect::CommitCapability(_) => {
+            unreachable!("capability commit effects require the runtime actor")
+        }
+        RuntimeActorEffect::ReplyCapability(reply) => match reply {
+            CapabilityReply::ReadTextFile { reply, result } => {
+                let _ = reply.send(result);
+            }
+            CapabilityReply::WriteTextFile { reply, result } => {
+                let _ = reply.send(result);
+            }
+            CapabilityReply::TerminalCreate { reply, result } => {
+                let _ = reply.send(result);
+            }
+            CapabilityReply::TerminalObservation { reply, result } => {
+                let _ = reply.send(result);
+            }
+            CapabilityReply::TerminalCleanup { reply, result } => {
+                let _ = reply.send(result);
+            }
+        },
+        RuntimeActorEffect::ReplyOperation {
+            reply,
+            result,
+            nonblocking,
+        } => {
+            if nonblocking {
+                let _ = reply.try_send(result);
+            } else {
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
+fn apply_optional_runtime_actor_reply_effect(effect: Option<RuntimeActorEffect>) {
+    if let Some(effect) = effect {
+        apply_runtime_actor_reply_effect(effect);
+    }
 }
 
 impl Drop for RuntimeAcpTerminalHandle {
@@ -7750,12 +7803,8 @@ fn bind_runtime_surface(
         ResidentSurfaceState {
             coordinator,
             hub: hub.clone(),
-            terminals,
-            pending_terminal_commits: HashMap::new(),
-            waiters: HashMap::new(),
+            capability: RuntimeCapabilityController::new(terminals),
             interactions,
-            capability_calls: HashMap::new(),
-            pending_capability_transitions: HashMap::new(),
             operation_origin_attachments: HashMap::new(),
             pending_task_ownership: None,
             pending_detaches: HashMap::new(),
@@ -8639,19 +8688,6 @@ struct PendingSurfaceStreamRedaction {
 
 const GOAL_COMPLETION_CAPACITY: usize = 8;
 
-enum GoalBlockingCompletion {
-    RuntimeOpened {
-        reply: SyncSender<Result<GoalRuntimeHandle, RuntimeHostError>>,
-        result: Result<OpenedGoalRuntime, RuntimeHostError>,
-    },
-}
-
-struct OpenedGoalRuntime {
-    handle: GoalRuntimeHandle,
-    join: Option<std::thread::JoinHandle<()>>,
-    recoveries: Vec<GoalRecoveryRecord>,
-}
-
 struct ThreadActor {
     state: Option<ThreadActorState>,
     config: RunConfig,
@@ -8663,14 +8699,16 @@ struct ThreadActor {
     background_capacity: usize,
     background_completion_tx: tokio_mpsc::UnboundedSender<String>,
     background_completion_rx: tokio_mpsc::UnboundedReceiver<String>,
-    goal_completion_tx: tokio_mpsc::Sender<GoalBlockingCompletion>,
-    goal_completion_rx: tokio_mpsc::Receiver<GoalBlockingCompletion>,
-    goal_blocking_in_flight: bool,
-    deferred_goal_commands: VecDeque<ThreadCommand>,
+    goal_controller: GoalOperationController<
+        ThreadCommand,
+        PendingSurfaceGoalCompletionRecovery,
+        GoalBlockingCompletion,
+        ActiveGoalControl,
+        PendingGoalPauseEvent,
+    >,
     usage_ledger: RuntimeUsageLedger,
     resident_surface: ResidentSurfaceSlot,
     pending_manual_compaction_completion: Option<PendingManualCompactionCompletion>,
-    pending_goal_completion_recovery: Option<PendingSurfaceGoalCompletionRecovery>,
     pending_provider_transfer: Option<PendingTypedProviderTransfer>,
     pending_workflow_completions:
         HashMap<surface::SurfaceOperationId, PendingTypedWorkflowCompletion>,
@@ -8715,23 +8753,17 @@ impl std::ops::DerefMut for ResidentSurfaceSlot {
     }
 }
 
+type ResidentCapabilityController = RuntimeCapabilityController<
+    ResidentSurfaceCapabilityCall,
+    PendingSurfaceCapabilityTransition,
+    PendingSurfaceTerminalCommit,
+>;
+
 struct ResidentSurfaceState {
     coordinator: surface::RuntimeCommitCoordinator<'static, surface::RuntimeSurfaceCommitLedger>,
     hub: surface::SurfaceHub,
-    terminals: HashMap<surface::SurfaceOperationId, surface::OperationTerminalAtCursor>,
-    pending_terminal_commits: HashMap<surface::SurfaceOperationId, PendingSurfaceTerminalCommit>,
-    waiters: HashMap<
-        surface::SurfaceOperationId,
-        Vec<
-            SyncSender<
-                Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
-            >,
-        >,
-    >,
+    capability: ResidentCapabilityController,
     interactions: HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction>,
-    capability_calls: HashMap<surface::SurfaceCapabilityCallId, ResidentSurfaceCapabilityCall>,
-    pending_capability_transitions:
-        HashMap<surface::SurfaceCapabilityCallId, PendingSurfaceCapabilityTransition>,
     operation_origin_attachments:
         HashMap<surface::SurfaceOperationId, surface::SurfaceAttachmentId>,
     pending_task_ownership: Option<PendingSurfaceTaskOwnership>,
@@ -8744,86 +8776,6 @@ struct ResidentSurfaceState {
     pending_admission_repairs: HashMap<surface::SurfaceOperationId, PendingSurfaceAdmissionRepair>,
     pending_admission_terminals:
         HashMap<surface::SurfaceOperationId, PendingSurfaceAdmissionTerminal>,
-}
-
-struct ResidentSurfaceCapabilityCall {
-    attachment_id: surface::SurfaceAttachmentId,
-    capability_revision: surface::CapabilityRevision,
-    write_claimed: bool,
-    terminal_cleanup_lease: Option<ResidentTerminalCleanupLease>,
-    waiter: Option<ResidentSurfaceCapabilityWaiter>,
-}
-
-#[derive(Clone)]
-struct ResidentTerminalCleanupLease {
-    lease_id: surface::UuidV7,
-    terminal_id: surface::SurfaceRemoteTerminalId,
-}
-
-enum ResidentSurfaceCapabilityWaiter {
-    ReadTextFile(SyncSender<io::Result<String>>),
-    WriteTextFile(SyncSender<io::Result<()>>),
-    TerminalCreate(SyncSender<io::Result<String>>),
-    TerminalObservation(SyncSender<io::Result<RuntimeAcpTerminalObservation>>),
-    TerminalCleanup(SyncSender<io::Result<()>>),
-}
-
-struct PendingSurfaceCapabilityTransition {
-    fence: surface::SurfaceOperationFence,
-    batch: surface::SurfaceCommitBatch,
-    waiter_outcome: Option<PendingSurfaceCapabilityWaiterOutcome>,
-    deferred_settlement: Option<PendingSurfaceCapabilitySettlement>,
-    retry_at: tokio::time::Instant,
-}
-
-enum PendingSurfaceCapabilityWaiterOutcome {
-    ReadTextFileCompleted(String),
-    WriteTextFileCompleted,
-    TerminalCreated(String),
-    TerminalOutputObserved(RuntimeAcpTerminalOutput),
-    TerminalExitObserved(RuntimeAcpTerminalExitStatus),
-    TerminalCleanupCompleted,
-    Failed {
-        kind: io::ErrorKind,
-        message: String,
-    },
-}
-
-enum PendingSurfaceCapabilitySettlement {
-    ReadTextFile {
-        client: surface::RuntimeSurfaceClientHandle,
-        capability_revision: surface::CapabilityRevision,
-        settlement: surface::AcpReadTextFileSettlement,
-    },
-    WriteTextFile {
-        client: surface::RuntimeSurfaceClientHandle,
-        capability_revision: surface::CapabilityRevision,
-        settlement: surface::AcpWriteTextFileSettlement,
-    },
-    TerminalCreate {
-        client: surface::RuntimeSurfaceClientHandle,
-        capability_revision: surface::CapabilityRevision,
-        settlement: surface::AcpTerminalCreateSettlement,
-    },
-    TerminalObservation {
-        client: surface::RuntimeSurfaceClientHandle,
-        capability_revision: surface::CapabilityRevision,
-        settlement: surface::AcpTerminalObservationSettlement,
-    },
-    TerminalCleanup {
-        client: surface::RuntimeSurfaceClientHandle,
-        capability_revision: surface::CapabilityRevision,
-        settlement: surface::AcpTerminalCleanupSettlement,
-    },
-    DispatchTerminalCleanup {
-        route: surface::AcpCapabilityAttachmentRoute,
-        dispatch: surface::AcpTerminalCleanupDispatch,
-    },
-    BeginTerminalRelease {
-        kill_call: surface::SurfaceCapabilityCall,
-        lease_id: surface::UuidV7,
-        terminal_id: surface::SurfaceRemoteTerminalId,
-    },
 }
 
 struct ResidentSurfaceInteraction {
@@ -10904,8 +10856,6 @@ struct ActiveOperation {
     steer_handle: ThreadSteerHandle,
     resume_queued: bool,
     goal_admitted_generation: Option<GenerationFence>,
-    goal_control: Option<ActiveGoalControl>,
-    pending_goal_pause_event: Option<PendingGoalPauseEvent>,
     generation: ActiveGeneration,
     surface_operation: Option<surface::SurfaceOperationFence>,
     surface_manual_compaction_before_messages: Option<u64>,
@@ -10979,23 +10929,6 @@ struct PendingSurfaceBackgroundTransfer {
             surface::SurfaceClientCommandError,
         >,
     >,
-}
-
-#[derive(Clone)]
-struct ActiveGoalControl {
-    session_id: String,
-    runtime: GoalRuntimeHandle,
-}
-
-struct PendingGoalPauseEvent {
-    goal_id: orca_core::goal_runtime::GoalId,
-    goal_run_id: Option<orca_core::goal_runtime::GoalRunId>,
-    outer_turn_id: Option<orca_core::goal_runtime::GoalOuterTurnId>,
-    previous_state: orca_core::goal_runtime::GoalState,
-    next_state: orca_core::goal_runtime::GoalState,
-    reason: orca_core::goal_runtime::GoalPauseReason,
-    message: String,
-    reason_code: String,
 }
 
 struct ActiveGeneration {
@@ -11418,11 +11351,13 @@ impl ThreadActor {
                     "typed Goal recovery could not reconcile its exact prepared batch: {error:?}"
                 ),
             })?;
-        let control = active.goal_control.as_ref().cloned().ok_or_else(|| {
-            RuntimeHostError::GoalControlFailed {
+        let control = self
+            .goal_controller
+            .active_control(active.operation_id)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::GoalControlFailed {
                 message: "typed Goal recovery lacks its runtime owner".to_string(),
-            }
-        })?;
+            })?;
         let operation_id = active
             .surface_operation
             .as_ref()
@@ -11616,6 +11551,7 @@ impl ThreadActor {
                 return Ok(());
             }
             self.cache_surface_terminal(value);
+            self.goal_controller.clear_active(active.operation_id);
             let completed = active.completion.complete(legacy_terminal);
             debug_assert!(
                 completed,
@@ -14747,18 +14683,6 @@ impl ThreadActor {
         Ok(tool)
     }
 
-    fn surface_capability_call(
-        snapshot: &surface::SurfaceSnapshot,
-        call_id: &surface::SurfaceCapabilityCallId,
-    ) -> Option<surface::SurfaceCapabilityCall> {
-        snapshot
-            .tools
-            .iter()
-            .flat_map(|tool| tool.capability_calls.iter())
-            .find(|call| call.call_id == *call_id)
-            .cloned()
-    }
-
     fn capability_call_batch(
         &self,
         call: surface::SurfaceCapabilityCall,
@@ -14864,11 +14788,6 @@ impl ThreadActor {
         Ok(self.surface_event_batch_with_commit_id(events, None))
     }
 
-    fn terminal_create_lease_id(call_id: &surface::SurfaceCapabilityCallId) -> surface::UuidV7 {
-        surface::UuidV7::try_from_bytes(*call_id.as_bytes())
-            .expect("capability call id is a UUIDv7")
-    }
-
     fn terminal_create_completed_batch(
         &self,
         call: surface::SurfaceCapabilityCall,
@@ -14878,7 +14797,7 @@ impl ThreadActor {
             fence: call.fence.clone(),
         };
         let lease = surface::SurfaceRemoteTerminalLease {
-            lease_id: Self::terminal_create_lease_id(&call.call_id),
+            lease_id: ResidentCapabilityController::terminal_create_lease_id(&call.call_id),
             owning_tool_call_id: call.owning_tool_call_id.clone(),
             state: surface::SurfaceRemoteTerminalLeaseState::Live {
                 terminal_id,
@@ -14910,7 +14829,7 @@ impl ThreadActor {
             fence: call.fence.clone(),
         };
         let lease = surface::SurfaceRemoteTerminalLease {
-            lease_id: Self::terminal_create_lease_id(&call.call_id),
+            lease_id: ResidentCapabilityController::terminal_create_lease_id(&call.call_id),
             owning_tool_call_id: call.owning_tool_call_id.clone(),
             state: surface::SurfaceRemoteTerminalLeaseState::IdentityUnknown {
                 create_call_id: call.call_id.clone(),
@@ -15075,317 +14994,155 @@ impl ThreadActor {
         Ok(self.surface_event_batch_with_commit_id(events, None))
     }
 
-    fn pending_read_capability_waiter_outcome(
-        result: io::Result<String>,
-    ) -> PendingSurfaceCapabilityWaiterOutcome {
-        match result {
-            Ok(content) => PendingSurfaceCapabilityWaiterOutcome::ReadTextFileCompleted(content),
-            Err(error) => PendingSurfaceCapabilityWaiterOutcome::Failed {
-                kind: error.kind(),
-                message: error.to_string(),
-            },
-        }
-    }
-
-    fn pending_write_capability_waiter_outcome(
-        result: io::Result<()>,
-    ) -> PendingSurfaceCapabilityWaiterOutcome {
-        match result {
-            Ok(()) => PendingSurfaceCapabilityWaiterOutcome::WriteTextFileCompleted,
-            Err(error) => PendingSurfaceCapabilityWaiterOutcome::Failed {
-                kind: error.kind(),
-                message: error.to_string(),
-            },
-        }
-    }
-
-    fn pending_terminal_create_waiter_outcome(
-        result: io::Result<String>,
-    ) -> PendingSurfaceCapabilityWaiterOutcome {
-        match result {
-            Ok(terminal_id) => PendingSurfaceCapabilityWaiterOutcome::TerminalCreated(terminal_id),
-            Err(error) => PendingSurfaceCapabilityWaiterOutcome::Failed {
-                kind: error.kind(),
-                message: error.to_string(),
-            },
-        }
-    }
-
-    fn pending_terminal_observation_waiter_outcome(
-        result: io::Result<RuntimeAcpTerminalObservation>,
-    ) -> PendingSurfaceCapabilityWaiterOutcome {
-        match result {
-            Ok(RuntimeAcpTerminalObservation::Output(output)) => {
-                PendingSurfaceCapabilityWaiterOutcome::TerminalOutputObserved(output)
-            }
-            Ok(RuntimeAcpTerminalObservation::Exit(status)) => {
-                PendingSurfaceCapabilityWaiterOutcome::TerminalExitObserved(status)
-            }
-            Err(error) => PendingSurfaceCapabilityWaiterOutcome::Failed {
-                kind: error.kind(),
-                message: error.to_string(),
-            },
-        }
-    }
-
-    fn apply_committed_surface_capability_transition(
-        &mut self,
-        call_id: &surface::SurfaceCapabilityCallId,
-        waiter_outcome: Option<PendingSurfaceCapabilityWaiterOutcome>,
-        physical_write_confirmed: bool,
-    ) {
-        let Some(waiter_outcome) = waiter_outcome else {
-            if physical_write_confirmed
-                && let Some(resident) = self.resident_surface.capability_calls.get_mut(call_id)
-            {
-                resident.write_claimed = false;
-            }
-            return;
-        };
-        if let Some(mut resident) = self.resident_surface.capability_calls.remove(call_id)
-            && let Some(waiter) = resident.waiter.take()
-        {
-            match (waiter, waiter_outcome) {
-                (
-                    ResidentSurfaceCapabilityWaiter::ReadTextFile(waiter),
-                    PendingSurfaceCapabilityWaiterOutcome::ReadTextFileCompleted(content),
-                ) => {
-                    let _ = waiter.send(Ok(content));
-                }
-                (
-                    ResidentSurfaceCapabilityWaiter::WriteTextFile(waiter),
-                    PendingSurfaceCapabilityWaiterOutcome::WriteTextFileCompleted,
-                ) => {
-                    let _ = waiter.send(Ok(()));
-                }
-                (
-                    ResidentSurfaceCapabilityWaiter::TerminalCreate(waiter),
-                    PendingSurfaceCapabilityWaiterOutcome::TerminalCreated(terminal_id),
-                ) => {
-                    let _ = waiter.send(Ok(terminal_id));
-                }
-                (
-                    ResidentSurfaceCapabilityWaiter::TerminalObservation(waiter),
-                    PendingSurfaceCapabilityWaiterOutcome::TerminalOutputObserved(output),
-                ) => {
-                    let _ = waiter.send(Ok(RuntimeAcpTerminalObservation::Output(output)));
-                }
-                (
-                    ResidentSurfaceCapabilityWaiter::TerminalObservation(waiter),
-                    PendingSurfaceCapabilityWaiterOutcome::TerminalExitObserved(status),
-                ) => {
-                    let _ = waiter.send(Ok(RuntimeAcpTerminalObservation::Exit(status)));
-                }
-                (
-                    ResidentSurfaceCapabilityWaiter::TerminalCleanup(waiter),
-                    PendingSurfaceCapabilityWaiterOutcome::TerminalCleanupCompleted,
-                ) => {
-                    let _ = waiter.send(Ok(()));
-                }
-                (
-                    ResidentSurfaceCapabilityWaiter::ReadTextFile(waiter),
-                    PendingSurfaceCapabilityWaiterOutcome::Failed { kind, message },
-                ) => {
-                    let _ = waiter.send(Err(io::Error::new(kind, message)));
-                }
-                (
-                    ResidentSurfaceCapabilityWaiter::WriteTextFile(waiter),
-                    PendingSurfaceCapabilityWaiterOutcome::Failed { kind, message },
-                ) => {
-                    let _ = waiter.send(Err(io::Error::new(kind, message)));
-                }
-                (
-                    ResidentSurfaceCapabilityWaiter::TerminalCreate(waiter),
-                    PendingSurfaceCapabilityWaiterOutcome::Failed { kind, message },
-                ) => {
-                    let _ = waiter.send(Err(io::Error::new(kind, message)));
-                }
-                (
-                    ResidentSurfaceCapabilityWaiter::TerminalObservation(waiter),
-                    PendingSurfaceCapabilityWaiterOutcome::Failed { kind, message },
-                ) => {
-                    let _ = waiter.send(Err(io::Error::new(kind, message)));
-                }
-                (
-                    ResidentSurfaceCapabilityWaiter::TerminalCleanup(waiter),
-                    PendingSurfaceCapabilityWaiterOutcome::Failed { kind, message },
-                ) => {
-                    let _ = waiter.send(Err(io::Error::new(kind, message)));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn retain_surface_capability_transition(
-        &mut self,
-        call_id: surface::SurfaceCapabilityCallId,
-        fence: surface::SurfaceOperationFence,
-        batch: surface::SurfaceCommitBatch,
-        waiter_outcome: Option<PendingSurfaceCapabilityWaiterOutcome>,
-    ) {
-        self.resident_surface.pending_capability_transitions.insert(
-            call_id,
-            PendingSurfaceCapabilityTransition {
-                fence,
-                batch,
-                waiter_outcome,
-                deferred_settlement: None,
-                retry_at: tokio::time::Instant::now(),
-            },
-        );
-    }
-
     fn retry_surface_capability_transition(
         &mut self,
         call_id: &surface::SurfaceCapabilityCallId,
         physical_write_confirmed: bool,
     ) -> bool {
-        let Some(mut pending) = self
+        let Some(RuntimeActorEffect::CommitCapability(effect)) = self
             .resident_surface
-            .pending_capability_transitions
-            .remove(call_id)
+            .capability
+            .retry_transition_effect(call_id, physical_write_confirmed)
         else {
             return true;
         };
-        if self
+        self.apply_surface_capability_commit(effect)
+    }
+
+    fn apply_surface_capability_commit(&mut self, effect: CapabilityCommitEffect) -> bool {
+        let committed = self
             .resident_surface
             .coordinator
-            .commit_generation_batch(pending.fence.clone(), &pending.batch)
-            .is_err()
-        {
-            pending.retry_at = tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-            self.resident_surface
-                .pending_capability_transitions
-                .insert(call_id.clone(), pending);
+            .commit_generation_batch(effect.fence().clone(), effect.batch())
+            .is_ok();
+        let call_id = effect.call_id().clone();
+        let resolution = self
+            .resident_surface
+            .capability
+            .resolve_commit_effect(effect, committed);
+        apply_optional_runtime_actor_reply_effect(resolution.reply);
+        if resolution.retained_for_retry {
             return false;
         }
-        let deferred_settlement = pending.deferred_settlement.take();
-        self.apply_committed_surface_capability_transition(
-            call_id,
-            pending.waiter_outcome,
-            physical_write_confirmed,
-        );
-        if let Some(deferred_settlement) = deferred_settlement {
-            match deferred_settlement {
-                PendingSurfaceCapabilitySettlement::ReadTextFile {
-                    client,
-                    capability_revision,
-                    settlement,
-                } => {
-                    let _ = self.settle_surface_acp_read_text_file(
-                        &client,
-                        call_id.clone(),
-                        capability_revision,
-                        settlement,
-                    );
-                }
-                PendingSurfaceCapabilitySettlement::WriteTextFile {
-                    client,
-                    capability_revision,
-                    settlement,
-                } => {
-                    let _ = self.settle_surface_acp_write_text_file(
-                        &client,
-                        call_id.clone(),
-                        capability_revision,
-                        settlement,
-                    );
-                }
-                PendingSurfaceCapabilitySettlement::TerminalCreate {
-                    client,
-                    capability_revision,
-                    settlement,
-                } => {
-                    let _ = self.settle_surface_acp_terminal_create(
-                        &client,
-                        call_id.clone(),
-                        capability_revision,
-                        settlement,
-                    );
-                }
-                PendingSurfaceCapabilitySettlement::TerminalObservation {
-                    client,
-                    capability_revision,
-                    settlement,
-                } => {
-                    let _ = self.settle_surface_acp_terminal_observation(
-                        &client,
-                        call_id.clone(),
-                        capability_revision,
-                        settlement,
-                    );
-                }
-                PendingSurfaceCapabilitySettlement::TerminalCleanup {
-                    client,
-                    capability_revision,
-                    settlement,
-                } => {
-                    let _ = self.settle_surface_acp_terminal_cleanup(
-                        &client,
-                        call_id.clone(),
-                        capability_revision,
-                        settlement,
-                    );
-                }
-                PendingSurfaceCapabilitySettlement::DispatchTerminalCleanup { route, dispatch } => {
-                    if let Some(resident) = self.resident_surface.capability_calls.get_mut(call_id)
-                    {
-                        resident.write_claimed = true;
-                    }
-                    if let Err(error) = self
-                        .resident_surface
-                        .hub
-                        .dispatch_acp_terminal_cleanup(&route, dispatch)
-                    {
-                        let _ = self.settle_surface_terminal_cleanup_ambiguous(
-                            call_id,
-                            format!(
-                                "ACP terminal cleanup dispatch failed after durable retry: {error:?}"
-                            ),
-                        );
-                    }
-                }
-                PendingSurfaceCapabilitySettlement::BeginTerminalRelease {
-                    kill_call,
-                    lease_id,
-                    terminal_id,
-                } => {
-                    if let Some(mut resident) =
-                        self.resident_surface.capability_calls.remove(call_id)
-                        && let Some(waiter) = resident.waiter.take()
-                    {
-                        let _ = self.begin_surface_terminal_release(
-                            kill_call,
-                            lease_id,
-                            terminal_id,
-                            resident,
-                            waiter,
-                        );
-                    }
-                }
-            }
-            return !self
-                .resident_surface
-                .pending_capability_transitions
-                .contains_key(call_id);
+        if let Some(deferred_settlement) = resolution.deferred_settlement {
+            self.apply_deferred_surface_capability_settlement(&call_id, deferred_settlement);
+            return !self.resident_surface.capability.has_transition(&call_id);
         }
         true
     }
 
+    fn apply_deferred_surface_capability_settlement(
+        &mut self,
+        call_id: &surface::SurfaceCapabilityCallId,
+        deferred_settlement: PendingSurfaceCapabilitySettlement,
+    ) {
+        match deferred_settlement {
+            PendingSurfaceCapabilitySettlement::ReadTextFile {
+                client,
+                capability_revision,
+                settlement,
+            } => {
+                let _ = self.settle_surface_acp_read_text_file(
+                    &client,
+                    call_id.clone(),
+                    capability_revision,
+                    settlement,
+                );
+            }
+            PendingSurfaceCapabilitySettlement::WriteTextFile {
+                client,
+                capability_revision,
+                settlement,
+            } => {
+                let _ = self.settle_surface_acp_write_text_file(
+                    &client,
+                    call_id.clone(),
+                    capability_revision,
+                    settlement,
+                );
+            }
+            PendingSurfaceCapabilitySettlement::TerminalCreate {
+                client,
+                capability_revision,
+                settlement,
+            } => {
+                let _ = self.settle_surface_acp_terminal_create(
+                    &client,
+                    call_id.clone(),
+                    capability_revision,
+                    settlement,
+                );
+            }
+            PendingSurfaceCapabilitySettlement::TerminalObservation {
+                client,
+                capability_revision,
+                settlement,
+            } => {
+                let _ = self.settle_surface_acp_terminal_observation(
+                    &client,
+                    call_id.clone(),
+                    capability_revision,
+                    settlement,
+                );
+            }
+            PendingSurfaceCapabilitySettlement::TerminalCleanup {
+                client,
+                capability_revision,
+                settlement,
+            } => {
+                let _ = self.settle_surface_acp_terminal_cleanup(
+                    &client,
+                    call_id.clone(),
+                    capability_revision,
+                    settlement,
+                );
+            }
+            PendingSurfaceCapabilitySettlement::DispatchTerminalCleanup { route, dispatch } => {
+                self.resident_surface.capability.try_claim_write(call_id);
+                if let Err(error) = self
+                    .resident_surface
+                    .hub
+                    .dispatch_acp_terminal_cleanup(&route, dispatch)
+                {
+                    let _ = self.settle_surface_terminal_cleanup_ambiguous(
+                        call_id,
+                        format!(
+                            "ACP terminal cleanup dispatch failed after durable retry: {error:?}"
+                        ),
+                    );
+                }
+            }
+            PendingSurfaceCapabilitySettlement::BeginTerminalRelease {
+                kill_call,
+                lease_id,
+                terminal_id,
+            } => {
+                if let Some((resident, waiter)) = self
+                    .resident_surface
+                    .capability
+                    .take_call_with_waiter(call_id)
+                {
+                    let _ = self.begin_surface_terminal_release(
+                        kill_call,
+                        lease_id,
+                        terminal_id,
+                        resident,
+                        waiter,
+                    );
+                }
+            }
+        }
+    }
+
     fn settle_surface_capability_transitions_for_shutdown(&mut self) -> bool {
         for _ in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
-            if self
-                .resident_surface
-                .pending_capability_transitions
-                .is_empty()
-            {
+            if self.resident_surface.capability.transitions_empty() {
                 return true;
             }
             let mut call_ids = self
                 .resident_surface
-                .pending_capability_transitions
-                .keys()
+                .capability
+                .pending_transition_ids()
                 .cloned()
                 .collect::<Vec<_>>();
             call_ids.sort();
@@ -15393,9 +15150,7 @@ impl ThreadActor {
                 self.retry_surface_capability_transition(&call_id, false);
             }
         }
-        self.resident_surface
-            .pending_capability_transitions
-            .is_empty()
+        self.resident_surface.capability.transitions_empty()
     }
 
     fn request_surface_acp_read_text_file(
@@ -15481,15 +15236,15 @@ impl ThreadActor {
             };
             let batch = self.capability_call_batch(call.clone());
             self.commit_surface_generation_batch_with_retry(fence.clone(), &batch)?;
-            self.resident_surface.capability_calls.insert(
+            self.resident_surface.capability.register_call(
                 call_id.clone(),
-                ResidentSurfaceCapabilityCall {
-                    attachment_id: route.attachment_id.clone(),
-                    capability_revision: route.capability_revision,
-                    write_claimed: false,
-                    terminal_cleanup_lease: None,
-                    waiter: Some(ResidentSurfaceCapabilityWaiter::ReadTextFile(reply.clone())),
-                },
+                ResidentSurfaceCapabilityCall::new(
+                    route.attachment_id.clone(),
+                    route.capability_revision,
+                    false,
+                    None,
+                    Some(ResidentSurfaceCapabilityWaiter::ReadTextFile(reply.clone())),
+                ),
             );
             let dispatch = surface::AcpReadTextFileDispatch {
                 call_id: call_id.clone(),
@@ -15520,17 +15275,17 @@ impl ThreadActor {
                     .commit_surface_generation_batch_with_retry(fence.clone(), &failed_batch)
                     .is_err()
                 {
-                    self.retain_surface_capability_transition(
+                    self.resident_surface.capability.retain_transition(
                         call_id,
                         fence,
                         failed_batch,
-                        Some(Self::pending_read_capability_waiter_outcome(Err(
+                        Some(ResidentCapabilityController::read_waiter_outcome(Err(
                             waiter_error,
                         ))),
                     );
                     return Ok(());
                 }
-                self.resident_surface.capability_calls.remove(&call_id);
+                self.resident_surface.capability.discard_call(&call_id);
                 return Err(waiter_error);
             }
             Ok(())
@@ -15546,17 +15301,14 @@ impl ThreadActor {
         call_id: &surface::SurfaceCapabilityCallId,
         capability_revision: surface::CapabilityRevision,
     ) -> Result<surface::SurfaceCapabilityCall, surface::SurfaceClientCommandError> {
-        let resident = self
-            .resident_surface
-            .capability_calls
-            .get(call_id)
-            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
-        if resident.attachment_id != *client.attachment_id()
-            || resident.capability_revision != capability_revision
-        {
+        if !self.resident_surface.capability.authorize_call(
+            call_id,
+            client.attachment_id(),
+            capability_revision,
+        ) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        let call = Self::surface_capability_call(
+        let call = ResidentCapabilityController::surface_call(
             self.resident_surface.coordinator.state().snapshot(),
             call_id,
         )
@@ -15577,22 +15329,13 @@ impl ThreadActor {
             self.authorize_surface_capability_settlement(client, &call_id, capability_revision)?;
         if call.kind != surface::SurfaceCapabilityCallKind::ReadTextFile
             || call.state != surface::SurfaceCapabilityCallState::Prepared
-            || self
-                .resident_surface
-                .pending_capability_transitions
-                .contains_key(&call_id)
+            || self.resident_surface.capability.has_transition(&call_id)
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        let resident = self
-            .resident_surface
-            .capability_calls
-            .get_mut(&call_id)
-            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
-        if resident.write_claimed {
+        if !self.resident_surface.capability.try_claim_write(&call_id) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        resident.write_claimed = true;
         call.state = surface::SurfaceCapabilityCallState::WrittenAwaitingResponse;
         let fence = call.fence.clone();
         let batch = self.capability_call_batch(call);
@@ -15600,7 +15343,9 @@ impl ThreadActor {
             .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
             .is_err()
         {
-            self.retain_surface_capability_transition(call_id, fence, batch, None);
+            self.resident_surface
+                .capability
+                .retain_transition(call_id, fence, batch, None);
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         Ok(())
@@ -15617,16 +15362,11 @@ impl ThreadActor {
         if call.kind != surface::SurfaceCapabilityCallKind::ReadTextFile {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if self
-            .resident_surface
-            .pending_capability_transitions
-            .contains_key(&call_id)
-        {
+        if self.resident_surface.capability.has_transition(&call_id) {
             let is_written_transition = self
                 .resident_surface
-                .pending_capability_transitions
-                .get(&call_id)
-                .is_some_and(|pending| pending.waiter_outcome.is_none());
+                .capability
+                .transition_waits_for_written(&call_id);
             if !is_written_transition {
                 return Err(surface::SurfaceClientCommandError::Unauthorized);
             }
@@ -15640,15 +15380,12 @@ impl ThreadActor {
         }
         if !self
             .resident_surface
-            .capability_calls
-            .get(&call_id)
-            .is_some_and(|resident| resident.write_claimed)
+            .capability
+            .call_write_claimed(&call_id)
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if let Some(resident) = self.resident_surface.capability_calls.get_mut(&call_id) {
-            resident.write_claimed = false;
-        }
+        self.resident_surface.capability.release_write(&call_id);
         Ok(())
     }
 
@@ -15664,31 +15401,27 @@ impl ThreadActor {
         if call.kind != surface::SurfaceCapabilityCallKind::ReadTextFile {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if self
-            .resident_surface
-            .pending_capability_transitions
-            .contains_key(&call_id)
-        {
+        if self.resident_surface.capability.has_transition(&call_id) {
             let waits_for_written = self
                 .resident_surface
-                .pending_capability_transitions
-                .get(&call_id)
-                .is_some_and(|pending| pending.waiter_outcome.is_none());
+                .capability
+                .transition_waits_for_written(&call_id);
             if waits_for_written {
-                let pending = self
+                if self
                     .resident_surface
-                    .pending_capability_transitions
-                    .get_mut(&call_id)
-                    .expect("checked pending capability transition");
-                if pending.deferred_settlement.is_some() {
+                    .capability
+                    .set_deferred_settlement(
+                        &call_id,
+                        PendingSurfaceCapabilitySettlement::ReadTextFile {
+                            client: client.clone(),
+                            capability_revision,
+                            settlement,
+                        },
+                    )
+                    .is_err()
+                {
                     return Err(surface::SurfaceClientCommandError::Unauthorized);
                 }
-                pending.deferred_settlement =
-                    Some(PendingSurfaceCapabilitySettlement::ReadTextFile {
-                        client: client.clone(),
-                        capability_revision,
-                        settlement,
-                    });
             }
             return self
                 .retry_surface_capability_transition(&call_id, false)
@@ -15828,18 +15561,24 @@ impl ThreadActor {
             .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
             .is_err()
         {
-            self.retain_surface_capability_transition(
+            self.resident_surface.capability.retain_transition(
                 call_id,
                 fence,
                 batch,
-                Some(Self::pending_read_capability_waiter_outcome(waiter_result)),
+                Some(ResidentCapabilityController::read_waiter_outcome(
+                    waiter_result,
+                )),
             );
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        self.apply_committed_surface_capability_transition(
-            &call_id,
-            Some(Self::pending_read_capability_waiter_outcome(waiter_result)),
-            false,
+        apply_optional_runtime_actor_reply_effect(
+            self.resident_surface.capability.apply_committed_transition(
+                &call_id,
+                Some(ResidentCapabilityController::read_waiter_outcome(
+                    waiter_result,
+                )),
+                false,
+            ),
         );
         Ok(())
     }
@@ -15926,17 +15665,17 @@ impl ThreadActor {
             };
             let batch = self.capability_call_batch(call.clone());
             self.commit_surface_generation_batch_with_retry(fence.clone(), &batch)?;
-            self.resident_surface.capability_calls.insert(
+            self.resident_surface.capability.register_call(
                 call_id.clone(),
-                ResidentSurfaceCapabilityCall {
-                    attachment_id: route.attachment_id.clone(),
-                    capability_revision: route.capability_revision,
-                    write_claimed: false,
-                    terminal_cleanup_lease: None,
-                    waiter: Some(ResidentSurfaceCapabilityWaiter::WriteTextFile(
+                ResidentSurfaceCapabilityCall::new(
+                    route.attachment_id.clone(),
+                    route.capability_revision,
+                    false,
+                    None,
+                    Some(ResidentSurfaceCapabilityWaiter::WriteTextFile(
                         reply.clone(),
                     )),
-                },
+                ),
             );
             let dispatch = surface::AcpWriteTextFileDispatch {
                 call_id: call_id.clone(),
@@ -15966,17 +15705,17 @@ impl ThreadActor {
                     .commit_surface_generation_batch_with_retry(fence.clone(), &failed_batch)
                     .is_err()
                 {
-                    self.retain_surface_capability_transition(
+                    self.resident_surface.capability.retain_transition(
                         call_id,
                         fence,
                         failed_batch,
-                        Some(Self::pending_write_capability_waiter_outcome(Err(
+                        Some(ResidentCapabilityController::write_waiter_outcome(Err(
                             waiter_error,
                         ))),
                     );
                     return Ok(());
                 }
-                self.resident_surface.capability_calls.remove(&call_id);
+                self.resident_surface.capability.discard_call(&call_id);
                 return Err(waiter_error);
             }
             Ok(())
@@ -15996,15 +15735,11 @@ impl ThreadActor {
             self.authorize_surface_capability_settlement(client, &call_id, capability_revision)?;
         if call.kind != surface::SurfaceCapabilityCallKind::WriteTextFile
             || call.state != surface::SurfaceCapabilityCallState::Prepared
+            || self.resident_surface.capability.has_transition(&call_id)
             || self
                 .resident_surface
-                .pending_capability_transitions
-                .contains_key(&call_id)
-            || self
-                .resident_surface
-                .capability_calls
-                .get(&call_id)
-                .is_some_and(|resident| resident.write_claimed)
+                .capability
+                .call_write_claimed(&call_id)
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
@@ -16015,15 +15750,14 @@ impl ThreadActor {
             .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
             .is_err()
         {
-            self.retain_surface_capability_transition(call_id, fence, batch, None);
+            self.resident_surface
+                .capability
+                .retain_transition(call_id, fence, batch, None);
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        let resident = self
-            .resident_surface
-            .capability_calls
-            .get_mut(&call_id)
-            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
-        resident.write_claimed = true;
+        if !self.resident_surface.capability.try_claim_write(&call_id) {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
         Ok(())
     }
 
@@ -16038,11 +15772,7 @@ impl ThreadActor {
         if call.kind != surface::SurfaceCapabilityCallKind::WriteTextFile {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if self
-            .resident_surface
-            .pending_capability_transitions
-            .contains_key(&call_id)
-        {
+        if self.resident_surface.capability.has_transition(&call_id) {
             return self
                 .retry_surface_capability_transition(&call_id, true)
                 .then_some(())
@@ -16051,9 +15781,8 @@ impl ThreadActor {
         if call.state != surface::SurfaceCapabilityCallState::DeliveryPossible
             || !self
                 .resident_surface
-                .capability_calls
-                .get(&call_id)
-                .is_some_and(|resident| resident.write_claimed)
+                .capability
+                .call_write_claimed(&call_id)
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
@@ -16064,12 +15793,12 @@ impl ThreadActor {
             .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
             .is_err()
         {
-            self.retain_surface_capability_transition(call_id, fence, batch, None);
+            self.resident_surface
+                .capability
+                .retain_transition(call_id, fence, batch, None);
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        if let Some(resident) = self.resident_surface.capability_calls.get_mut(&call_id) {
-            resident.write_claimed = false;
-        }
+        self.resident_surface.capability.release_write(&call_id);
         Ok(())
     }
 
@@ -16085,24 +15814,22 @@ impl ThreadActor {
         if call.kind != surface::SurfaceCapabilityCallKind::WriteTextFile {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if self
-            .resident_surface
-            .pending_capability_transitions
-            .contains_key(&call_id)
-        {
-            let pending = self
+        if self.resident_surface.capability.has_transition(&call_id) {
+            if self
                 .resident_surface
-                .pending_capability_transitions
-                .get_mut(&call_id)
-                .expect("checked pending capability transition");
-            if pending.deferred_settlement.is_some() {
+                .capability
+                .set_deferred_settlement(
+                    &call_id,
+                    PendingSurfaceCapabilitySettlement::WriteTextFile {
+                        client: client.clone(),
+                        capability_revision,
+                        settlement,
+                    },
+                )
+                .is_err()
+            {
                 return Err(surface::SurfaceClientCommandError::Unauthorized);
             }
-            pending.deferred_settlement = Some(PendingSurfaceCapabilitySettlement::WriteTextFile {
-                client: client.clone(),
-                capability_revision,
-                settlement,
-            });
             return self
                 .retry_surface_capability_transition(&call_id, false)
                 .then_some(())
@@ -16201,18 +15928,24 @@ impl ThreadActor {
             .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
             .is_err()
         {
-            self.retain_surface_capability_transition(
+            self.resident_surface.capability.retain_transition(
                 call_id,
                 fence,
                 batch,
-                Some(Self::pending_write_capability_waiter_outcome(waiter_result)),
+                Some(ResidentCapabilityController::write_waiter_outcome(
+                    waiter_result,
+                )),
             );
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        self.apply_committed_surface_capability_transition(
-            &call_id,
-            Some(Self::pending_write_capability_waiter_outcome(waiter_result)),
-            false,
+        apply_optional_runtime_actor_reply_effect(
+            self.resident_surface.capability.apply_committed_transition(
+                &call_id,
+                Some(ResidentCapabilityController::write_waiter_outcome(
+                    waiter_result,
+                )),
+                false,
+            ),
         );
         Ok(())
     }
@@ -16312,17 +16045,17 @@ impl ThreadActor {
             };
             let batch = self.capability_call_batch(call.clone());
             self.commit_surface_generation_batch_with_retry(fence.clone(), &batch)?;
-            self.resident_surface.capability_calls.insert(
+            self.resident_surface.capability.register_call(
                 call_id.clone(),
-                ResidentSurfaceCapabilityCall {
-                    attachment_id: route.attachment_id.clone(),
-                    capability_revision: route.capability_revision,
-                    write_claimed: false,
-                    terminal_cleanup_lease: None,
-                    waiter: Some(ResidentSurfaceCapabilityWaiter::TerminalCreate(
+                ResidentSurfaceCapabilityCall::new(
+                    route.attachment_id.clone(),
+                    route.capability_revision,
+                    false,
+                    None,
+                    Some(ResidentSurfaceCapabilityWaiter::TerminalCreate(
                         reply.clone(),
                     )),
-                },
+                ),
             );
             let dispatch = surface::AcpTerminalCreateDispatch {
                 call_id: call_id.clone(),
@@ -16355,17 +16088,19 @@ impl ThreadActor {
                     .commit_surface_generation_batch_with_retry(fence.clone(), &failed_batch)
                     .is_err()
                 {
-                    self.retain_surface_capability_transition(
+                    self.resident_surface.capability.retain_transition(
                         call_id,
                         fence,
                         failed_batch,
-                        Some(Self::pending_terminal_create_waiter_outcome(Err(
-                            waiter_error,
-                        ))),
+                        Some(
+                            ResidentCapabilityController::terminal_create_waiter_outcome(Err(
+                                waiter_error,
+                            )),
+                        ),
                     );
                     return Ok(());
                 }
-                self.resident_surface.capability_calls.remove(&call_id);
+                self.resident_surface.capability.discard_call(&call_id);
                 return Err(waiter_error);
             }
             Ok(())
@@ -16385,15 +16120,11 @@ impl ThreadActor {
             self.authorize_surface_capability_settlement(client, &call_id, capability_revision)?;
         if call.kind != surface::SurfaceCapabilityCallKind::TerminalCreate
             || call.state != surface::SurfaceCapabilityCallState::Prepared
+            || self.resident_surface.capability.has_transition(&call_id)
             || self
                 .resident_surface
-                .pending_capability_transitions
-                .contains_key(&call_id)
-            || self
-                .resident_surface
-                .capability_calls
-                .get(&call_id)
-                .is_some_and(|resident| resident.write_claimed)
+                .capability
+                .call_write_claimed(&call_id)
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
@@ -16404,15 +16135,14 @@ impl ThreadActor {
             .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
             .is_err()
         {
-            self.retain_surface_capability_transition(call_id, fence, batch, None);
+            self.resident_surface
+                .capability
+                .retain_transition(call_id, fence, batch, None);
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        let resident = self
-            .resident_surface
-            .capability_calls
-            .get_mut(&call_id)
-            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
-        resident.write_claimed = true;
+        if !self.resident_surface.capability.try_claim_write(&call_id) {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
         Ok(())
     }
 
@@ -16427,11 +16157,7 @@ impl ThreadActor {
         if call.kind != surface::SurfaceCapabilityCallKind::TerminalCreate {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if self
-            .resident_surface
-            .pending_capability_transitions
-            .contains_key(&call_id)
-        {
+        if self.resident_surface.capability.has_transition(&call_id) {
             return self
                 .retry_surface_capability_transition(&call_id, true)
                 .then_some(())
@@ -16440,9 +16166,8 @@ impl ThreadActor {
         if call.state != surface::SurfaceCapabilityCallState::DeliveryPossible
             || !self
                 .resident_surface
-                .capability_calls
-                .get(&call_id)
-                .is_some_and(|resident| resident.write_claimed)
+                .capability
+                .call_write_claimed(&call_id)
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
@@ -16453,12 +16178,12 @@ impl ThreadActor {
             .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
             .is_err()
         {
-            self.retain_surface_capability_transition(call_id, fence, batch, None);
+            self.resident_surface
+                .capability
+                .retain_transition(call_id, fence, batch, None);
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        if let Some(resident) = self.resident_surface.capability_calls.get_mut(&call_id) {
-            resident.write_claimed = false;
-        }
+        self.resident_surface.capability.release_write(&call_id);
         Ok(())
     }
 
@@ -16474,25 +16199,22 @@ impl ThreadActor {
         if call.kind != surface::SurfaceCapabilityCallKind::TerminalCreate {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if self
-            .resident_surface
-            .pending_capability_transitions
-            .contains_key(&call_id)
-        {
-            let pending = self
+        if self.resident_surface.capability.has_transition(&call_id) {
+            if self
                 .resident_surface
-                .pending_capability_transitions
-                .get_mut(&call_id)
-                .expect("checked pending capability transition");
-            if pending.deferred_settlement.is_some() {
+                .capability
+                .set_deferred_settlement(
+                    &call_id,
+                    PendingSurfaceCapabilitySettlement::TerminalCreate {
+                        client: client.clone(),
+                        capability_revision,
+                        settlement,
+                    },
+                )
+                .is_err()
+            {
                 return Err(surface::SurfaceClientCommandError::Unauthorized);
             }
-            pending.deferred_settlement =
-                Some(PendingSurfaceCapabilitySettlement::TerminalCreate {
-                    client: client.clone(),
-                    capability_revision,
-                    settlement,
-                });
             return self
                 .retry_surface_capability_transition(&call_id, false)
                 .then_some(())
@@ -16623,18 +16345,20 @@ impl ThreadActor {
             .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
             .is_err()
         {
-            self.retain_surface_capability_transition(
+            self.resident_surface.capability.retain_transition(
                 call_id,
                 fence,
                 batch,
-                Some(Self::pending_terminal_create_waiter_outcome(waiter_result)),
+                Some(ResidentCapabilityController::terminal_create_waiter_outcome(waiter_result)),
             );
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        self.apply_committed_surface_capability_transition(
-            &call_id,
-            Some(Self::pending_terminal_create_waiter_outcome(waiter_result)),
-            false,
+        apply_optional_runtime_actor_reply_effect(
+            self.resident_surface.capability.apply_committed_transition(
+                &call_id,
+                Some(ResidentCapabilityController::terminal_create_waiter_outcome(waiter_result)),
+                false,
+            ),
         );
         Ok(())
     }
@@ -16739,17 +16463,17 @@ impl ThreadActor {
             };
             let batch = self.capability_call_batch(call.clone());
             self.commit_surface_generation_batch_with_retry(fence.clone(), &batch)?;
-            self.resident_surface.capability_calls.insert(
+            self.resident_surface.capability.register_call(
                 call_id.clone(),
-                ResidentSurfaceCapabilityCall {
-                    attachment_id: route.attachment_id.clone(),
-                    capability_revision: route.capability_revision,
-                    write_claimed: false,
-                    terminal_cleanup_lease: None,
-                    waiter: Some(ResidentSurfaceCapabilityWaiter::TerminalObservation(
+                ResidentSurfaceCapabilityCall::new(
+                    route.attachment_id.clone(),
+                    route.capability_revision,
+                    false,
+                    None,
+                    Some(ResidentSurfaceCapabilityWaiter::TerminalObservation(
                         reply.clone(),
                     )),
-                },
+                ),
             );
             let dispatch = surface::AcpTerminalObservationDispatch {
                 call_id: call_id.clone(),
@@ -16779,17 +16503,19 @@ impl ThreadActor {
                     .commit_surface_generation_batch_with_retry(fence.clone(), &failed_batch)
                     .is_err()
                 {
-                    self.retain_surface_capability_transition(
+                    self.resident_surface.capability.retain_transition(
                         call_id,
                         fence,
                         failed_batch,
-                        Some(Self::pending_terminal_observation_waiter_outcome(Err(
-                            waiter_error,
-                        ))),
+                        Some(
+                            ResidentCapabilityController::terminal_observation_waiter_outcome(Err(
+                                waiter_error,
+                            )),
+                        ),
                     );
                     return Ok(());
                 }
-                self.resident_surface.capability_calls.remove(&call_id);
+                self.resident_surface.capability.discard_call(&call_id);
                 return Err(waiter_error);
             }
             Ok(())
@@ -16812,22 +16538,13 @@ impl ThreadActor {
             surface::SurfaceCapabilityCallKind::TerminalOutput
                 | surface::SurfaceCapabilityCallKind::TerminalWaitForExit
         ) || call.state != surface::SurfaceCapabilityCallState::Prepared
-            || self
-                .resident_surface
-                .pending_capability_transitions
-                .contains_key(&call_id)
+            || self.resident_surface.capability.has_transition(&call_id)
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        let resident = self
-            .resident_surface
-            .capability_calls
-            .get_mut(&call_id)
-            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
-        if resident.write_claimed {
+        if !self.resident_surface.capability.try_claim_write(&call_id) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        resident.write_claimed = true;
         call.state = surface::SurfaceCapabilityCallState::WrittenAwaitingResponse;
         let fence = call.fence.clone();
         let batch = self.capability_call_batch(call);
@@ -16835,7 +16552,9 @@ impl ThreadActor {
             .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
             .is_err()
         {
-            self.retain_surface_capability_transition(call_id, fence, batch, None);
+            self.resident_surface
+                .capability
+                .retain_transition(call_id, fence, batch, None);
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         Ok(())
@@ -16856,11 +16575,7 @@ impl ThreadActor {
         ) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if self
-            .resident_surface
-            .pending_capability_transitions
-            .contains_key(&call_id)
-        {
+        if self.resident_surface.capability.has_transition(&call_id) {
             return self
                 .retry_surface_capability_transition(&call_id, true)
                 .then_some(())
@@ -16869,15 +16584,12 @@ impl ThreadActor {
         if call.state != surface::SurfaceCapabilityCallState::WrittenAwaitingResponse
             || !self
                 .resident_surface
-                .capability_calls
-                .get(&call_id)
-                .is_some_and(|resident| resident.write_claimed)
+                .capability
+                .call_write_claimed(&call_id)
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if let Some(resident) = self.resident_surface.capability_calls.get_mut(&call_id) {
-            resident.write_claimed = false;
-        }
+        self.resident_surface.capability.release_write(&call_id);
         Ok(())
     }
 
@@ -16897,25 +16609,22 @@ impl ThreadActor {
         ) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if self
-            .resident_surface
-            .pending_capability_transitions
-            .contains_key(&call_id)
-        {
-            let pending = self
+        if self.resident_surface.capability.has_transition(&call_id) {
+            if self
                 .resident_surface
-                .pending_capability_transitions
-                .get_mut(&call_id)
-                .expect("checked pending capability transition");
-            if pending.deferred_settlement.is_some() {
+                .capability
+                .set_deferred_settlement(
+                    &call_id,
+                    PendingSurfaceCapabilitySettlement::TerminalObservation {
+                        client: client.clone(),
+                        capability_revision,
+                        settlement,
+                    },
+                )
+                .is_err()
+            {
                 return Err(surface::SurfaceClientCommandError::Unauthorized);
             }
-            pending.deferred_settlement =
-                Some(PendingSurfaceCapabilitySettlement::TerminalObservation {
-                    client: client.clone(),
-                    capability_revision,
-                    settlement,
-                });
             return self
                 .retry_surface_capability_transition(&call_id, false)
                 .then_some(())
@@ -17090,22 +16799,28 @@ impl ThreadActor {
             .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
             .is_err()
         {
-            self.retain_surface_capability_transition(
+            self.resident_surface.capability.retain_transition(
                 call_id,
                 fence,
                 batch,
-                Some(Self::pending_terminal_observation_waiter_outcome(
-                    waiter_result,
-                )),
+                Some(
+                    ResidentCapabilityController::terminal_observation_waiter_outcome(
+                        waiter_result,
+                    ),
+                ),
             );
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        self.apply_committed_surface_capability_transition(
-            &call_id,
-            Some(Self::pending_terminal_observation_waiter_outcome(
-                waiter_result,
-            )),
-            false,
+        apply_optional_runtime_actor_reply_effect(
+            self.resident_surface.capability.apply_committed_transition(
+                &call_id,
+                Some(
+                    ResidentCapabilityController::terminal_observation_waiter_outcome(
+                        waiter_result,
+                    ),
+                ),
+                false,
+            ),
         );
         Ok(())
     }
@@ -17211,20 +16926,20 @@ impl ThreadActor {
             };
             let cleanup_lease_id = kill_pending_lease.lease_id.clone();
             let batch = self.terminal_cleanup_started_batch(call.clone(), kill_pending_lease);
-            self.resident_surface.capability_calls.insert(
+            self.resident_surface.capability.register_call(
                 call_id.clone(),
-                ResidentSurfaceCapabilityCall {
-                    attachment_id: route.attachment_id.clone(),
-                    capability_revision: route.capability_revision,
-                    write_claimed: true,
-                    terminal_cleanup_lease: Some(ResidentTerminalCleanupLease {
+                ResidentSurfaceCapabilityCall::new(
+                    route.attachment_id.clone(),
+                    route.capability_revision,
+                    true,
+                    Some(ResidentTerminalCleanupLease {
                         lease_id: cleanup_lease_id,
                         terminal_id: terminal_id.clone(),
                     }),
-                    waiter: Some(ResidentSurfaceCapabilityWaiter::TerminalCleanup(
+                    Some(ResidentSurfaceCapabilityWaiter::TerminalCleanup(
                         reply.clone(),
                     )),
-                },
+                ),
             );
             let dispatch = surface::AcpTerminalCleanupDispatch {
                 call_id: call_id.clone(),
@@ -17237,13 +16952,24 @@ impl ThreadActor {
                 .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
                 .is_err()
             {
-                self.retain_surface_capability_transition(call_id.clone(), fence, batch, None);
-                self.resident_surface
-                    .pending_capability_transitions
-                    .get_mut(&call_id)
-                    .expect("retained terminal cleanup admission")
-                    .deferred_settlement = Some(
-                    PendingSurfaceCapabilitySettlement::DispatchTerminalCleanup { route, dispatch },
+                self.resident_surface.capability.retain_transition(
+                    call_id.clone(),
+                    fence,
+                    batch,
+                    None,
+                );
+                assert!(
+                    self.resident_surface
+                        .capability
+                        .set_deferred_settlement(
+                            &call_id,
+                            PendingSurfaceCapabilitySettlement::DispatchTerminalCleanup {
+                                route,
+                                dispatch,
+                            },
+                        )
+                        .is_ok(),
+                    "retained terminal cleanup admission"
                 );
                 return Ok(());
             }
@@ -17284,11 +17010,7 @@ impl ThreadActor {
         ) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if self
-            .resident_surface
-            .pending_capability_transitions
-            .contains_key(&call_id)
-        {
+        if self.resident_surface.capability.has_transition(&call_id) {
             return self
                 .retry_surface_capability_transition(&call_id, true)
                 .then_some(())
@@ -17297,9 +17019,8 @@ impl ThreadActor {
         if call.state != surface::SurfaceCapabilityCallState::DeliveryPossible
             || !self
                 .resident_surface
-                .capability_calls
-                .get(&call_id)
-                .is_some_and(|resident| resident.write_claimed)
+                .capability
+                .call_write_claimed(&call_id)
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
@@ -17310,12 +17031,12 @@ impl ThreadActor {
             .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
             .is_err()
         {
-            self.retain_surface_capability_transition(call_id, fence, batch, None);
+            self.resident_surface
+                .capability
+                .retain_transition(call_id, fence, batch, None);
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        if let Some(resident) = self.resident_surface.capability_calls.get_mut(&call_id) {
-            resident.write_claimed = false;
-        }
+        self.resident_surface.capability.release_write(&call_id);
         Ok(())
     }
 
@@ -17335,25 +17056,22 @@ impl ThreadActor {
         ) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if self
-            .resident_surface
-            .pending_capability_transitions
-            .contains_key(&call_id)
-        {
-            let pending = self
+        if self.resident_surface.capability.has_transition(&call_id) {
+            if self
                 .resident_surface
-                .pending_capability_transitions
-                .get_mut(&call_id)
-                .expect("checked pending capability transition");
-            if pending.deferred_settlement.is_some() {
+                .capability
+                .set_deferred_settlement(
+                    &call_id,
+                    PendingSurfaceCapabilitySettlement::TerminalCleanup {
+                        client: client.clone(),
+                        capability_revision,
+                        settlement,
+                    },
+                )
+                .is_err()
+            {
                 return Err(surface::SurfaceClientCommandError::Unauthorized);
             }
-            pending.deferred_settlement =
-                Some(PendingSurfaceCapabilitySettlement::TerminalCleanup {
-                    client: client.clone(),
-                    capability_revision,
-                    settlement,
-                });
             return self
                 .retry_surface_capability_transition(&call_id, false)
                 .then_some(())
@@ -17393,9 +17111,8 @@ impl ThreadActor {
     ) -> Result<(), surface::SurfaceClientCommandError> {
         let cleanup_lease = self
             .resident_surface
-            .capability_calls
-            .get(&call_id)
-            .and_then(|resident| resident.terminal_cleanup_lease.clone())
+            .capability
+            .terminal_cleanup_lease(&call_id)
             .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let lease = snapshot
@@ -17470,42 +17187,44 @@ impl ThreadActor {
         {
             let waiter_outcome = (kind == surface::SurfaceCapabilityCallKind::TerminalRelease)
                 .then_some(PendingSurfaceCapabilityWaiterOutcome::TerminalCleanupCompleted);
-            self.retain_surface_capability_transition(
+            self.resident_surface.capability.retain_transition(
                 call_id.clone(),
                 fence,
                 batch,
                 waiter_outcome,
             );
             if kind == surface::SurfaceCapabilityCallKind::TerminalKill {
-                self.resident_surface
-                    .pending_capability_transitions
-                    .get_mut(&call_id)
-                    .expect("retained terminal kill settlement")
-                    .deferred_settlement =
-                    Some(PendingSurfaceCapabilitySettlement::BeginTerminalRelease {
-                        kill_call: call,
-                        lease_id: lease.lease_id,
-                        terminal_id,
-                    });
+                assert!(
+                    self.resident_surface
+                        .capability
+                        .set_deferred_settlement(
+                            &call_id,
+                            PendingSurfaceCapabilitySettlement::BeginTerminalRelease {
+                                kill_call: call,
+                                lease_id: lease.lease_id,
+                                terminal_id,
+                            },
+                        )
+                        .is_ok(),
+                    "retained terminal kill settlement"
+                );
             }
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         if kind == surface::SurfaceCapabilityCallKind::TerminalRelease {
-            self.apply_committed_surface_capability_transition(
-                &call_id,
-                Some(PendingSurfaceCapabilityWaiterOutcome::TerminalCleanupCompleted),
-                false,
+            apply_optional_runtime_actor_reply_effect(
+                self.resident_surface.capability.apply_committed_transition(
+                    &call_id,
+                    Some(PendingSurfaceCapabilityWaiterOutcome::TerminalCleanupCompleted),
+                    false,
+                ),
             );
             return Ok(());
         }
-        let mut resident = self
+        let (resident, waiter) = self
             .resident_surface
-            .capability_calls
-            .remove(&call_id)
-            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
-        let waiter = resident
-            .waiter
-            .take()
+            .capability
+            .take_call_with_waiter(&call_id)
             .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
         self.begin_surface_terminal_release(call, lease.lease_id, terminal_id, resident, waiter)
     }
@@ -17521,11 +17240,12 @@ impl ThreadActor {
         let call_id =
             surface::SurfaceCapabilityCallId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7");
+        let capability_revision = resident.capability_revision();
         let release_call = surface::SurfaceCapabilityCall {
             call_id: call_id.clone(),
             acp_session_id: kill_call.acp_session_id.clone(),
             fence: kill_call.fence.clone(),
-            capability_revision: resident.capability_revision,
+            capability_revision,
             policy_epoch: kill_call.policy_epoch,
             kind: surface::SurfaceCapabilityCallKind::TerminalRelease,
             arguments_digest: surface_sha256(terminal_id.as_str().as_bytes()),
@@ -17533,27 +17253,28 @@ impl ThreadActor {
             state: surface::SurfaceCapabilityCallState::Prepared,
         };
         let batch = self.terminal_release_started_batch(release_call.clone());
+        let attachment_id = resident.attachment_id().clone();
         let route = surface::AcpCapabilityAttachmentRoute {
-            attachment_id: resident.attachment_id.clone(),
-            capability_revision: resident.capability_revision,
+            attachment_id: attachment_id.clone(),
+            capability_revision,
         };
-        self.resident_surface.capability_calls.insert(
+        self.resident_surface.capability.register_call(
             call_id.clone(),
-            ResidentSurfaceCapabilityCall {
-                attachment_id: resident.attachment_id,
-                capability_revision: resident.capability_revision,
-                write_claimed: true,
-                terminal_cleanup_lease: Some(ResidentTerminalCleanupLease {
+            ResidentSurfaceCapabilityCall::new(
+                attachment_id,
+                capability_revision,
+                true,
+                Some(ResidentTerminalCleanupLease {
                     lease_id,
                     terminal_id: terminal_id.clone(),
                 }),
-                waiter: Some(waiter),
-            },
+                Some(waiter),
+            ),
         );
         let dispatch = surface::AcpTerminalCleanupDispatch {
             call_id: call_id.clone(),
             acp_session_id: release_call.acp_session_id,
-            capability_revision: resident.capability_revision,
+            capability_revision,
             terminal_id,
             kind: surface::SurfaceCapabilityCallKind::TerminalRelease,
         };
@@ -17561,18 +17282,24 @@ impl ThreadActor {
             .commit_surface_generation_batch_with_retry(release_call.fence.clone(), &batch)
             .is_err()
         {
-            self.retain_surface_capability_transition(
+            self.resident_surface.capability.retain_transition(
                 call_id.clone(),
                 release_call.fence,
                 batch,
                 None,
             );
-            self.resident_surface
-                .pending_capability_transitions
-                .get_mut(&call_id)
-                .expect("retained terminal release admission")
-                .deferred_settlement = Some(
-                PendingSurfaceCapabilitySettlement::DispatchTerminalCleanup { route, dispatch },
+            assert!(
+                self.resident_surface
+                    .capability
+                    .set_deferred_settlement(
+                        &call_id,
+                        PendingSurfaceCapabilitySettlement::DispatchTerminalCleanup {
+                            route,
+                            dispatch
+                        },
+                    )
+                    .is_ok(),
+                "retained terminal release admission"
             );
             return Ok(());
         }
@@ -17594,7 +17321,7 @@ impl ThreadActor {
         call_id: &surface::SurfaceCapabilityCallId,
         message: String,
     ) -> Result<(), surface::SurfaceClientCommandError> {
-        let mut call = Self::surface_capability_call(
+        let mut call = ResidentCapabilityController::surface_call(
             self.resident_surface.coordinator.state().snapshot(),
             call_id,
         )
@@ -17612,9 +17339,8 @@ impl ThreadActor {
         }
         let cleanup_lease = self
             .resident_surface
-            .capability_calls
-            .get(call_id)
-            .and_then(|resident| resident.terminal_cleanup_lease.clone())
+            .capability
+            .terminal_cleanup_lease(call_id)
             .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let lease = snapshot
@@ -17671,7 +17397,7 @@ impl ThreadActor {
             .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
             .is_err()
         {
-            self.retain_surface_capability_transition(
+            self.resident_surface.capability.retain_transition(
                 call_id.clone(),
                 fence,
                 batch,
@@ -17682,13 +17408,15 @@ impl ThreadActor {
             );
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        self.apply_committed_surface_capability_transition(
-            call_id,
-            Some(PendingSurfaceCapabilityWaiterOutcome::Failed {
-                kind: io::ErrorKind::Other,
-                message: waiter_error,
-            }),
-            false,
+        apply_optional_runtime_actor_reply_effect(
+            self.resident_surface.capability.apply_committed_transition(
+                call_id,
+                Some(PendingSurfaceCapabilityWaiterOutcome::Failed {
+                    kind: io::ErrorKind::Other,
+                    message: waiter_error,
+                }),
+                false,
+            ),
         );
         Ok(())
     }
@@ -19972,19 +19700,9 @@ impl ThreadActor {
         let snapshot = self.resident_surface.coordinator.state().snapshot();
         let mut capability_calls = self
             .resident_surface
-            .capability_calls
-            .iter()
-            .filter_map(|(call_id, resident)| {
-                Self::surface_capability_call(snapshot, call_id)
-                    .filter(|call| &call.fence == fence)
-                    .map(|call| {
-                        (
-                            call,
-                            resident.terminal_cleanup_lease.clone(),
-                            resident.write_claimed,
-                        )
-                    })
-            })
+            .capability
+            .durable_calls(snapshot)
+            .filter(|(call, _, _)| &call.fence == fence)
             .collect::<Vec<_>>();
         capability_calls.sort_by_key(|(call, _, _)| call.call_id.clone());
         let mut events = vec![(
@@ -20141,7 +19859,9 @@ impl ThreadActor {
                     },
                     surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
                         lease: surface::SurfaceRemoteTerminalLease {
-                            lease_id: Self::terminal_create_lease_id(&call.call_id),
+                            lease_id: ResidentCapabilityController::terminal_create_lease_id(
+                                &call.call_id,
+                            ),
                             owning_tool_call_id: call.owning_tool_call_id.clone(),
                             state: surface::SurfaceRemoteTerminalLeaseState::IdentityUnknown {
                                 create_call_id: call.call_id.clone(),
@@ -20388,41 +20108,13 @@ impl ThreadActor {
         &mut self,
         call_ids: &[surface::SurfaceCapabilityCallId],
     ) {
-        for call_id in call_ids {
-            if let Some(mut call) = self.resident_surface.capability_calls.remove(call_id)
-                && let Some(waiter) = call.waiter.take()
-            {
-                let error = || {
-                    io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "ACP capability was cancelled before settlement",
-                    )
-                };
-                match waiter {
-                    ResidentSurfaceCapabilityWaiter::ReadTextFile(waiter) => {
-                        let _ = waiter.send(Err(error()));
-                    }
-                    ResidentSurfaceCapabilityWaiter::WriteTextFile(waiter) => {
-                        let _ = waiter.send(Err(error()));
-                    }
-                    ResidentSurfaceCapabilityWaiter::TerminalCreate(waiter) => {
-                        let _ = waiter.send(Err(error()));
-                    }
-                    ResidentSurfaceCapabilityWaiter::TerminalObservation(waiter) => {
-                        let _ = waiter.send(Err(error()));
-                    }
-                    ResidentSurfaceCapabilityWaiter::TerminalCleanup(waiter) => {
-                        let _ = waiter.send(Err(error()));
-                    }
-                }
-            }
+        for effect in self.resident_surface.capability.cancel_calls(call_ids) {
+            apply_runtime_actor_reply_effect(effect);
         }
     }
 
     fn abandon_surface_capability_waiters_for_cold_recovery(&mut self) {
-        for call in self.resident_surface.capability_calls.values_mut() {
-            drop(call.waiter.take());
-        }
+        self.resident_surface.capability.abandon_call_waiters();
     }
 
     fn prepare_surface_attachment_transition(
@@ -20710,12 +20402,7 @@ impl ThreadActor {
                             .values()
                             .map(|pending| pending.retry_at),
                     )
-                    .chain(
-                        resident
-                            .pending_capability_transitions
-                            .values()
-                            .map(|pending| pending.retry_at),
-                    )
+                    .chain(resident.capability.pending_transition_retry_times())
                     .chain(
                         resident
                             .pending_background_controls
@@ -20729,8 +20416,9 @@ impl ThreadActor {
                     .map(|pending| pending.retry_at),
             )
             .chain(
-                self.pending_goal_completion_recovery
-                    .iter()
+                self.goal_controller
+                    .pending_recovery()
+                    .into_iter()
                     .map(|pending| pending.retry_at),
             )
             .chain(
@@ -20766,7 +20454,7 @@ impl ThreadActor {
     }
 
     fn has_pending_goal_completion_recovery_owner(&self) -> bool {
-        self.pending_goal_completion_recovery.is_some()
+        self.goal_controller.pending_recovery().is_some()
             || self
                 .resident_surface
                 .0
@@ -20784,8 +20472,8 @@ impl ThreadActor {
     }
 
     fn pending_goal_completion_recovery_operation_id(&self) -> Option<surface::SurfaceOperationId> {
-        self.pending_goal_completion_recovery
-            .as_ref()
+        self.goal_controller
+            .pending_recovery()
             .and_then(|pending| {
                 pending
                     .active
@@ -21010,10 +20698,11 @@ impl ThreadActor {
         if let (Some(completion), Some(terminal)) =
             (pending.legacy_completion, pending.legacy_terminal)
         {
+            self.goal_controller.clear_active(terminal.operation_id);
             let completed = completion.complete(terminal);
             debug_assert!(completed, "legacy terminal must complete exactly once");
         }
-        if self.resident_surface.pending_terminal_commits.is_empty() {
+        if self.resident_surface.capability.pending_terminals_empty() {
             self.surface_terminal_blocked = None;
         }
     }
@@ -21106,10 +20795,11 @@ impl ThreadActor {
             pending.pending.legacy_completion,
             pending.pending.legacy_terminal,
         ) {
+            self.goal_controller.clear_active(terminal.operation_id);
             let completed = completion.complete(terminal);
             debug_assert!(completed, "legacy terminal must complete exactly once");
         }
-        if self.resident_surface.pending_terminal_commits.is_empty() {
+        if self.resident_surface.capability.pending_terminals_empty() {
             self.surface_terminal_blocked = None;
         }
     }
@@ -21170,12 +20860,16 @@ impl ThreadActor {
                     PendingSurfaceTransitionRetry::ManualCompactionCompletion,
                 )
             });
-        let goal_completion = self.pending_goal_completion_recovery.iter().map(|pending| {
-            (
-                pending.retry_at,
-                PendingSurfaceTransitionRetry::GoalCompletionRecovery,
-            )
-        });
+        let goal_completion = self
+            .goal_controller
+            .pending_recovery()
+            .into_iter()
+            .map(|pending| {
+                (
+                    pending.retry_at,
+                    PendingSurfaceTransitionRetry::GoalCompletionRecovery,
+                )
+            });
         let provider_transfer = self.pending_provider_transfer.iter().map(|pending| {
             (
                 pending.retry_at,
@@ -21327,13 +21021,13 @@ impl ThreadActor {
                             ))
                             .chain(
                                 self.resident_surface
-                                    .pending_capability_transitions
-                                    .iter()
-                                    .map(|(call_id, pending)| {
+                                    .capability
+                                    .pending_transition_retries()
+                                    .map(|(call_id, retry_at)| {
                                         (
-                                            pending.retry_at,
+                                            retry_at,
                                             PendingSurfaceTransitionRetry::CapabilityTransition(
-                                                call_id.clone(),
+                                                call_id,
                                             ),
                                         )
                                     }),
@@ -21393,7 +21087,7 @@ impl ThreadActor {
             return;
         }
         if retry == PendingSurfaceTransitionRetry::GoalCompletionRecovery {
-            let Some(mut pending) = self.pending_goal_completion_recovery.take() else {
+            let Some(mut pending) = self.goal_controller.take_pending_recovery() else {
                 return;
             };
             if self
@@ -21405,7 +21099,7 @@ impl ThreadActor {
             {
                 pending.retry_at =
                     tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-                self.pending_goal_completion_recovery = Some(pending);
+                self.goal_controller.set_pending_recovery(pending);
             }
             return;
         }
@@ -21744,7 +21438,7 @@ impl ThreadActor {
         surface::SurfaceClientCommandError,
     > {
         if self.pending_manual_compaction_completion.is_some()
-            || !self.resident_surface.pending_terminal_commits.is_empty()
+            || !self.resident_surface.capability.pending_terminals_empty()
             || !self.resident_surface.pending_admission_commits.is_empty()
             || !self.resident_surface.pending_admission_repairs.is_empty()
             || !self.resident_surface.pending_admission_terminals.is_empty()
@@ -22144,7 +21838,7 @@ impl ThreadActor {
             || !self.resident_surface.interactions.is_empty()
             || !self.resident_surface.pending_detaches.is_empty()
             || !self.resident_surface.pending_capability_losses.is_empty()
-            || !self.resident_surface.pending_terminal_commits.is_empty()
+            || !self.resident_surface.capability.pending_terminals_empty()
             || !self.resident_surface.pending_admission_commits.is_empty()
             || !self.resident_surface.pending_admission_repairs.is_empty()
             || !self.resident_surface.pending_admission_terminals.is_empty()
@@ -23885,7 +23579,7 @@ impl ThreadActor {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
         if self.pending_manual_compaction_completion.is_some()
-            || !self.resident_surface.pending_terminal_commits.is_empty()
+            || !self.resident_surface.capability.pending_terminals_empty()
             || !self.resident_surface.pending_admission_commits.is_empty()
             || !self.resident_surface.pending_admission_repairs.is_empty()
             || !self.resident_surface.pending_admission_terminals.is_empty()
@@ -24722,6 +24416,7 @@ impl ThreadActor {
         }
         self.cache_surface_terminal(value.clone());
         if let Some((completion, terminal)) = legacy {
+            self.goal_controller.clear_active(terminal.operation_id);
             let completed = completion.complete(terminal);
             debug_assert!(completed, "legacy terminal must complete exactly once");
         }
@@ -24903,7 +24598,7 @@ impl ThreadActor {
             Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
         >,
     ) {
-        if let Some(value) = self.resident_surface.terminals.get(&operation_id) {
+        if let Some(value) = self.resident_surface.capability.terminal(&operation_id) {
             let _ = reply.send(Ok(surface::WaitOperationTerminalResult::Terminal {
                 value: value.clone(),
             }));
@@ -24911,8 +24606,8 @@ impl ThreadActor {
         }
         if let Some(pending) = self
             .resident_surface
-            .pending_terminal_commits
-            .get(&operation_id)
+            .capability
+            .pending_terminal(&operation_id)
         {
             let _ = reply.try_send(Ok(pending.failure.clone()));
             return;
@@ -24956,28 +24651,20 @@ impl ThreadActor {
             return;
         }
         self.resident_surface
-            .waiters
-            .entry(operation_id)
-            .or_default()
-            .push(reply);
+            .capability
+            .register_terminal_waiter(operation_id, reply);
     }
 
     fn cache_surface_terminal(&mut self, value: surface::OperationTerminalAtCursor) {
         let operation_id = value.operation_id.clone();
         self.clear_ephemeral_reservation_expiry(&operation_id);
         self.live_input_capsules.remove(&operation_id);
-        self.resident_surface
-            .terminals
-            .insert(operation_id.clone(), value.clone());
-        for waiter in self
+        let effects = self
             .resident_surface
-            .waiters
-            .remove(&operation_id)
-            .unwrap_or_default()
-        {
-            let _ = waiter.send(Ok(surface::WaitOperationTerminalResult::Terminal {
-                value: value.clone(),
-            }));
+            .capability
+            .cache_terminal(operation_id, value);
+        for effect in effects {
+            apply_runtime_actor_reply_effect(effect);
         }
     }
 
@@ -25025,8 +24712,8 @@ impl ThreadActor {
             .is_err()
             && !self
                 .resident_surface
-                .pending_terminal_commits
-                .contains_key(&expiry.operation_id)
+                .capability
+                .has_pending_terminal(&expiry.operation_id)
         {
             self.ephemeral_reservation_expiry = Some(EphemeralReservationExpiry {
                 operation_id: expiry.operation_id,
@@ -25041,15 +24728,15 @@ impl ThreadActor {
         self.surface_terminal_blocked =
             Some("typed surface terminal commit failed and requires cold recovery".to_string());
         self.resident_surface
-            .pending_terminal_commits
-            .insert(operation_id.clone(), pending);
-        for waiter in self
-            .resident_surface
-            .waiters
-            .remove(&operation_id)
-            .unwrap_or_default()
-        {
-            let _ = waiter.try_send(Ok(failure.clone()));
+            .capability
+            .retain_pending_terminal(operation_id.clone(), pending);
+        let effects = self.resident_surface.capability.settle_terminal_waiters(
+            &operation_id,
+            Ok(failure),
+            true,
+        );
+        for effect in effects {
+            apply_runtime_actor_reply_effect(effect);
         }
     }
 
@@ -25064,13 +24751,13 @@ impl ThreadActor {
         self.resident_surface
             .pending_admission_terminals
             .insert(operation_id.clone(), pending);
-        for waiter in self
-            .resident_surface
-            .waiters
-            .remove(&operation_id)
-            .unwrap_or_default()
-        {
-            let _ = waiter.try_send(Ok(failure.clone()));
+        let effects = self.resident_surface.capability.settle_terminal_waiters(
+            &operation_id,
+            Ok(failure),
+            true,
+        );
+        for effect in effects {
+            apply_runtime_actor_reply_effect(effect);
         }
     }
 
@@ -25080,8 +24767,8 @@ impl ThreadActor {
     ) -> surface::MutationReply<surface::OperationTerminalAtCursor> {
         let exact_pending = self
             .resident_surface
-            .pending_terminal_commits
-            .get(token.operation_id())
+            .capability
+            .pending_terminal(token.operation_id())
             .is_some_and(|pending| {
                 let exact = matches!(
                     &pending.failure,
@@ -25540,11 +25227,13 @@ impl ThreadActor {
             }
         };
         if active.request.surface_goal_owned {
-            let control = active.goal_control.as_ref().ok_or_else(|| {
-                RuntimeHostError::GoalControlFailed {
+            let control = self
+                .goal_controller
+                .active_control(active.operation_id)
+                .cloned()
+                .ok_or_else(|| RuntimeHostError::GoalControlFailed {
                     message: "typed Goal finalization lacks its runtime owner".to_string(),
-                }
-            })?;
+                })?;
             self.reconcile_goal_surface_outbox(&control.runtime, &control.session_id)?;
         }
         let operation_id = fence.operation_id.clone();
@@ -25635,11 +25324,13 @@ impl ThreadActor {
                 .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
                     message: "typed Goal finalization lacks its generation identity".to_string(),
                 })?;
-            let control = active.goal_control.as_ref().ok_or_else(|| {
-                RuntimeHostError::ThreadStartFailed {
+            let control = self
+                .goal_controller
+                .active_control(active.operation_id)
+                .cloned()
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
                     message: "typed Goal finalization lacks its runtime owner".to_string(),
-                }
-            })?;
+                })?;
             let goal_revision = snapshot
                 .goal
                 .as_ref()
@@ -26161,13 +25852,13 @@ impl ThreadActor {
         {
             return Ok(None);
         }
-        let control =
-            active
-                .goal_control
-                .as_ref()
-                .ok_or_else(|| RuntimeHostError::GoalControlFailed {
-                    message: "typed Goal continuation lacks its runtime owner".to_string(),
-                })?;
+        let control = self
+            .goal_controller
+            .active_control(active.operation_id)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                message: "typed Goal continuation lacks its runtime owner".to_string(),
+            })?;
         self.reconcile_goal_surface_outbox(&control.runtime, &control.session_id)?;
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let operation = snapshot
@@ -26927,7 +26618,7 @@ impl ThreadActor {
     > {
         if self.pending_manual_compaction_completion.is_some()
             || !self.bind_surface_operation_controller(client, &operation_id)
-            || !self.resident_surface.pending_terminal_commits.is_empty()
+            || !self.resident_surface.capability.pending_terminals_empty()
             || !self.resident_surface.pending_admission_commits.is_empty()
             || !self.resident_surface.pending_admission_repairs.is_empty()
             || !self.resident_surface.pending_admission_terminals.is_empty()
@@ -27448,7 +27139,12 @@ impl ThreadActor {
         {
             return self.cancel_surface_before_admission(client, request_id, operation_id);
         }
-        if let Some(terminal) = self.resident_surface.terminals.get(&operation_id).cloned() {
+        if let Some(terminal) = self
+            .resident_surface
+            .capability
+            .terminal(&operation_id)
+            .cloned()
+        {
             return Ok(surface::MutationReply::Committed {
                 mutation: surface::CommittedMutation {
                     request_id,
@@ -28565,14 +28261,16 @@ impl ThreadActor {
             .as_ref()
             .filter(|operation| operation.operation_id == operation_fence.operation_id)
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        let runtime = active
-            .goal_control
-            .as_ref()
+        let runtime = self
+            .goal_controller
+            .active_control(active.operation_id)
+            .cloned()
             .map(|control| control.runtime.clone())
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        let session_id = active
-            .goal_control
-            .as_ref()
+        let session_id = self
+            .goal_controller
+            .active_control(active.operation_id)
+            .cloned()
             .map(|control| control.session_id.clone())
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         let message = "paused by user";
@@ -28806,21 +28504,10 @@ impl ThreadActor {
         if !self.settle_surface_capability_transitions_for_shutdown() {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        if self
-            .resident_surface
-            .capability_calls
-            .iter()
-            .any(|(call_id, resident)| {
-                resident.write_claimed
-                    && Self::surface_capability_call(
-                        self.resident_surface.coordinator.state().snapshot(),
-                        call_id,
-                    )
-                    .is_some_and(|call| {
-                        Self::surface_capability_write_blocks_terminalization(&call, fence)
-                    })
-            })
-        {
+        if self.resident_surface.capability.any_claimed_durable_call(
+            self.resident_surface.coordinator.state().snapshot(),
+            |call| Self::surface_capability_write_blocks_terminalization(call, fence),
+        ) {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         if active.surface_terminalization.is_some()
@@ -28910,8 +28597,6 @@ impl ThreadActor {
         let usage_ledger = RuntimeUsageLedger::new(thread.session().aggregate_usage_totals());
         let events = thread.event_factory();
         let (background_completion_tx, background_completion_rx) = tokio_mpsc::unbounded_channel();
-        let (goal_completion_tx, goal_completion_rx) =
-            tokio_mpsc::channel(GOAL_COMPLETION_CAPACITY);
         let pending_background_approval_resolutions = resident_surface
             .as_ref()
             .map(|resident| {
@@ -28929,14 +28614,10 @@ impl ThreadActor {
             background_capacity,
             background_completion_tx,
             background_completion_rx,
-            goal_completion_tx,
-            goal_completion_rx,
-            goal_blocking_in_flight: false,
-            deferred_goal_commands: VecDeque::new(),
+            goal_controller: GoalOperationController::new(GOAL_COMPLETION_CAPACITY),
             usage_ledger,
             resident_surface: ResidentSurfaceSlot(resident_surface),
             pending_manual_compaction_completion: None,
-            pending_goal_completion_recovery: None,
             pending_provider_transfer: None,
             pending_workflow_completions: HashMap::new(),
             pending_provider_preparations: HashMap::new(),
@@ -28963,18 +28644,19 @@ impl ThreadActor {
             surface::ThreadPersistence::RecordedCatalogued
             | surface::ThreadPersistence::EphemeralAttached => return false,
         };
-        let completion_visible = resident
-            .terminals
-            .values()
-            .any(|terminal| match close_after {
-                surface::FirstOperationCompletionPolicy::Terminal => true,
-                surface::FirstOperationCompletionPolicy::NotAdmitted => {
-                    matches!(
-                        terminal.terminal,
-                        surface::OperationTerminal::NotAdmitted { .. }
-                    )
-                }
-            });
+        let completion_visible =
+            resident
+                .capability
+                .terminal_values()
+                .any(|terminal| match close_after {
+                    surface::FirstOperationCompletionPolicy::Terminal => true,
+                    surface::FirstOperationCompletionPolicy::NotAdmitted => {
+                        matches!(
+                            terminal.terminal,
+                            surface::OperationTerminal::NotAdmitted { .. }
+                        )
+                    }
+                });
         completion_visible
             && !resident.coordinator.has_incomplete_batch()
             && !self.has_pending_surface_transition_retry()
@@ -29082,9 +28764,9 @@ impl ThreadActor {
         &mut self,
         reply: SyncSender<Result<GoalRuntimeHandle, RuntimeHostError>>,
     ) {
-        let completion_tx = self.goal_completion_tx.clone();
+        let completion_tx = self.goal_controller.completion_sender();
         let session_id = self.handle.session_id.clone();
-        self.goal_blocking_in_flight = true;
+        debug_assert!(self.goal_controller.begin_blocking());
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let (handle, join) = GoalRuntimeHandle::open_default().map_err(|error| {
@@ -29124,7 +28806,7 @@ impl ThreadActor {
     }
 
     fn handle_goal_blocking_completion(&mut self, completion: GoalBlockingCompletion) {
-        self.goal_blocking_in_flight = false;
+        self.goal_controller.finish_blocking();
         match completion {
             GoalBlockingCompletion::RuntimeOpened { reply, result } => {
                 let result = result.and_then(|mut opened| {
@@ -29155,8 +28837,8 @@ impl ThreadActor {
             }
         }
 
-        while !self.goal_blocking_in_flight {
-            let Some(command) = self.deferred_goal_commands.pop_front() else {
+        while !self.goal_controller.is_blocking() {
+            let Some(command) = self.goal_controller.take_deferred() else {
                 break;
             };
             self.handle_idle_command(command);
@@ -29193,6 +28875,7 @@ impl ThreadActor {
             let Some(mut active) = self.active.take() else {
                 let surface_retry_at = self.next_surface_transition_retry_at();
                 let reservation_expiry_at = self.next_ephemeral_reservation_expiry_at();
+                let goal_blocking_in_flight = self.goal_controller.is_blocking();
                 tokio::select! {
                     biased;
                     _ = wait_for_surface_transition_retry(surface_retry_at) => {
@@ -29208,7 +28891,7 @@ impl ThreadActor {
                             self.reconcile_surface_interaction_capabilities(None);
                         }
                     }
-                    completion = self.goal_completion_rx.recv(), if self.goal_blocking_in_flight => {
+                    completion = self.goal_controller.completion_receiver().recv(), if goal_blocking_in_flight => {
                         if let Some(completion) = completion {
                             self.handle_goal_blocking_completion(completion);
                         }
@@ -29258,7 +28941,7 @@ impl ThreadActor {
                                 .0
                                 .as_ref()
                                 .is_some_and(|resident| {
-                                    !resident.pending_capability_transitions.is_empty()
+                                    !resident.capability.transitions_empty()
                                 });
                             let bounded_surface_recovery = bounded_goal_recovery
                                 || bounded_workflow_recovery
@@ -29316,7 +28999,7 @@ impl ThreadActor {
                                 .0
                                 .as_ref()
                                 .is_some_and(|resident| {
-                                    !resident.pending_capability_transitions.is_empty()
+                                    !resident.capability.transitions_empty()
                                 });
                             if goal_recovery_still_pending
                                 || workflow_recovery_still_pending
@@ -29328,9 +29011,8 @@ impl ThreadActor {
                                 if let Some(operation_id) = goal_recovery_operation_id {
                                     for waiter in self
                                         .resident_surface
-                                        .waiters
-                                        .remove(&operation_id)
-                                        .unwrap_or_default()
+                                        .capability
+                                        .take_terminal_waiters(&operation_id)
                                     {
                                         let _ = waiter.try_send(Err(
                                             surface::SurfaceClientCommandError::RuntimeUnavailable,
@@ -29346,9 +29028,8 @@ impl ThreadActor {
                                 {
                                     for waiter in self
                                         .resident_surface
-                                        .waiters
-                                        .remove(&operation_id)
-                                        .unwrap_or_default()
+                                        .capability
+                                        .take_terminal_waiters(&operation_id)
                                     {
                                         let _ = waiter.try_send(Err(
                                             surface::SurfaceClientCommandError::RuntimeUnavailable,
@@ -29363,9 +29044,8 @@ impl ThreadActor {
                                         .expect("checked pending provider transfer");
                                     for waiter in self
                                         .resident_surface
-                                        .waiters
-                                        .remove(&operation_id)
-                                        .unwrap_or_default()
+                                        .capability
+                                        .take_terminal_waiters(&operation_id)
                                     {
                                         let _ = waiter.try_send(Err(
                                             surface::SurfaceClientCommandError::RuntimeUnavailable,
@@ -29382,9 +29062,8 @@ impl ThreadActor {
                                 for operation_id in background_control_operation_ids {
                                     for waiter in self
                                         .resident_surface
-                                        .waiters
-                                        .remove(&operation_id)
-                                        .unwrap_or_default()
+                                        .capability
+                                        .take_terminal_waiters(&operation_id)
                                     {
                                         let _ = waiter.try_send(Err(
                                             surface::SurfaceClientCommandError::RuntimeUnavailable,
@@ -29594,7 +29273,7 @@ impl ThreadActor {
                                 });
                             if current_interrupt_is_durable {
                                 command_rx.close();
-                                let pause_result = Self::pause_active_goal(
+                                let pause_result = self.pause_active_goal(
                                     &mut active,
                                     "goal run paused during runtime shutdown",
                                 );
@@ -29618,21 +29297,12 @@ impl ThreadActor {
                                 break;
                             }
                             if active.surface_operation.as_ref().is_some_and(|fence| {
-                                self.resident_surface.capability_calls.iter().any(
-                                    |(call_id, resident)| {
-                                        resident.write_claimed
-                                            && Self::surface_capability_call(
-                                                self.resident_surface
-                                                    .coordinator
-                                                    .state()
-                                                    .snapshot(),
-                                                call_id,
-                                            )
-                                            .is_some_and(|call| {
-                                                Self::surface_capability_write_blocks_terminalization(
-                                                    &call, fence,
-                                                )
-                                            })
+                                self.resident_surface.capability.any_claimed_durable_call(
+                                    self.resident_surface.coordinator.state().snapshot(),
+                                    |call| {
+                                        Self::surface_capability_write_blocks_terminalization(
+                                            call, fence,
+                                        )
                                     },
                                 )
                             }) {
@@ -29670,7 +29340,7 @@ impl ThreadActor {
                                 continue;
                             }
                             command_rx.close();
-                            let pause_result = Self::pause_active_goal(
+                            let pause_result = self.pause_active_goal(
                                 &mut active,
                                 "goal run paused during runtime shutdown",
                             );
@@ -29711,7 +29381,7 @@ impl ThreadActor {
                             operation_id,
                             reply,
                         }) => {
-                            let result = Self::request_goal_pause(&mut active, operation_id);
+                            let result = self.request_goal_pause(&mut active, operation_id);
                             let waits_for_join = matches!(
                                 result,
                                 Ok(PauseGoalRunResult::Requested { .. }
@@ -29734,7 +29404,7 @@ impl ThreadActor {
                             self.active = Some(active);
                         }
                         None => {
-                            let _ = Self::pause_active_goal(
+                            let _ = self.pause_active_goal(
                                 &mut active,
                                 "goal run paused because runtime command channel closed",
                             );
@@ -30051,8 +29721,8 @@ impl ThreadActor {
         #[cfg(test)]
         let permitted_during_goal_blocking = permitted_during_goal_blocking
             || matches!(&command, ThreadCommand::SurfaceActorTestProbe { .. });
-        if self.goal_blocking_in_flight && !permitted_during_goal_blocking {
-            self.deferred_goal_commands.push_back(command);
+        if self.goal_controller.is_blocking() && !permitted_during_goal_blocking {
+            self.goal_controller.defer(command);
             return;
         }
         let permitted_during_manual_retry = matches!(
@@ -30557,9 +30227,8 @@ impl ThreadActor {
                 let _ = reply.send(SurfaceActorTestProbe {
                     waiter_count: self
                         .resident_surface
-                        .waiters
-                        .get(&operation_id)
-                        .map_or(0, Vec::len),
+                        .capability
+                        .terminal_waiter_count(&operation_id),
                     legacy_completion: None,
                     pending_manual_compaction_completion: self
                         .pending_manual_compaction_completion
@@ -30696,9 +30365,11 @@ impl ThreadActor {
                 request.root_task_id = Some(root_task_id.clone());
                 let task_registry = state.thread.session().task_registry().clone();
                 let steer_handle = ThreadSteerHandle::default();
+                let goal_turn = request.surface_goal_turn.take();
                 let generation = self.spawn_generation(
                     state,
                     &request,
+                    goal_turn.clone(),
                     writer,
                     GenerationContext::new(
                         initial_generation,
@@ -30708,6 +30379,8 @@ impl ThreadActor {
                         config.clone(),
                     ),
                 );
+                self.goal_controller
+                    .bind_active(operation_id, goal_control, goal_turn);
                 self.active = Some(ActiveOperation {
                     operation_id,
                     runtime_task_id,
@@ -30720,8 +30393,6 @@ impl ThreadActor {
                     steer_handle,
                     resume_queued: false,
                     goal_admitted_generation: None,
-                    goal_control,
-                    pending_goal_pause_event: None,
                     generation,
                     surface_operation: None,
                     surface_manual_compaction_before_messages: None,
@@ -30814,9 +30485,9 @@ impl ThreadActor {
                     let _ = reply.send(Ok(runtime));
                 } else if self.state.is_none() {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
-                } else if self.goal_blocking_in_flight {
-                    self.deferred_goal_commands
-                        .push_back(ThreadCommand::GoalRuntime { reply });
+                } else if self.goal_controller.is_blocking() {
+                    self.goal_controller
+                        .defer(ThreadCommand::GoalRuntime { reply });
                 } else {
                     self.open_goal_runtime_off_actor(reply);
                 }
@@ -31711,9 +31382,8 @@ impl ThreadActor {
                 let _ = reply.send(SurfaceActorTestProbe {
                     waiter_count: self
                         .resident_surface
-                        .waiters
-                        .get(&operation_id)
-                        .map_or(0, Vec::len),
+                        .capability
+                        .terminal_waiter_count(&operation_id),
                     legacy_completion,
                     pending_manual_compaction_completion: self
                         .pending_manual_compaction_completion
@@ -31775,7 +31445,7 @@ impl ThreadActor {
                 } else if active.generation.cancel.is_cancelled() {
                     InterruptOperationResult::AlreadyRequested { generation }
                 } else if let Err(error) =
-                    Self::pause_active_goal(active, "goal run interrupted by user")
+                    self.pause_active_goal(active, "goal run interrupted by user")
                 {
                     let _ = reply.send(Err(error));
                     return;
@@ -31789,7 +31459,7 @@ impl ThreadActor {
                 operation_id,
                 reply,
             } => {
-                let _ = reply.send(Self::request_goal_pause(active, operation_id));
+                let _ = reply.send(self.request_goal_pause(active, operation_id));
             }
             ThreadCommand::ResumeOperation {
                 operation_id,
@@ -31900,74 +31570,23 @@ impl ThreadActor {
     }
 
     fn pause_active_goal(
+        &mut self,
         active: &mut ActiveOperation,
         message: &str,
     ) -> Result<(), RuntimeHostError> {
         if active.request.surface_goal_owned {
             return Ok(());
         }
-        let Some(control) = active.goal_control.as_ref() else {
-            return Ok(());
-        };
-        let runtime = control.runtime.clone();
-        let session_id = control.session_id.clone();
-        let previous =
-            runtime
-                .read(&session_id)
-                .map_err(|error| RuntimeHostError::GoalControlFailed {
-                    message: error.to_string(),
-                })?;
-        runtime
-            .pause(
-                &session_id,
-                orca_core::goal_runtime::GoalPauseReason::User,
-                message,
-                chrono::Utc::now().timestamp(),
-            )
-            .map_err(|error| RuntimeHostError::GoalControlFailed {
-                message: error.to_string(),
-            })?;
-        let next =
-            runtime
-                .read(&session_id)
-                .map_err(|error| RuntimeHostError::GoalControlFailed {
-                    message: error.to_string(),
-                })?;
-        if active.pending_goal_pause_event.is_none()
-            && let (Some(previous), Some(next)) = (previous, next)
-            && previous.state != next.state
-            && let orca_core::goal_runtime::GoalState::Paused { reason, message } = &next.state
-        {
-            active.pending_goal_pause_event = Some(PendingGoalPauseEvent {
-                goal_id: next.goal_id.clone(),
-                goal_run_id: previous
-                    .current_run
-                    .as_ref()
-                    .map(|run| run.goal_run_id.clone()),
-                outer_turn_id: previous
-                    .current_run
-                    .as_ref()
-                    .and_then(|run| run.outer_turn_id.clone()),
-                previous_state: previous.state,
-                next_state: next.state.clone(),
-                reason: *reason,
-                message: message.clone(),
-                reason_code: next
-                    .last_transition
-                    .as_ref()
-                    .map(|transition| transition.reason_code.clone())
-                    .unwrap_or_else(|| "paused".to_string()),
-            });
-        }
-        Ok(())
+        self.goal_controller
+            .pause_active(active.operation_id, message)
     }
 
     fn publish_pending_goal_pause_event(
-        &self,
+        &mut self,
         state: &mut ThreadActorState,
         active: &mut ActiveOperation,
     ) {
-        let Some(event) = active.pending_goal_pause_event.take() else {
+        let Some(event) = self.goal_controller.take_pause_event(active.operation_id) else {
             return;
         };
         let observer = active.request.event_observer();
@@ -32028,6 +31647,7 @@ impl ThreadActor {
     }
 
     fn request_goal_pause(
+        &mut self,
         active: &mut ActiveOperation,
         operation_id: OperationId,
     ) -> Result<PauseGoalRunResult, RuntimeHostError> {
@@ -32038,11 +31658,11 @@ impl ThreadActor {
                 active: generation,
             });
         }
-        if active.goal_control.is_none() {
+        if !self.goal_controller.has_active_control(active.operation_id) {
             return Ok(PauseGoalRunResult::NotGoalRun { generation });
         }
         let already_requested = active.generation.cancel.is_cancelled();
-        Self::pause_active_goal(active, "paused by user")?;
+        self.pause_active_goal(active, "paused by user")?;
         active.generation.cancel.cancel();
         Ok(if already_requested {
             PauseGoalRunResult::AlreadyRequested { generation }
@@ -32055,11 +31675,13 @@ impl ThreadActor {
         &self,
         state: ThreadActorState,
         request: &HostedTurnRequest,
+        goal_turn: Option<crate::goal_actor::GoalTurnContext>,
         mut writer: Box<dyn HostedOperationWriter>,
         mut context: GenerationContext,
     ) -> ActiveGeneration {
         let executor = Arc::clone(&self.executor);
-        let task_request = request.clone();
+        let mut task_request = request.clone();
+        task_request.surface_goal_turn = goal_turn;
         let cancel = CancelToken::new();
         if let Some(factory) = request.generation_handler_factory.as_ref() {
             context.handlers = factory(context.fence(), cancel.clone());
@@ -32323,6 +31945,8 @@ impl ThreadActor {
             ),
         })?;
         self.state = Some(pending.state);
+        self.goal_controller
+            .clear_active(pending.active.operation_id);
         let completed = pending.active.completion.complete(OperationTerminal {
             operation_id: pending.active.operation_id,
             outcome: OperationOutcome::Backgrounded {
@@ -32475,6 +32099,8 @@ impl ThreadActor {
             .request
             .reply
             .send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+        self.goal_controller
+            .clear_active(pending.active.operation_id);
         let completed = pending.active.completion.complete(OperationTerminal {
             operation_id: pending.active.operation_id,
             outcome: OperationOutcome::ExecutionFailed {
@@ -32488,6 +32114,20 @@ impl ThreadActor {
     }
 
     fn finish_generation(
+        &mut self,
+        active: ActiveOperation,
+        result: Result<OperationTaskResult, tokio::task::JoinError>,
+        allow_resume: bool,
+    ) -> Result<(), RuntimeHostError> {
+        let operation_id = active.operation_id;
+        let result = self.finish_generation_inner(active, result, allow_resume);
+        if result.is_err() {
+            self.goal_controller.clear_active(operation_id);
+        }
+        result
+    }
+
+    fn finish_generation_inner(
         &mut self,
         mut active: ActiveOperation,
         result: Result<OperationTaskResult, tokio::task::JoinError>,
@@ -32778,6 +32418,9 @@ impl ThreadActor {
                                     active.generation = self.spawn_generation(
                                         result.state,
                                         &active.request,
+                                        self.goal_controller
+                                            .active_turn(active.operation_id)
+                                            .cloned(),
                                         result.writer,
                                         context,
                                     );
@@ -32786,6 +32429,7 @@ impl ThreadActor {
                                 }
                                 Ok(QueuedJsonlResumePreparation::RecoveryRequired { message }) => {
                                     self.state = Some(result.state);
+                                    self.goal_controller.clear_active(active.operation_id);
                                     let completed = active.completion.complete(OperationTerminal {
                                         operation_id: active.operation_id,
                                         outcome: OperationOutcome::ExecutionFailed {
@@ -32831,6 +32475,9 @@ impl ThreadActor {
                             active.generation = self.spawn_generation(
                                 result.state,
                                 &active.request,
+                                self.goal_controller
+                                    .active_turn(active.operation_id)
+                                    .cloned(),
                                 result.writer,
                                 context,
                             );
@@ -32877,16 +32524,14 @@ impl ThreadActor {
                                         self.surface_terminal_blocked = Some(format!(
                                             "typed Goal completion recovery is pending: {message}"
                                         ));
-                                        debug_assert!(
-                                            self.pending_goal_completion_recovery.is_none()
-                                        );
-                                        self.pending_goal_completion_recovery =
-                                            Some(PendingSurfaceGoalCompletionRecovery {
+                                        self.goal_controller.set_pending_recovery(
+                                            PendingSurfaceGoalCompletionRecovery {
                                                 active,
                                                 message,
                                                 retry_at: tokio::time::Instant::now()
                                                     + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
-                                            });
+                                            },
+                                        );
                                     }
                                     return Ok(());
                                 }
@@ -32912,14 +32557,14 @@ impl ThreadActor {
                                     self.surface_terminal_blocked = Some(format!(
                                         "typed Goal completion recovery is pending: {message}"
                                     ));
-                                    debug_assert!(self.pending_goal_completion_recovery.is_none());
-                                    self.pending_goal_completion_recovery =
-                                        Some(PendingSurfaceGoalCompletionRecovery {
+                                    self.goal_controller.set_pending_recovery(
+                                        PendingSurfaceGoalCompletionRecovery {
                                             active,
                                             message,
                                             retry_at: tokio::time::Instant::now()
                                                 + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
-                                        });
+                                        },
+                                    );
                                 }
                                 return Ok(());
                             }
@@ -32950,20 +32595,24 @@ impl ThreadActor {
                             active.request.goal_turn_origin =
                                 orca_core::goal_runtime::GoalTurnOrigin::Continuation;
                             active.request.resumes_existing_turn = false;
-                            active.request.surface_goal_turn =
-                                Some(crate::goal_actor::GoalTurnContext {
-                                    session_id: active
-                                        .goal_control
-                                        .as_ref()
-                                        .expect("surface Goal continuation keeps control")
-                                        .session_id
-                                        .clone(),
-                                    goal_id,
-                                    goal_run_id,
-                                    outer_turn_id,
-                                    origin: orca_core::goal_runtime::GoalTurnOrigin::Continuation,
-                                    run_started: false,
-                                });
+                            let successor_turn = crate::goal_actor::GoalTurnContext {
+                                session_id: self
+                                    .goal_controller
+                                    .active_control(active.operation_id)
+                                    .cloned()
+                                    .expect("surface Goal continuation keeps control")
+                                    .session_id,
+                                goal_id,
+                                goal_run_id,
+                                outer_turn_id,
+                                origin: orca_core::goal_runtime::GoalTurnOrigin::Continuation,
+                                run_started: false,
+                            };
+                            assert!(
+                                self.goal_controller
+                                    .replace_active_turn(active.operation_id, successor_turn),
+                                "surface Goal continuation keeps turn ownership",
+                            );
                             let interaction_command_tx = self.handle.command_tx.clone();
                             let interaction_fence = successor.operation_fence.clone();
                             active.request.generation_handler_factory =
@@ -33021,6 +32670,9 @@ impl ThreadActor {
                             active.generation = self.spawn_generation(
                                 result.state,
                                 &active.request,
+                                self.goal_controller
+                                    .active_turn(active.operation_id)
+                                    .cloned(),
                                 result.writer,
                                 context,
                             );
@@ -33084,6 +32736,7 @@ impl ThreadActor {
                                         kind: error.kind(),
                                         message: error.to_string(),
                                     };
+                                    self.goal_controller.clear_active(active.operation_id);
                                     let completed = active.completion.complete(OperationTerminal {
                                         operation_id: active.operation_id,
                                         outcome,
@@ -33124,6 +32777,9 @@ impl ThreadActor {
                                 active.generation = self.spawn_generation(
                                     result.state,
                                     &active.request,
+                                    self.goal_controller
+                                        .active_turn(active.operation_id)
+                                        .cloned(),
                                     result.writer,
                                     context,
                                 );
@@ -33208,8 +32864,8 @@ impl ThreadActor {
                     .expect("guarded surface operation");
                 if self
                     .resident_surface
-                    .pending_terminal_commits
-                    .contains_key(&operation_id)
+                    .capability
+                    .has_pending_terminal(&operation_id)
                 {
                     return Ok(());
                 }
@@ -33225,14 +32881,14 @@ impl ThreadActor {
                         self.surface_terminal_blocked = Some(format!(
                             "typed Goal completion recovery is pending: {message}"
                         ));
-                        debug_assert!(self.pending_goal_completion_recovery.is_none());
-                        self.pending_goal_completion_recovery =
-                            Some(PendingSurfaceGoalCompletionRecovery {
+                        self.goal_controller.set_pending_recovery(
+                            PendingSurfaceGoalCompletionRecovery {
                                 active,
                                 message,
                                 retry_at: tokio::time::Instant::now()
                                     + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
-                            });
+                            },
+                        );
                     }
                     return Ok(());
                 }
@@ -33245,6 +32901,7 @@ impl ThreadActor {
             self.pending_surface_stream_redactions
                 .retain(|_, pending| pending.fence.operation_id != fence.operation_id);
         }
+        self.goal_controller.clear_active(active.operation_id);
         let completed = active.completion.complete(OperationTerminal {
             operation_id: active.operation_id,
             outcome,
