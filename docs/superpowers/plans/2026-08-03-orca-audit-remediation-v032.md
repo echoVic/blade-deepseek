@@ -1137,13 +1137,13 @@ git diff --check
 Expected: all exit 0 before versioning. On 2026-08-04, the TUI profile passed
 1,023/1,023 and the workspace profile passed 2,490/2,490 with zero failures and
 zero skipped tests; nextest reported one leaky process but no flaky retry. The
-SEO check is rerun after the v0.3.3 site version/date assets are updated.
+SEO check passed after the v0.3.3 site version/date assets were updated.
 
-- [ ] **Step 4: Prepare v0.3.3**
+- [x] **Step 4: Prepare v0.3.3**
 
 Set Cargo workspace/package, Cargo.lock, and root npm package to 0.3.3. Write release notes with Changes, Compatibility, Verification, and Upgrade. Add v0.3.3 to site releases and both language summary maps.
 
-- [ ] **Step 5: Verify version assets and commit**
+- [x] **Step 5: Verify version assets and commit**
 
 ~~~sh
 cargo check --workspace --locked

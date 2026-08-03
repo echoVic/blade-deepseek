@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.3":
+        "Closes the Orca runtime and architecture audit. Goal persistence and terminal replies now settle in order without blocking Tokio actors, operation cancellation owns spawned task trees, and session switch, fork, rename, and stale-event handling are transactionally fenced. Runtime surfaces use an explicit facade, tool schemas are provider-neutral, root MCP ownership lives in RuntimeHost, and transcript streaming, reflow, search, deduplication, usage, and projection state now have bounded or revision-checked behavior.",
       "v0.3.2":
         "Fixes a crash when Orca is launched through the npm wrapper (node stdio:inherit sets O_NONBLOCK on inherited terminal fds). Orca now clears non-blocking flags at startup and wraps stdout with an EAGAIN/EINTR retry writer, eliminating os error 35 during rapid terminal resize on macOS. Also adds reasoning effort low for DeepSeek V4, with correct thinking configuration and default max_tokens in API requests.",
       "v0.3.1":
@@ -562,6 +564,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.3":
+        "完成 Orca runtime 与架构审计整改。Goal 持久化和 terminal reply 现在按顺序结算且不会阻塞 Tokio actor，operation 取消会收拢其创建的任务树；session 切换、fork、rename 与陈旧事件都受事务和 attachment fence 约束。Runtime surface 改为显式 facade，tool schema 与 provider 解耦，根 MCP 生命周期归 RuntimeHost 所有；transcript streaming、reflow、search、去重、usage 与 projection state 也具备有界或 revision 校验语义。",
       "v0.3.2":
         "修复通过 npm 包装器启动时的崩溃问题（node stdio:inherit 会在继承的终端 fd 上设置 O_NONBLOCK）。Orca 现在在启动时清除非阻塞标记，并为 stdout 添加 EAGAIN/EINTR 重试写入器，消除 macOS 上快速调整终端窗口大小时的 os error 35。同时新增 DeepSeek V4 低思考强度支持，正确发送 thinking 配置和默认 max_tokens。",
       "v0.3.1":

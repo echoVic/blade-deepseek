@@ -47,8 +47,10 @@ Pre-version verification on 2026-08-04 completed with exit 0 for every command i
 Task 23 Step 3. The TUI serial profile ran 1,023/1,023 tests. The workspace
 profile ran 2,490/2,490 tests with zero failures and zero skipped tests; nextest
 reported one leaky test process, with no flaky retry or test failure. The SEO
-check is intentionally rerun after the v0.3.3 site version/date assets are
-updated.
+check passed after the v0.3.3 site version/date assets were updated. Cargo,
+Cargo.lock, npm, site, changelog, and release-note version sync passed for
+0.3.3; the workspace check, npm staging test, and site production build also
+exited 0.
 
 The release is incomplete until all table rows are closed and the following are
 independently visible:
