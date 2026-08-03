@@ -1,4 +1,55 @@
-use super::*;
+use super::commands::{
+    ClosedThreadReceipt, EphemeralThreadPersistence, HostReceiptAckRequirement,
+    HostReceiptIdentityPair, HostReceiptRequirementIdentity, MutationCommitAck,
+    OperationTerminalAckRequirement, OperationTerminalAtCursor, RetainedShutdownOutput,
+    ShutdownBarrierPlan, ShutdownBarrierRecord, ShutdownBarrierState, ShutdownHostOutput,
+    ShutdownOperationPlan, ShutdownOperationSourcePhase, ShutdownRequestCause,
+    ShutdownSelectedCause, ShutdownThreadPlan, SurfaceCommitBatch,
+    SurfaceCommitBatchPreflightResult, SurfaceEvent, SurfaceEventEnvelope,
+    SurfaceHostShutdownReceipt, SurfaceHostShutdownStage, SurfaceSessionCatalogAction,
+    SurfaceSessionCatalogReceipt, ThreadCursorAckRequirement,
+};
+use super::commit::ImmutableShutdownLedger;
+use super::identity::{
+    CanonicalPath, CommitClass, CursorSourceRevision, DisplayText, DurableRevision,
+    HostIncarnation, HostLifecycleRevision, InteractionRevision, LiveRevision, NonEmptyText,
+    NonEmptyVec, PolicyEpoch, SafeDiagnosticText, SequenceNumber, SessionCatalogRevision,
+    Sha256Digest, SurfaceBackgroundFence, SurfaceBackgroundOwnerToken, SurfaceCommitId,
+    SurfaceCursor, SurfaceEventId, SurfaceFinalizeIntentId, SurfaceGenerationId, SurfaceGoalId,
+    SurfaceInteractionId, SurfaceItemId, SurfaceOperationFence, SurfaceOperationId,
+    SurfaceRequestId, SurfaceScope, SurfaceSettlementId, SurfaceSubagentId, SurfaceTaskFence,
+    SurfaceTaskId, SurfaceThreadId, SurfaceToolCallId, SurfaceTurnId, SurfaceWorkflowRunId,
+    TaskRevision, ThreadOwnerEpoch, UnixMillis, UuidV7, canonical_background_fence_v1,
+};
+use super::interaction::{
+    AuthorityFingerprint, InteractionCancelReason, InteractionExpiryDeadline, InteractionPatch,
+    InteractionUnavailableDisposition, SurfaceInteractionKind, SurfaceInteractionLifecycle,
+    SurfaceInteractionRequest, SurfaceInteractionResolutionReceipt, SurfaceInteractionRoute,
+    SurfaceInteractionView, SurfaceMcpElicitationRequest, SurfacePermissionProfile,
+    SurfaceToolRequest,
+};
+#[cfg(test)]
+use super::operation::GenerationExecutionFailureClass;
+use super::operation::{
+    AdmittedInput, FinalizationDegradedCause, GenerationRecord, GenerationStartedWitness,
+    GenerationStopReason, InputResolutionErrorCode, OperationFinalizationCause, OperationRecord,
+    OperationTerminal, OperationTerminalRecord, PendingControlIntent, SurfaceAgentLoopTurn,
+    SurfaceResolvedInputFact, SurfaceSettlementReceipt, SuspendedFinalizationCause,
+    SuspensionCause, UsageTotals,
+};
+use super::projection::{
+    AssistantPatch, FirstOperationCompletionPolicy, GoalPatchEnvelope, ItemPatch, McpCatalogPatch,
+    OperationPatch, PinnedContextPatch, SessionPatch, SettingsPatch, SubagentPatch,
+    SurfaceContextSnapshot, SurfaceFactFamily, SurfacePlanSnapshot, SurfaceTask, SurfaceTaskStatus,
+    SurfaceTaskType, SurfaceUsageSnapshot, SurfaceVerificationResult, TaskPatch, ToolPatch,
+    WorkflowPatch,
+};
+#[cfg(test)]
+use super::projection::{
+    CompactionReason, CompactionState, SurfaceCapabilityCall, SurfaceCapabilityCallKind,
+    SurfaceCapabilityCallState,
+};
+use super::reducer::{canonical_batch_digest, preflight_batch};
 use crate::thread_store::JsonlThreadStore;
 use orca_platform::PlatformError;
 use orca_platform::fs::ExclusiveFileLock;

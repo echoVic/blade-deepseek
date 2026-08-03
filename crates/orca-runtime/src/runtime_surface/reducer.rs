@@ -1,4 +1,60 @@
-use super::*;
+use super::commands::{
+    MutationCommitAck, SURFACE_COMMIT_BATCH_BYTE_LIMIT, SURFACE_COMMIT_BATCH_EVENT_LIMIT,
+    SurfaceCommitBatch, SurfaceCommitBatchPreflightErrorCode, SurfaceCommitBatchPreflightResult,
+    SurfaceEvent, SurfaceEventEnvelope, SurfaceSnapshot,
+};
+use super::identity::{
+    ByteCount, ByteOffset, CanonicalBackgroundFenceV1, CanonicalSurfaceScopeV1, CommitClass,
+    CursorSourceRevision, DisplayText, InteractionRevision, NonEmptyText,
+    PinnedContextSourceRevision, ResponseRouteEpoch, SafeDiagnosticText, SequenceNumber,
+    Sha256Digest, SurfaceCommitId, SurfaceCursor, SurfaceEventId, SurfaceFinalizeIntentId,
+    SurfaceGenerationId, SurfaceGoalId, SurfaceGoalIntentId, SurfaceGoalOuterTurnId,
+    SurfaceGoalRunId, SurfaceInteractionId, SurfaceItemId, SurfaceOperationFence,
+    SurfaceOperationId, SurfaceRequestId, SurfaceScope, SurfaceSettlementId, SurfaceSubagentId,
+    SurfaceTaskFence, SurfaceTaskId, SurfaceToolCallId, SurfaceTurnId, SurfaceWorkflowFence,
+    SurfaceWorkflowRunId, TaskRevision, ThreadOwnerEpoch, UnixMillis, UuidV7, WorkflowRevision,
+    canonical_background_fence_v1, canonical_surface_scope_v1,
+};
+use super::interaction::{
+    AuthorityFingerprint, CanonicalInteractionPatchV1, InteractionCancelReason,
+    InteractionExpiryAuthorityFailure, InteractionPatch, InteractionUnavailableDisposition,
+    SurfaceInteractionKind, SurfaceInteractionLifecycle, SurfaceInteractionRequest,
+    SurfaceInteractionRoute, SurfaceInteractionSafeProjection, SurfaceInteractionView,
+    SurfaceToolAction, SurfaceToolRequest, canonical_interaction_patch_v1,
+};
+use super::operation::{
+    AdmissionRejectionReason, AdmittedInput, CancelReason, FailureClass, FinalizationDegradedCause,
+    FinalizationStartedAtCursor, GenerationAttempt, GenerationCompletionStatus,
+    GenerationExecutionFailureClass, GenerationInputState, GenerationPhase, GenerationRecord,
+    GenerationStartedWitness, GenerationStopReason, GoalOuterTurnOrigin, InputResolutionErrorCode,
+    LiveOperationCapsule, NonReplayableReason, NotAdmittedReason, NotStartedReason,
+    OperationBudget, OperationFinalizationCause, OperationFinalizationRecord, OperationKind,
+    OperationPhase, OperationRecord, OperationTerminal, OperationTerminalRecord,
+    PendingControlIntent, Replayability, ReservationFinalizerReason, SurfaceAgentLoopTurn,
+    SurfaceGoalGenerationIdentity, SurfaceResolvedInputFact, SurfaceSettlementReceipt,
+    SurfaceShutdownReason, SuspendedFinalizationCause, SuspensionCause, TerminalizationCause,
+    TurnRequestBudgetScope, UsageTotals,
+};
+use super::projection::{
+    AssistantChannel, AssistantPatch, CapabilityCallResult, CompactionReason, CompactionState,
+    ExternalEffectKind, GoalContinuationDecision, GoalContinuationStopReason, GoalPatch,
+    GoalPatchEnvelope, GoalUsage, ItemPatch, ItemRemovalReason, McpCatalogPatch, OperationPatch,
+    PinnedContextPatch, SessionPatch, SettingsPatch, SubagentPatch, SurfaceAssistantStreamState,
+    SurfaceBackgroundOperation, SurfaceCapabilityCall, SurfaceCapabilityCallKind,
+    SurfaceCapabilityCallState, SurfaceCompletedModelResponse, SurfaceContextSnapshot,
+    SurfaceFactFamily, SurfaceGoal, SurfaceGoalCloseReason, SurfaceGoalClosedRunReceipt,
+    SurfaceGoalIntent, SurfaceGoalIntentAck, SurfaceGoalOuterTurnReceipt,
+    SurfaceGoalOuterTurnReceiptOrigin, SurfaceGoalPauseReason, SurfaceGoalReceiptState,
+    SurfaceGoalRun, SurfaceGoalRunOrigin, SurfaceGoalRunPhase, SurfaceGoalState,
+    SurfaceGoalStoreReceipt, SurfaceHealthIssue, SurfaceHealthIssueId, SurfaceItem,
+    SurfaceItemOrigin, SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfacePlanSnapshot,
+    SurfaceRemoteTerminalLease, SurfaceRemoteTerminalLeaseState, SurfaceSubagentStatus,
+    SurfaceSubagentTerminalStatus, SurfaceTask, SurfaceTaskStatus, SurfaceTaskType,
+    SurfaceToolResultKind, SurfaceToolView, SurfaceToolViewState, SurfaceUsageSnapshot,
+    SurfaceUserInputState, SurfaceVerificationResult, SurfaceWorkflow, SurfaceWorkflowAgent,
+    SurfaceWorkflowAgentStatus, SurfaceWorkflowStatus, TaskPatch, ToolInvocationStarted, ToolPatch,
+    WorkflowPatch,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -7984,6 +8040,23 @@ fn goal_patch_id(patch: &GoalPatch) -> &SurfaceGoalId {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::runtime_surface::identity::{
+        ContextRevision, DurableRevision, HostIncarnation, HostMonotonicClockId,
+        McpCatalogRevision, MonotonicInstant, MonotonicTick, NonEmptyVec, PinnedContextRevision,
+        PlanRevision, PolicyEpoch, SessionHealthRevision, SessionMetadataRevision,
+        SettingsRevision, SurfaceAdmissionLeaseId, SurfaceBackgroundFence,
+        SurfaceBackgroundOwnerToken, SurfaceIncarnation, SurfaceThreadId, UsageRevision,
+    };
+    use crate::runtime_surface::operation::{
+        BusyDisposition, InterruptSettlement, LegacyVisibility, ManualCompactionReason,
+        OperationIntent, OperationOrigin, OperationSettingsPreparationReceipt, ReservationLease,
+        SurfaceApprovalMode, SurfaceNetworkPermissions, SurfacePermissionRuleSet,
+        SurfaceReasoningEffort, SurfaceRuntimeSettings,
+    };
+    use crate::runtime_surface::projection::{
+        ProviderReplayHealth, SurfaceMcpCatalogSnapshot, SurfacePinnedContextSnapshot,
+        SurfaceSessionHealth, SurfaceSettingsSnapshot, SurfaceThreadSnapshot, ThreadPersistence,
+    };
     use std::collections::BTreeSet;
 
     pub(crate) fn uuid_v7_bytes(seed: u8) -> [u8; 16] {

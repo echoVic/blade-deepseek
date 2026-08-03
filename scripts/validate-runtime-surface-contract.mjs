@@ -15,6 +15,19 @@ const REVIEWED_ARTIFACT_PATHS = [
   DEFAULT_MANIFEST,
   "docs/superpowers/plans/2026-07-21-runtime-owned-typed-surface-implementation.md",
 ];
+const RUNTIME_SURFACE_MODULES = [
+  "commands",
+  "commit",
+  "host",
+  "hub",
+  "identity",
+  "ingress",
+  "interaction",
+  "operation",
+  "projection",
+  "reducer",
+  "store",
+];
 
 const TABLES = {
   source_fact_columns: "source_facts",
@@ -1054,6 +1067,37 @@ function validateClosedInventories(manifest) {
       fail(`${id} has unknown materialization ${materialization}`);
     }
   }
+}
+
+function validateRuntimeSurfacePublicExportManifest(manifest) {
+  const exportsByModule = requireObject(
+    manifest.runtime_surface_public_exports,
+    "runtime_surface_public_exports",
+  );
+  assertExactArray(
+    Object.keys(exportsByModule),
+    RUNTIME_SURFACE_MODULES,
+    "runtime_surface_public_exports modules",
+  );
+  for (const moduleName of RUNTIME_SURFACE_MODULES) {
+    const names = requireArray(
+      exportsByModule[moduleName],
+      `runtime_surface_public_exports.${moduleName}`,
+    );
+    names.forEach((name, index) =>
+      requireNonemptyString(name, `runtime_surface_public_exports.${moduleName}[${index}]`),
+    );
+    assertUnique(names, `runtime_surface_public_exports.${moduleName}`);
+    assertExactArray(
+      names,
+      [...names].sort(),
+      `runtime_surface_public_exports.${moduleName} sorted order`,
+    );
+  }
+  assertUnique(
+    RUNTIME_SURFACE_MODULES.flatMap((moduleName) => exportsByModule[moduleName]),
+    "runtime_surface_public_exports flattened names",
+  );
 }
 
 function validateCommands(manifest, tableKey, inventoryKey, dispositionKey) {
@@ -2121,6 +2165,7 @@ export function validateManifestStructure(manifest, { reviewedManifest } = {}) {
   requireNonemptyString(manifest.normative_document, "normative_document");
   validateTables(manifest);
   validateClosedInventories(manifest);
+  validateRuntimeSurfacePublicExportManifest(manifest);
   validateCommands(manifest, "thread_commands", "surface_commands", "thread_command_dispositions");
   validateCommands(manifest, "host_commands", "surface_host_commands", "host_dispositions");
   validateAcpDispositions(manifest);
@@ -2418,6 +2463,49 @@ export function parseRustEnum(source, declaration) {
     }
   }
   return variants;
+}
+
+export function parseRuntimeSurfacePublicExports(source) {
+  const code = maskRustNonCode(source);
+  const exportsByModule = {};
+  const declarations = [...code.matchAll(/\bpub\s+use\s+([a-z_][a-z0-9_]*)\s*::/g)];
+  for (const declaration of declarations) {
+    const moduleName = declaration[1];
+    const bodyStart = declaration.index + declaration[0].length;
+    const declarationEnd = code.indexOf(";", bodyStart);
+    if (declarationEnd < 0) fail(`unterminated public export for ${moduleName}`);
+    const body = code.slice(bodyStart, declarationEnd).trim();
+    if (body === "*") {
+      fail(`runtime-surface public exports must be explicit; found pub use ${moduleName}::*`);
+    }
+    if (exportsByModule[moduleName]) {
+      fail(`runtime-surface module ${moduleName} has more than one public export declaration`);
+    }
+    const names = (body.startsWith("{") && body.endsWith("}")
+      ? body.slice(1, -1)
+      : body
+    )
+      .split(",")
+      .map((name) => name.trim())
+      .filter(Boolean);
+    for (const name of names) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+        fail(`runtime-surface public export ${moduleName}::${name} is not an exact identifier`);
+      }
+    }
+    assertUnique(names, `runtime-surface ${moduleName} public exports`);
+    exportsByModule[moduleName] = names;
+  }
+  return exportsByModule;
+}
+
+export function assertNoProductionRuntimeSurfaceSiblingGlobs(source, moduleName) {
+  const production = maskCfgTestItems(source);
+  for (const declaration of rustUseDeclarations(production)) {
+    if (declaration.path === "super::*") {
+      fail(`runtime-surface ${moduleName} production imports must be explicit; found use super::*`);
+    }
+  }
 }
 
 function readRepoSource(repoRoot, relativePath, sourceOverrides) {
@@ -3603,6 +3691,31 @@ function validateTuiMutationScan(repoRoot, sourceOverrides) {
 }
 
 export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides }) {
+  const runtimeSurfaceModulePath = "crates/orca-runtime/src/runtime_surface/mod.rs";
+  const runtimeSurfaceExports = parseRuntimeSurfacePublicExports(
+    readRepoSource(repoRoot, runtimeSurfaceModulePath, sourceOverrides),
+  );
+  assertExactArray(
+    Object.keys(runtimeSurfaceExports),
+    RUNTIME_SURFACE_MODULES,
+    "current runtime-surface public export modules",
+  );
+  for (const moduleName of RUNTIME_SURFACE_MODULES) {
+    assertExactArray(
+      runtimeSurfaceExports[moduleName],
+      manifest.runtime_surface_public_exports[moduleName],
+      `current runtime-surface ${moduleName} public exports`,
+    );
+    assertNoProductionRuntimeSurfaceSiblingGlobs(
+      readRepoSource(
+        repoRoot,
+        `crates/orca-runtime/src/runtime_surface/${moduleName}.rs`,
+        sourceOverrides,
+      ),
+      moduleName,
+    );
+  }
+
   const eventSchemaPath = checkedRepoFile(
     repoRoot,
     "crates/orca-core/src/event_schema.rs",

@@ -1,4 +1,56 @@
-use super::*;
+use super::hub::{
+    AcpReadTextFileDispatchReceiver, AcpReadTextFileSettlement, AcpTerminalCleanupDispatchReceiver,
+    AcpTerminalCleanupSettlement, AcpTerminalCreateDispatchReceiver, AcpTerminalCreateSettlement,
+    AcpTerminalObservationDispatchReceiver, AcpTerminalObservationSettlement,
+    AcpWriteTextFileDispatchReceiver, AcpWriteTextFileSettlement, SurfaceHub,
+    SurfaceSubscriptionReceiver,
+};
+use super::identity::{
+    BootstrapCredentialRevision, CanonicalPath, CanonicalUri, CapabilityRevision, CommitClass,
+    ContextRevision, DisplayText, DurableRevision, DurationMillis, GoalCatalogRevision,
+    GoalObjectiveRevision, GoalOwnerEpoch, GoalRevision, HostIncarnation, HostLifecycleRevision,
+    HostRevisionWitness, InputCatalogRevision, InteractionRevision, McpCatalogRevision,
+    MemoryRevision, NonEmptySet, NonEmptyText, NonEmptyVec, OpaqueToken,
+    OptionalProcessLocalCancel, PinnedContextRevision, PlanRevision, PolicyEpoch,
+    ProjectRootMemoryRevision, ResponseRouteEpoch, Rfc3339Timestamp, SequenceNumber,
+    SessionCatalogRevision, SessionMetadataRevision, Set, SettingsRevision, Sha256Digest,
+    SurfaceAdmissionLeaseId, SurfaceAttachmentGrant, SurfaceAttachmentId, SurfaceAttachmentRole,
+    SurfaceBackgroundFence, SurfaceBoundCaller, SurfaceCapability, SurfaceCapabilityCallId,
+    SurfaceCatalogEntryId, SurfaceCommitId, SurfaceConnectionId, SurfaceCursor, SurfaceEventId,
+    SurfaceFinalizeIntentId, SurfaceGenerationId, SurfaceGoalFence, SurfaceGoalId,
+    SurfaceHostBoundCaller, SurfaceIncarnation, SurfaceInteractionId, SurfaceItemId,
+    SurfaceOperationFence, SurfaceOperationId, SurfaceRequestId, SurfaceResponseGrantToken,
+    SurfaceResponseId, SurfaceResponseToken, SurfaceScope, SurfaceSettlementId, SurfaceTaskFence,
+    SurfaceTaskId, SurfaceThreadId, SurfaceUnavailableReason, SurfaceValueError,
+    SurfaceWorkflowFence, SurfaceWorkflowRunId, TaskRevision, ThreadOwnerEpoch, TrustRevision,
+    UnixMillis, UsageRevision, UuidV7, WorkflowCatalogRevision, WorkflowRevision,
+    ZeroizingProcessLocalSecret,
+};
+use super::interaction::{
+    BoundInteractionResponse, BrokerInteractionAnswerPolicy, InteractionPatch,
+    SurfaceClientInteractionAnswer, SurfaceDataValue, SurfaceInteractionKind,
+    SurfaceInteractionResolutionReceipt, SurfaceInteractionView,
+};
+use super::operation::{
+    FinalizationStartedAtCursor, GenerationPhase, InterruptSettlement, LastUserTurn, LegacyTurnId,
+    OperationFinalizationCause, OperationKind, OperationPhase, OperationRecord,
+    OperationRequestIntent, OperationTerminal, Replayability, ReservationLease,
+    RuntimeSettingsPatch, SurfaceActivePermissionProfile, SurfaceAdditionalWorkingDirectory,
+    SurfaceApprovalMode, SurfaceInputBindingKind, SurfaceInputRequest, SurfaceNetworkPermissions,
+    SurfacePermissionRuleSet, SurfaceRuntimeSettings,
+};
+use super::projection::{
+    AssistantPatch, FirstOperationCompletionPolicy, GoalPatchEnvelope, ItemPatch, McpCatalogPatch,
+    OperationPatch, PinnedContextPatch, SessionPatch, SettingsPatch, SubagentPatch,
+    SurfaceAssistantStream, SurfaceBackgroundOperation, SurfaceContextSnapshot, SurfaceFactFamily,
+    SurfaceGoal, SurfaceGoalStoreReceipt, SurfaceItem, SurfaceMcpCatalogSnapshot,
+    SurfaceMcpResource, SurfaceMcpResourceTemplate, SurfaceMcpTool, SurfacePinnedContextEntry,
+    SurfacePinnedContextSnapshot, SurfacePlanSnapshot, SurfaceSessionHealth,
+    SurfaceSettingsSnapshot, SurfaceSubagent, SurfaceTask, SurfaceThreadSnapshot, SurfaceToolView,
+    SurfaceUsageSnapshot, SurfaceWorkflow, TaskPatch, ThreadPersistence, ToolInvocationStarted,
+    ToolPatch, ToolTerminalSource, WorkflowPatch,
+};
+use super::reducer::canonical_replayability_digest;
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
@@ -4218,6 +4270,21 @@ pub enum StoreProviderCredentialResult {
 #[cfg(test)]
 mod closed_command_domain_tests {
     use super::*;
+    use crate::runtime_surface::identity::{
+        CursorSourceRevision, HostMonotonicClockId, MonotonicInstant, MonotonicTick,
+        SurfaceResponseReceiptId,
+    };
+    use crate::runtime_surface::interaction::{
+        ApplicableAuthorityFingerprint, SurfaceInteractionSafeProjection, SurfaceUserInputDecision,
+    };
+    use crate::runtime_surface::operation::{
+        OperationIngressCorrelation, OperationSettingsPreparation, ReplayabilityRequest,
+        SurfaceInputRequestBlock, SurfaceReasoningEffort, UsageTotals,
+    };
+    use crate::runtime_surface::projection::{
+        GoalUsage, SurfaceGoalReceiptState, SurfaceGoalState, SurfaceTaskStatus, SurfaceTaskType,
+        SurfaceWorkflowStatus,
+    };
     use std::collections::{BTreeSet, HashSet};
 
     fn uuid_v7_bytes(seed: u8) -> [u8; 16] {

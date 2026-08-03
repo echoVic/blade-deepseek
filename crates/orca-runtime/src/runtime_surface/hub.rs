@@ -1,4 +1,22 @@
-use super::*;
+use super::commands::{
+    AcpAttachmentCapabilityProfile, AcpStandardCapabilitySet, AttachDeniedReason, AttachResult,
+    CursorAttachRequest, CursorSurfaceAttachment, DetachRequest, DetachResult,
+    DetachRevocationReceipt, FreshAttachRequest, FreshSurfaceAttachment, InvalidCursor,
+    InvalidCursorReason, RuntimeSurfaceClientHandle, RuntimeSurfaceCommandDispatcher,
+    SURFACE_RETAINED_BYTE_LIMIT, SURFACE_RETAINED_EVENT_LIMIT, SURFACE_SUBSCRIBER_BYTE_LIMIT,
+    SURFACE_SUBSCRIBER_EVENT_LIMIT, SnapshotAtCursor, SnapshotRequired, SnapshotRequiredReason,
+    SurfaceAttachAuthority, SurfaceAttachmentCapabilities, SurfaceCommitBatch, SurfaceSnapshot,
+    SurfaceSubscriptionHandle, SurfaceSubscriptionItem, SurfaceSubscriptionSealReason,
+};
+use super::identity::{
+    CanonicalPath, CapabilityRevision, HostIncarnation, NonEmptySet, NonEmptyText, Sha256Digest,
+    SurfaceAttachmentGrant, SurfaceAttachmentId, SurfaceAttachmentRole, SurfaceCapability,
+    SurfaceCapabilityCallId, SurfaceCursor, SurfaceRemoteTerminalId, SurfaceThreadId,
+    SurfaceUnavailableReason,
+};
+use super::interaction::SurfaceInteractionKind;
+use super::projection::{SurfaceCapabilityCallKind, SurfaceTerminalExitStatus};
+use super::reducer::canonical_batch_encoded_bytes;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::{
@@ -1849,7 +1867,18 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_surface::reducer::tests::{reducer_snapshot, uuid_v7_bytes};
+    use crate::runtime_surface::commands::{SurfaceEvent, SurfaceEventEnvelope};
+    use crate::runtime_surface::identity::{
+        CommitClass, CursorSourceRevision, DisplayText, DurableRevision, NonEmptyVec,
+        SequenceNumber, SurfaceCommitId, SurfaceConnectionId, SurfaceEventId, SurfaceRequestId,
+        SurfaceScope, ThreadOwnerEpoch,
+    };
+    use crate::runtime_surface::operation::FailureClass;
+    use crate::runtime_surface::projection::SessionPatch;
+    use crate::runtime_surface::reducer::{
+        canonical_batch_digest,
+        tests::{reducer_snapshot, uuid_v7_bytes},
+    };
 
     fn subscriber(seed: u8, cursor: &SurfaceCursor) -> SurfaceSubscriber {
         let attachment_id = SurfaceAttachmentId::try_from_bytes(uuid_v7_bytes(seed)).unwrap();

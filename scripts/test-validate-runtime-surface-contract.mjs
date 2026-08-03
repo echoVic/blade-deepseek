@@ -8,7 +8,9 @@ import { fileURLToPath } from "node:url";
 import * as validator from "./validate-runtime-surface-contract.mjs";
 
 const {
+  assertNoProductionRuntimeSurfaceSiblingGlobs,
   parseManifestText,
+  parseRuntimeSurfacePublicExports,
   validateArtifactBundle,
   validateArtifactDigest,
   validateCurrentInventories,
@@ -47,6 +49,37 @@ function expectReviewedDrift(label, mutate) {
   mutate(manifest);
   expectFailure(label, () => validateCandidate(manifest), /reviewed manifest .* drift/);
 }
+
+expectFailure(
+  "wildcard runtime-surface exports are rejected",
+  () => parseRuntimeSurfacePublicExports("pub use commands::*;"),
+  /public exports must be explicit.*commands::\*/,
+);
+
+assert.deepEqual(
+  parseRuntimeSurfacePublicExports(
+    "pub use commands::{AdmissionOutput, SurfaceCommand};\npub use store::{SurfaceStore};",
+  ),
+  {
+    commands: ["AdmissionOutput", "SurfaceCommand"],
+    store: ["SurfaceStore"],
+  },
+);
+assert.deepEqual(parseRuntimeSurfacePublicExports("pub use host::RuntimeHost;"), {
+  host: ["RuntimeHost"],
+});
+
+expectFailure(
+  "production sibling globs are rejected",
+  () => assertNoProductionRuntimeSurfaceSiblingGlobs("use super::*;", "commands"),
+  /production imports must be explicit.*use super::\*/,
+);
+assert.doesNotThrow(() =>
+  assertNoProductionRuntimeSurfaceSiblingGlobs(
+    "#[cfg(test)]\nmod tests { use super::*; }",
+    "commands",
+  ),
+);
 
 function appSourceOverride(extraSource) {
   const relativePath = "crates/orca-tui/src/app.rs";

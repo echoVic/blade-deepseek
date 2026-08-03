@@ -1,4 +1,28 @@
-use super::*;
+use super::identity::{
+    ByteCount, ByteOffset, CanonicalMime, CanonicalPath, CanonicalUri, CapabilityRevision,
+    ContextRevision, DisplayText, GoalCatalogRevision, GoalObjectiveRevision, GoalOwnerEpoch,
+    GoalRevision, McpCatalogRevision, NonEmptyText, NonEmptyVec, PinnedContextRevision,
+    PinnedContextSourceRevision, PlanRevision, PolicyEpoch, SafeDiagnosticText, SequenceNumber,
+    SessionHealthRevision, SessionMetadataRevision, SettingsRevision, Sha256Digest,
+    SubagentRevision, SurfaceBackgroundFence, SurfaceCapabilityCallId, SurfaceCatalogEntryId,
+    SurfaceCommitId, SurfaceCursor, SurfaceFinalizeIntentId, SurfaceGenerationId, SurfaceGoalId,
+    SurfaceGoalIntentId, SurfaceGoalOuterTurnId, SurfaceGoalRunId, SurfaceInputCorrelationId,
+    SurfaceInteractionId, SurfaceItemId, SurfaceOperationFence, SurfaceOperationId,
+    SurfaceRemoteTerminalId, SurfaceRequestId, SurfaceSettlementId, SurfaceStreamId,
+    SurfaceSubagentId, SurfaceTaskId, SurfaceThreadId, SurfaceToolCallId, SurfaceTurnId,
+    SurfaceValueError, SurfaceWorkflowFence, SurfaceWorkflowResultId, SurfaceWorkflowRunId,
+    TaskRevision, ThreadOwnerEpoch, UnixMillis, UsageRevision, UuidV7, WorkflowRevision,
+};
+use super::interaction::{SurfaceSchema, SurfaceToolRequest};
+use super::operation::{
+    AdmittedInput, FailureClass, FinalizationDegradedCause, GenerationRecord,
+    GenerationStartedWitness, GenerationStopReason, InputResolutionErrorCode, OperationBudget,
+    OperationFinalizationCause, OperationRecord, OperationTerminal, OperationTerminalRecord,
+    PendingControlIntent, SurfaceAgentLoopTurn, SurfaceGoalGenerationIdentity,
+    SurfaceInputPresentation, SurfaceResolvedInputFact, SurfaceRuntimeSettings,
+    SurfaceSettlementReceipt, SurfaceShutdownReason, SuspendedFinalizationCause, SuspensionCause,
+    TerminalizationCause, UsageTotals,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub const ACP_CAPABILITY_TEXT_BYTE_LIMIT: usize = 4_194_304;
