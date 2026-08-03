@@ -851,11 +851,11 @@ git commit -m "refactor(runtime): close unstable surface access"
 - Modify: crates/orca-runtime/src/lib.rs
 - Test: crates/orca-runtime/tests/runtime_host.rs
 
-- [ ] **Step 1: Add differential traces**
+- [x] **Step 1: Add differential traces**
 
 Create deterministic traces for ACP file/terminal capabilities, interaction settlement, goal set/run, pause/resume, verification, and terminalization. Capture snapshots, commits, terminals, and durable records as typed/in-memory values.
 
-- [ ] **Step 2: Define component effects**
+- [x] **Step 2: Define component effects**
 
 Use explicit effects rather than borrowing ThreadActor:
 
@@ -879,21 +879,21 @@ pub(crate) struct GoalOperationController {
 }
 ~~~
 
-- [ ] **Step 3: Move capability/terminal ownership**
+- [x] **Step 3: Move capability/terminal ownership**
 
 Move the capability/terminal methods and fields. ThreadActor supplies canonical inputs and applies effects. The component does not retain &mut ThreadActor, call TUI, or write outside declared runtime boundaries.
 
-- [ ] **Step 4: Verify capability parity**
+- [x] **Step 4: Verify capability parity**
 
 ~~~sh
 cargo test -p orca-runtime --test runtime_host capability_controller_trace_equivalence -- --nocapture
 ~~~
 
-- [ ] **Step 5: Move goal ownership**
+- [x] **Step 5: Move goal ownership**
 
 Move goal methods, runtime handle, turn context, and pending completion state while retaining Task 3's blocking boundary.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 ~~~sh
 cargo test -p orca-runtime --test runtime_host goal_controller_trace_equivalence -- --nocapture
