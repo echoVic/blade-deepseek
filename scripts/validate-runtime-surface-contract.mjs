@@ -685,7 +685,6 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
     "crates/orca-tui/src/app.rs:hosted_tui_controller_loop_with_ordinary_turn_runner:background_approval.respond",
     1,
   ],
-  ["crates/orca-tui/src/app.rs:run_tui_inner:catalog.mutate", 1],
   ["crates/orca-tui/src/approval_actions.rs:resolve_approval:user_action.route", 2],
   ["crates/orca-tui/src/approval_actions.rs:resolve_approval_option:approval_allowlist.insert", 2],
   ["crates/orca-tui/src/approval_mode_actions.rs:cycle_approval_mode:user_action.route", 1],

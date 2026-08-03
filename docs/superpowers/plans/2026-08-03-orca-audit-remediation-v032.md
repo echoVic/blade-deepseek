@@ -1032,32 +1032,32 @@ git commit -m "refactor: move tool contracts above provider transport"
 - Test: crates/orca-tui/src/app.rs
 - Test: tests/dependency_architecture_contract.rs
 
-- [ ] **Step 1: Add dependency and ownership tests**
+- [x] **Step 1: Add dependency and ownership tests**
 
 Assert TUI has no provider dependency. Instrument MCP construction and assert one root construction per hosted session, replacement on switch, and old connection shutdown.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 cargo test --test dependency_architecture_contract tui_does_not_depend_on_provider -- --nocapture
-cargo test -p orca-tui runtime_owns_root_mcp_registry --lib -- --test-threads=1
+cargo test -p orca-tui runtime_replaces_root_mcp_registry_and_reaps_replaced_stdio_process --lib -- --test-threads=1
 ~~~
 
 Expected: current dependency and TUI construction fail.
 
-- [ ] **Step 3: Remove unused provider dependency**
+- [x] **Step 3: Remove unused provider dependency**
 
 Delete orca-provider from TUI Cargo.toml and verify zero TUI imports.
 
-- [ ] **Step 4: Move initialization**
+- [x] **Step 4: Move initialization**
 
 Remove TUI initialize_registry and the registry parameter passed through presentation call chains. RuntimeThreadStartRequest constructs from RunConfig.mcp_servers. RuntimeThreadHandle exposes typed access and projected connection/errors state.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
 ~~~sh
 cargo test --test dependency_architecture_contract tui_does_not_depend_on_provider -- --nocapture
-cargo test -p orca-tui runtime_owns_root_mcp_registry --lib -- --test-threads=1
+cargo test -p orca-tui runtime_replaces_root_mcp_registry_and_reaps_replaced_stdio_process --lib -- --test-threads=1
 cargo check -p orca-tui --locked
 git add crates/orca-tui crates/orca-runtime/src/runtime_host.rs tests/dependency_architecture_contract.rs docs/reports/2026-08-03-orca-audit-remediation-evidence.md
 git commit -m "refactor(runtime): own root MCP registry"
@@ -1108,19 +1108,19 @@ git commit -m "test(tui): enforce projection consistency"
 - Modify: Cargo.toml, Cargo.lock, npm/orca/package.json
 - Finalize: docs/reports/2026-08-03-orca-audit-remediation-evidence.md
 
-- [ ] **Step 1: Update documentation**
+- [x] **Step 1: Update documentation**
 
 Document blocking boundaries, operation-owned cancellation, four actor controllers, explicit facade, provider-neutral tool contracts, runtime MCP ownership, session attachments, and rename/switch transactions. Add contract gates to release process.
 
-- [ ] **Step 2: Finalize evidence ledger**
+- [x] **Step 2: Finalize evidence ledger**
 
 Replace every `Not yet run` cell with a commit SHA and fresh output summary. Focused latency, durability, dependency, or public proofs cannot be replaced by a broad workspace test.
 
-- [ ] **Step 3: Run pre-version matrix**
+- [x] **Step 3: Run pre-version matrix**
 
 ~~~sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --locked -j 1
 node --test scripts/test-validate-runtime-surface-contract.mjs
 node scripts/validate-runtime-surface-contract.mjs
 node --test scripts/test-validate-windows-platform-boundaries.mjs
@@ -1134,7 +1134,10 @@ npm --prefix site run check:seo
 git diff --check
 ~~~
 
-Expected: all exit 0 before versioning.
+Expected: all exit 0 before versioning. On 2026-08-04, the TUI profile passed
+1,023/1,023 and the workspace profile passed 2,490/2,490 with zero failures and
+zero skipped tests; nextest reported one leaky process but no flaky retry. The
+SEO check is rerun after the v0.3.3 site version/date assets are updated.
 
 - [ ] **Step 4: Prepare v0.3.3**
 

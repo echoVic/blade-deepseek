@@ -109,6 +109,21 @@ More detail:
 - [Dynamic workflow design](docs/claude-code-workflow-parity.md)
 - [Production roadmap](docs/production-roadmap.md)
 
+## Reliability
+
+- TUI, headless, ACP, and JSONL sessions use the same runtime host for turn
+  ownership, cancellation, persistence, and terminal results.
+- Goal and session storage run outside the async actor loop, so a slow disk or
+  busy SQLite database does not freeze unrelated controls such as cancel or
+  status.
+- Cancelling a foreground turn also stops the subagent task tree it owns;
+  unrelated detached work is left alone.
+- Session switches start the replacement before closing the current runtime.
+  Rename, fork, archive, and delete commit through revision-checked and durable
+  paths, and stale events from a previous attachment are ignored.
+- Runtime surface and platform contracts run in CI before release artifacts are
+  built for macOS, Linux, and Windows.
+
 ## Community
 
 - QQ group: `472309526`

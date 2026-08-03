@@ -193,6 +193,27 @@
       "windows-test-portability"
     ],
     [
+      "runtime-host-inline-test-shell",
+      "crates/orca-runtime/src/runtime_host.rs",
+      "unix_shell_spawn",
+      1,
+      "windows-test-portability"
+    ],
+    [
+      "runtime-host-inline-test-unix-api",
+      "crates/orca-runtime/src/runtime_host.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
+      "runtime-host-inline-test-unix-process",
+      "crates/orca-runtime/src/runtime_host.rs",
+      "unix_libc_process",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "runtime-surface-test-symlink",
       "crates/orca-runtime/tests/runtime_surface_commit.rs",
       "unix_std_api",

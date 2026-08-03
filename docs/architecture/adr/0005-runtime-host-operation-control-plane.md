@@ -796,6 +796,38 @@ APIs and unrelated historical source-shape tests can be removed only after
 all remaining internal callers migrate to actor commands. They are not
 alternate lifecycle authorities for the shipped TUI/server/headless paths.
 
+## v0.3.3 Audit Remediation Boundary
+
+The v0.3.3 audit closes the remaining ownership and responsiveness gaps around
+the control plane without changing public wire or persistence formats.
+
+- `ThreadActor` orchestrates four focused state owners:
+  `GoalOperationController`, `BackgroundOperationController`,
+  `RuntimeCapabilityController`, and `SurfaceCommitController`. Each controller
+  owns its pending operations, retries, and terminal bookkeeping; the actor no
+  longer edits those maps as shared generic state.
+- Goal Store and host session-store calls execute in blocking workers and
+  return through bounded typed completion channels. Actor command and
+  completion branches never wait synchronously for SQLite or filesystem I/O,
+  and the process retains one serialized Goal runtime handle.
+- Every foreground operation owns a persisted task-tree root. Interrupt,
+  shutdown, and terminal paths request stop for that exact tree, including
+  descendants created by attached workers, without cancelling unrelated work.
+- The runtime surface exposes an explicit, manifest-bound facade. Provider
+  transport consumes provider-neutral tool definitions and policies rather
+  than importing concrete tools or branching on tool names.
+- `RuntimeHost` constructs and replaces the root MCP registry for each hosted
+  session. TUI mention search uses typed runtime access and cannot become a
+  second connection owner.
+- TUI events carry an immutable session attachment identity. Session switches
+  install and project the replacement before retiring the source; stale queued
+  events are rejected. Rename commits an exact-revision runtime metadata patch
+  and durable title as one operation, restoring the runtime projection if the
+  disk write fails.
+
+These boundaries are enforced by behavior, dependency, closed-inventory, and
+portable contract tests. Private source layout is not a release contract.
+
 ## Rejected Alternatives
 
 ### Add Another Surface Wrapper

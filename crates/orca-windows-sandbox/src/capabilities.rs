@@ -80,14 +80,13 @@ impl CapabilityStore {
         let receipt_path = self.receipt_path(workspace)?;
         atomic_write(&receipt_path, &bytes, AtomicWritePolicy::NoFollow)?;
         let legacy_path = self.root.join(SETUP_RECEIPT_FILE);
-        if let Ok(legacy) = fs::read(&legacy_path) {
-            if let Ok(legacy_receipt) = serde_json::from_slice::<SandboxSetupReceipt>(&legacy) {
-                let legacy_key = PathIdentity::windows(&legacy_receipt.workspace)?.storage_key();
-                let workspace_key =
-                    PathIdentity::windows(&workspace.to_string_lossy())?.storage_key();
-                if legacy_key == workspace_key {
-                    let _ = fs::remove_file(legacy_path);
-                }
+        if let Ok(legacy) = fs::read(&legacy_path)
+            && let Ok(legacy_receipt) = serde_json::from_slice::<SandboxSetupReceipt>(&legacy)
+        {
+            let legacy_key = PathIdentity::windows(&legacy_receipt.workspace)?.storage_key();
+            let workspace_key = PathIdentity::windows(&workspace.to_string_lossy())?.storage_key();
+            if legacy_key == workspace_key {
+                let _ = fs::remove_file(legacy_path);
             }
         }
         Ok(receipt)
