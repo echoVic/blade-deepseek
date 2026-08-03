@@ -967,11 +967,11 @@ git commit -m "refactor(runtime): extract background and commit controllers"
 - Test: tests/dependency_architecture_contract.rs
 - Test: tests/provider_contract.rs
 
-- [ ] **Step 1: Add dependency and parity tests**
+- [x] **Step 1: Add dependency and parity tests**
 
 Assert no orca-provider to orca-tools edge. Build representative root, goal, child, MCP, and external tool definitions; assert DeepSeek JSON preserves names, descriptions, required properties, and strictness.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 cargo test --test dependency_architecture_contract provider_does_not_depend_on_tools -- --nocapture
@@ -979,7 +979,7 @@ cargo test --test dependency_architecture_contract provider_does_not_depend_on_t
 
 Expected: FAIL on current dependency.
 
-- [ ] **Step 3: Add canonical definitions in tools**
+- [x] **Step 3: Add canonical definitions in tools**
 
 Define:
 
@@ -1003,15 +1003,15 @@ pub fn normalize_tool_arguments(
 
 Move built-in schemas and tool-name normalization into these APIs. System prompts consume the same definitions.
 
-- [ ] **Step 4: Make DeepSeek lowering generic**
+- [x] **Step 4: Make DeepSeek lowering generic**
 
 Provider accepts provider-neutral definitions. Lower unsupported JSON-schema keywords generically, never branching on web_search, update_plan, or other concrete names.
 
-- [ ] **Step 5: Remove dependency**
+- [x] **Step 5: Remove dependency**
 
 Delete orca-tools from crates/orca-provider/Cargo.toml. Runtime obtains canonical definitions and passes them to provider.
 
-- [ ] **Step 6: Run GREEN and commit**
+- [x] **Step 6: Run GREEN and commit**
 
 ~~~sh
 cargo test --test dependency_architecture_contract provider_does_not_depend_on_tools -- --nocapture
