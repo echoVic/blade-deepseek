@@ -4186,7 +4186,6 @@ fn prepare_and_start_runtime_thread(
     request: RuntimeThreadStartRequest,
 ) -> Result<PreparedStartedRuntimeThread, RuntimeHostError> {
     let actor_title = request.title.clone();
-    let actor_config = request.config.clone();
     let ephemeral_reservation_timeout = request.ephemeral_reservation_timeout;
     #[cfg(test)]
     let ephemeral_close_commit_failures = request.ephemeral_close_commit_failures;
@@ -4195,6 +4194,7 @@ fn prepare_and_start_runtime_thread(
         surface_owner,
         resume_scope_replacement,
     } = request.prepare()?;
+    let actor_config = request.config.clone();
     let thread = request
         .start()
         .map_err(|error| RuntimeHostError::ThreadStartFailed {
