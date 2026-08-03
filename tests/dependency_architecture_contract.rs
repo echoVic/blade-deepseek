@@ -70,6 +70,17 @@ fn cargo_metadata_enforces_the_thin_root_dependency_graph() {
 }
 
 #[test]
+fn provider_does_not_depend_on_tools() {
+    let metadata = cargo_metadata();
+    let provider = package(&metadata, "orca-provider");
+
+    assert!(
+        !normal_dependencies(provider).contains("orca-tools"),
+        "provider adapters must consume provider-neutral definitions supplied by the runtime"
+    );
+}
+
+#[test]
 fn cargo_metadata_enforces_binary_and_library_target_ownership() {
     let metadata = cargo_metadata();
     let root = package(&metadata, "blade-deepseek");

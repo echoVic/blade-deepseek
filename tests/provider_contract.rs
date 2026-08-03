@@ -1,6 +1,134 @@
 use std::process::Command;
 
+use orca_core::approval_types::ActionKind;
+use orca_core::external_config::ExternalToolConfig;
+use orca_core::mcp_types::McpTool;
+use orca_core::subagent_types::SubagentType;
+use orca_mcp::McpRegistry;
+use orca_provider::tool_schema::{
+    ProviderToolDefinition, deepseek_strict_tools_schema_for_endpoint, deepseek_tools_schema,
+};
+use orca_tools::schema::{ToolPolicy, canonical_tool_definitions};
 use serde_json::Value;
+
+#[test]
+fn tool_schema_preserves_canonical_definitions_across_agent_policies() {
+    let mcp = McpRegistry::from_tools_for_test(vec![McpTool {
+        server: "local".to_string(),
+        name: "inspect".to_string(),
+        schema_name: "mcp__local__inspect".to_string(),
+        description: Some("Inspect with MCP".to_string()),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+    }]);
+    let external = ExternalToolConfig {
+        name: "external_lookup".to_string(),
+        description: "External lookup".to_string(),
+        action_kind: ActionKind::Read,
+        command: "true".to_string(),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+    };
+    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        Some(&mcp),
+        std::slice::from_ref(&external),
+    );
+
+    let root = canonical_tool_definitions(&ToolPolicy::base(), &registry);
+    let read_file = definition(&root, "read_file");
+    assert!(read_file.description.contains("Read the contents"));
+    assert_eq!(
+        read_file.input_schema["required"],
+        serde_json::json!(["path"])
+    );
+    assert!(!read_file.strict_capable);
+    assert!(definition(&root, "update_plan").strict_capable);
+    assert!(!root.iter().any(|tool| tool.name == "update_goal"));
+
+    let goal = canonical_tool_definitions(&ToolPolicy::goal(), &registry);
+    assert!(goal.iter().any(|tool| tool.name == "get_goal"));
+    assert!(goal.iter().any(|tool| tool.name == "create_goal"));
+    assert!(goal.iter().any(|tool| tool.name == "update_goal"));
+
+    let child = canonical_tool_definitions(
+        &ToolPolicy::for_subagent(&SubagentType::CodeReviewer),
+        &registry,
+    );
+    assert!(child.iter().any(|tool| tool.name == "read_file"));
+    assert!(child.iter().any(|tool| tool.name == "glob"));
+    assert!(!child.iter().any(|tool| tool.name == "subagent"));
+    assert_eq!(
+        definition(&child, "mcp__local__inspect").input_schema,
+        serde_json::json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"],
+            "additionalProperties": false
+        })
+    );
+    assert_eq!(
+        definition(&child, "external_lookup").description,
+        "External lookup"
+    );
+}
+
+#[test]
+fn tool_schema_lowering_is_generic_and_preserves_deepseek_wire_shape() {
+    let definitions = vec![ProviderToolDefinition {
+        name: "arbitrary_tool".to_string(),
+        description: "Arbitrary provider-neutral tool".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "required_value": { "type": "string" },
+                "optional_value": { "type": ["string", "null"] }
+            },
+            "required": ["required_value"],
+            "additionalProperties": false
+        }),
+        strict_capable: true,
+    }];
+
+    let wire = deepseek_tools_schema(&definitions);
+    assert_eq!(wire[0]["type"], "function");
+    assert_eq!(wire[0]["function"]["name"], "arbitrary_tool");
+    assert_eq!(
+        wire[0]["function"]["description"],
+        "Arbitrary provider-neutral tool"
+    );
+    assert_eq!(
+        wire[0]["function"]["parameters"],
+        definitions[0].input_schema
+    );
+    assert!(wire[0]["function"].get("strict").is_none());
+
+    let strict =
+        deepseek_strict_tools_schema_for_endpoint(&definitions, "https://api.deepseek.com/beta")
+            .expect("strict beta schema");
+    assert_eq!(strict[0]["function"]["strict"], true);
+    assert_eq!(
+        strict[0]["function"]["parameters"]["required"],
+        serde_json::json!(["optional_value", "required_value"])
+    );
+}
+
+fn definition<'a>(
+    definitions: &'a [orca_tools::schema::CanonicalToolDefinition],
+    name: &str,
+) -> &'a orca_tools::schema::CanonicalToolDefinition {
+    definitions
+        .iter()
+        .find(|definition| definition.name == name)
+        .unwrap_or_else(|| panic!("missing canonical definition {name}"))
+}
 
 #[test]
 fn deepseek_fixture_preserves_reasoning_and_replay_state() {

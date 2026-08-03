@@ -1602,7 +1602,6 @@ dependencies = [
  "orca-core",
  "orca-mcp",
  "orca-platform",
- "orca-tools",
  "reqwest",
  "serde",
  "serde_json",

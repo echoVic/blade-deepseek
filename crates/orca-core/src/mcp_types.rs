@@ -67,21 +67,6 @@ pub struct McpTool {
     pub input_schema: Value,
 }
 
-impl McpTool {
-    pub fn to_deepseek_schema(&self) -> Value {
-        json!({
-            "type": "function",
-            "function": {
-                "name": self.schema_name,
-                "description": self.description.clone().unwrap_or_else(|| {
-                    format!("MCP tool {} from server {}", self.name, self.server)
-                }),
-                "parameters": self.input_schema
-            }
-        })
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct McpToolRef {
     pub server: String,

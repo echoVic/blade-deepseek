@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use orca_provider::tool_schema::{ProviderToolDefinition, deepseek_tools_schema};
 use serde_json::{Value, json};
 
 const MODEL: &str = "deepseek-v4-flash";
@@ -35,12 +36,36 @@ fn load_api_key() -> Option<String> {
 }
 
 fn update_plan_tool_schema() -> Vec<Value> {
-    orca_provider::tool_schema::deepseek_tools_schema_with_mcp_and_external(None, &[])
-        .into_iter()
-        .filter(|tool| {
-            tool.pointer("/function/name").and_then(Value::as_str) == Some("update_plan")
-        })
-        .collect()
+    let definitions = vec![ProviderToolDefinition {
+        name: "update_plan".to_string(),
+        description: "Update the current execution plan.".to_string(),
+        input_schema: update_plan_input_schema(),
+        strict_capable: true,
+    }];
+    deepseek_tools_schema(&definitions)
+}
+
+fn update_plan_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "explanation": { "type": ["string", "null"] },
+            "plan": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "step": { "type": "string" },
+                        "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+                    },
+                    "required": ["step", "status"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["plan"],
+        "additionalProperties": false
+    })
 }
 
 fn post(api_key: &str, base_url: &str, body: &Value) -> Result<Value, String> {

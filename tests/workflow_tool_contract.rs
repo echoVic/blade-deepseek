@@ -10,10 +10,10 @@ use serde_json::Value;
 fn workflow_schema_is_registered_with_official_fields() {
     let registry = orca_tools::registry::default_tool_registry();
     let tool = registry.get("Workflow").expect("Workflow tool registered");
-    let schema = tool.schema();
-    let properties = &schema["function"]["parameters"]["properties"];
+    let schema = &tool.spec().input_schema;
+    let properties = &schema["properties"];
 
-    assert_eq!(schema["function"]["name"], "Workflow");
+    assert_eq!(tool.name(), "Workflow");
     assert_eq!(tool.action_kind(), ActionKind::Agent);
     assert!(properties.get("script").is_some());
     assert!(properties.get("name").is_some());
@@ -31,10 +31,10 @@ fn workflow_draft_schema_is_registered_for_preview_creation() {
     let tool = registry
         .get("WorkflowDraft")
         .expect("WorkflowDraft tool registered");
-    let schema = tool.schema();
-    let properties = &schema["function"]["parameters"]["properties"];
+    let schema = &tool.spec().input_schema;
+    let properties = &schema["properties"];
 
-    assert_eq!(schema["function"]["name"], "WorkflowDraft");
+    assert_eq!(tool.name(), "WorkflowDraft");
     assert_eq!(tool.action_kind(), ActionKind::Write);
     let script_property = properties.get("script").expect("script property");
     assert!(
@@ -51,10 +51,10 @@ fn workflow_draft_action_schema_is_registered_for_preview_decisions() {
     let tool = registry
         .get("WorkflowDraftAction")
         .expect("WorkflowDraftAction tool registered");
-    let schema = tool.schema();
-    let properties = &schema["function"]["parameters"]["properties"];
+    let schema = &tool.spec().input_schema;
+    let properties = &schema["properties"];
 
-    assert_eq!(schema["function"]["name"], "WorkflowDraftAction");
+    assert_eq!(tool.name(), "WorkflowDraftAction");
     assert_eq!(tool.action_kind(), ActionKind::Write);
     assert!(properties.get("draftId").is_some());
     assert!(properties.get("action").is_some());

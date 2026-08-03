@@ -47,17 +47,6 @@ pub trait Tool: Send + Sync {
         &self.spec().description
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "function",
-            "function": {
-                "name": self.name(),
-                "description": self.description(),
-                "parameters": self.spec().input_schema
-            }
-        })
-    }
-
     fn action_kind(&self) -> ActionKind {
         self.spec().capabilities.action_kind()
     }
@@ -244,13 +233,6 @@ impl ToolRegistry {
         resolved.tool.execute(request, ctx)
     }
 }
-
-/// Tools whose input schemas fit the DeepSeek strict-mode JSON Schema subset
-/// (every object lists all properties as required once optional fields are made
-/// nullable, additionalProperties is false throughout, and no unsupported
-/// keywords such as oneOf/minLength/minItems are used). Providers opt these
-/// tools into strict function calling on endpoints that support it.
-pub const STRICT_MODE_TOOL_NAMES: &[&str] = &["glob", "update_goal", "update_plan"];
 
 pub fn validate_tool_request(registry: &ToolRegistry, request: &ToolRequest) -> Result<(), String> {
     let Some(resolved) = registry.resolve(request.name.as_str()) else {

@@ -316,6 +316,7 @@ mod step_context;
 pub mod subagent;
 pub mod subagent_async_worker;
 pub mod subagent_execution;
+mod system_prompt;
 pub mod task_output;
 pub mod tasks;
 pub mod thread;

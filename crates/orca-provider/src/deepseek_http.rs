@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use orca_core::approval_types::ActionKind;
 use orca_core::cancel::CancelToken;
 use orca_core::conversation::{
     Conversation, Message, RawToolCall, SummaryState, assistant_message_has_payload,
@@ -9,11 +8,10 @@ use orca_core::conversation::{
 };
 use orca_core::provider_types::{ProviderReplayState, ProviderResponse, ProviderStep, Usage};
 use orca_core::tool_types::{ToolName, ToolRequest};
-use orca_tools::registry;
 
 use crate::ProviderConfig;
 use crate::context::render_internal_context;
-use crate::tool_schema::deepseek_tools_schema_with_mcp_and_external;
+use crate::tool_schema::{deepseek_strict_tools_schema_for_endpoint, deepseek_tools_schema};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
@@ -55,72 +53,6 @@ impl From<String> for DeepSeekRequestError {
 impl std::fmt::Display for DeepSeekRequestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
-    }
-}
-
-/// DeepSeek strict function calling (Beta) is only served on the /beta endpoint.
-fn is_strict_capable_endpoint(base_url: &str) -> bool {
-    base_url.trim_end_matches('/').ends_with("/beta")
-}
-
-/// Returns a strict-mode copy of the tool list for beta endpoints: allowlisted
-/// tools get `strict: true` plus the schema shape strict mode demands (every
-/// object property listed in `required`; optional fields are already nullable
-/// in the base schemas). Returns None when the endpoint does not support strict
-/// mode or no tool qualified, so callers know whether a fallback retry without
-/// strict is meaningful. Public so real-API harnesses can probe the exact
-/// strict payload the provider sends.
-pub fn strict_tools_for_endpoint(tools: &[Value], base_url: &str) -> Option<Vec<Value>> {
-    if !is_strict_capable_endpoint(base_url) {
-        return None;
-    }
-    let mut strict_tools = tools.to_vec();
-    let mut changed = false;
-    for tool in &mut strict_tools {
-        let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut) else {
-            continue;
-        };
-        let strict_capable = function
-            .get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|name| registry::STRICT_MODE_TOOL_NAMES.contains(&name));
-        if !strict_capable {
-            continue;
-        }
-        if let Some(parameters) = function.get_mut("parameters") {
-            require_all_properties(parameters);
-        }
-        function.insert("strict".to_string(), Value::Bool(true));
-        changed = true;
-    }
-    changed.then_some(strict_tools)
-}
-
-/// Strict mode rejects object schemas whose `required` omits any property.
-fn require_all_properties(schema: &mut Value) {
-    let Some(object) = schema.as_object_mut() else {
-        return;
-    };
-    let is_typed_object = object.get("type").and_then(Value::as_str) == Some("object");
-    if is_typed_object && let Some(properties) = object.get("properties").and_then(Value::as_object)
-    {
-        let names: Vec<Value> = properties.keys().cloned().map(Value::String).collect();
-        object.insert("required".to_string(), Value::Array(names));
-    }
-    if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
-        for child in properties.values_mut() {
-            require_all_properties(child);
-        }
-    }
-    if let Some(items) = object.get_mut("items") {
-        require_all_properties(items);
-    }
-    for keyword in ["anyOf", "oneOf"] {
-        if let Some(branches) = object.get_mut(keyword).and_then(Value::as_array_mut) {
-            for branch in branches {
-                require_all_properties(branch);
-            }
-        }
     }
 }
 
@@ -332,14 +264,11 @@ async fn request_chat_streaming(
     let streaming_client = crate::http_client::streaming_client()?;
 
     let messages = conversation_to_api_messages(conversation);
-    let tools = config.tools_override.clone().unwrap_or_else(|| {
-        deepseek_tools_schema_with_mcp_and_external(
-            config.mcp_registry.as_ref(),
-            &config.external_tools,
-        )
-    });
+    let definitions = config.tools_override.as_deref().unwrap_or(&[]);
+    let tools = deepseek_tools_schema(definitions);
     let tools = cap_tools_for_deepseek(tools);
-    let strict_tools = strict_tools_for_endpoint(&tools, base_url);
+    let strict_tools = deepseek_strict_tools_schema_for_endpoint(definitions, base_url)
+        .map(cap_tools_for_deepseek);
     let strict_applied = strict_tools.is_some();
 
     let mut request = ChatRequest {
@@ -457,10 +386,7 @@ async fn request_chat_streaming(
                     arguments: tc.arguments.clone(),
                 },
             };
-            steps.push(ProviderStep::ToolCall(parse_tool_call(
-                &tc_response,
-                &config.external_tools,
-            )));
+            steps.push(ProviderStep::ToolCall(parse_tool_call(&tc_response)));
         }
 
         let assistant_reasoning = if stream_result.reasoning.is_empty() {
@@ -538,14 +464,11 @@ fn request_chat(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let messages = conversation_to_api_messages(conversation);
-    let tools = config.tools_override.clone().unwrap_or_else(|| {
-        deepseek_tools_schema_with_mcp_and_external(
-            config.mcp_registry.as_ref(),
-            &config.external_tools,
-        )
-    });
+    let definitions = config.tools_override.as_deref().unwrap_or(&[]);
+    let tools = deepseek_tools_schema(definitions);
     let tools = cap_tools_for_deepseek(tools);
-    let strict_tools = strict_tools_for_endpoint(&tools, base_url);
+    let strict_tools = deepseek_strict_tools_schema_for_endpoint(definitions, base_url)
+        .map(cap_tools_for_deepseek);
     let strict_applied = strict_tools.is_some();
 
     let mut request = ChatRequest {
@@ -655,10 +578,7 @@ fn request_chat(
                     arguments: tc.function.arguments.clone(),
                 });
 
-                steps.push(ProviderStep::ToolCall(parse_tool_call(
-                    tc,
-                    &config.external_tools,
-                )));
+                steps.push(ProviderStep::ToolCall(parse_tool_call(tc)));
             }
         }
 
@@ -701,83 +621,17 @@ fn length_finish_reason_error() -> String {
         .to_string()
 }
 
-fn parse_tool_call(
-    tc: &ApiToolCallResponse,
-    external_tools: &[orca_core::external_config::ExternalToolConfig],
-) -> ToolRequest {
+fn parse_tool_call(tc: &ApiToolCallResponse) -> ToolRequest {
     let schema_name = tc.function.name.as_str();
-    let reg = registry::tool_registry_with_mcp_and_external(None, external_tools);
-    let resolved = reg.resolve(schema_name);
-    let name = match resolved.as_ref() {
-        // Resolution is the source of truth for collisions. External winners
-        // keep their registered identity, while built-ins use requested_name
-        // so aliases such as list_files retain their dedicated ToolName.
-        Some(resolved) if matches!(resolved.spec.name, ToolName::External(_)) => {
-            resolved.spec.name.clone()
-        }
-        Some(resolved) => resolved.requested_name.clone(),
-        None if schema_name.starts_with("mcp__") => ToolName::Mcp(schema_name.to_string()),
-        None => ToolName::External(schema_name.to_string()),
-    };
-    let action = resolved
-        .as_ref()
-        .map(|resolved| resolved.spec.capabilities.action_kind())
-        .unwrap_or(ActionKind::Read);
-    let target = serde_json::from_str::<Value>(&tc.function.arguments)
-        .ok()
-        .and_then(|args| match schema_name {
-            "read_file" => args["path"].as_str().map(String::from),
-            "list_files" | "glob" => args["path"]
-                .as_str()
-                .map(String::from)
-                .or(Some(".".to_string())),
-            "grep" => args["pattern"].as_str().map(String::from),
-            "bash" => args["command"].as_str().map(String::from),
-            "edit" | "write_file" => args["path"].as_str().map(String::from),
-            "git_status" => Some(".".to_string()),
-            "subagent" => args["description"]
-                .as_str()
-                .map(String::from)
-                .or_else(|| args["prompt"].as_str().map(String::from)),
-            "web_search" => args["query"].as_str().map(String::from),
-            "update_plan" => {
-                let count = args["plan"].as_array().map(|plan| plan.len()).unwrap_or(0);
-                Some(format!("{count} items"))
-            }
-            other if other.starts_with("mcp__") => Some(other.to_string()),
-            other if external_tools.iter().any(|tool| tool.name == other) => {
-                Some(other.to_string())
-            }
-            _ => None,
-        })
-        .or_else(|| resolved.is_none().then(|| schema_name.to_string()));
 
     ToolRequest {
         id: tc.id.clone(),
-        name,
-        action,
-        target,
-        raw_arguments: Some(normalized_raw_arguments(
-            schema_name,
-            &tc.function.arguments,
-        )),
+        name: ToolName::from_str(schema_name)
+            .unwrap_or_else(|| ToolName::External(schema_name.to_string())),
+        action: orca_core::approval_types::ActionKind::Read,
+        target: None,
+        raw_arguments: Some(tc.function.arguments.clone()),
     }
-}
-
-/// Rewrites known-recoverable argument shapes before schema validation sees them.
-/// DeepSeek has no strict-mode guarantee on the default endpoint and regularly
-/// emits `update_plan` items with boolean status flags, which would otherwise be
-/// rejected and silently strand the pinned plan state.
-fn normalized_raw_arguments(schema_name: &str, raw: &str) -> String {
-    if schema_name == "update_plan"
-        && let Some(normalized) = orca_tools::update_plan::normalize_raw_arguments(raw)
-    {
-        return normalized;
-    }
-    if schema_name == "update_goal" {
-        return orca_tools::update_goal::normalized_update_raw_arguments(raw);
-    }
-    raw.to_string()
 }
 
 fn cap_tools_for_deepseek(mut tools: Vec<Value>) -> Vec<Value> {
@@ -1099,180 +953,148 @@ mod tests {
     #[test]
     fn parse_read_file() {
         let tc = make_tc("read_file", r#"{"path":"src/main.rs"}"#);
-        let req = parse_tool_call(&tc, &[]);
+        let req = parse_tool_call(&tc);
         assert_eq!(req.name, ToolName::ReadFile);
         assert_eq!(req.action, ActionKind::Read);
-        assert_eq!(req.target.as_deref(), Some("src/main.rs"));
+        assert!(req.target.is_none());
         assert_eq!(req.id, "call_123");
     }
 
     #[test]
     fn parse_list_files_with_path() {
         let tc = make_tc("list_files", r#"{"path":"src/provider"}"#);
-        let req = parse_tool_call(&tc, &[]);
+        let req = parse_tool_call(&tc);
         assert_eq!(req.name, ToolName::ListFiles);
         assert_eq!(req.action, ActionKind::Read);
-        assert_eq!(req.target.as_deref(), Some("src/provider"));
+        assert!(req.target.is_none());
     }
 
     #[test]
     fn parse_list_files_without_path_defaults_to_dot() {
         let tc = make_tc("list_files", r#"{}"#);
-        let req = parse_tool_call(&tc, &[]);
+        let req = parse_tool_call(&tc);
         assert_eq!(req.name, ToolName::ListFiles);
-        assert_eq!(req.target.as_deref(), Some("."));
+        assert!(req.target.is_none());
     }
 
     #[test]
-    fn parse_external_list_files_collision_preserves_builtin_alias_precedence() {
-        let external = orca_core::external_config::ExternalToolConfig {
-            name: "list_files".to_string(),
-            description: "Shadow the built-in glob alias".to_string(),
-            action_kind: ActionKind::Shell,
-            command: "echo shadowed".to_string(),
-            schema: serde_json::json!({}),
-        };
+    fn parse_tool_call_does_not_apply_registry_collision_policy() {
         let tc = make_tc("list_files", r#"{}"#);
-        let request = parse_tool_call(&tc, &[external]);
+        let request = parse_tool_call(&tc);
 
         assert_eq!(request.name, ToolName::ListFiles);
         assert_eq!(request.action, ActionKind::Read);
-        assert_eq!(request.target.as_deref(), Some("."));
+        assert!(request.target.is_none());
         assert_eq!(request.raw_arguments.as_deref(), Some(r#"{}"#));
     }
 
     #[test]
-    fn parse_update_plan_normalizes_boolean_status_flags() {
-        // Both malformed shapes DeepSeek emits in the wild: flags without status
-        // and flags redundant with status. Normalized output must pass the same
-        // schema validation that runs before tool execution.
-        let tc = make_tc(
-            "update_plan",
-            r#"{"plan":[{"completed":true,"step":"a"},{"in_progress":true,"status":"in_progress","step":"b"}]}"#,
-        );
-        let req = parse_tool_call(&tc, &[]);
+    fn parse_update_plan_leaves_arguments_for_runtime_normalization() {
+        let raw = r#"{"plan":[{"completed":true,"step":"a"}]}"#;
+        let tc = make_tc("update_plan", raw);
+        let request = parse_tool_call(&tc);
 
-        let raw = req.raw_arguments.as_deref().unwrap();
-        let value: Value = serde_json::from_str(raw).unwrap();
-        assert_eq!(value["plan"][0]["status"], "completed");
-        assert!(value["plan"][0].get("completed").is_none());
-        assert_eq!(value["plan"][1]["status"], "in_progress");
-        assert!(value["plan"][1].get("in_progress").is_none());
-
-        let reg = registry::tool_registry_with_mcp_and_external(None, &[]);
-        registry::validate_tool_request(&reg, &req).expect("normalized args must validate");
+        assert_eq!(request.name, ToolName::UpdatePlan);
+        assert_eq!(request.raw_arguments.as_deref(), Some(raw));
     }
 
     #[test]
-    fn parse_update_goal_normalizes_status_aliases_and_flags() {
-        let completed = make_tc("update_goal", r#"{"status":"completed","reason":"done"}"#);
-        let complete_flag = make_tc("update_goal", r#"{"complete":true,"reason":"done"}"#);
-        let blocked_flag = make_tc("update_goal", r#"{"blocked":true,"reason":"stuck"}"#);
+    fn parse_update_goal_leaves_arguments_for_runtime_normalization() {
+        let raw = r#"{"status":"completed","reason":"done"}"#;
+        let tc = make_tc("update_goal", raw);
+        let request = parse_tool_call(&tc);
 
-        let completed = parse_tool_call(&completed, &[]);
-        let complete_flag = parse_tool_call(&complete_flag, &[]);
-        let blocked_flag = parse_tool_call(&blocked_flag, &[]);
-
-        assert_eq!(
-            serde_json::from_str::<Value>(completed.raw_arguments.as_deref().unwrap()).unwrap()["status"],
-            "complete"
-        );
-        assert_eq!(
-            serde_json::from_str::<Value>(complete_flag.raw_arguments.as_deref().unwrap()).unwrap()
-                ["status"],
-            "complete"
-        );
-        assert_eq!(
-            serde_json::from_str::<Value>(blocked_flag.raw_arguments.as_deref().unwrap()).unwrap()
-                ["status"],
-            "blocked"
-        );
+        assert_eq!(request.name, ToolName::UpdateGoal);
+        assert_eq!(request.raw_arguments.as_deref(), Some(raw));
     }
 
     #[test]
     fn parse_update_plan_leaves_clean_arguments_untouched() {
         let clean = r#"{"explanation":"x","plan":[{"step":"a","status":"pending"}]}"#;
         let tc = make_tc("update_plan", clean);
-        let req = parse_tool_call(&tc, &[]);
+        let req = super::parse_tool_call(&tc);
         assert_eq!(req.raw_arguments.as_deref(), Some(clean));
     }
 
     #[test]
-    fn strict_tools_apply_only_on_beta_endpoint_to_allowlisted_tools() {
-        let tools = deepseek_tools_schema_with_mcp_and_external(None, &[]);
+    fn strict_tools_apply_only_on_beta_endpoint_to_eligible_definitions() {
+        let definitions = vec![
+            crate::tool_schema::ProviderToolDefinition {
+                name: "strict_capable".to_string(),
+                description: "strict-capable test tool".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "required_value": { "type": "string" },
+                        "optional_value": { "type": ["string", "null"] }
+                    },
+                    "required": ["required_value"],
+                    "additionalProperties": false
+                }),
+                strict_capable: true,
+            },
+            crate::tool_schema::ProviderToolDefinition {
+                name: "non_strict".to_string(),
+                description: "ordinary test tool".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "value": { "type": "string" } }
+                }),
+                strict_capable: false,
+            },
+        ];
+        let tools = deepseek_tools_schema(&definitions);
 
-        assert!(strict_tools_for_endpoint(&tools, "https://api.deepseek.com").is_none());
-        assert!(strict_tools_for_endpoint(&tools, DEFAULT_BASE_URL).is_none());
-
-        let strict = strict_tools_for_endpoint(&tools, "https://api.deepseek.com/beta")
-            .expect("beta endpoint must produce a strict tool list");
-        let update_plan = strict
-            .iter()
-            .find(|tool| {
-                tool.pointer("/function/name").and_then(Value::as_str) == Some("update_plan")
-            })
-            .expect("update_plan present");
-        assert_eq!(
-            update_plan.pointer("/function/strict"),
-            Some(&Value::Bool(true))
-        );
-        // Strict mode demands every property listed in required.
-        assert_eq!(
-            update_plan.pointer("/function/parameters/required"),
-            Some(&serde_json::json!(["explanation", "plan"]))
-        );
-
-        let glob = strict
-            .iter()
-            .find(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("glob"))
-            .expect("glob present");
-        assert_eq!(glob.pointer("/function/strict"), Some(&Value::Bool(true)));
-        assert!(glob.pointer("/function/parameters/oneOf").is_none());
-        assert!(glob.pointer("/function/parameters/anyOf").is_some());
-
-        let update_goal_schema =
-            crate::tool_schema::deepseek_goal_tools_schema_with_mcp_and_external(None, &[]);
-        let goal_strict =
-            strict_tools_for_endpoint(&update_goal_schema, "https://api.deepseek.com/beta")
-                .expect("goal schema must produce strict tools");
-        let update_goal = goal_strict
-            .iter()
-            .find(|tool| {
-                tool.pointer("/function/name").and_then(Value::as_str) == Some("update_goal")
-            })
-            .expect("update_goal present");
-        assert_eq!(
-            update_goal.pointer("/function/strict"),
-            Some(&Value::Bool(true))
-        );
-        assert_eq!(
-            update_goal.pointer("/function/parameters/required"),
-            Some(&serde_json::json!([
-                "blocker", "evidence", "reason", "status"
-            ]))
-        );
-        assert_eq!(
-            update_goal.pointer("/function/parameters/properties/reason/anyOf/1/type"),
-            Some(&Value::String("null".to_string()))
-        );
-
-        let bash = strict
-            .iter()
-            .find(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("bash"))
-            .expect("bash present");
         assert!(
-            bash.pointer("/function/strict").is_none(),
-            "non-allowlisted tools must stay non-strict"
+            deepseek_strict_tools_schema_for_endpoint(&definitions, "https://api.deepseek.com")
+                .is_none()
+        );
+        assert!(
+            deepseek_strict_tools_schema_for_endpoint(&definitions, DEFAULT_BASE_URL).is_none()
         );
 
-        // The original list must stay untouched for the fallback retry.
-        let original_update_plan = tools
+        let strict = deepseek_strict_tools_schema_for_endpoint(
+            &definitions,
+            "https://api.deepseek.com/beta",
+        )
+        .expect("beta endpoint must produce a strict tool list");
+        let strict_capable = strict
             .iter()
             .find(|tool| {
-                tool.pointer("/function/name").and_then(Value::as_str) == Some("update_plan")
+                tool.pointer("/function/name").and_then(Value::as_str) == Some("strict_capable")
             })
-            .expect("update_plan present");
-        assert!(original_update_plan.pointer("/function/strict").is_none());
+            .expect("strict-capable definition present");
+        assert_eq!(
+            strict_capable.pointer("/function/strict"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            strict_capable.pointer("/function/parameters/required"),
+            Some(&serde_json::json!(["optional_value", "required_value"]))
+        );
+
+        let non_strict = strict
+            .iter()
+            .find(|tool| {
+                tool.pointer("/function/name").and_then(Value::as_str) == Some("non_strict")
+            })
+            .expect("ordinary definition present");
+        assert!(
+            non_strict.pointer("/function/strict").is_none(),
+            "ineligible definitions must stay non-strict"
+        );
+
+        let original_strict_capable = tools
+            .iter()
+            .find(|tool| {
+                tool.pointer("/function/name").and_then(Value::as_str) == Some("strict_capable")
+            })
+            .expect("strict-capable definition present");
+        assert!(
+            original_strict_capable
+                .pointer("/function/strict")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1294,10 +1116,10 @@ mod tests {
     #[test]
     fn parse_glob_with_pattern_and_path() {
         let tc = make_tc("glob", r#"{"pattern":"**/*.rs","path":"src"}"#);
-        let req = parse_tool_call(&tc, &[]);
+        let req = parse_tool_call(&tc);
         assert_eq!(req.name, ToolName::Glob);
         assert_eq!(req.action, ActionKind::Read);
-        assert_eq!(req.target.as_deref(), Some("src"));
+        assert!(req.target.is_none());
         assert_eq!(
             req.raw_arguments.as_deref(),
             Some(r#"{"pattern":"**/*.rs","path":"src"}"#)
@@ -1307,71 +1129,61 @@ mod tests {
     #[test]
     fn parse_glob_with_pattern_only_defaults_path_to_dot() {
         let tc = make_tc("glob", r#"{"pattern":"*.rs"}"#);
-        let req = parse_tool_call(&tc, &[]);
+        let req = parse_tool_call(&tc);
         assert_eq!(req.name, ToolName::Glob);
         assert_eq!(req.action, ActionKind::Read);
-        assert_eq!(req.target.as_deref(), Some("."));
+        assert!(req.target.is_none());
         assert_eq!(req.raw_arguments.as_deref(), Some(r#"{"pattern":"*.rs"}"#));
     }
 
     #[test]
     fn parse_grep() {
         let tc = make_tc("grep", r#"{"pattern":"fn main","path":"src"}"#);
-        let req = parse_tool_call(&tc, &[]);
+        let req = parse_tool_call(&tc);
         assert_eq!(req.name, ToolName::Grep);
         assert_eq!(req.action, ActionKind::Read);
-        assert_eq!(req.target.as_deref(), Some("fn main"));
+        assert!(req.target.is_none());
     }
 
     #[test]
     fn parse_bash() {
         let tc = make_tc("bash", r#"{"command":"cargo test"}"#);
-        let req = parse_tool_call(&tc, &[]);
+        let req = parse_tool_call(&tc);
         assert_eq!(req.name, ToolName::Bash);
-        assert_eq!(req.action, ActionKind::Shell);
-        assert_eq!(req.target.as_deref(), Some("cargo test"));
+        assert_eq!(req.action, ActionKind::Read);
+        assert!(req.target.is_none());
     }
 
     #[test]
-    fn parse_external_bash_collision_preserves_builtin_registry_precedence() {
-        let external = orca_core::external_config::ExternalToolConfig {
-            name: "bash".to_string(),
-            description: "Shadow the built-in shell tool".to_string(),
-            action_kind: ActionKind::Network,
-            command: "echo shadowed".to_string(),
-            schema: serde_json::json!({}),
-        };
+    fn parse_tool_call_does_not_apply_external_action_policy() {
         let raw_arguments = r#"{"command":"cargo test -p orca-provider"}"#;
         let tc = make_tc("bash", raw_arguments);
-        let request = parse_tool_call(&tc, &[external]);
+        let request = parse_tool_call(&tc);
 
         assert_eq!(request.id, "call_123");
         assert_eq!(request.name, ToolName::Bash);
-        assert_eq!(request.action, ActionKind::Shell);
-        assert_eq!(
-            request.target.as_deref(),
-            Some("cargo test -p orca-provider")
-        );
+        assert_eq!(request.action, ActionKind::Read);
+        assert!(request.target.is_none());
         assert_eq!(request.raw_arguments.as_deref(), Some(raw_arguments));
     }
 
     #[test]
     fn parse_edit() {
         let tc = make_tc("edit", r#"{"path":"foo.rs","old_text":"a","new_text":"b"}"#);
-        let req = parse_tool_call(&tc, &[]);
+        let req = parse_tool_call(&tc);
         assert_eq!(req.name, ToolName::Edit);
-        assert_eq!(req.action, ActionKind::Write);
-        assert_eq!(req.target.as_deref(), Some("foo.rs"));
+        assert_eq!(req.action, ActionKind::Read);
+        assert!(req.target.is_none());
         assert!(req.raw_arguments.is_some());
     }
 
     #[test]
     fn parse_git_status() {
         let tc = make_tc("git_status", r#"{}"#);
-        let req = parse_tool_call(&tc, &[]);
+        let req = parse_tool_call(&tc);
         assert_eq!(req.name, ToolName::GitStatus);
         assert_eq!(req.action, ActionKind::Read);
-        assert_eq!(req.target.as_deref(), Some("."));
+        assert!(req.target.is_none());
     }
 
     #[test]
@@ -1380,20 +1192,20 @@ mod tests {
             "subagent",
             r#"{"description":"inspect repo","prompt":"inspect the repo and report"}"#,
         );
-        let req = parse_tool_call(&tc, &[]);
+        let req = parse_tool_call(&tc);
         assert_eq!(req.name, ToolName::Subagent);
-        assert_eq!(req.action, ActionKind::Agent);
-        assert_eq!(req.target.as_deref(), Some("inspect repo"));
+        assert_eq!(req.action, ActionKind::Read);
+        assert!(req.target.is_none());
         assert!(req.raw_arguments.is_some());
     }
 
     #[test]
     fn parse_mcp_tool() {
         let tc = make_tc("mcp__demo__search", r#"{"query":"orca"}"#);
-        let req = parse_tool_call(&tc, &[]);
+        let req = parse_tool_call(&tc);
         assert_eq!(req.name, ToolName::Mcp("mcp__demo__search".to_string()));
         assert_eq!(req.action, ActionKind::Read);
-        assert_eq!(req.target.as_deref(), Some("mcp__demo__search"));
+        assert!(req.target.is_none());
         assert_eq!(req.raw_arguments.as_deref(), Some(r#"{"query":"orca"}"#));
     }
 
@@ -1403,10 +1215,10 @@ mod tests {
             "web_search",
             r#"{"query":"deepseek latest","count":3,"fresh_days":30}"#,
         );
-        let req = parse_tool_call(&tc, &[]);
+        let req = parse_tool_call(&tc);
         assert_eq!(req.name, ToolName::WebSearch);
-        assert_eq!(req.action, ActionKind::Network);
-        assert_eq!(req.target.as_deref(), Some("deepseek latest"));
+        assert_eq!(req.action, ActionKind::Read);
+        assert!(req.target.is_none());
         assert!(req.raw_arguments.is_some());
     }
 
@@ -1416,58 +1228,51 @@ mod tests {
             "update_plan",
             r#"{"plan":[{"step":"Inspect references","status":"completed"},{"step":"Patch Orca","status":"in_progress"}]}"#,
         );
-        let req = parse_tool_call(&tc, &[]);
+        let req = parse_tool_call(&tc);
         assert_eq!(req.name, ToolName::UpdatePlan);
         assert_eq!(req.action, ActionKind::Read);
-        assert_eq!(req.target.as_deref(), Some("2 items"));
+        assert!(req.target.is_none());
         assert!(req.raw_arguments.is_some());
     }
 
     #[test]
     fn parse_unknown_tool_preserves_call_for_model_correction() {
         let tc = make_tc("wc -l", r#"{}"#);
-        let request = parse_tool_call(&tc, &[]);
+        let request = parse_tool_call(&tc);
 
         assert_eq!(request.name, ToolName::External("wc -l".to_string()));
         assert_ne!(request.name, ToolName::Bash);
         assert_eq!(request.action, ActionKind::Read);
-        assert_eq!(request.target.as_deref(), Some("wc -l"));
+        assert!(request.target.is_none());
         assert_eq!(request.raw_arguments.as_deref(), Some(r#"{}"#));
     }
 
     #[test]
-    fn parse_unresolved_namespaced_tool_stays_external() {
+    fn parse_unresolved_namespaced_tool_preserves_namespaced_identity() {
         let tc = make_tc("wc__lines", r#"{}"#);
-        let request = parse_tool_call(&tc, &[]);
+        let request = parse_tool_call(&tc);
 
-        assert_eq!(request.name, ToolName::External("wc__lines".to_string()));
+        assert_eq!(request.name, ToolName::namespaced("wc", "lines"));
         assert_eq!(request.action, ActionKind::Read);
-        assert_eq!(request.target.as_deref(), Some("wc__lines"));
+        assert!(request.target.is_none());
         assert_eq!(request.raw_arguments.as_deref(), Some(r#"{}"#));
     }
 
     #[test]
-    fn parse_configured_namespaced_external_tool_stays_external() {
-        let external = orca_core::external_config::ExternalToolConfig {
-            name: "acme__deploy".to_string(),
-            description: "Deploy through Acme".to_string(),
-            action_kind: ActionKind::Shell,
-            command: "acme deploy".to_string(),
-            schema: serde_json::json!({}),
-        };
+    fn parse_namespaced_tool_does_not_apply_external_configuration() {
         let tc = make_tc("acme__deploy", r#"{}"#);
-        let request = parse_tool_call(&tc, &[external]);
+        let request = parse_tool_call(&tc);
 
-        assert_eq!(request.name, ToolName::External("acme__deploy".to_string()));
-        assert_eq!(request.action, ActionKind::Shell);
-        assert_eq!(request.target.as_deref(), Some("acme__deploy"));
+        assert_eq!(request.name, ToolName::namespaced("acme", "deploy"));
+        assert_eq!(request.action, ActionKind::Read);
+        assert!(request.target.is_none());
         assert_eq!(request.raw_arguments.as_deref(), Some(r#"{}"#));
     }
 
     #[test]
     fn parse_invalid_json_preserves_known_tool_call() {
         let tc = make_tc("write_file", r#"{"path":"note.txt","content":"partial"#);
-        let request = parse_tool_call(&tc, &[]);
+        let request = super::parse_tool_call(&tc);
 
         assert_eq!(request.name, ToolName::WriteFile);
         assert!(request.target.is_none());
@@ -1971,7 +1776,7 @@ mod tests {
                     && request.name == ToolName::External("wc -l".to_string())
                     && request.name != ToolName::Bash
                     && request.action == ActionKind::Read
-                    && request.target.as_deref() == Some("wc -l")
+                    && request.target.is_none()
                     && request.raw_arguments.as_deref() == Some("{}")
         ));
         assert_eq!(response.tool_calls[0].id, "call_wc");
@@ -2324,7 +2129,7 @@ mod tests {
             [ProviderStep::ToolCall(request)]
                 if request.id == "call_wc"
                     && request.name == ToolName::External("wc -l".to_string())
-                    && request.target.as_deref() == Some("wc -l")
+                    && request.target.is_none()
         ));
         assert_eq!(response.tool_calls[0].function_name, "wc -l");
         assert_eq!(response.tool_calls[0].arguments, "{}");
@@ -2359,7 +2164,9 @@ mod tests {
         assert!(matches!(
             response.steps.as_slice(),
             [ProviderStep::ToolCall(request)]
-                if request.id == "call_complete" && request.target.as_deref() == Some("src/main.rs")
+                if request.id == "call_complete"
+                    && request.name == ToolName::WriteFile
+                    && request.target.is_none()
         ));
     }
 

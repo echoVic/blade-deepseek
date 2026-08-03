@@ -4,7 +4,6 @@ pub mod deepseek_http;
 pub mod http_client;
 pub mod streaming;
 pub mod summary_cache;
-pub mod system_prompt;
 pub mod tool_schema;
 
 use std::collections::VecDeque;
@@ -27,7 +26,7 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: ReasoningEffort,
-    pub tools_override: Option<Vec<serde_json::Value>>,
+    pub tools_override: Option<Vec<tool_schema::ProviderToolDefinition>>,
     pub mcp_registry: Option<McpRegistry>,
     pub external_tools: Vec<ExternalToolConfig>,
 }

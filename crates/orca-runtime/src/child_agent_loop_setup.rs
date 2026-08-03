@@ -7,7 +7,6 @@ use orca_core::event_schema::RunStatus;
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
 use orca_provider::context::ContextConfig;
-use orca_provider::tool_schema::deepseek_tools_schema_for_type_with_mcp_and_external;
 
 use crate::agent_common;
 use crate::child_agent_types::{ChildAgentRequest, ChildAgentResult};
@@ -45,11 +44,13 @@ pub fn prepare_child_agent_loop(
         base_url: config.base_url.clone(),
         model: Some(orca_core::model::FLASH_MODEL.to_string()),
         reasoning_effort: config.reasoning_effort,
-        tools_override: Some(deepseek_tools_schema_for_type_with_mcp_and_external(
+        tools_override: crate::tool_invocation::provider_tool_schema_override(
+            request.depth,
             &request.subagent_type,
-            Some(&mcp_registry),
+            crate::tool_invocation::AgentToolPolicyContext::unrestricted(),
+            &mcp_registry,
             &config.external_tools,
-        )),
+        ),
         mcp_registry: Some(mcp_registry.clone()),
         external_tools: config.external_tools.clone(),
     };

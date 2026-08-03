@@ -17,6 +17,7 @@ pub mod process;
 pub mod read_file;
 pub mod registry;
 pub mod sandbox;
+pub mod schema;
 pub mod skills;
 pub mod update_goal;
 pub mod update_plan;
