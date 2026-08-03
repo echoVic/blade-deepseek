@@ -11166,6 +11166,10 @@ struct ActiveOperation {
     request: HostedTurnRequest,
     config: RunConfig,
     steer_handle: ThreadSteerHandle,
+    pending_goal_pause_replies: Vec<(
+        SyncSender<Result<PauseGoalRunResult, RuntimeHostError>>,
+        PauseGoalRunResult,
+    )>,
     resume_queued: bool,
     goal_admitted_generation: Option<GenerationFence>,
     generation: ActiveGeneration,
@@ -13102,10 +13106,15 @@ fn prepare_legacy_goal_continuation_worker(
     work: LegacyGoalContinuationWork,
 ) -> Result<LegacyGoalContinuationResult, RuntimeHostError> {
     if let Some(admission) = goal_continuation_preflight(work.preflight) {
+        let record = work.runtime.read(&work.session_id).map_err(|error| {
+            RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            }
+        })?;
         return Ok(LegacyGoalContinuationResult {
             admission,
             envelope: None,
-            record: None,
+            record,
         });
     }
     let snapshot = match work.runtime.continuation_state(&work.session_id) {
@@ -31646,9 +31655,12 @@ impl ThreadActor {
                             operation_id,
                             reply,
                         }) => {
-                            let result = self.request_goal_pause(&mut active, operation_id);
+                            self.request_goal_pause_with_reply(
+                                &mut active,
+                                operation_id,
+                                reply,
+                            );
                             self.active = Some(active);
-                            let _ = reply.send(result);
                         }
                         Some(command) => {
                             self.handle_running_command(command, &mut active);
@@ -32634,6 +32646,7 @@ impl ThreadActor {
                     request,
                     config,
                     steer_handle,
+                    pending_goal_pause_replies: Vec::new(),
                     resume_queued: false,
                     goal_admitted_generation: None,
                     generation,
@@ -33721,7 +33734,7 @@ impl ThreadActor {
                 operation_id,
                 reply,
             } => {
-                let _ = reply.send(self.request_goal_pause(active, operation_id));
+                self.request_goal_pause_with_reply(active, operation_id, reply);
             }
             ThreadCommand::ResumeOperation {
                 operation_id,
@@ -33868,6 +33881,15 @@ impl ThreadActor {
         let Some(event) = settlement? else {
             return Ok(());
         };
+        Self::publish_goal_pause_event(state, active, &event);
+        Ok(())
+    }
+
+    fn publish_goal_pause_event(
+        state: &mut ThreadActorState,
+        active: &ActiveOperation,
+        event: &PendingGoalPauseEvent,
+    ) {
         let observer = active.request.event_observer();
         observe_runtime_event(
             observer.as_deref(),
@@ -33888,7 +33910,6 @@ impl ThreadActor {
                 &event.message,
             ),
         );
-        Ok(())
     }
 
     fn publish_goal_recovery_records(
@@ -33932,6 +33953,30 @@ impl ThreadActor {
         } else {
             PauseGoalRunResult::Requested { generation }
         })
+    }
+
+    fn request_goal_pause_with_reply(
+        &mut self,
+        active: &mut ActiveOperation,
+        operation_id: OperationId,
+        reply: SyncSender<Result<PauseGoalRunResult, RuntimeHostError>>,
+    ) {
+        match self.request_goal_pause(active, operation_id) {
+            Ok(result @ PauseGoalRunResult::Requested { .. })
+            | Ok(result @ PauseGoalRunResult::AlreadyRequested { .. }) => {
+                active.pending_goal_pause_replies.push((reply, result));
+            }
+            result => {
+                let _ = reply.send(result);
+            }
+        }
+    }
+
+    fn settle_goal_pause_replies(active: &mut ActiveOperation, error: Option<&RuntimeHostError>) {
+        for (reply, result) in active.pending_goal_pause_replies.drain(..) {
+            let result = error.cloned().map_or_else(|| Ok(result), Err);
+            let _ = reply.send(result);
+        }
     }
 
     fn spawn_generation(
@@ -34380,7 +34425,7 @@ impl ThreadActor {
         allow_resume: bool,
     ) -> Result<(), RuntimeHostError> {
         let operation_id = active.operation_id;
-        let result = self.finish_generation_inner(active, result, allow_resume);
+        let result = self.finish_generation_inner(active, result, allow_resume, true);
         if result.is_err() {
             self.goal_controller.clear_active(operation_id);
         }
@@ -34392,6 +34437,7 @@ impl ThreadActor {
         mut active: ActiveOperation,
         result: Result<OperationTaskResult, tokio::task::JoinError>,
         allow_resume: bool,
+        settle_lost_goal_turn: bool,
     ) -> Result<(), RuntimeHostError> {
         if active.pending_surface_background_transfer.is_some() {
             return self.finish_surface_background_transfer(active, result, allow_resume);
@@ -34469,7 +34515,13 @@ impl ThreadActor {
                 }
                 surface_usage = result.usage_delta;
                 self.usage_ledger.add(result.usage_delta);
-                self.publish_pending_goal_pause_event(&mut result.state, &mut active)?;
+                if let Err(error) =
+                    self.publish_pending_goal_pause_event(&mut result.state, &mut active)
+                {
+                    Self::settle_goal_pause_replies(&mut active, Some(&error));
+                    return Err(error);
+                }
+                Self::settle_goal_pause_replies(&mut active, None);
                 // Terminal owner for a lost generation. The in-task settlement
                 // is skipped when the task unwinds, so settle here — outside the
                 // supervised task and before the continuation gate — to keep a
@@ -34480,15 +34532,53 @@ impl ThreadActor {
                 // through the surface mutation outbox, and the legacy store path
                 // rejects them after the actor has already dropped its active
                 // turn, which would lose the recorded surface result.
-                if !active.request.surface_goal_owned
+                if settle_lost_goal_turn
+                    && !active.request.surface_goal_owned
                     && let GenerationTaskOutcome::Panicked { message }
                     | GenerationTaskOutcome::ExecutionFailed { message, .. } = &result.outcome
                 {
                     let diagnostic = format!("goal outer turn lost its generation: {message}");
-                    if let Err(error) =
-                        self.settle_unsettled_goal_turn(&mut result.state, &diagnostic)
-                    {
-                        eprintln!("orca: failed to settle a lost Goal outer turn: {error}");
+                    let binding = result
+                        .state
+                        .thread
+                        .thread_extensions()
+                        .get::<crate::goal_actor::GoalRuntimeBinding>();
+                    if let Some(binding) = binding {
+                        let Some(turn) = binding.turn.clone() else {
+                            result.state.thread.clear_goal_turn_binding();
+                            return self.finish_generation_inner(
+                                active,
+                                Ok(result),
+                                allow_resume,
+                                false,
+                            );
+                        };
+                        let runtime = binding.handle.clone();
+                        result.state.thread.clear_goal_turn_binding();
+                        result.state.thread.session_mut().replace_goal_context(None);
+                        let operation_id = active.operation_id;
+                        self.spawn_goal_blocking(
+                            "lost Goal outer-turn settlement",
+                            GoalBlockingCompletionKind::FinishVerify,
+                            move || settle_lost_goal_turn_worker(runtime, turn, diagnostic),
+                            move |actor, settlement| {
+                                if let Err(error) = settlement {
+                                    eprintln!(
+                                        "orca: failed to settle a lost Goal outer turn: {error}"
+                                    );
+                                }
+                                if let Err(error) = actor.finish_generation_inner(
+                                    active,
+                                    Ok(result),
+                                    allow_resume,
+                                    false,
+                                ) {
+                                    actor.goal_controller.clear_active(operation_id);
+                                    actor.surface_terminal_blocked = Some(error.to_string());
+                                }
+                            },
+                        )?;
+                        return Ok(());
                     }
                 }
                 let background_error = match &mut result.outcome {
@@ -34838,9 +34928,16 @@ impl ThreadActor {
                     }
                 }
             }
-            Err(error) => OperationOutcome::Panicked {
-                message: error.to_string(),
-            },
+            Err(error) => {
+                let pause_error = self
+                    .goal_controller
+                    .take_pause_settlement(active.operation_id)
+                    .and_then(Result::err);
+                Self::settle_goal_pause_replies(&mut active, pause_error.as_ref());
+                OperationOutcome::Panicked {
+                    message: error.to_string(),
+                }
+            }
         };
         if active.surface_operation.is_some() {
             match self.finish_surface_operation(
@@ -34889,39 +34986,6 @@ impl ThreadActor {
         });
         debug_assert!(completed, "operation terminal must complete exactly once");
         Ok(())
-    }
-
-    /// Schedules settlement for a Goal outer turn whose generation was lost.
-    fn settle_unsettled_goal_turn(
-        &mut self,
-        state: &mut ThreadActorState,
-        message: &str,
-    ) -> Result<(), RuntimeHostError> {
-        let Some(binding) = state
-            .thread
-            .thread_extensions()
-            .get::<crate::goal_actor::GoalRuntimeBinding>()
-        else {
-            return Ok(());
-        };
-        let Some(turn) = binding.turn.clone() else {
-            state.thread.clear_goal_turn_binding();
-            return Ok(());
-        };
-        state.thread.clear_goal_turn_binding();
-        state.thread.session_mut().replace_goal_context(None);
-        let runtime = binding.handle.clone();
-        let message = message.to_string();
-        self.spawn_goal_blocking(
-            "lost Goal outer-turn settlement",
-            GoalBlockingCompletionKind::FinishVerify,
-            move || settle_lost_goal_turn_worker(runtime, turn, message),
-            |_actor, result| {
-                if let Err(error) = result {
-                    eprintln!("orca: failed to settle a lost Goal outer turn: {error}");
-                }
-            },
-        )
     }
 
     fn dispatch_legacy_goal_continuation(
@@ -35129,13 +35193,16 @@ impl ThreadActor {
                 };
                 if let Some(pause_reason) = pause_reason {
                     result.state.thread.session_mut().replace_goal_context(None);
-                    if let Err(error) = self.dispatch_goal_pause_with_reason(
-                        active.operation_id,
+                    if let Err(error) = self.dispatch_legacy_goal_pause_before_completion(
+                        active,
+                        result,
                         pause_reason,
-                        &message,
+                        message,
                     ) {
                         eprintln!("orca: failed to dispatch rejected Goal pause: {error}");
+                        self.surface_terminal_blocked = Some(error.to_string());
                     }
+                    return;
                 }
                 if let Err(error) = self.finish_legacy_goal_without_continuation(active, result) {
                     self.surface_terminal_blocked = Some(error.to_string());
@@ -35147,6 +35214,48 @@ impl ThreadActor {
                 }
             }
         }
+    }
+
+    fn dispatch_legacy_goal_pause_before_completion(
+        &mut self,
+        active: ActiveOperation,
+        result: OperationTaskResult,
+        reason: orca_core::goal_runtime::GoalPauseReason,
+        message: String,
+    ) -> Result<(), RuntimeHostError> {
+        let Some(control) = self
+            .goal_controller
+            .active_control(active.operation_id)
+            .cloned()
+        else {
+            return self.finish_legacy_goal_without_continuation(active, result);
+        };
+        let operation_id = active.operation_id;
+        self.spawn_goal_blocking(
+            "rejected legacy Goal continuation pause",
+            GoalBlockingCompletionKind::PauseResume,
+            move || prepare_goal_pause_worker(control, reason, message),
+            move |actor, settlement| {
+                let mut result = result;
+                match settlement {
+                    Ok(Some(event)) => {
+                        Self::publish_goal_pause_event(&mut result.state, &active, &event);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("orca: rejected Goal pause settlement failed: {error}");
+                        result.outcome = GenerationTaskOutcome::ExecutionFailed {
+                            kind: io::ErrorKind::Other,
+                            message: error.to_string(),
+                        };
+                    }
+                }
+                if let Err(error) = actor.finish_legacy_goal_without_continuation(active, result) {
+                    actor.goal_controller.clear_active(operation_id);
+                    actor.surface_terminal_blocked = Some(error.to_string());
+                }
+            },
+        )
     }
 
     fn complete_failed_legacy_goal_operation(
