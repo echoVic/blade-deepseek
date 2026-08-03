@@ -1232,7 +1232,14 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
             "export const meta = { name: 'silent', description: 'Silent host', phases: [] };\nwhile (true) {}\nexport default 'unreachable';",
         )
         .expect("write silent workflow");
+        // The stop predicate waits 100ms so the child is genuinely spinning in
+        // its busy-loop before we ask the host to stop. It records the instant
+        // it first requests the stop, so the deadline below measures only the
+        // stop-to-return propagation — not the Node process cold start, which is
+        // unrelated to how promptly the host tears a running child down.
         let started = Instant::now();
+        let stop_requested_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let predicate_stop_at = Arc::clone(&stop_requested_at);
 
         let result = WorkflowHost::run_collecting_events_with_agent_and_event_callback_inner(
             &script,
@@ -1246,15 +1253,31 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
                 })
             },
             |_| Ok(()),
-            || Ok(started.elapsed() >= Duration::from_millis(100)),
+            || {
+                if started.elapsed() >= Duration::from_millis(100) {
+                    predicate_stop_at
+                        .lock()
+                        .expect("stop instant")
+                        .get_or_insert_with(Instant::now);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            },
             || {},
         );
+        let returned_at = Instant::now();
 
         let error = result.expect_err("silent workflow should be cancelled");
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        let stop_requested_at = stop_requested_at
+            .lock()
+            .expect("stop instant")
+            .expect("stop predicate never requested a stop");
+        let stop_latency = returned_at.saturating_duration_since(stop_requested_at);
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "silent workflow host did not stop promptly"
+            stop_latency < Duration::from_secs(2),
+            "silent workflow host did not stop promptly: {stop_latency:?}"
         );
     }
 

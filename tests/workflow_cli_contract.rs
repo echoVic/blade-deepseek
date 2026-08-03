@@ -205,9 +205,12 @@ fn workflow_run_returns_before_slow_workflow_completes() {
     // The mock provider honors a `mock_stream_delay_ms <n>` prompt with a real,
     // cancellable in-provider delay, so the model call is deterministically slow
     // on every platform without depending on shell hooks or wall-clock races.
+    const MODEL_CALL_MS: u64 = 6000;
     fs::write(
         &script,
-        "export const meta = { name: 'slow', description: 'Slow workflow', phases: [] };\nexport default await agent('mock_stream_delay_ms 6000');",
+        format!(
+            "export const meta = {{ name: 'slow', description: 'Slow workflow', phases: [] }};\nexport default await agent('mock_stream_delay_ms {MODEL_CALL_MS}');"
+        ),
     )
     .unwrap();
 
@@ -233,9 +236,16 @@ fn workflow_run_returns_before_slow_workflow_completes() {
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
+    // This wall-clock bound only guards against a gross regression to fully
+    // synchronous execution (launch blocking for the whole model call). The
+    // real "returned while still active" guarantee is asserted deterministically
+    // by wait_until_active below, so the deadline is expressed as a fraction of
+    // the model-call delay with wide margin rather than a tight absolute value
+    // that would race the orca binary's cold start.
+    let blocking_guard = Duration::from_millis(MODEL_CALL_MS / 2);
     assert!(
-        elapsed < Duration::from_secs(5),
-        "workflow run blocked for {elapsed:?}; it must return before the 6s model call completes"
+        elapsed < blocking_guard,
+        "workflow run blocked for {elapsed:?}; it must return well before the {MODEL_CALL_MS}ms model call completes"
     );
     let launched: Value = serde_json::from_slice(&run.stdout).unwrap();
     let task_id = launched["taskId"].as_str().unwrap();

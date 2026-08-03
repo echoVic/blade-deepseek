@@ -289,8 +289,11 @@ mod tests {
         });
         let url = format!("http://{address}/retry");
 
-        let started = Instant::now();
+        // Build the client outside the timed window: constructing the reqwest
+        // client (connection pool + hickory DNS resolver) is unrelated to the
+        // cancellation latency under test and can be slow on a cold CI runner.
         let client = streaming_client().expect("streaming client");
+        let started = Instant::now();
         let result =
             execute_streaming_with_retry(&client, |client| client.get(&url), &cancel).await;
         let elapsed = started.elapsed();
@@ -361,8 +364,11 @@ mod tests {
         });
         let url = format!("http://{address}/stall");
 
-        let started = Instant::now();
+        // Build the client outside the timed window: constructing the reqwest
+        // client (connection pool + hickory DNS resolver) is unrelated to the
+        // cancellation latency under test and can be slow on a cold CI runner.
         let client = streaming_client().expect("streaming client");
+        let started = Instant::now();
         let result =
             execute_streaming_with_retry(&client, |client| client.get(&url), &cancel).await;
         let elapsed = started.elapsed();

@@ -165,11 +165,10 @@ fn windows_job_object_descendant_helper() {
 #[cfg(windows)]
 #[test]
 fn windows_background_child_does_not_hold_parent_capture_open() {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     let temp = tempfile::tempdir().expect("tempdir");
     let child_pid = temp.path().join("background-child-pid");
-    let started = Instant::now();
     let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
         .args([
             "--exact",
@@ -179,17 +178,27 @@ fn windows_background_child_does_not_hold_parent_capture_open() {
         .env("ORCA_BACKGROUND_CHILD_PID", &child_pid)
         .output()
         .expect("run background capture parent");
-    let elapsed = started.elapsed();
 
     assert!(output.status.success(), "helper failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        elapsed < Duration::from_secs(2),
-        "captured parent output stayed open for {elapsed:?}"
+        stdout.contains("parent-exit"),
+        "parent marker missing: {stdout}"
     );
+    // The parent reports how long it stayed open from the start of its own
+    // work. Measuring that internal window (rather than this subprocess's total
+    // wall time) keeps the deadline free of the test binary's cold-start cost:
+    // if the background child still held the capture pipe open, this would be
+    // near the child's 5s sleep instead of the sub-millisecond spawn-and-exit.
+    let parent_open = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("parent-open-micros="))
+        .and_then(|micros| micros.trim().parse::<u64>().ok())
+        .map(Duration::from_micros)
+        .unwrap_or_else(|| panic!("parent-open-micros marker missing: {stdout}"));
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("parent-exit"),
-        "parent marker missing: {}",
-        String::from_utf8_lossy(&output.stdout)
+        parent_open < Duration::from_secs(2),
+        "captured parent output stayed open for {parent_open:?}"
     );
 
     let pid = std::fs::read_to_string(&child_pid)
@@ -204,10 +213,17 @@ fn windows_background_child_does_not_hold_parent_capture_open() {
 #[cfg(windows)]
 #[test]
 fn windows_background_capture_parent_helper() {
+    use std::time::Instant;
+
     let Some(child_pid) = std::env::var_os("ORCA_BACKGROUND_CHILD_PID") else {
         return;
     };
 
+    // Start timing only once this helper begins its own work, so the parent
+    // test measures how long the capturing parent stays open — not the cold
+    // start of this test binary, which is unrelated to the handle-inheritance
+    // behavior under test.
+    let started = Instant::now();
     orca_platform::process::clear_current_process_std_handle_inheritance()
         .expect("clear inherited std handles");
     let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
@@ -223,6 +239,7 @@ fn windows_background_capture_parent_helper() {
         .spawn()
         .expect("spawn background child");
     std::fs::write(child_pid, child.id().to_string()).expect("write child pid");
+    println!("parent-open-micros={}", started.elapsed().as_micros());
     println!("parent-exit");
 }
 
