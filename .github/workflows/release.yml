@@ -45,6 +45,10 @@ jobs:
           node-version: 20
       - name: Verify repository version sync
         run: node scripts/release/verify-version-sync.mjs
+      - name: Validate reviewed platform boundaries
+        run: |
+          node scripts/test-validate-windows-platform-boundaries.mjs
+          node scripts/validate-windows-platform-boundaries.mjs
       - id: version
         shell: bash
         env:
