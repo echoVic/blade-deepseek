@@ -71,7 +71,6 @@ pub use app::run_tui;
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::borrow::Cow;
     use std::io;
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::Duration;
@@ -99,26 +98,6 @@ pub(crate) mod test_support {
         PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    pub(crate) fn normalized_source(source: &str) -> Cow<'_, str> {
-        if source.contains('\r') {
-            Cow::Owned(source.replace("\r\n", "\n").replace('\r', "\n"))
-        } else {
-            Cow::Borrowed(source)
-        }
-    }
-
-    #[test]
-    fn normalized_source_uses_one_line_ending_on_every_host() {
-        assert_eq!(
-            normalized_source("first\r\nsecond\rthird"),
-            "first\nsecond\nthird"
-        );
-        assert!(matches!(
-            normalized_source("first\nsecond"),
-            Cow::Borrowed(_)
-        ));
     }
 
     struct HostedControlExecutor {

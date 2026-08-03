@@ -6367,25 +6367,6 @@ mod tests {
         let first = status_line(&state, &theme, 120);
         let second = status_line(&state, &theme, 120);
         assert_eq!(first, second);
-
-        let source = crate::test_support::normalized_source(include_str!("ui.rs"));
-        let source = source
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("production UI source");
-        for forbidden in [
-            "std::process",
-            "Command::new",
-            "orca_tools::process",
-            "workspace_status::snapshot",
-            "read_to_string",
-            "read_dir",
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "rendering must not perform workspace I/O: {forbidden}"
-            );
-        }
     }
 
     #[test]

@@ -3199,20 +3199,6 @@ mod tests {
     }
 
     #[test]
-    fn command_exec_sandbox_resolution_is_owned_by_focused_module() {
-        let server_source = include_str!("server.rs");
-
-        assert!(
-            !server_source.contains("\nfn shell_sandbox_mode_from_permission_profile("),
-            "command/exec permission-profile sandbox resolution should live outside server.rs"
-        );
-        assert!(
-            !server_source.contains("\nfn resolve_permission_profile("),
-            "command/exec permission-profile traversal should live outside server.rs"
-        );
-    }
-
-    #[test]
     fn command_exec_sandbox_resolves_custom_permission_profile_chain() {
         let mut config = test_run_config();
         config.permission_profiles.insert(

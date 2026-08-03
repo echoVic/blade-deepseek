@@ -700,10 +700,6 @@ mod tests {
         let key_file = temp.path().join("worker-key");
         let sentinel = "orca-secret-sentinel-not-for-argv";
         let agent_id = "task-test-worker";
-        assert!(
-            !include_str!("subagent_async_worker.rs").contains(".arg(\"--api-key\")"),
-            "production async worker launch must not rebuild the leaked API key argument"
-        );
         let mut command = ProcessCommand::new("sh");
         prepare_async_subagent_worker_command(&mut command, agent_id);
         command

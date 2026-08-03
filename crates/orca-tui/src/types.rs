@@ -4284,23 +4284,18 @@ mod tests {
 
     #[test]
     fn workflow_notification_action_carries_notification_boundary() {
-        let source = include_str!("types.rs");
-        let user_action = source
-            .split("pub enum UserAction {")
-            .nth(1)
-            .expect("UserAction enum")
-            .split("pub enum ApprovalOption")
-            .next()
-            .expect("UserAction enum body");
+        let expected = PendingWorkflowNotification {
+            id: "notice-1".to_string(),
+            prompt: "continue the workflow".to_string(),
+        };
+        let action = UserAction::SubmitWorkflowNotification(expected.clone());
 
-        assert!(
-            user_action.contains("SubmitWorkflowNotification(PendingWorkflowNotification)"),
-            "workflow notification actions should carry the typed notification boundary"
-        );
-        assert!(
-            !user_action.contains("SubmitWorkflowNotification { id: String, prompt: String }"),
-            "workflow notification actions should not split notification id and prompt"
-        );
+        match action {
+            UserAction::SubmitWorkflowNotification(actual) => {
+                assert_eq!(actual, expected);
+            }
+            _ => unreachable!("constructed the workflow notification variant"),
+        }
     }
 
     #[test]

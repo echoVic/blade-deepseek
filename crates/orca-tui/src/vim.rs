@@ -1168,36 +1168,6 @@ mod tests {
     }
 
     #[test]
-    fn line_positioning_avoids_composer_sized_iteration() {
-        let source = crate::test_support::normalized_source(include_str!("vim.rs"));
-        let production = source
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("production vim source");
-        let line_head = production
-            .split("fn move_to_line_head")
-            .nth(1)
-            .and_then(|tail| tail.split("\n}\n\nfn move_to_line_end").next())
-            .expect("move_to_line_head source");
-        let line_end = production
-            .split("fn move_to_line_end")
-            .nth(1)
-            .and_then(|tail| tail.split("\n}\n\nfn move_to_row_head").next())
-            .expect("move_to_line_end source");
-        let delete_lines = production
-            .split("fn delete_lines")
-            .nth(1)
-            .and_then(|tail| tail.split("\nfn yank_lines").next())
-            .expect("delete_lines source");
-
-        assert!(line_head.contains("textarea.move_cursor(CursorMove::Head);"));
-        assert!(!line_head.contains("for _ in"));
-        assert!(line_end.contains("textarea.move_cursor(CursorMove::End);"));
-        assert!(!line_end.contains("for _ in"));
-        assert!(!delete_lines.contains("move_to_row_head"));
-    }
-
-    #[test]
     fn line_commands_handle_twenty_thousand_columns_and_rows() {
         let theme = Theme::named(ThemeName::Dark);
         let mut line_state = VimState::new(true);

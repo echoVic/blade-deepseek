@@ -881,13 +881,17 @@ impl ZeroizingProcessLocalSecret {
     }
 }
 
+fn zeroize_process_local_secret(value: &mut [u8]) {
+    for byte in value {
+        // SAFETY: `byte` is a valid, uniquely borrowed byte in this owned buffer.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
 impl Drop for ZeroizingProcessLocalSecret {
     fn drop(&mut self) {
-        for byte in &mut self.0 {
-            // SAFETY: `byte` is a valid, uniquely borrowed byte in this owned buffer.
-            unsafe { std::ptr::write_volatile(byte, 0) };
-        }
-        compiler_fence(Ordering::SeqCst);
+        zeroize_process_local_secret(&mut self.0);
     }
 }
 
@@ -1225,5 +1229,12 @@ mod tests {
     fn opaque_tokens_compare_without_exposing_bytes() {
         assert!(OpaqueToken::new([1; 32]) == OpaqueToken::new([1; 32]));
         assert!(OpaqueToken::new([1; 32]) != OpaqueToken::new([2; 32]));
+    }
+
+    #[test]
+    fn process_local_secret_zeroization_clears_every_byte() {
+        let mut bytes = vec![1, 2, 3, 4];
+        zeroize_process_local_secret(&mut bytes);
+        assert_eq!(bytes, [0, 0, 0, 0]);
     }
 }

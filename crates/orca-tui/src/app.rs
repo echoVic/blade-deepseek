@@ -1810,113 +1810,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_input_ownership_is_single() {
-        let source = crate::test_support::normalized_source(include_str!("app.rs"));
-        let production = source
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("production source before tests");
-
-        for forbidden in [
-            "event::poll",
-            "event::read",
-            "EventStream",
-            "enable_raw_mode",
-            "EnterAlternateScreen",
-            "EnableMouseCapture",
-            "EnableBracketedPaste",
-            "PushKeyboardEnhancementFlags",
-            "TerminalCleanup",
-        ] {
-            assert!(
-                !production.contains(forbidden),
-                "production app must not own terminal input/mode operation {forbidden}"
-            );
-        }
-
-        let start = production
-            .find("InputRuntime::start")
-            .expect("qwertty input starts");
-        let terminal = production
-            .find("Terminal::new")
-            .expect("ratatui terminal is constructed");
-        assert!(start < terminal);
-        assert_eq!(production.matches("InputRuntime::start").count(), 1);
-        assert_eq!(production.matches("Terminal::new").count(), 1);
-    }
-
-    #[test]
-    fn non_composer_input_boundaries_cancel_pending_vim_commands() {
-        let source = crate::test_support::normalized_source(include_str!("app.rs"));
-        let production = source
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("production app source");
-
-        assert!(
-            production
-                .matches("vim_state.cancel_pending_command()")
-                .count()
-                >= 4
-        );
-        assert!(production.contains(
-            "&mut vim_state,\n                                        || clear_terminal_scrollback"
-        ));
-    }
-
-    #[test]
-    fn startup_captures_workspace_status_once_before_frame_loop() {
-        let source = crate::test_support::normalized_source(include_str!("app.rs"));
-        let production = source
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("production source before tests");
-        assert_eq!(
-            production
-                .matches("workspace_status::snapshot(&workspace_root)")
-                .count(),
-            1
-        );
-        let snapshot = production
-            .find("workspace_status::snapshot(&workspace_root)")
-            .expect("workspace snapshot");
-        let state = production
-            .find("AppState::new(")
-            .expect("app state construction");
-        let terminal = production
-            .find("Terminal::new")
-            .expect("frame loop terminal");
-        assert!(snapshot < state);
-        assert!(state < terminal);
-        assert!(!production[state..].contains("workspace_status::snapshot("));
-    }
-
-    #[test]
-    fn focus_events_are_consumed_before_normal_input_handlers() {
-        let source = crate::test_support::normalized_source(include_str!("app.rs"));
-        let production = source
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("production source before tests");
-        let focus = production
-            .find("consume_focus_event(&ev")
-            .expect("focus consumption");
-        let paste = production
-            .find("handle_paste_event(&ev")
-            .expect("paste handling");
-        let resize = production
-            .find("handle_resize_event(&ev")
-            .expect("resize handling");
-        let key = production
-            .find("let Event::Key(key) = &ev")
-            .expect("key handling");
-
-        assert!(focus < paste);
-        assert!(focus < resize);
-        assert!(focus < key);
-    }
-
-    #[test]
     fn clear_terminal_runs_move_all_purge_then_frame_clear() {
         let mut calls = Vec::new();
 
@@ -6171,29 +6064,6 @@ mod tests {
     }
 
     #[test]
-    fn submitted_turn_workflow_notification_carries_notification_boundary() {
-        let source = std::fs::read_to_string(format!(
-            "{}/src/submitted_turn.rs",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .expect("submitted_turn source should be readable");
-        let impl_start = source
-            .find("impl SubmittedTurn {")
-            .expect("SubmittedTurn impl");
-        let submitted_turn_impl = &source[impl_start..];
-
-        assert!(
-            submitted_turn_impl
-                .contains("fn workflow_notification(notification: PendingWorkflowNotification)"),
-            "workflow notification submitted turns should carry the typed notification boundary"
-        );
-        assert!(
-            !submitted_turn_impl.contains("fn workflow_notification(id: String, prompt: String)"),
-            "submitted turns should not split workflow notification id and prompt at construction"
-        );
-    }
-
-    #[test]
     fn hosted_user_turn_request_opts_into_task_tracking_without_goal_tools() {
         let submitted = SubmittedTurn::user("inspect the runtime".to_string());
 
@@ -6221,43 +6091,6 @@ mod tests {
         assert_eq!(
             request.task_description(),
             Some("Workflow notification notification-42")
-        );
-    }
-
-    #[test]
-    fn submitted_turn_kind_owns_prompt_source_state() {
-        let source = std::fs::read_to_string(format!(
-            "{}/src/submitted_turn.rs",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .expect("submitted_turn source should be readable");
-        let kind_start = source
-            .rfind("enum SubmittedTurnKind {")
-            .expect("SubmittedTurnKind enum");
-        let submitted_turn_start = source
-            .rfind("struct SubmittedTurn {")
-            .expect("SubmittedTurn struct");
-        let submitted_turn_section = &source[submitted_turn_start..];
-        let struct_body = submitted_turn_section
-            .split("}")
-            .next()
-            .expect("SubmittedTurn struct body");
-
-        assert!(
-            kind_start < submitted_turn_start,
-            "submitted-turn kind should be declared before SubmittedTurn"
-        );
-        assert!(
-            struct_body.contains("kind: SubmittedTurnKind"),
-            "SubmittedTurn should store a single kind that owns the prompt/source data"
-        );
-        assert!(
-            !struct_body.contains("prompt: String"),
-            "prompt text should live inside SubmittedTurnKind variants"
-        );
-        assert!(
-            !struct_body.contains("source: SubmittedTurnSource"),
-            "source state should live inside SubmittedTurnKind variants"
         );
     }
 

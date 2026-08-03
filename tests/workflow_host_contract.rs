@@ -9,6 +9,9 @@ use std::time::Duration;
 use orca_runtime::workflow::host::{HostEvent, WorkflowHost, WorkflowHostIpcPaths};
 use tempfile::tempdir;
 
+// Exact JavaScript bytes are the released workflow-host protocol fixture.
+const WORKFLOW_HOST_SCRIPT: &str = include_str!("../crates/orca-runtime/src/workflow/host.mjs");
+
 #[test]
 fn host_emits_phase_and_agent_call_events() {
     if !WorkflowHost::node_available() {
@@ -940,11 +943,7 @@ fn host_reports_workflow_failed_when_stdin_closes_before_agent_result() {
     .unwrap();
 
     let host = temp.path().join("host.mjs");
-    fs::write(
-        &host,
-        include_str!("../crates/orca-runtime/src/workflow/host.mjs"),
-    )
-    .unwrap();
+    fs::write(&host, WORKFLOW_HOST_SCRIPT).unwrap();
 
     let mut child = Command::new(WorkflowHost::node_executable())
         .arg(&host)
@@ -999,11 +998,7 @@ fn host_reports_workflow_failed_for_partial_trailing_json_on_stdin_eof() {
     .unwrap();
 
     let host = temp.path().join("host.mjs");
-    fs::write(
-        &host,
-        include_str!("../crates/orca-runtime/src/workflow/host.mjs"),
-    )
-    .unwrap();
+    fs::write(&host, WORKFLOW_HOST_SCRIPT).unwrap();
 
     let mut child = Command::new(WorkflowHost::node_executable())
         .arg(&host)
