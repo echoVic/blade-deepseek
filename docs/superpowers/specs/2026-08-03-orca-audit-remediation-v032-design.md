@@ -1,8 +1,8 @@
-# Orca Audit Remediation v0.3.2 Design
+# Orca Audit Remediation v0.3.3 Design
 
 Date: 2026-08-03
 Status: approved for implementation
-Target release: v0.3.2
+Target release: v0.3.3
 Scope: remediate every confirmed defect, performance cliff, missing contract gate,
 test gap, and planned architectural debt item from the 2026-08-03 comprehensive
 Orca audit before publishing the next patch release
@@ -12,8 +12,13 @@ Orca audit before publishing the next patch release
 Bring Orca's runtime, TUI, provider/tool layering, and release controls to a
 state where the audit findings are fixed by behavior and enforced by durable
 tests or CI gates. The work ships as ordered, independently verifiable commits
-on one release branch. No intermediate public release is produced: v0.3.2 is
+on one release branch. No intermediate public release is produced: v0.3.3 is
 published only after the complete scope passes the release evidence matrix.
+
+The original target was `v0.3.2`. On 2026-08-03, the protected rebase found
+that `origin/main` already contained the published `v0.3.2` release at
+`10eef6329`; this remediation was retargeted to the next unused patch,
+`v0.3.3`.
 
 The local Codex, Claude Code, and Grok Build repositories may inform bounded
 actor calls, cancellation, process ownership, and session fencing. They are
@@ -406,7 +411,7 @@ The branch updates:
 - `docs/release-process.md` with the new contract/CI gates;
 - English and Chinese README text for user-visible cancellation or session
   behavior changes;
-- `docs/releases/v0.3.2.md`; and
+- `docs/releases/v0.3.3.md`; and
 - website release/changelog data.
 
 Documentation distinguishes measured facts from design targets and records any
@@ -467,15 +472,15 @@ compile is not sufficient release evidence.
 
 After all code and documentation gates pass on the release candidate:
 
-1. update `Cargo.toml`, `Cargo.lock`, and `npm/orca/package.json` to `0.3.2`;
+1. update `Cargo.toml`, `Cargo.lock`, and `npm/orca/package.json` to `0.3.3`;
 2. update site release metadata and bilingual changelog summaries;
-3. create and verify `docs/releases/v0.3.2.md`;
+3. create and verify `docs/releases/v0.3.3.md`;
 4. rerun the complete local release candidate matrix;
 5. push the reviewed branch, integrate it to `main`, and verify required CI;
-6. create and push tag `v0.3.2` without force;
+6. create and push tag `v0.3.3` without force;
 7. monitor the release workflow until all six native archives, checksum files,
    the GitHub Release, six platform npm packages, and root npm package exist;
-8. run `scripts/release/verify-published.mjs` for `0.3.2`; and
+8. run `scripts/release/verify-published.mjs` for `0.3.3`; and
 9. independently query GitHub and npm, install the public package in a clean
    temporary directory, and run `orca --version`.
 

@@ -1,8 +1,13 @@
-# Orca Audit Remediation v0.3.2 Implementation Plan
+# Orca Audit Remediation v0.3.3 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Fix every defect, performance cliff, contract gap, architectural debt item, and release deliverable in the 2026-08-03 Orca audit, then publish and independently verify v0.3.2 on GitHub and npm.
+**Goal:** Fix every defect, performance cliff, contract gap, architectural debt item, and release deliverable in the 2026-08-03 Orca audit, then publish and independently verify v0.3.3 on GitHub and npm.
+
+**Release retarget:** On 2026-08-03, `origin/main` already contained the published
+`v0.3.2` release at `10eef6329`. This remediation therefore targets the next
+unused patch, `v0.3.3`; the existing `v032` document filenames remain stable so
+prior links do not break.
 
 **Architecture:** Preserve Orca's single-owner runtime and typed surface while moving blocking work outside Tokio actors, making cancellation operation-owned, fencing TUI events by session attachment, and replacing syntax snapshots with behavioral boundaries. Extract ThreadActor one state machine at a time, invert provider/tool dependencies through provider-neutral schemas, and release only after the complete evidence matrix is green.
 
@@ -46,7 +51,7 @@ Evidence and release:
 
 - docs/reports/2026-08-03-orca-audit-remediation-evidence.md: finding-to-proof ledger.
 - architecture, lifecycle, release, README, release-note, and website documentation.
-- Cargo.toml, Cargo.lock, and npm/orca/package.json: v0.3.2 version sync.
+- Cargo.toml, Cargo.lock, and npm/orca/package.json: v0.3.3 version sync.
 
 ---
 
@@ -806,11 +811,11 @@ git commit -m "refactor(runtime): make surface exports explicit"
 - Modify: crates/orca-runtime/src/acp/supervisor.rs
 - Modify: crates/orca-tui/src/surface_projection.rs
 
-- [ ] **Step 1: Add zero-consumer gate**
+- [x] **Step 1: Add zero-consumer gate**
 
 The contract validator rejects every production import of unstable_surface. Tests must import the curated surface facade.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 node scripts/validate-runtime-surface-contract.mjs
@@ -818,15 +823,15 @@ node scripts/validate-runtime-surface-contract.mjs
 
 Expected: FAIL listing current production consumers.
 
-- [ ] **Step 3: Migrate by capability**
+- [x] **Step 3: Migrate by capability**
 
 Expose only named read, subscription, interaction, operation/task control, ACP, and JSONL types needed by a consumer. Migrate read-only clients first, interaction adapters second, mutation/control last. Never replace the import with another glob.
 
-- [ ] **Step 4: Remove the module**
+- [x] **Step 4: Remove the module**
 
 Delete pub mod unstable_surface after production imports reach zero.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
 ~~~sh
 node scripts/validate-runtime-surface-contract.mjs
@@ -1091,14 +1096,14 @@ git add crates/orca-tui/src/types.rs crates/orca-tui/src/surface_projection.rs c
 git commit -m "test(tui): enforce projection consistency"
 ~~~
 
-### Task 23: Document, Verify, And Publish v0.3.2
+### Task 23: Document, Verify, And Publish v0.3.3
 
 **Files:**
 - Modify: docs/architecture/adr/0005-runtime-host-operation-control-plane.md
 - Modify: docs/superpowers/specs/2026-08-02-tui-session-lifecycle-commands-design.md
 - Modify: docs/release-process.md
 - Modify: README.md and README.zh-CN.md
-- Create: docs/releases/v0.3.2.md
+- Create: docs/releases/v0.3.3.md
 - Modify: site/src/shared.ts and site/src/changelog/Changelog.tsx
 - Modify: Cargo.toml, Cargo.lock, npm/orca/package.json
 - Finalize: docs/reports/2026-08-03-orca-audit-remediation-evidence.md
@@ -1131,9 +1136,9 @@ git diff --check
 
 Expected: all exit 0 before versioning.
 
-- [ ] **Step 4: Prepare v0.3.2**
+- [ ] **Step 4: Prepare v0.3.3**
 
-Set Cargo workspace/package, Cargo.lock, and root npm package to 0.3.2. Write release notes with Changes, Compatibility, Verification, and Upgrade. Add v0.3.2 to site releases and both language summary maps.
+Set Cargo workspace/package, Cargo.lock, and root npm package to 0.3.3. Write release notes with Changes, Compatibility, Verification, and Upgrade. Add v0.3.3 to site releases and both language summary maps.
 
 - [ ] **Step 5: Verify version assets and commit**
 
@@ -1144,7 +1149,7 @@ node scripts/release/test-stage-npm.mjs
 npm --prefix site run build
 npm --prefix site run check:seo
 git add Cargo.toml Cargo.lock npm/orca/package.json docs README.md README.zh-CN.md site
-git commit -m "release: prepare Orca v0.3.2"
+git commit -m "release: prepare Orca v0.3.3"
 ~~~
 
 - [ ] **Step 6: Rerun complete release matrix**
@@ -1165,8 +1170,8 @@ Wait for required Linux and Windows checks, fix failures on the branch, and merg
 After local main equals origin/main and contains release commit:
 
 ~~~sh
-git tag v0.3.2
-git push origin v0.3.2
+git tag v0.3.3
+git push origin v0.3.3
 gh run list --repo echoVic/orca-agent --workflow release.yml --limit 5
 ~~~
 
@@ -1176,13 +1181,13 @@ Never force or recreate an existing tag. Wait for successful publication.
 
 ~~~sh
 node scripts/release/verify-published.mjs \
-  --version 0.3.2 \
+  --version 0.3.3 \
   --repo echoVic/orca-agent \
   --package @blade-ai/orca \
   --bin orca
 ~~~
 
-Also query gh release view and npm for root plus six platform packages. Install @blade-ai/orca@0.3.2 in mktemp -d and require orca --version to report 0.3.2.
+Also query gh release view and npm for root plus six platform packages. Install @blade-ai/orca@0.3.3 in mktemp -d and require orca --version to report 0.3.3.
 
 - [ ] **Step 10: Close the evidence report**
 
