@@ -1,0 +1,50 @@
+name: Runtime Surface Contract
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/orca-runtime/**"
+      - "crates/orca-tui/**"
+      - "docs/superpowers/plans/2026-07-21-runtime-owned-typed-surface-implementation.md"
+      - "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract*"
+      - "scripts/validate-runtime-surface-contract.mjs"
+      - "scripts/test-validate-runtime-surface-contract.mjs"
+      - ".github/workflows/runtime-contract.yml"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/windows-ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/orca-runtime/**"
+      - "crates/orca-tui/**"
+      - "docs/superpowers/plans/2026-07-21-runtime-owned-typed-surface-implementation.md"
+      - "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract*"
+      - "scripts/validate-runtime-surface-contract.mjs"
+      - "scripts/test-validate-runtime-surface-contract.mjs"
+      - ".github/workflows/runtime-contract.yml"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/windows-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate reviewed artifacts and current inventories
+        run: |
+          node --test scripts/test-validate-runtime-surface-contract.mjs
+          node scripts/validate-runtime-surface-contract.mjs
+      - name: Validate dependency graph and Rust inventory
+        run: |
+          cargo metadata --locked --format-version 1 > /dev/null
+          cargo test -p orca-tui runtime_surface_contract --lib --locked

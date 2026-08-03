@@ -219,6 +219,13 @@
     ],
     "current_tui_user_actions": [
       "NewSession",
+      "ForkCurrentSession",
+      "RenameCurrentSession",
+      "ResumeSavedSession",
+      "ForkSavedSession",
+      "RenameSavedSession",
+      "ArchiveSavedSession",
+      "DeleteSavedSession",
       "Submit",
       "SubmitWithMentions",
       "SubmitQueued",
@@ -3843,9 +3850,9 @@
       "ForkCurrentSession",
       "current",
       [
-        "crates/orca-tui/src/types.rs",
-        "crates/orca-tui/src/slash_command_actions.rs",
-        "crates/orca-tui/src/app.rs"
+        "crates/orca-tui/src/types.rs:510",
+        "crates/orca-tui/src/slash_command_actions.rs:203",
+        "crates/orca-tui/src/app.rs:8209"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::ForkCurrentSession{title}",
@@ -3866,14 +3873,14 @@
       "RenameCurrentSession",
       "current",
       [
-        "crates/orca-tui/src/types.rs",
-        "crates/orca-tui/src/slash_command_actions.rs",
-        "crates/orca-tui/src/app.rs"
+        "crates/orca-tui/src/types.rs:513",
+        "crates/orca-tui/src/slash_command_actions.rs:214",
+        "crates/orca-tui/src/app.rs:8248"
       ],
       "host_store_mutation",
       "UserAction::RenameCurrentSession{title}",
       "UpdateSessionMetadata(current,title)",
-      "RuntimeSurfaceHostHandle::rename_saved_session(current,title)",
+      "TuiSurfaceActions::rename_current_session(exact_revision_patch+durable_persist+compensation)",
       [
         "ManageSessionLifecycle"
       ],
@@ -3888,9 +3895,9 @@
       "ResumeSavedSession",
       "current",
       [
-        "crates/orca-tui/src/types.rs",
-        "crates/orca-tui/src/session_picker_actions.rs",
-        "crates/orca-tui/src/app.rs"
+        "crates/orca-tui/src/types.rs:516",
+        "crates/orca-tui/src/session_picker_actions.rs:215",
+        "crates/orca-tui/src/app.rs:8281"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::ResumeSavedSession{session_id}",
@@ -3911,9 +3918,9 @@
       "ForkSavedSession",
       "current",
       [
-        "crates/orca-tui/src/types.rs",
-        "crates/orca-tui/src/session_picker_actions.rs",
-        "crates/orca-tui/src/app.rs"
+        "crates/orca-tui/src/types.rs:519",
+        "crates/orca-tui/src/session_picker_actions.rs:244",
+        "crates/orca-tui/src/app.rs:8323"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::ForkSavedSession{session_id}",
@@ -3934,9 +3941,9 @@
       "RenameSavedSession",
       "current",
       [
-        "crates/orca-tui/src/types.rs",
-        "crates/orca-tui/src/session_picker_actions.rs",
-        "crates/orca-tui/src/app.rs"
+        "crates/orca-tui/src/types.rs:522",
+        "crates/orca-tui/src/session_picker_actions.rs:119",
+        "crates/orca-tui/src/app.rs:8374"
       ],
       "host_store_mutation",
       "UserAction::RenameSavedSession{session_id,title}",
@@ -3956,9 +3963,9 @@
       "ArchiveSavedSession",
       "current",
       [
-        "crates/orca-tui/src/types.rs",
-        "crates/orca-tui/src/session_picker_actions.rs",
-        "crates/orca-tui/src/app.rs"
+        "crates/orca-tui/src/types.rs:526",
+        "crates/orca-tui/src/session_picker_actions.rs:155",
+        "crates/orca-tui/src/app.rs:8387"
       ],
       "host_store_mutation",
       "UserAction::ArchiveSavedSession{session_id}",
@@ -3978,9 +3985,9 @@
       "DeleteSavedSession",
       "current",
       [
-        "crates/orca-tui/src/types.rs",
-        "crates/orca-tui/src/session_picker_actions.rs",
-        "crates/orca-tui/src/app.rs"
+        "crates/orca-tui/src/types.rs:529",
+        "crates/orca-tui/src/session_picker_actions.rs:188",
+        "crates/orca-tui/src/app.rs:8410"
       ],
       "host_store_mutation",
       "UserAction::DeleteSavedSession{session_id}",
@@ -7075,7 +7082,7 @@
   ],
   "phase_0a_manifest_invariants": [
     "source_facts has exactly 53 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 23 unique variants matching UserAction at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 30 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",

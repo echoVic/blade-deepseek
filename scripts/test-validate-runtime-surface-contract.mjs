@@ -10,6 +10,7 @@ import * as validator from "./validate-runtime-surface-contract.mjs";
 const {
   parseManifestText,
   validateArtifactBundle,
+  validateArtifactDigest,
   validateCurrentInventories,
   validateManifestStructure,
   validateRuntimeSurfaceContract,
@@ -19,6 +20,10 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const manifestPath = path.join(
   repoRoot,
   "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json",
+);
+const digestPath = path.join(
+  repoRoot,
+  "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.digest.json",
 );
 const baseline = JSON.parse(readFileSync(manifestPath, "utf8"));
 const productionMutationSites = [
@@ -85,6 +90,16 @@ expectFailure(
     "artifact hash mismatches are rejected",
     () => validateArtifactBundle(manifest, { repoRoot }),
     /private contract SHA-256 mismatch/,
+  );
+}
+
+{
+  const digest = JSON.parse(readFileSync(digestPath, "utf8"));
+  digest.artifacts[0].sha256 = "0".repeat(64);
+  expectFailure(
+    "reviewed artifact digest mismatches are rejected without commit metadata",
+    () => validateArtifactDigest(digest, { repoRoot }),
+    /artifact digest SHA-256 mismatch for .*private-contract\.md/,
   );
 }
 
@@ -316,6 +331,28 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
     "TUI actions must match UserAction",
     () => validateCurrentInventories(manifest, { repoRoot }),
     /current_tui_user_actions does not match current UserAction/,
+  );
+}
+
+{
+  const manifest = cloneManifest();
+  const sessionActions = new Set([
+    "ForkCurrentSession",
+    "RenameCurrentSession",
+    "ResumeSavedSession",
+    "ForkSavedSession",
+    "RenameSavedSession",
+    "ArchiveSavedSession",
+    "DeleteSavedSession",
+  ]);
+  manifest.closed_inventory.current_tui_user_actions =
+    manifest.closed_inventory.current_tui_user_actions.filter(
+      (action) => !sessionActions.has(action),
+    );
+  expectFailure(
+    "inventory drift lists all seven missing current session actions",
+    () => validateCurrentInventories(manifest, { repoRoot }),
+    /missing: ForkCurrentSession, RenameCurrentSession, ResumeSavedSession, ForkSavedSession, RenameSavedSession, ArchiveSavedSession, DeleteSavedSession/,
   );
 }
 
@@ -1065,6 +1102,71 @@ const IGNORED_LITERAL: &str = ".mutate(";\n`;
     productionMutationSites,
     "comment and string contents do not create mutation-capable TUI entrypoints",
   );
+}
+
+{
+  const relativePath = "crates/orca-tui/src/synthetic/scanner.rs";
+  const source = String.raw`
+trait BodylessDeclarations {
+    async fn wait_for<'a>(&'a self, callback: fn(char)) -> Result<(), Error>;
+    fn array(&self, bytes: [u8; 32]);
+}
+
+#[cfg(all(test, target_os = "windows"))]
+#[allow(clippy::let_unit_value)]
+fn ignored_test_only<'a>(value: &'a str) {
+    let _character = '\u{7b}';
+    runtime_thread.mutate(mutation);
+}
+
+#[inline(always)]
+fn discovered_mixed_syntax<'a>(value: &'a str) {
+    let _raw = r###"fn fake() { runtime_thread.mutate(mutation); }"###;
+    let _character = '\x7b';
+    nested_macro!({ inner_macro!({ value.len() }) });
+    /* fn commented() { runtime_thread.mutate(mutation); } */
+    runtime_thread.mutate(mutation);
+}
+`;
+  assert.deepEqual(
+    [...validator.scanTuiMutationEntrypoints({
+      repoRoot,
+      sourcePaths: [relativePath],
+      sourceOverrides: new Map([[relativePath, source]]),
+    })],
+    [[`${relativePath}:discovered_mixed_syntax:thread.mutate`, 1]],
+    "Rust scanning handles attributes, bodyless declarations, raw strings, nested macro tokens, comments, lifetimes, character literals, and cfg(test)",
+  );
+}
+
+for (const [relativePath, minimumOccurrences] of [
+  [".github/workflows/release.yml", 1],
+  [".github/workflows/windows-ci.yml", 2],
+]) {
+  const workflow = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const command of [
+    "node --test scripts/test-validate-runtime-surface-contract.mjs",
+    "node scripts/validate-runtime-surface-contract.mjs",
+  ]) {
+    assert.ok(
+      workflow.split(command).length - 1 >= minimumOccurrences,
+      `${relativePath} must run ${command} in every required job`,
+    );
+  }
+}
+
+{
+  const workflow = readFileSync(
+    path.join(repoRoot, ".github/workflows/runtime-contract.yml"),
+    "utf8",
+  );
+  for (const command of [
+    "node --test scripts/test-validate-runtime-surface-contract.mjs",
+    "node scripts/validate-runtime-surface-contract.mjs",
+    "cargo test -p orca-tui runtime_surface_contract --lib --locked",
+  ]) {
+    assert.ok(workflow.includes(command), `runtime contract workflow must run ${command}`);
+  }
 }
 
 assert.equal(typeof validator.parseRustEnum, "function", "the Rust enum parser is testable");

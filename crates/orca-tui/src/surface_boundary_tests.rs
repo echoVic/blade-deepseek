@@ -405,7 +405,7 @@ pub enum LifetimeFixture<'a> {
 }
 
 #[test]
-fn user_actions_are_exactly_classified_with_required_recovery_variants() {
+fn runtime_surface_contract_user_actions_are_exactly_classified_with_required_recovery_variants() {
     let manifest: serde_json::Value = serde_json::from_str(MANIFEST).expect("manifest JSON");
     let rows = manifest["tui_actions"].as_array().expect("tui_actions");
     let current_rows: Vec<(&str, &str)> = rows
@@ -421,6 +421,19 @@ fn user_actions_are_exactly_classified_with_required_recovery_variants() {
     let current_variants = enum_variants(TYPES, "pub enum UserAction {");
 
     assert_eq!(current_rows, CURRENT_ACTIONS);
+    assert_eq!(
+        manifest["closed_inventory"]["current_tui_user_actions"]
+            .as_array()
+            .expect("closed current actions")
+            .iter()
+            .map(|value| value.as_str().expect("closed current action"))
+            .collect::<Vec<_>>(),
+        CURRENT_ACTIONS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>(),
+        "closed current actions must exactly match the current action rows"
+    );
     let expected = CURRENT_ACTIONS
         .map(|(name, _)| name.to_string())
         .into_iter()
