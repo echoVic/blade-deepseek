@@ -1003,6 +1003,10 @@ export function canonicalSha256(content) {
   return createHash("sha256").update(content).digest("hex");
 }
 
+function canonicalSourceSha256(content) {
+  return canonicalSha256(content.replace(/\r\n?/g, "\n"));
+}
+
 export function parseManifestText(text) {
   try {
     return JSON.parse(text);
@@ -3488,7 +3492,7 @@ function receiverFamiliesAtCall(source, callIndex, receiver, relativePath) {
   return {
     families: resolve(receiver),
     functionName: functionInfo.name,
-    functionSha256: canonicalSha256(
+    functionSha256: canonicalSourceSha256(
       source.slice(functionInfo.declarationStart, functionInfo.bodyEnd),
     ),
   };
@@ -3557,7 +3561,7 @@ function scanTuiMutationSurface({ repoRoot, sourceOverrides, sourcePaths: suppli
         harmlessAssociatedSites.set(key, (harmlessAssociatedSites.get(key) ?? 0) + 1);
         harmlessAssociatedFunctionHashes.set(
           `${relativePath}:${functionInfo.name}`,
-          canonicalSha256(
+          canonicalSourceSha256(
             source.slice(functionInfo.declarationStart, functionInfo.bodyEnd),
           ),
         );
@@ -3580,7 +3584,7 @@ function scanTuiMutationSurface({ repoRoot, sourceOverrides, sourcePaths: suppli
         );
         unresolvedUserActionSendFunctionHashes.set(
           `${relativePath}:${functionInfo.name}`,
-          canonicalSha256(
+          canonicalSourceSha256(
             source.slice(functionInfo.declarationStart, functionInfo.bodyEnd),
           ),
         );

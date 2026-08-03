@@ -422,15 +422,22 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 {
   const relativePath = "crates/orca-tui/src/slash_command_actions.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const sourceWithCrLf = source.replace(/\r?\n/g, "\r\n");
+  const appPath = "crates/orca-tui/src/app.rs";
+  const appWithCrLf = readFileSync(path.join(repoRoot, appPath), "utf8").replace(
+    /\r?\n/g,
+    "\r\n",
+  );
   assert.doesNotThrow(
     () =>
       validateCurrentInventories(cloneManifest(), {
         repoRoot,
         sourceOverrides: new Map([
-          [relativePath, `// inserted without changing an entrypoint\n${source}`],
+          [relativePath, `// inserted without changing an entrypoint\r\n${sourceWithCrLf}`],
+          [appPath, appWithCrLf],
         ]),
       }),
-    "entrypoint validation follows the declared source file when a reviewed line drifts",
+    "entrypoint validation ignores checkout line endings when a reviewed line drifts",
   );
 }
 
@@ -1197,6 +1204,13 @@ for (const [relativePath, minimumOccurrences] of [
   [".github/workflows/windows-ci.yml", 2],
 ]) {
   const workflow = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const fullHistoryCheckouts = workflow.match(
+    /- uses: actions\/checkout@v5\r?\n\s+with:\r?\n\s+fetch-depth: 0/g,
+  );
+  assert.ok(
+    (fullHistoryCheckouts?.length ?? 0) >= minimumOccurrences,
+    `${relativePath} must fetch full history for every runtime contract job`,
+  );
   for (const command of [
     "node --test scripts/test-validate-runtime-surface-contract.mjs",
     "node scripts/validate-runtime-surface-contract.mjs",
@@ -1212,6 +1226,11 @@ for (const [relativePath, minimumOccurrences] of [
   const workflow = readFileSync(
     path.join(repoRoot, ".github/workflows/runtime-contract.yml"),
     "utf8",
+  );
+  assert.match(
+    workflow,
+    /- uses: actions\/checkout@v5\r?\n\s+with:\r?\n\s+fetch-depth: 0/,
+    "runtime contract workflow must fetch the reviewed design commit",
   );
   for (const command of [
     "node --test scripts/test-validate-runtime-surface-contract.mjs",

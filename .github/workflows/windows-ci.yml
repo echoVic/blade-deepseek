@@ -50,6 +50,8 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
@@ -113,6 +115,8 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-pc-windows-msvc
