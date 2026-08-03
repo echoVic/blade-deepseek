@@ -2058,12 +2058,18 @@ mod tests {
         };
         let cancel = CancelToken::new();
         let cancel_after_accept = cancel.clone();
+        let (cancelled_at_tx, cancelled_at_rx) = mpsc::channel();
         let canceller = std::thread::spawn(move || {
             accepted_rx.recv().expect("wait for accepted request");
             cancel_after_accept.cancel();
+            // Report the instant of cancellation so the deadline measures only
+            // the header-wait unblock latency, not the CPU-bound compaction prep
+            // (token counting + summary rendering) that runs before any request.
+            cancelled_at_tx
+                .send(Instant::now())
+                .expect("report cancellation instant");
         });
 
-        let started = Instant::now();
         let result = compact_with_summary_cancellable(
             ProviderKind::DeepSeek,
             &conversation,
@@ -2071,10 +2077,14 @@ mod tests {
             &provider_config,
             &cancel,
         );
-        let elapsed = started.elapsed();
+        let returned_at = Instant::now();
         let connection_closed = closed_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("wait for summary peer close result");
+        let cancelled_at = cancelled_at_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("wait for cancellation instant");
+        let elapsed = returned_at.saturating_duration_since(cancelled_at);
 
         canceller.join().expect("summary canceller");
         server.join().expect("summary server");
