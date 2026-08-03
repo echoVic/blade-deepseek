@@ -763,11 +763,11 @@ git commit -m "test(architecture): replace source text assertions"
 - Modify: crates/orca-runtime/src/runtime_surface/store.rs
 - Test: crates/orca-runtime/tests/runtime_surface_types.rs
 
-- [ ] **Step 1: Add export gate**
+- [x] **Step 1: Add export gate**
 
 Extend the contract validator to compare public exports with the curated manifest. Add a fixture proving pub use commands::* fails.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 node scripts/validate-runtime-surface-contract.mjs
@@ -775,11 +775,11 @@ node scripts/validate-runtime-surface-contract.mjs
 
 Expected: FAIL on wildcard exports.
 
-- [ ] **Step 3: Replace globs**
+- [x] **Step 3: Replace globs**
 
 List exports explicitly in mod.rs. Replace production use super::* imports with exact sibling imports. Test modules may use super::* only when the module itself is the intended test namespace.
 
-- [ ] **Step 4: Run GREEN and commit**
+- [x] **Step 4: Run GREEN and commit**
 
 ~~~sh
 node scripts/validate-runtime-surface-contract.mjs
