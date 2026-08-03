@@ -56,11 +56,19 @@ use crate::provider_stream::{
     RuntimeProviderSuspension, RuntimeProviderSuspensionControl, RuntimeProviderSuspensionEvent,
 };
 use crate::runtime_actor::RuntimeActorEffect;
+use crate::runtime_actor::background::{
+    BackgroundOperationController, BackgroundRetryEffect, BackgroundRetryKey,
+    BackgroundRetryResolution, ManagedBackgroundTask, ScheduledBackgroundRetry,
+};
 use crate::runtime_actor::capability::{
     CapabilityCommitEffect, CapabilityReply, PendingSurfaceCapabilitySettlement,
     PendingSurfaceCapabilityTransition, PendingSurfaceCapabilityWaiterOutcome,
     ResidentSurfaceCapabilityCall, ResidentSurfaceCapabilityWaiter, ResidentTerminalCleanupLease,
     RuntimeCapabilityController,
+};
+use crate::runtime_actor::commit::{
+    GoalRecoverySurfaceCommit, ScheduledSurfaceCommit, SurfaceCommitController,
+    SurfaceCommitEffect, SurfaceCommitResolution, SurfaceCommitRetryKey,
 };
 use crate::runtime_actor::goal::{
     ActiveGoalControl, GoalBlockingCompletion, GoalOperationController, OpenedGoalRuntime,
@@ -7809,11 +7817,7 @@ fn bind_runtime_surface(
             pending_task_ownership: None,
             pending_detaches: HashMap::new(),
             pending_capability_losses: HashMap::new(),
-            pending_background_controls: HashMap::new(),
-            pending_terminalization: None,
-            pending_admission_commits: HashMap::new(),
-            pending_admission_repairs: HashMap::new(),
-            pending_admission_terminals: HashMap::new(),
+            commit: SurfaceCommitController::new(),
         },
     ))
 }
@@ -8695,10 +8699,7 @@ struct ThreadActor {
     executor: Arc<dyn ThreadOperationExecutor>,
     operation_ids: OperationIdAllocator,
     active: Option<ActiveOperation>,
-    background_tasks: HashMap<String, HostBackgroundTask>,
-    background_capacity: usize,
-    background_completion_tx: tokio_mpsc::UnboundedSender<String>,
-    background_completion_rx: tokio_mpsc::UnboundedReceiver<String>,
+    background_controller: ResidentBackgroundController,
     goal_controller: GoalOperationController<
         ThreadCommand,
         PendingSurfaceGoalCompletionRecovery,
@@ -8710,14 +8711,6 @@ struct ThreadActor {
     resident_surface: ResidentSurfaceSlot,
     pending_manual_compaction_completion: Option<PendingManualCompactionCompletion>,
     pending_provider_transfer: Option<PendingTypedProviderTransfer>,
-    pending_workflow_completions:
-        HashMap<surface::SurfaceOperationId, PendingTypedWorkflowCompletion>,
-    pending_provider_preparations:
-        HashMap<surface::SurfaceOperationId, PendingTypedProviderPreparation>,
-    pending_provider_completions:
-        HashMap<surface::SurfaceOperationId, PendingTypedProviderCompletion>,
-    pending_background_approval_resolutions:
-        HashMap<surface::SurfaceOperationId, PendingBackgroundApprovalResolution>,
     pending_surface_stream_redactions:
         HashMap<surface::SurfaceItemId, PendingSurfaceStreamRedaction>,
     live_input_capsules: HashMap<surface::SurfaceOperationId, surface::SurfaceInputRequest>,
@@ -8759,6 +8752,24 @@ type ResidentCapabilityController = RuntimeCapabilityController<
     PendingSurfaceTerminalCommit,
 >;
 
+type ResidentBackgroundController = BackgroundOperationController<
+    HostBackgroundTask,
+    TypedWorkflowBackground,
+    TypedProviderBackground,
+    PendingTypedWorkflowCompletion,
+    PendingTypedProviderPreparation,
+    PendingTypedProviderCompletion,
+    PendingBackgroundApprovalResolution,
+    PendingSurfaceBackgroundControl,
+>;
+
+type ResidentCommitController = SurfaceCommitController<
+    PreparedSurfaceTerminalization,
+    PendingSurfaceAdmissionCommit,
+    PendingSurfaceAdmissionRepair,
+    PendingSurfaceAdmissionTerminal,
+>;
+
 struct ResidentSurfaceState {
     coordinator: surface::RuntimeCommitCoordinator<'static, surface::RuntimeSurfaceCommitLedger>,
     hub: surface::SurfaceHub,
@@ -8769,13 +8780,7 @@ struct ResidentSurfaceState {
     pending_task_ownership: Option<PendingSurfaceTaskOwnership>,
     pending_detaches: HashMap<surface::SurfaceAttachmentId, PendingSurfaceDetach>,
     pending_capability_losses: HashMap<surface::SurfaceAttachmentId, PendingSurfaceCapabilityLoss>,
-    pending_background_controls:
-        HashMap<surface::SurfaceOperationId, PendingSurfaceBackgroundControl>,
-    pending_terminalization: Option<PreparedSurfaceTerminalization>,
-    pending_admission_commits: HashMap<surface::SurfaceOperationId, PendingSurfaceAdmissionCommit>,
-    pending_admission_repairs: HashMap<surface::SurfaceOperationId, PendingSurfaceAdmissionRepair>,
-    pending_admission_terminals:
-        HashMap<surface::SurfaceOperationId, PendingSurfaceAdmissionTerminal>,
+    commit: ResidentCommitController,
 }
 
 struct ResidentSurfaceInteraction {
@@ -8821,6 +8826,26 @@ struct PendingSurfaceAdmissionRepair {
     retry_at: tokio::time::Instant,
 }
 
+impl ScheduledSurfaceCommit for PendingSurfaceAdmissionRepair {
+    fn operation_id(&self) -> &surface::SurfaceOperationId {
+        &self.fence.operation_id
+    }
+
+    fn retry_at(&self) -> tokio::time::Instant {
+        self.retry_at
+    }
+
+    fn defer_until(&mut self, retry_at: tokio::time::Instant) {
+        self.retry_at = retry_at;
+    }
+}
+
+impl GoalRecoverySurfaceCommit for PendingSurfaceAdmissionRepair {
+    fn owns_goal_recovery(&self) -> bool {
+        self.goal_recovery_owned
+    }
+}
+
 #[derive(Clone)]
 struct PendingSurfaceGoalAdmissionCommit {
     runtime: GoalRuntimeHandle,
@@ -8836,6 +8861,20 @@ struct PendingSurfaceAdmissionCommit {
     goal: Option<PendingSurfaceGoalAdmissionCommit>,
     message: &'static str,
     retry_at: tokio::time::Instant,
+}
+
+impl ScheduledSurfaceCommit for PendingSurfaceAdmissionCommit {
+    fn operation_id(&self) -> &surface::SurfaceOperationId {
+        &self.fence.operation_id
+    }
+
+    fn retry_at(&self) -> tokio::time::Instant {
+        self.retry_at
+    }
+
+    fn defer_until(&mut self, retry_at: tokio::time::Instant) {
+        self.retry_at = retry_at;
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -8878,6 +8917,16 @@ struct PendingBackgroundApprovalResolution {
     decision: surface::SurfaceAllowDeny,
     pending_commit: Option<PendingBackgroundApprovalCommit>,
     retry_at: tokio::time::Instant,
+}
+
+impl ScheduledBackgroundRetry for PendingBackgroundApprovalResolution {
+    fn retry_at(&self) -> tokio::time::Instant {
+        self.retry_at
+    }
+
+    fn defer_until(&mut self, retry_at: tokio::time::Instant) {
+        self.retry_at = retry_at;
+    }
 }
 
 #[derive(Clone)]
@@ -8929,8 +8978,17 @@ struct PendingSurfaceBackgroundControl {
     fence: surface::SurfaceBackgroundFence,
     batch: surface::SurfaceCommitBatch,
     task_id: surface::SurfaceTaskId,
-    cancel: CancelToken,
     retry_at: tokio::time::Instant,
+}
+
+impl ScheduledBackgroundRetry for PendingSurfaceBackgroundControl {
+    fn retry_at(&self) -> tokio::time::Instant {
+        self.retry_at
+    }
+
+    fn defer_until(&mut self, retry_at: tokio::time::Instant) {
+        self.retry_at = retry_at;
+    }
 }
 
 struct PendingTypedProviderTransfer {
@@ -8967,6 +9025,20 @@ struct PreparedSurfaceTerminalization {
     interaction_ids: Vec<surface::SurfaceInteractionId>,
     capability_call_ids: Vec<surface::SurfaceCapabilityCallId>,
     retry_at: tokio::time::Instant,
+}
+
+impl ScheduledSurfaceCommit for PreparedSurfaceTerminalization {
+    fn operation_id(&self) -> &surface::SurfaceOperationId {
+        &self.fence.operation_id
+    }
+
+    fn retry_at(&self) -> tokio::time::Instant {
+        self.retry_at
+    }
+
+    fn defer_until(&mut self, retry_at: tokio::time::Instant) {
+        self.retry_at = retry_at;
+    }
 }
 
 #[derive(Clone)]
@@ -10810,7 +10882,7 @@ fn pending_capability_loss_for_test(
 fn pending_terminalization_for_test(
     state: &ResidentSurfaceState,
 ) -> Option<PendingTerminalizationTestProbe> {
-    state.pending_terminalization.as_ref().map(|pending| {
+    state.commit.inspect_terminalization(|pending| {
         let surface::CommitClass::Recorded { commit_id, .. } = &pending.batch.commit_class else {
             unreachable!("recorded runtime surface used ephemeral commit class")
         };
@@ -10837,6 +10909,26 @@ struct PendingSurfaceAdmissionTerminal {
     pending: PendingSurfaceTerminalCommit,
     goal_recovery_owned: bool,
     retry_at: tokio::time::Instant,
+}
+
+impl ScheduledSurfaceCommit for PendingSurfaceAdmissionTerminal {
+    fn operation_id(&self) -> &surface::SurfaceOperationId {
+        &self.pending.value.operation_id
+    }
+
+    fn retry_at(&self) -> tokio::time::Instant {
+        self.retry_at
+    }
+
+    fn defer_until(&mut self, retry_at: tokio::time::Instant) {
+        self.retry_at = retry_at;
+    }
+}
+
+impl GoalRecoverySurfaceCommit for PendingSurfaceAdmissionTerminal {
+    fn owns_goal_recovery(&self) -> bool {
+        self.goal_recovery_owned
+    }
 }
 
 struct ThreadActorState {
@@ -10976,6 +11068,26 @@ struct HostBackgroundTask {
     typed_provider: Option<TypedProviderBackground>,
 }
 
+impl ManagedBackgroundTask<TypedWorkflowBackground, TypedProviderBackground>
+    for HostBackgroundTask
+{
+    fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    fn workflow(&self) -> Option<&TypedWorkflowBackground> {
+        self.typed_workflow.as_ref()
+    }
+
+    fn provider(&self) -> Option<&TypedProviderBackground> {
+        self.typed_provider.as_ref()
+    }
+
+    fn attach_workflow(&mut self, workflow: TypedWorkflowBackground) {
+        self.typed_workflow = Some(workflow);
+    }
+}
+
 #[derive(Clone)]
 struct TypedWorkflowBackground {
     fence: surface::SurfaceBackgroundFence,
@@ -11035,6 +11147,16 @@ struct PendingTypedProviderPreparation {
     retry_at: tokio::time::Instant,
 }
 
+impl ScheduledBackgroundRetry for PendingTypedProviderPreparation {
+    fn retry_at(&self) -> tokio::time::Instant {
+        self.retry_at
+    }
+
+    fn defer_until(&mut self, retry_at: tokio::time::Instant) {
+        self.retry_at = retry_at;
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TypedProviderCompletionStage {
     Completion,
@@ -11059,6 +11181,16 @@ struct PendingTypedProviderCompletion {
     retry_at: tokio::time::Instant,
 }
 
+impl ScheduledBackgroundRetry for PendingTypedProviderCompletion {
+    fn retry_at(&self) -> tokio::time::Instant {
+        self.retry_at
+    }
+
+    fn defer_until(&mut self, retry_at: tokio::time::Instant) {
+        self.retry_at = retry_at;
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TypedWorkflowCompletionStage {
     Completion,
@@ -11078,6 +11210,16 @@ struct PendingTypedWorkflowCompletion {
     terminal_value: Option<surface::OperationTerminalAtCursor>,
     stage: TypedWorkflowCompletionStage,
     retry_at: tokio::time::Instant,
+}
+
+impl ScheduledBackgroundRetry for PendingTypedWorkflowCompletion {
+    fn retry_at(&self) -> tokio::time::Instant {
+        self.retry_at
+    }
+
+    fn defer_until(&mut self, retry_at: tokio::time::Instant) {
+        self.retry_at = retry_at;
+    }
 }
 
 struct ProviderBackgroundTaskContext {
@@ -11594,12 +11736,12 @@ impl ThreadActor {
             Err(_)
                 if self
                     .resident_surface
-                    .pending_admission_repairs
-                    .contains_key(&operation_id)
+                    .commit
+                    .has_admission_repair(&operation_id)
                     || self
                         .resident_surface
-                        .pending_admission_terminals
-                        .contains_key(&operation_id) =>
+                        .commit
+                        .has_admission_terminal(&operation_id) =>
             {
                 Ok(())
             }
@@ -18725,8 +18867,8 @@ impl ThreadActor {
             let operation_id = pending.fence.operation_id.clone();
             if let Err(error) = self.settle_background_approval_resolution(&mut pending) {
                 eprintln!("orca: background approval settlement deferred: {error}");
-                self.pending_background_approval_resolutions
-                    .insert(operation_id, pending);
+                self.background_controller
+                    .retain_approval_resolution(operation_id, pending);
             }
         }
         if let Some(waiter) = waiter {
@@ -20357,30 +20499,12 @@ impl ThreadActor {
             .into_iter()
             .flat_map(|resident| {
                 resident
-                    .pending_admission_commits
-                    .values()
-                    .map(|pending| pending.retry_at)
+                    .commit
+                    .next_retry_at()
+                    .into_iter()
                     .chain(
                         resident
                             .pending_task_ownership
-                            .iter()
-                            .map(|pending| pending.retry_at),
-                    )
-                    .chain(
-                        resident
-                            .pending_admission_repairs
-                            .values()
-                            .map(|pending| pending.retry_at),
-                    )
-                    .chain(
-                        resident
-                            .pending_admission_terminals
-                            .values()
-                            .map(|pending| pending.retry_at),
-                    )
-                    .chain(
-                        resident
-                            .pending_terminalization
                             .iter()
                             .map(|pending| pending.retry_at),
                     )
@@ -20403,12 +20527,6 @@ impl ThreadActor {
                             .map(|pending| pending.retry_at),
                     )
                     .chain(resident.capability.pending_transition_retry_times())
-                    .chain(
-                        resident
-                            .pending_background_controls
-                            .values()
-                            .map(|pending| pending.retry_at),
-                    )
             })
             .chain(
                 self.pending_manual_compaction_completion
@@ -20426,26 +20544,7 @@ impl ThreadActor {
                     .iter()
                     .map(|pending| pending.retry_at),
             )
-            .chain(
-                self.pending_workflow_completions
-                    .values()
-                    .map(|pending| pending.retry_at),
-            )
-            .chain(
-                self.pending_provider_preparations
-                    .values()
-                    .map(|pending| pending.retry_at),
-            )
-            .chain(
-                self.pending_provider_completions
-                    .values()
-                    .map(|pending| pending.retry_at),
-            )
-            .chain(
-                self.pending_background_approval_resolutions
-                    .values()
-                    .map(|pending| pending.retry_at),
-            )
+            .chain(self.background_controller.next_retry_at().into_iter())
             .min()
     }
 
@@ -20460,15 +20559,7 @@ impl ThreadActor {
                 .0
                 .as_ref()
                 .into_iter()
-                .flat_map(|resident| resident.pending_admission_repairs.values())
-                .any(|pending| pending.goal_recovery_owned)
-            || self
-                .resident_surface
-                .0
-                .as_ref()
-                .into_iter()
-                .flat_map(|resident| resident.pending_admission_terminals.values())
-                .any(|pending| pending.goal_recovery_owned)
+                .any(|resident| resident.commit.has_goal_recovery_owner())
     }
 
     fn pending_goal_completion_recovery_operation_id(&self) -> Option<surface::SurfaceOperationId> {
@@ -20486,22 +20577,7 @@ impl ThreadActor {
                     .0
                     .as_ref()
                     .into_iter()
-                    .flat_map(|resident| resident.pending_admission_repairs.iter())
-                    .filter(|(_, pending)| pending.goal_recovery_owned)
-                    .map(|(operation_id, _)| operation_id)
-                    .min()
-                    .cloned()
-            })
-            .or_else(|| {
-                self.resident_surface
-                    .0
-                    .as_ref()
-                    .into_iter()
-                    .flat_map(|resident| resident.pending_admission_terminals.iter())
-                    .filter(|(_, pending)| pending.goal_recovery_owned)
-                    .map(|(operation_id, _)| operation_id)
-                    .min()
-                    .cloned()
+                    .find_map(|resident| resident.commit.goal_recovery_operation_id())
             })
     }
 
@@ -20600,11 +20676,9 @@ impl ThreadActor {
     }
 
     fn retry_surface_admission_repair(&mut self, operation_id: &surface::SurfaceOperationId) {
-        let Some(pending) = self
-            .resident_surface
-            .pending_admission_repairs
-            .get(operation_id)
-            .cloned()
+        let key = SurfaceCommitRetryKey::AdmissionRepair(operation_id.clone());
+        let Some(SurfaceCommitEffect::AdmissionRepair(pending)) =
+            self.resident_surface.commit.begin_attempt(&key)
         else {
             return;
         };
@@ -20619,19 +20693,14 @@ impl ThreadActor {
             )
             .is_err()
         {
-            if let Some(retained) = self
-                .resident_surface
-                .pending_admission_repairs
-                .get_mut(operation_id)
-            {
-                retained.retry_at =
-                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-            }
+            self.resident_surface.commit.resolve_attempt(
+                SurfaceCommitEffect::AdmissionRepair(pending),
+                SurfaceCommitResolution::RetryAt(
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                ),
+            );
             return;
         }
-        self.resident_surface
-            .pending_admission_repairs
-            .remove(operation_id);
         let terminal_batch = self.surface_operation_batch_with_commit_id(
             operation_id,
             vec![surface::OperationPatch::Terminal {
@@ -20654,7 +20723,7 @@ impl ThreadActor {
         );
         let value = surface::OperationTerminalAtCursor {
             operation_id: operation_id.clone(),
-            terminal: pending.terminal,
+            terminal: pending.terminal.clone(),
             cursor: terminal_batch.cursor_after.clone(),
             commit_class: terminal_batch.commit_class.clone(),
             batch_digest: terminal_batch.batch_digest.clone(),
@@ -20668,7 +20737,7 @@ impl ThreadActor {
             let finalize_intent_id = pending.finalize_intent_id.clone();
             let terminal_commit_id = pending.terminal_commit_id.clone();
             let repair = surface::RetryFinalizationToken::new(
-                pending.original_request_id,
+                pending.original_request_id.clone(),
                 pending.fence.thread_id.clone(),
                 operation_id.clone(),
                 finalize_intent_id.clone(),
@@ -20692,8 +20761,20 @@ impl ThreadActor {
                 goal_recovery_owned: pending.goal_recovery_owned,
                 retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
             });
+            self.resident_surface.commit.resolve_attempt(
+                SurfaceCommitEffect::AdmissionRepair(pending),
+                SurfaceCommitResolution::Committed,
+            );
             return;
         }
+        let Some(SurfaceCommitEffect::AdmissionRepair(pending)) =
+            self.resident_surface.commit.resolve_attempt(
+                SurfaceCommitEffect::AdmissionRepair(pending),
+                SurfaceCommitResolution::Committed,
+            )
+        else {
+            unreachable!("committed admission repair effect must be returned")
+        };
         self.cache_surface_terminal(value);
         if let (Some(completion), Some(terminal)) =
             (pending.legacy_completion, pending.legacy_terminal)
@@ -20708,11 +20789,9 @@ impl ThreadActor {
     }
 
     fn retry_surface_admission_commit(&mut self, operation_id: &surface::SurfaceOperationId) {
-        let Some(pending) = self
-            .resident_surface
-            .pending_admission_commits
-            .get(operation_id)
-            .cloned()
+        let key = SurfaceCommitRetryKey::AdmissionCommit(operation_id.clone());
+        let Some(SurfaceCommitEffect::AdmissionCommit(pending)) =
+            self.resident_surface.commit.begin_attempt(&key)
         else {
             return;
         };
@@ -20728,20 +20807,23 @@ impl ThreadActor {
                 .commit_actor_batch(&pending.batch),
         };
         if commit.is_err() {
-            if let Some(retained) = self
-                .resident_surface
-                .pending_admission_commits
-                .get_mut(operation_id)
-            {
-                retained.retry_at =
-                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-            }
+            self.resident_surface.commit.resolve_attempt(
+                SurfaceCommitEffect::AdmissionCommit(pending),
+                SurfaceCommitResolution::RetryAt(
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                ),
+            );
             return;
         }
-        self.resident_surface
-            .pending_admission_commits
-            .remove(operation_id);
-        if let Some(goal) = pending.goal {
+        let Some(SurfaceCommitEffect::AdmissionCommit(pending)) =
+            self.resident_surface.commit.resolve_attempt(
+                SurfaceCommitEffect::AdmissionCommit(pending),
+                SurfaceCommitResolution::Committed,
+            )
+        else {
+            unreachable!("committed admission commit effect must be returned")
+        };
+        if let Some(goal) = pending.goal.as_ref() {
             Self::acknowledge_goal_surface_mutation_best_effort(&goal.runtime, &goal.mutation);
         }
         if let Err(error) = self.repair_surface_admission_failure(&pending.fence, pending.message) {
@@ -20753,11 +20835,9 @@ impl ThreadActor {
     }
 
     fn retry_surface_admission_terminal(&mut self, operation_id: &surface::SurfaceOperationId) {
-        let Some(pending) = self
-            .resident_surface
-            .pending_admission_terminals
-            .get(operation_id)
-            .cloned()
+        let key = SurfaceCommitRetryKey::AdmissionTerminal(operation_id.clone());
+        let Some(SurfaceCommitEffect::AdmissionTerminal(pending)) =
+            self.resident_surface.commit.begin_attempt(&key)
         else {
             return;
         };
@@ -20777,23 +20857,30 @@ impl ThreadActor {
             )
             .is_err()
         {
-            if let Some(retained) = self
-                .resident_surface
-                .pending_admission_terminals
-                .get_mut(operation_id)
-            {
-                retained.retry_at =
-                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-            }
+            self.resident_surface.commit.resolve_attempt(
+                SurfaceCommitEffect::AdmissionTerminal(pending),
+                SurfaceCommitResolution::RetryAt(
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                ),
+            );
             return;
         }
-        self.resident_surface
-            .pending_admission_terminals
-            .remove(operation_id);
-        self.cache_surface_terminal(pending.pending.value);
+        let Some(SurfaceCommitEffect::AdmissionTerminal(pending)) =
+            self.resident_surface.commit.resolve_attempt(
+                SurfaceCommitEffect::AdmissionTerminal(pending),
+                SurfaceCommitResolution::Committed,
+            )
+        else {
+            unreachable!("committed admission terminal effect must be returned")
+        };
+        let PendingSurfaceAdmissionTerminal {
+            pending: terminal_pending,
+            ..
+        } = pending;
+        self.cache_surface_terminal(terminal_pending.value);
         if let (Some(completion), Some(terminal)) = (
-            pending.pending.legacy_completion,
-            pending.pending.legacy_terminal,
+            terminal_pending.legacy_completion,
+            terminal_pending.legacy_terminal,
         ) {
             self.goal_controller.clear_active(terminal.operation_id);
             let completed = completion.complete(terminal);
@@ -20876,44 +20963,32 @@ impl ThreadActor {
                 PendingSurfaceTransitionRetry::ProviderTransfer(pending.fence.operation_id.clone()),
             )
         });
-        let workflow_completions =
-            self.pending_workflow_completions
-                .iter()
-                .map(|(operation_id, pending)| {
-                    (
-                        pending.retry_at,
-                        PendingSurfaceTransitionRetry::WorkflowCompletion(operation_id.clone()),
-                    )
+        let background_retries =
+            self.background_controller
+                .next_retry()
+                .into_iter()
+                .map(|(retry_at, key)| {
+                    let retry = match key {
+                        BackgroundRetryKey::WorkflowCompletion(operation_id) => {
+                            PendingSurfaceTransitionRetry::WorkflowCompletion(operation_id)
+                        }
+                        BackgroundRetryKey::ProviderPreparation(operation_id) => {
+                            PendingSurfaceTransitionRetry::ProviderPreparation(operation_id)
+                        }
+                        BackgroundRetryKey::ProviderCompletion(operation_id) => {
+                            PendingSurfaceTransitionRetry::ProviderCompletion(operation_id)
+                        }
+                        BackgroundRetryKey::ApprovalResolution(operation_id) => {
+                            PendingSurfaceTransitionRetry::BackgroundApprovalResolution(
+                                operation_id,
+                            )
+                        }
+                        BackgroundRetryKey::Control(operation_id) => {
+                            PendingSurfaceTransitionRetry::BackgroundControl(operation_id)
+                        }
+                    };
+                    (retry_at, retry)
                 });
-        let provider_completions =
-            self.pending_provider_completions
-                .iter()
-                .map(|(operation_id, pending)| {
-                    (
-                        pending.retry_at,
-                        PendingSurfaceTransitionRetry::ProviderCompletion(operation_id.clone()),
-                    )
-                });
-        let provider_preparations =
-            self.pending_provider_preparations
-                .iter()
-                .map(|(operation_id, pending)| {
-                    (
-                        pending.retry_at,
-                        PendingSurfaceTransitionRetry::ProviderPreparation(operation_id.clone()),
-                    )
-                });
-        let background_approval_resolutions = self
-            .pending_background_approval_resolutions
-            .iter()
-            .map(|(operation_id, pending)| {
-                (
-                    pending.retry_at,
-                    PendingSurfaceTransitionRetry::BackgroundApprovalResolution(
-                        operation_id.clone(),
-                    ),
-                )
-            });
         let background_interaction_routes = self.resident_surface.interactions.iter().filter_map(
             |(interaction_id, interaction)| {
                 interaction
@@ -20939,121 +21014,81 @@ impl ThreadActor {
                     PendingSurfaceTransitionRetry::TaskOwnership(pending.operation_id.clone()),
                 )
             });
+        let commit_retries =
+            self.resident_surface
+                .commit
+                .next_retry()
+                .into_iter()
+                .map(|(retry_at, key)| {
+                    let retry = match key {
+                        SurfaceCommitRetryKey::AdmissionCommit(operation_id) => {
+                            PendingSurfaceTransitionRetry::AdmissionCommit(operation_id)
+                        }
+                        SurfaceCommitRetryKey::AdmissionRepair(operation_id) => {
+                            PendingSurfaceTransitionRetry::AdmissionRepair(operation_id)
+                        }
+                        SurfaceCommitRetryKey::AdmissionTerminal(operation_id) => {
+                            PendingSurfaceTransitionRetry::AdmissionTerminal(operation_id)
+                        }
+                        SurfaceCommitRetryKey::Terminalization(operation_id) => {
+                            PendingSurfaceTransitionRetry::PreparedTerminalization(operation_id)
+                        }
+                    };
+                    (retry_at, retry)
+                });
+        let private_responses = self.resident_surface.interactions.iter().filter_map(
+            |(interaction_id, interaction)| {
+                interaction
+                    .private_response
+                    .as_ref()
+                    .and_then(|private| private.retry_at)
+                    .map(|retry_at| {
+                        (
+                            retry_at,
+                            PendingSurfaceTransitionRetry::PrivateResponse(interaction_id.clone()),
+                        )
+                    })
+            },
+        );
+        let capability_retries = self
+            .resident_surface
+            .capability
+            .pending_transition_retries()
+            .map(|(call_id, retry_at)| {
+                (
+                    retry_at,
+                    PendingSurfaceTransitionRetry::CapabilityTransition(call_id),
+                )
+            });
+        let detaches =
+            self.resident_surface
+                .pending_detaches
+                .iter()
+                .map(|(attachment_id, pending)| {
+                    (
+                        pending.retry_at,
+                        PendingSurfaceTransitionRetry::Detach(attachment_id.clone()),
+                    )
+                });
+        let capability_losses = self.resident_surface.pending_capability_losses.iter().map(
+            |(attachment_id, pending)| {
+                (
+                    pending.retry_at,
+                    PendingSurfaceTransitionRetry::CapabilityLoss(attachment_id.clone()),
+                )
+            },
+        );
         let Some((_, retry)) = manual_compaction
             .chain(goal_completion)
             .chain(provider_transfer)
-            .chain(workflow_completions)
-            .chain(provider_preparations)
-            .chain(provider_completions)
-            .chain(background_approval_resolutions)
+            .chain(background_retries)
             .chain(background_interaction_routes)
             .chain(task_ownership)
-            .chain(
-                self.resident_surface
-                    .pending_background_controls
-                    .iter()
-                    .map(|(operation_id, pending)| {
-                        (
-                            pending.retry_at,
-                            PendingSurfaceTransitionRetry::BackgroundControl(operation_id.clone()),
-                        )
-                    })
-                    .chain(
-                        self.resident_surface
-                            .pending_admission_repairs
-                            .values()
-                            .map(|pending| {
-                                (
-                                    pending.retry_at,
-                                    PendingSurfaceTransitionRetry::AdmissionRepair(
-                                        pending.fence.operation_id.clone(),
-                                    ),
-                                )
-                            })
-                            .chain(self.resident_surface.pending_admission_commits.iter().map(
-                                |(operation_id, pending)| {
-                                    (
-                                        pending.retry_at,
-                                        PendingSurfaceTransitionRetry::AdmissionCommit(
-                                            operation_id.clone(),
-                                        ),
-                                    )
-                                },
-                            ))
-                            .chain(self.resident_surface.pending_terminalization.iter().map(
-                                |pending| {
-                                    (
-                                        pending.retry_at,
-                                        PendingSurfaceTransitionRetry::PreparedTerminalization(
-                                            pending.fence.operation_id.clone(),
-                                        ),
-                                    )
-                                },
-                            ))
-                            .chain(
-                                self.resident_surface
-                                    .pending_admission_terminals
-                                    .iter()
-                                    .map(|(operation_id, pending)| {
-                                        (
-                                            pending.retry_at,
-                                            PendingSurfaceTransitionRetry::AdmissionTerminal(
-                                                operation_id.clone(),
-                                            ),
-                                        )
-                                    }),
-                            )
-                            .chain(self.resident_surface.interactions.iter().filter_map(
-                                |(interaction_id, interaction)| {
-                                    interaction
-                                        .private_response
-                                        .as_ref()
-                                        .and_then(|private| private.retry_at)
-                                        .map(|retry_at| {
-                                            (
-                                                retry_at,
-                                                PendingSurfaceTransitionRetry::PrivateResponse(
-                                                    interaction_id.clone(),
-                                                ),
-                                            )
-                                        })
-                                },
-                            ))
-                            .chain(
-                                self.resident_surface
-                                    .capability
-                                    .pending_transition_retries()
-                                    .map(|(call_id, retry_at)| {
-                                        (
-                                            retry_at,
-                                            PendingSurfaceTransitionRetry::CapabilityTransition(
-                                                call_id,
-                                            ),
-                                        )
-                                    }),
-                            )
-                            .chain(self.resident_surface.pending_detaches.iter().map(
-                                |(attachment_id, pending)| {
-                                    (
-                                        pending.retry_at,
-                                        PendingSurfaceTransitionRetry::Detach(
-                                            attachment_id.clone(),
-                                        ),
-                                    )
-                                },
-                            ))
-                            .chain(self.resident_surface.pending_capability_losses.iter().map(
-                                |(attachment_id, pending)| {
-                                    (
-                                        pending.retry_at,
-                                        PendingSurfaceTransitionRetry::CapabilityLoss(
-                                            attachment_id.clone(),
-                                        ),
-                                    )
-                                },
-                            )),
-                    ),
-            )
+            .chain(commit_retries)
+            .chain(private_responses)
+            .chain(capability_retries)
+            .chain(detaches)
+            .chain(capability_losses)
             .min()
         else {
             return;
@@ -21120,21 +21155,31 @@ impl ThreadActor {
             return;
         }
         if let PendingSurfaceTransitionRetry::BackgroundApprovalResolution(operation_id) = retry {
-            let Some(mut pending) = self
-                .pending_background_approval_resolutions
-                .remove(&operation_id)
+            let key = BackgroundRetryKey::ApprovalResolution(operation_id);
+            let Some(BackgroundRetryEffect::ApprovalResolution {
+                operation_id,
+                mut pending,
+            }) = self.background_controller.begin_retry(&key)
             else {
                 return;
             };
-            if self
+            let resolution = if self
                 .settle_background_approval_resolution(&mut pending)
                 .is_err()
             {
-                pending.retry_at =
-                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-                self.pending_background_approval_resolutions
-                    .insert(operation_id, pending);
-            }
+                BackgroundRetryResolution::RetryAt(
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                )
+            } else {
+                BackgroundRetryResolution::Settled
+            };
+            self.background_controller.resolve_retry(
+                BackgroundRetryEffect::ApprovalResolution {
+                    operation_id,
+                    pending,
+                },
+                resolution,
+            );
             return;
         }
         if let PendingSurfaceTransitionRetry::BackgroundInteractionRoute(interaction_id) = retry {
@@ -21162,11 +21207,12 @@ impl ThreadActor {
             return;
         }
         if let PendingSurfaceTransitionRetry::PreparedTerminalization(operation_id) = retry {
-            let pending = self
-                .resident_surface
-                .pending_terminalization
-                .clone()
-                .expect("selected terminalization remains pending");
+            let key = SurfaceCommitRetryKey::Terminalization(operation_id.clone());
+            let Some(SurfaceCommitEffect::Terminalization(pending)) =
+                self.resident_surface.commit.begin_attempt(&key)
+            else {
+                return;
+            };
             debug_assert_eq!(pending.fence.operation_id, operation_id);
             if self
                 .resident_surface
@@ -21177,13 +21223,22 @@ impl ThreadActor {
                 )
                 .is_err()
             {
-                if let Some(retained) = self.resident_surface.pending_terminalization.as_mut() {
-                    retained.retry_at =
-                        tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-                }
+                self.resident_surface.commit.resolve_attempt(
+                    SurfaceCommitEffect::Terminalization(pending),
+                    SurfaceCommitResolution::RetryAt(
+                        tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                    ),
+                );
                 return;
             }
-            self.resident_surface.pending_terminalization = None;
+            let Some(SurfaceCommitEffect::Terminalization(pending)) =
+                self.resident_surface.commit.resolve_attempt(
+                    SurfaceCommitEffect::Terminalization(pending),
+                    SurfaceCommitResolution::Committed,
+                )
+            else {
+                unreachable!("committed terminalization effect must be returned")
+            };
             if let Some(active) = active.as_deref_mut()
                 && active.surface_operation.as_ref() == Some(&pending.fence)
             {
@@ -21439,9 +21494,7 @@ impl ThreadActor {
     > {
         if self.pending_manual_compaction_completion.is_some()
             || !self.resident_surface.capability.pending_terminals_empty()
-            || !self.resident_surface.pending_admission_commits.is_empty()
-            || !self.resident_surface.pending_admission_repairs.is_empty()
-            || !self.resident_surface.pending_admission_terminals.is_empty()
+            || self.resident_surface.commit.has_pending_admission()
             || self.surface_terminal_blocked.is_some()
         {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
@@ -21834,14 +21887,12 @@ impl ThreadActor {
         }
         if self.active.is_some()
             || self.pending_manual_compaction_completion.is_some()
-            || !self.background_tasks.is_empty()
+            || !self.background_controller.is_empty()
             || !self.resident_surface.interactions.is_empty()
             || !self.resident_surface.pending_detaches.is_empty()
             || !self.resident_surface.pending_capability_losses.is_empty()
             || !self.resident_surface.capability.pending_terminals_empty()
-            || !self.resident_surface.pending_admission_commits.is_empty()
-            || !self.resident_surface.pending_admission_repairs.is_empty()
-            || !self.resident_surface.pending_admission_terminals.is_empty()
+            || self.resident_surface.commit.has_pending_admission()
             || self.surface_terminal_blocked.is_some()
         {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
@@ -22189,17 +22240,20 @@ impl ThreadActor {
         {
             return Ok(None);
         }
-        let typed = self.background_tasks.values().find_map(|background_task| {
-            background_task
-                .typed_provider
-                .as_ref()
-                .filter(|typed| {
-                    typed.task_id == task.task_id
-                        && typed.fence == background.fence
-                        && typed.fence.operation_fence == *requested_fence
-                })
-                .cloned()
-        });
+        let typed = self
+            .background_controller
+            .tasks()
+            .find_map(|background_task| {
+                background_task
+                    .typed_provider
+                    .as_ref()
+                    .filter(|typed| {
+                        typed.task_id == task.task_id
+                            && typed.fence == background.fence
+                            && typed.fence.operation_fence == *requested_fence
+                    })
+                    .cloned()
+            });
         let Some(typed) = typed else {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         };
@@ -22383,13 +22437,11 @@ impl ThreadActor {
         if !self.bind_surface_operation_controller(client, parent_operation) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        let owns_background_provider = self.background_tasks.values().any(|background| {
-            background.typed_provider.as_ref().is_some_and(|typed| {
-                typed.task_id == task.task_id
-                    && typed.fence.operation_fence.operation_id == *parent_operation
-                    && (task.background_fence.is_none()
-                        || Some(&typed.fence) == task.background_fence.as_ref())
-            })
+        let owns_background_provider = self.background_controller.has_provider_matching(|typed| {
+            typed.task_id == task.task_id
+                && typed.fence.operation_fence.operation_id == *parent_operation
+                && (task.background_fence.is_none()
+                    || Some(&typed.fence) == task.background_fence.as_ref())
         });
         let owns_suspended_background_approval = foreground
             && task.status == surface::SurfaceTaskStatus::ApprovalRequired
@@ -22859,10 +22911,13 @@ impl ThreadActor {
                         Some(tool_use_id),
                     )]),
                 );
-                self.background_tasks
-                    .get_mut(&launched_task_id)
-                    .expect("activated workflow background task was registered")
-                    .typed_workflow = Some(typed_workflow);
+                assert!(
+                    self.background_controller
+                        .update_task(&launched_task_id, |task| {
+                            task.typed_workflow = Some(typed_workflow);
+                        }),
+                    "activated workflow background task was registered"
+                );
             }
             Err(error) => {
                 runner.abort_prepared_background(prepared, error.to_string());
@@ -23580,9 +23635,7 @@ impl ThreadActor {
         }
         if self.pending_manual_compaction_completion.is_some()
             || !self.resident_surface.capability.pending_terminals_empty()
-            || !self.resident_surface.pending_admission_commits.is_empty()
-            || !self.resident_surface.pending_admission_repairs.is_empty()
-            || !self.resident_surface.pending_admission_terminals.is_empty()
+            || self.resident_surface.commit.has_pending_admission()
             || self.surface_terminal_blocked.is_some()
         {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
@@ -23889,8 +23942,7 @@ impl ThreadActor {
                                 return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
                             }
                         };
-                        self.resident_surface.pending_admission_commits.insert(
-                            operation_id.clone(),
+                        self.resident_surface.commit.prepare_admission_commit(
                             PendingSurfaceAdmissionCommit {
                                 fence: fence.clone(),
                                 batch: admitted_batch,
@@ -24336,9 +24388,9 @@ impl ThreadActor {
             )
         {
             eprintln!("orca: typed surface admission repair failed: {error:?}");
-            self.resident_surface.pending_admission_repairs.insert(
-                fence.operation_id.clone(),
-                PendingSurfaceAdmissionRepair {
+            self.resident_surface
+                .commit
+                .prepare_admission_repair(PendingSurfaceAdmissionRepair {
                     fence: fence.clone(),
                     batch: stop_and_finalization_batch,
                     original_request_id,
@@ -24349,8 +24401,7 @@ impl ThreadActor {
                     legacy_terminal: legacy.as_ref().map(|(_, terminal)| terminal.clone()),
                     goal_recovery_owned,
                     retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
-                },
-            );
+                });
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         let usage = surface::UsageTotals {
@@ -24614,8 +24665,8 @@ impl ThreadActor {
         }
         if let Some(pending) = self
             .resident_surface
-            .pending_admission_terminals
-            .get(&operation_id)
+            .commit
+            .admission_terminal(&operation_id)
         {
             let _ = reply.try_send(Ok(pending.pending.failure.clone()));
             return;
@@ -24749,8 +24800,8 @@ impl ThreadActor {
         self.surface_terminal_blocked =
             Some("typed surface admission terminal commit is retrying".to_string());
         self.resident_surface
-            .pending_admission_terminals
-            .insert(operation_id.clone(), pending);
+            .commit
+            .prepare_admission_terminal(pending);
         let effects = self.resident_surface.capability.settle_terminal_waiters(
             &operation_id,
             Ok(failure),
@@ -26619,9 +26670,7 @@ impl ThreadActor {
         if self.pending_manual_compaction_completion.is_some()
             || !self.bind_surface_operation_controller(client, &operation_id)
             || !self.resident_surface.capability.pending_terminals_empty()
-            || !self.resident_surface.pending_admission_commits.is_empty()
-            || !self.resident_surface.pending_admission_repairs.is_empty()
-            || !self.resident_surface.pending_admission_terminals.is_empty()
+            || self.resident_surface.commit.has_pending_admission()
             || self.surface_terminal_blocked.is_some()
         {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
@@ -27171,10 +27220,8 @@ impl ThreadActor {
             .iter()
             .any(|operation| operation.operation_id == operation_id)
         {
-            if self.background_tasks.values().any(|task| {
-                task.typed_provider
-                    .as_ref()
-                    .is_some_and(|typed| typed.fence.operation_fence.operation_id == operation_id)
+            if self.background_controller.has_provider_matching(|typed| {
+                typed.fence.operation_fence.operation_id == operation_id
             }) {
                 return self.cancel_surface_background_provider(
                     request_id,
@@ -27842,11 +27889,10 @@ impl ThreadActor {
         surface::SurfaceClientCommandError,
     > {
         let typed = self
-            .background_tasks
-            .values()
-            .filter_map(|task| task.typed_provider.as_ref())
-            .find(|typed| typed.fence.operation_fence.operation_id == operation_id)
-            .cloned()
+            .background_controller
+            .find_provider_matching(|typed| {
+                typed.fence.operation_fence.operation_id == operation_id
+            })
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         let operation = snapshot
             .operation_history
@@ -27863,9 +27909,8 @@ impl ThreadActor {
             .cloned()
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         if task.status == surface::SurfaceTaskStatus::Stopping {
-            if let Some(background) = self.background_tasks.get(typed.task_id.as_str()) {
-                background.cancel.cancel();
-            }
+            self.background_controller
+                .cancel_task(typed.task_id.as_str());
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         let next_task_revision = surface::TaskRevision::try_new(
@@ -27911,12 +27956,6 @@ impl ThreadActor {
             fence: typed.fence.clone(),
             batch: batch.clone(),
             task_id: typed.task_id.clone(),
-            cancel: self
-                .background_tasks
-                .get(typed.task_id.as_str())
-                .expect("typed provider background task remains registered")
-                .cancel
-                .clone(),
             retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
         };
         match self
@@ -27929,9 +27968,8 @@ impl ThreadActor {
                 surface::SurfaceCommitError::Ledger(surface::SurfaceLedgerError::CheckpointFailed)
                 | surface::SurfaceCommitError::Ledger(surface::SurfaceLedgerError::PartialAppend),
             ) => {
-                self.resident_surface
-                    .pending_background_controls
-                    .insert(operation_id, pending);
+                self.background_controller
+                    .retain_control(operation_id, pending);
                 return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
             }
             Err(_) => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
@@ -27961,11 +27999,10 @@ impl ThreadActor {
         surface::SurfaceClientCommandError,
     > {
         let typed = self
-            .background_tasks
-            .values()
-            .filter_map(|task| task.typed_workflow.as_ref())
-            .find(|typed| typed.fence.operation_fence.operation_id == operation_id)
-            .cloned()
+            .background_controller
+            .find_workflow_matching(|typed| {
+                typed.fence.operation_fence.operation_id == operation_id
+            })
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         let operation = snapshot
             .operation_history
@@ -27990,9 +28027,8 @@ impl ThreadActor {
         if task.status == surface::SurfaceTaskStatus::Stopping
             && workflow.status == surface::SurfaceWorkflowStatus::Stopping
         {
-            if let Some(background) = self.background_tasks.get(typed.task_id.as_str()) {
-                background.cancel.cancel();
-            }
+            self.background_controller
+                .cancel_task(typed.task_id.as_str());
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         let next_task_revision = surface::TaskRevision::try_new(
@@ -28060,12 +28096,6 @@ impl ThreadActor {
             fence: typed.fence.clone(),
             batch: batch.clone(),
             task_id: typed.task_id.clone(),
-            cancel: self
-                .background_tasks
-                .get(typed.task_id.as_str())
-                .expect("typed workflow background task remains registered")
-                .cancel
-                .clone(),
             retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
         };
         match self
@@ -28078,9 +28108,8 @@ impl ThreadActor {
                 surface::SurfaceCommitError::Ledger(surface::SurfaceLedgerError::CheckpointFailed)
                 | surface::SurfaceCommitError::Ledger(surface::SurfaceLedgerError::PartialAppend),
             ) => {
-                self.resident_surface
-                    .pending_background_controls
-                    .insert(operation_id, pending);
+                self.background_controller
+                    .retain_control(operation_id, pending);
                 return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
             }
             Err(_) => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
@@ -28127,10 +28156,11 @@ impl ThreadActor {
     }
 
     fn retry_surface_background_control(&mut self, operation_id: &surface::SurfaceOperationId) {
-        let Some(mut pending) = self
-            .resident_surface
-            .pending_background_controls
-            .remove(operation_id)
+        let key = BackgroundRetryKey::Control(operation_id.clone());
+        let Some(BackgroundRetryEffect::Control {
+            operation_id,
+            pending,
+        }) = self.background_controller.begin_retry(&key)
         else {
             return;
         };
@@ -28140,36 +28170,42 @@ impl ThreadActor {
             .commit_actor_background_control_batch(pending.fence.clone(), &pending.batch)
             .is_err()
         {
-            pending.retry_at = tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-            self.resident_surface
-                .pending_background_controls
-                .insert(operation_id.clone(), pending);
+            self.background_controller.resolve_retry(
+                BackgroundRetryEffect::Control {
+                    operation_id,
+                    pending,
+                },
+                BackgroundRetryResolution::RetryAt(
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                ),
+            );
             return;
         }
         self.apply_committed_surface_background_control(&pending);
+        self.background_controller.resolve_retry(
+            BackgroundRetryEffect::Control {
+                operation_id,
+                pending,
+            },
+            BackgroundRetryResolution::Settled,
+        );
     }
 
     fn settle_surface_background_controls_for_shutdown(&mut self) -> bool {
         for _ in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
-            if self.resident_surface.pending_background_controls.is_empty() {
+            if !self.background_controller.has_pending_control() {
                 return true;
             }
-            let mut operation_ids = self
-                .resident_surface
-                .pending_background_controls
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>();
-            operation_ids.sort();
+            let operation_ids = self.background_controller.pending_control_operation_ids();
             for operation_id in operation_ids {
                 self.retry_surface_background_control(&operation_id);
             }
         }
-        self.resident_surface.pending_background_controls.is_empty()
+        !self.background_controller.has_pending_control()
     }
 
     fn apply_committed_surface_background_control(
-        &self,
+        &mut self,
         pending: &PendingSurfaceBackgroundControl,
     ) {
         if let Some(state) = self.state.as_ref() {
@@ -28179,7 +28215,8 @@ impl ThreadActor {
                 .task_registry()
                 .request_stop(pending.task_id.as_str());
         }
-        pending.cancel.cancel();
+        self.background_controller
+            .cancel_task(pending.task_id.as_str());
     }
 
     fn cancel_surface_running(
@@ -28552,7 +28589,10 @@ impl ThreadActor {
                 surface::SurfaceCommitError::Ledger(surface::SurfaceLedgerError::CheckpointFailed)
                 | surface::SurfaceCommitError::Ledger(surface::SurfaceLedgerError::PartialAppend),
             ) => {
-                self.resident_surface.pending_terminalization = Some(prepared);
+                let _ = self
+                    .resident_surface
+                    .commit
+                    .prepare_terminalization(prepared);
                 Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
             }
             Err(_) => {
@@ -28596,13 +28636,16 @@ impl ThreadActor {
     ) -> Self {
         let usage_ledger = RuntimeUsageLedger::new(thread.session().aggregate_usage_totals());
         let events = thread.event_factory();
-        let (background_completion_tx, background_completion_rx) = tokio_mpsc::unbounded_channel();
-        let pending_background_approval_resolutions = resident_surface
+        let mut background_controller = BackgroundOperationController::new(background_capacity);
+        for (operation_id, pending) in resident_surface
             .as_ref()
             .map(|resident| {
                 recovered_background_approval_resolutions(resident.coordinator.state().snapshot())
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+        {
+            background_controller.retain_approval_resolution(operation_id, pending);
+        }
         Self {
             state: Some(ThreadActorState { thread, events }),
             config,
@@ -28610,19 +28653,12 @@ impl ThreadActor {
             executor,
             operation_ids: OperationIdAllocator::new(),
             active: None,
-            background_tasks: HashMap::new(),
-            background_capacity,
-            background_completion_tx,
-            background_completion_rx,
+            background_controller,
             goal_controller: GoalOperationController::new(GOAL_COMPLETION_CAPACITY),
             usage_ledger,
             resident_surface: ResidentSurfaceSlot(resident_surface),
             pending_manual_compaction_completion: None,
             pending_provider_transfer: None,
-            pending_workflow_completions: HashMap::new(),
-            pending_provider_preparations: HashMap::new(),
-            pending_provider_completions: HashMap::new(),
-            pending_background_approval_resolutions,
             pending_surface_stream_redactions: HashMap::new(),
             live_input_capsules: HashMap::new(),
             ephemeral_reservation_expiry: None,
@@ -28876,6 +28912,7 @@ impl ThreadActor {
                 let surface_retry_at = self.next_surface_transition_retry_at();
                 let reservation_expiry_at = self.next_ephemeral_reservation_expiry_at();
                 let goal_blocking_in_flight = self.goal_controller.is_blocking();
+                let has_background_tasks = !self.background_controller.is_empty();
                 tokio::select! {
                     biased;
                     _ = wait_for_surface_transition_retry(surface_retry_at) => {
@@ -28917,18 +28954,11 @@ impl ThreadActor {
                             let bounded_goal_recovery =
                                 self.has_pending_goal_completion_recovery_owner();
                             let bounded_workflow_recovery =
-                                !self.pending_workflow_completions.is_empty()
-                                    || !self.pending_provider_preparations.is_empty()
-                                    || !self.pending_provider_completions.is_empty();
+                                self.background_controller.has_pending_completion();
                             let bounded_provider_transfer_recovery =
                                 self.pending_provider_transfer.is_some();
-                            let bounded_background_control_recovery = self
-                                .resident_surface
-                                .0
-                                .as_ref()
-                                .is_some_and(|resident| {
-                                    !resident.pending_background_controls.is_empty()
-                                });
+                            let bounded_background_control_recovery =
+                                self.background_controller.has_pending_control();
                             let bounded_task_ownership_recovery = self
                                 .resident_surface
                                 .0
@@ -28975,18 +29005,11 @@ impl ThreadActor {
                             let goal_recovery_still_pending = bounded_goal_recovery
                                 && self.has_pending_goal_completion_recovery_owner();
                             let workflow_recovery_still_pending =
-                                !self.pending_workflow_completions.is_empty()
-                                    || !self.pending_provider_preparations.is_empty()
-                                    || !self.pending_provider_completions.is_empty();
+                                self.background_controller.has_pending_completion();
                             let provider_transfer_still_pending =
                                 self.pending_provider_transfer.is_some();
-                            let background_control_still_pending = self
-                                .resident_surface
-                                .0
-                                .as_ref()
-                                .is_some_and(|resident| {
-                                    !resident.pending_background_controls.is_empty()
-                                });
+                            let background_control_still_pending =
+                                self.background_controller.has_pending_control();
                             let task_ownership_still_pending = self
                                 .resident_surface
                                 .0
@@ -29020,11 +29043,7 @@ impl ThreadActor {
                                     }
                                 }
                                 for operation_id in
-                                    self.pending_workflow_completions
-                                        .keys()
-                                        .chain(self.pending_provider_preparations.keys())
-                                        .chain(self.pending_provider_completions.keys())
-                                        .cloned()
+                                    self.background_controller.pending_completion_operation_ids()
                                 {
                                     for waiter in self
                                         .resident_surface
@@ -29054,11 +29073,8 @@ impl ThreadActor {
                                     self.retain_provider_transfer_for_cold_recovery();
                                 }
                                 let background_control_operation_ids = self
-                                    .resident_surface
-                                    .pending_background_controls
-                                    .keys()
-                                    .cloned()
-                                    .collect::<Vec<_>>();
+                                    .background_controller
+                                    .pending_control_operation_ids();
                                 for operation_id in background_control_operation_ids {
                                     for waiter in self
                                         .resident_surface
@@ -29141,7 +29157,7 @@ impl ThreadActor {
                         }
                         self.handle_idle_command(command);
                     }
-                    task_id = self.background_completion_rx.recv(), if !self.background_tasks.is_empty() => {
+                    task_id = self.background_controller.recv_completion(), if has_background_tasks => {
                         if let Some(task_id) = task_id {
                             self.reap_background_task(&task_id).await;
                         }
@@ -29151,6 +29167,7 @@ impl ThreadActor {
             };
 
             let surface_retry_at = self.next_surface_transition_retry_at();
+            let has_background_tasks = !self.background_controller.is_empty();
             tokio::select! {
                 biased;
                 _ = wait_for_surface_transition_retry(surface_retry_at) => {
@@ -29315,7 +29332,7 @@ impl ThreadActor {
                             if let Err(error) = self
                                 .commit_surface_terminalization(&mut active, terminalization)
                             {
-                                if self.resident_surface.pending_terminalization.is_some() {
+                                if self.resident_surface.commit.has_terminalization() {
                                     if let Some(reply) = reply.as_ref() {
                                         let _ = reply.send(ThreadShutdownAck::Retry);
                                     }
@@ -29430,7 +29447,7 @@ impl ThreadActor {
                         self.surface_terminal_blocked = Some(error.to_string());
                     }
                 }
-                task_id = self.background_completion_rx.recv(), if !self.background_tasks.is_empty() => {
+                task_id = self.background_controller.recv_completion(), if has_background_tasks => {
                     if let Some(task_id) = task_id {
                         self.reap_background_task(&task_id).await;
                     }
@@ -30234,18 +30251,13 @@ impl ThreadActor {
                         .pending_manual_compaction_completion
                         .is_some(),
                     pending_workflow_completion: self
-                        .pending_workflow_completions
-                        .contains_key(&operation_id)
-                        || self
-                            .pending_provider_preparations
-                            .contains_key(&operation_id)
-                        || self
-                            .pending_provider_completions
-                            .contains_key(&operation_id),
+                        .background_controller
+                        .has_pending_completion_operation(&operation_id),
                     pending_admission_repair: self
                         .resident_surface
-                        .pending_admission_repairs
-                        .contains_key(&operation_id),
+                        .commit
+                        .admission_repair(&operation_id)
+                        .is_some(),
                     exact_interaction_selector: exact_interaction_selector_for_test(
                         &self.resident_surface,
                         &operation_id,
@@ -30676,7 +30688,7 @@ impl ThreadActor {
                 let accepted = can_control
                     && active.pending_surface_background_transfer.is_none()
                     && !active.request.surface_goal_owned
-                    && self.background_tasks.len() < self.background_capacity
+                    && self.background_controller.has_capacity(1)
                     && active.surface_operation.as_ref().is_some_and(|fence| {
                         matches!(
                             &target,
@@ -31389,18 +31401,13 @@ impl ThreadActor {
                         .pending_manual_compaction_completion
                         .is_some(),
                     pending_workflow_completion: self
-                        .pending_workflow_completions
-                        .contains_key(&operation_id)
-                        || self
-                            .pending_provider_preparations
-                            .contains_key(&operation_id)
-                        || self
-                            .pending_provider_completions
-                            .contains_key(&operation_id),
+                        .background_controller
+                        .has_pending_completion_operation(&operation_id),
                     pending_admission_repair: self
                         .resident_surface
-                        .pending_admission_repairs
-                        .contains_key(&operation_id),
+                        .commit
+                        .admission_repair(&operation_id)
+                        .is_some(),
                     exact_interaction_selector: exact_interaction_selector_for_test(
                         &self.resident_surface,
                         &operation_id,
@@ -31965,10 +31972,7 @@ impl ThreadActor {
             },
         );
         let _ = pending.request.reply.send(Ok(reply));
-        if self.pending_provider_preparations.is_empty()
-            && self.pending_provider_completions.is_empty()
-            && self.pending_workflow_completions.is_empty()
-        {
+        if !self.background_controller.has_pending_completion() {
             self.surface_terminal_blocked = None;
         }
         Ok(())
@@ -33385,16 +33389,17 @@ impl ThreadActor {
     }
 
     fn ensure_background_capacity(&self, additional: usize) -> io::Result<()> {
-        if self.background_tasks.len().saturating_add(additional) > self.background_capacity {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!(
-                    "runtime host background task capacity exhausted ({})",
-                    self.background_capacity
-                ),
-            ));
-        }
-        Ok(())
+        self.background_controller
+            .ensure_capacity(additional)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "runtime host background task capacity exhausted ({})",
+                        error.capacity()
+                    ),
+                )
+            })
     }
 
     fn spawn_workflow_background_tasks(
@@ -33407,7 +33412,7 @@ impl ThreadActor {
         for workflow in workflows.into_inner() {
             let task_id = workflow.task_id.clone();
             let completion_task_id = task_id.clone();
-            let completion_tx = self.background_completion_tx.clone();
+            let completion_tx = self.background_controller.completion_notifier();
             let cancel = CancelToken::new();
             let worker_cancel = cancel.clone();
             let context = WorkflowBackgroundTaskContext {
@@ -33447,15 +33452,17 @@ impl ThreadActor {
                 }
                 let _ = completion_tx.send(completion_task_id);
             });
-            self.background_tasks.insert(
-                task_id,
-                HostBackgroundTask {
-                    cancel,
-                    join,
-                    typed_workflow: None,
-                    typed_provider: None,
-                },
-            );
+            self.background_controller
+                .admit_task(
+                    task_id,
+                    HostBackgroundTask {
+                        cancel,
+                        join,
+                        typed_workflow: None,
+                        typed_provider: None,
+                    },
+                )
+                .expect("background capacity was checked before workflow admission");
         }
     }
 
@@ -33470,15 +33477,7 @@ impl ThreadActor {
             .main_session_task_id
             .clone()
             .ok_or_else(|| io::Error::other("provider suspension requires a main-session task"))?;
-        if self.background_tasks.len() >= self.background_capacity {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!(
-                    "runtime host background task capacity exhausted ({})",
-                    self.background_capacity
-                ),
-            ));
-        }
+        self.ensure_background_capacity(1)?;
 
         let task_registry = state.thread.session().task_registry().clone();
         if typed_provider.is_none() {
@@ -33536,7 +33535,7 @@ impl ThreadActor {
             .map(Duration::from_millis);
         let cancel = CancelToken::new();
         let worker_cancel = cancel.clone();
-        let completion_tx = self.background_completion_tx.clone();
+        let completion_tx = self.background_controller.completion_notifier();
         let completion_task_id = task_id.clone();
         let panic_surface_outcome = typed_provider
             .as_ref()
@@ -33579,20 +33578,24 @@ impl ThreadActor {
             }
             let _ = completion_tx.send(completion_task_id);
         });
-        self.background_tasks.insert(
-            task_id.clone(),
-            HostBackgroundTask {
-                cancel,
-                join,
-                typed_workflow: None,
-                typed_provider,
-            },
-        );
+        self.background_controller
+            .admit_task(
+                task_id.clone(),
+                HostBackgroundTask {
+                    cancel,
+                    join,
+                    typed_workflow: None,
+                    typed_provider,
+                },
+            )
+            .map_err(|error| {
+                io::Error::other(format!("background task admission failed: {error:?}"))
+            })?;
         Ok(task_id)
     }
 
     async fn reap_background_task(&mut self, task_id: &str) {
-        if let Some(task) = self.background_tasks.remove(task_id) {
+        if let Some(task) = self.background_controller.begin_completion(task_id) {
             let HostBackgroundTask {
                 join,
                 typed_workflow,
@@ -33627,7 +33630,7 @@ impl ThreadActor {
                 eprintln!(
                     "orca: typed provider completion preparation deferred for {operation_id:?}: {error}"
                 );
-                self.pending_provider_preparations.insert(
+                self.background_controller.retain_provider_preparation(
                     operation_id,
                     PendingTypedProviderPreparation {
                         typed,
@@ -33648,8 +33651,8 @@ impl ThreadActor {
                 );
                 pending.retry_at =
                     tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-                self.pending_provider_completions
-                    .insert(operation_id, pending);
+                self.background_controller
+                    .retain_provider_completion(operation_id, pending);
                 Err(error)
             }
         }
@@ -34260,23 +34263,40 @@ impl ThreadActor {
     }
 
     fn retry_typed_provider_completion(&mut self, operation_id: &surface::SurfaceOperationId) {
-        let Some(mut pending) = self.pending_provider_completions.remove(operation_id) else {
+        let key = BackgroundRetryKey::ProviderCompletion(operation_id.clone());
+        let Some(BackgroundRetryEffect::ProviderCompletion {
+            operation_id,
+            mut pending,
+        }) = self.background_controller.begin_retry(&key)
+        else {
             return;
         };
-        if self.settle_typed_provider_completion(&mut pending).is_err() {
-            pending.retry_at = tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-            self.pending_provider_completions
-                .insert(operation_id.clone(), pending);
-        } else if self.pending_provider_preparations.is_empty()
-            && self.pending_provider_completions.is_empty()
-            && self.pending_workflow_completions.is_empty()
-        {
+        let resolution = if self.settle_typed_provider_completion(&mut pending).is_err() {
+            BackgroundRetryResolution::RetryAt(
+                tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+            )
+        } else {
+            BackgroundRetryResolution::Settled
+        };
+        self.background_controller.resolve_retry(
+            BackgroundRetryEffect::ProviderCompletion {
+                operation_id,
+                pending,
+            },
+            resolution,
+        );
+        if !self.background_controller.has_pending_completion() {
             self.surface_terminal_blocked = None;
         }
     }
 
     fn retry_typed_provider_preparation(&mut self, operation_id: &surface::SurfaceOperationId) {
-        let Some(mut pending) = self.pending_provider_preparations.remove(operation_id) else {
+        let key = BackgroundRetryKey::ProviderPreparation(operation_id.clone());
+        let Some(BackgroundRetryEffect::ProviderPreparation {
+            operation_id,
+            pending,
+        }) = self.background_controller.begin_retry(&key)
+        else {
             return;
         };
         match self.prepare_typed_provider_completion(
@@ -34284,27 +34304,35 @@ impl ThreadActor {
             pending.shutdown_reason.clone(),
         ) {
             Ok(mut completion) => {
-                if self
+                let settled = self
                     .settle_typed_provider_completion(&mut completion)
-                    .is_err()
-                {
+                    .is_ok();
+                if !settled {
                     completion.retry_at =
                         tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-                    self.pending_provider_completions
-                        .insert(operation_id.clone(), completion);
-                } else if self.pending_provider_preparations.is_empty()
-                    && self.pending_provider_completions.is_empty()
-                    && self.pending_workflow_completions.is_empty()
-                {
+                    self.background_controller
+                        .retain_provider_completion(operation_id.clone(), completion);
+                }
+                self.background_controller.resolve_retry(
+                    BackgroundRetryEffect::ProviderPreparation {
+                        operation_id,
+                        pending,
+                    },
+                    BackgroundRetryResolution::Settled,
+                );
+                if !self.background_controller.has_pending_completion() {
                     self.surface_terminal_blocked = None;
                 }
             }
-            Err(_) => {
-                pending.retry_at =
-                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-                self.pending_provider_preparations
-                    .insert(operation_id.clone(), pending);
-            }
+            Err(_) => self.background_controller.resolve_retry(
+                BackgroundRetryEffect::ProviderPreparation {
+                    operation_id,
+                    pending,
+                },
+                BackgroundRetryResolution::RetryAt(
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                ),
+            ),
         }
     }
 
@@ -34626,8 +34654,8 @@ impl ThreadActor {
             Err(error) => {
                 pending.retry_at =
                     tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-                self.pending_workflow_completions
-                    .insert(operation_id, pending);
+                self.background_controller
+                    .retain_workflow_completion(operation_id, pending);
                 Err(error)
             }
         }
@@ -34706,17 +34734,29 @@ impl ThreadActor {
     }
 
     fn retry_typed_workflow_completion(&mut self, operation_id: &surface::SurfaceOperationId) {
-        let Some(mut pending) = self.pending_workflow_completions.remove(operation_id) else {
+        let key = BackgroundRetryKey::WorkflowCompletion(operation_id.clone());
+        let Some(BackgroundRetryEffect::WorkflowCompletion {
+            operation_id,
+            mut pending,
+        }) = self.background_controller.begin_retry(&key)
+        else {
             return;
         };
-        if self.settle_typed_workflow_completion(&mut pending).is_err() {
-            pending.retry_at = tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-            self.pending_workflow_completions
-                .insert(operation_id.clone(), pending);
-        } else if self.pending_workflow_completions.is_empty()
-            && self.pending_provider_preparations.is_empty()
-            && self.pending_provider_completions.is_empty()
-        {
+        let resolution = if self.settle_typed_workflow_completion(&mut pending).is_err() {
+            BackgroundRetryResolution::RetryAt(
+                tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+            )
+        } else {
+            BackgroundRetryResolution::Settled
+        };
+        self.background_controller.resolve_retry(
+            BackgroundRetryEffect::WorkflowCompletion {
+                operation_id,
+                pending,
+            },
+            resolution,
+        );
+        if !self.background_controller.has_pending_completion() {
             self.surface_terminal_blocked = None;
         }
     }
@@ -34725,14 +34765,7 @@ impl ThreadActor {
         &mut self,
         reason: surface::SurfaceShutdownReason,
     ) -> Result<(), RuntimeHostError> {
-        for task in self.background_tasks.values() {
-            task.cancel.cancel();
-        }
-        let tasks = self
-            .background_tasks
-            .drain()
-            .map(|(_, task)| task)
-            .collect::<Vec<_>>();
+        let tasks = self.background_controller.begin_shutdown();
         let mut first_error = None;
         for task in tasks {
             let HostBackgroundTask {
@@ -34759,28 +34792,18 @@ impl ThreadActor {
             }
         }
         for _ in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
-            if self.pending_workflow_completions.is_empty()
-                && self.pending_provider_preparations.is_empty()
-                && self.pending_provider_completions.is_empty()
-            {
+            if !self.background_controller.has_pending_completion() {
                 return Ok(());
             }
             let operation_ids = self
-                .pending_workflow_completions
-                .keys()
-                .chain(self.pending_provider_preparations.keys())
-                .chain(self.pending_provider_completions.keys())
-                .cloned()
-                .collect::<Vec<_>>();
+                .background_controller
+                .pending_completion_operation_ids();
             for operation_id in operation_ids {
                 self.retry_typed_workflow_completion(&operation_id);
                 self.retry_typed_provider_preparation(&operation_id);
                 self.retry_typed_provider_completion(&operation_id);
             }
-            if !self.pending_workflow_completions.is_empty()
-                || !self.pending_provider_preparations.is_empty()
-                || !self.pending_provider_completions.is_empty()
-            {
+            if self.background_controller.has_pending_completion() {
                 tokio::time::sleep(SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL).await;
             }
         }

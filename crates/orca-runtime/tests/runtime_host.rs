@@ -2863,6 +2863,117 @@ fn runtime_host_owns_suspended_provider_and_releases_actor_for_the_next_turn() {
 }
 
 #[test]
+fn background_controller_trace_equivalence() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf()),
+            "background controller completion trace",
+        )
+        .expect("start hosted runtime thread");
+    let observer = Arc::new(RecordingEventObserver::default());
+    let release_marker = cwd.path().join("background-release");
+    let request = HostedTurnRequest::new(format!(
+        "mock_stream_release_marker {}",
+        release_marker.display()
+    ))
+    .with_task_description("controller-owned background completion")
+    .with_event_observer(observer.clone())
+    .with_generation_handlers(|_fence, _cancel| {
+        HostedGenerationHandlers::default()
+            .with_provider_suspension_control(Arc::new(OneShotProviderSuspension::new()))
+    });
+    let operation = thread
+        .start_turn(request, io::sink())
+        .expect("start backgroundable provider turn");
+    let task_id = match operation
+        .wait_timeout(TEST_TIMEOUT)
+        .expect("background handoff terminal")
+        .outcome()
+    {
+        OperationOutcome::Backgrounded { task_id } => task_id.clone(),
+        other => panic!("expected background handoff, got {other:?}"),
+    };
+    let admitted = thread.task_registry().get(&task_id).unwrap();
+    assert_eq!(admitted.status, TaskStatus::Running);
+    assert!(admitted.is_backgrounded);
+    assert!(
+        !release_marker.exists(),
+        "background provider must remain in-flight while foreground admission is attempted"
+    );
+
+    let foreground = thread
+        .start_turn(
+            HostedTurnRequest::new("concurrent foreground").with_event_observer(observer.clone()),
+            io::sink(),
+        )
+        .expect("background ownership releases foreground admission");
+    std::fs::write(&release_marker, "release").expect("release background completion");
+    assert_eq!(
+        foreground.wait_timeout(TEST_TIMEOUT).unwrap().outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+    wait_until_task_status(&thread, &task_id, TaskStatus::Completed);
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while !observer.events().iter().any(|event| {
+        event.event_type == EventType::TaskStatusUpdated
+            && event.payload["task"]["id"] == task_id
+            && event.payload["task"]["status"] == "completed"
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "missing background completion event"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_one_thread_event_sequence(&observer, thread.thread_id());
+    host.shutdown().expect("shutdown completed background host");
+
+    let cancel_cwd = tempfile::tempdir().unwrap();
+    let cancel_host = RuntimeHost::start().expect("start cancellation host");
+    let cancel_thread = cancel_host
+        .start_thread(
+            test_config(cancel_cwd.path().to_path_buf()),
+            "background controller cancellation trace",
+        )
+        .expect("start cancellation thread");
+    let cancel_operation = cancel_thread
+        .start_turn(
+            HostedTurnRequest::new("mock_stream_delay_ms 5000")
+                .with_task_description("controller-owned background cancellation")
+                .with_generation_handlers(|_fence, _cancel| {
+                    HostedGenerationHandlers::default().with_provider_suspension_control(Arc::new(
+                        OneShotProviderSuspension::new(),
+                    ))
+                }),
+            io::sink(),
+        )
+        .expect("start cancellable provider turn");
+    let cancelled_task_id = match cancel_operation
+        .wait_timeout(TEST_TIMEOUT)
+        .expect("cancellation handoff terminal")
+        .outcome()
+    {
+        OperationOutcome::Backgrounded { task_id } => task_id.clone(),
+        other => panic!("expected background handoff, got {other:?}"),
+    };
+    let started = Instant::now();
+    cancel_host
+        .shutdown()
+        .expect("cancel and join background work");
+    assert!(started.elapsed() < TEST_TIMEOUT);
+    assert_eq!(
+        cancel_thread
+            .task_registry()
+            .get(&cancelled_task_id)
+            .unwrap()
+            .status,
+        TaskStatus::Stopped
+    );
+}
+
+#[test]
 fn provider_background_handoff_keeps_one_thread_event_sequence() {
     let cwd = tempfile::tempdir().unwrap();
     let config = test_config(cwd.path().to_path_buf());

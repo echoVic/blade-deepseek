@@ -1,4 +1,6 @@
+pub(super) mod background;
 pub(super) mod capability;
+pub(super) mod commit;
 pub(super) mod goal;
 
 use capability::{CapabilityCommitEffect, CapabilityReply};
