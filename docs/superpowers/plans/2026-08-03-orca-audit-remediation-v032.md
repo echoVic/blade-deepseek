@@ -404,7 +404,7 @@ git commit -m "perf(tui): index projected tool calls"
 
 **Files:**
 - Modify: crates/orca-tui/src/types.rs
-- Modify: crates/orca-tui/src/surface_projection.rs
+- Boundary: crates/orca-tui/src/surface_projection.rs (producers are fenced by the controller relay)
 - Test: crates/orca-tui/src/types.rs
 
 - [x] **Step 1: Write compaction and stale-order tests**
@@ -498,11 +498,11 @@ git commit -m "perf(tui): bound search and reflow work"
 - Modify: crates/orca-tui/src/surface_projection.rs
 - Test: crates/orca-tui/src/app.rs
 
-- [ ] **Step 1: Write stale-event injection tests**
+- [x] **Step 1: Write stale-event injection tests**
 
 Attach A, queue WorkflowTasksUpdated and UsageUpdated for A, switch to B, then deliver A events. Assert B transcript, workflow, usage, goal, identity, and operation state are unchanged.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ~~~sh
 cargo test -p orca-tui stale_attachment_events_do_not_mutate_switched_session --lib -- --test-threads=1
@@ -510,7 +510,7 @@ cargo test -p orca-tui stale_attachment_events_do_not_mutate_switched_session --
 
 Expected: FAIL because events have no attachment identity.
 
-- [ ] **Step 3: Introduce the event envelope**
+- [x] **Step 3: Introduce the event envelope**
 
 Add:
 
@@ -526,18 +526,25 @@ pub(crate) struct AttachedTuiEvent {
 
 Global UI events use None. Runtime/session events use Some(id). The controller allocates monotonically; AppState rejects a non-active attachment.
 
-- [ ] **Step 4: Route every session producer**
+- [x] **Step 4: Route every session producer**
 
-Envelope transcript, workflow, goal, usage, interaction, operation, metadata, and runtime-ready producers. Leave only truly session-independent input/UI events unattached.
+Envelope transcript, workflow, goal, usage, interaction, operation, metadata, and runtime-ready producers through the controller's attachment-scoped relay. Leave only truly session-independent input/UI events, including saved-session picker refreshes, unattached.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
 ~~~sh
 cargo test -p orca-tui attachment --lib -- --test-threads=1
 cargo test -p orca-tui --lib --no-run
+cargo test -p orca-tui --lib -- --test-threads=1
+cargo check -p orca-tui --all-targets
 git add crates/orca-tui/src/types.rs crates/orca-tui/src/app.rs crates/orca-tui/src/surface_projection.rs docs/reports/2026-08-03-orca-audit-remediation-evidence.md
 git commit -m "fix(tui): fence events by session attachment"
 ~~~
+
+Evidence: the stale-event reducer test and relay rotation test pass; all 1,039
+`orca-tui` library tests and the all-targets check pass. The controller relay
+keeps the attachment immutable for every producer clone, so an old session's
+queued projection cannot mutate the newly active AppState.
 
 ### Task 12: Make Session Switching Replace Projection Atomically
 

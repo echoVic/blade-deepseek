@@ -57,7 +57,9 @@ use crate::submitted_turn::SubmittedTurn;
 use crate::surface_actions::{TuiHostActions, TuiSurfaceActions};
 use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
 use crate::theme::Theme;
-use crate::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
+use crate::types::{
+    AppState, AppStatus, AttachedTuiEvent, ChatMessage, SessionAttachmentId, TuiEvent, UserAction,
+};
 use crate::ui;
 use crate::vim::{PendingInsertEscapeFlow, VimState};
 use crate::workspace_status;
@@ -66,6 +68,72 @@ use crate::workspace_status;
 enum PendingInsertEscapeRouting {
     Continue,
     Consumed,
+}
+
+fn accept_attached_tui_event(
+    state: &mut AppState,
+    event: TuiEvent,
+) -> Result<Option<TuiEvent>, ()> {
+    let TuiEvent::Attached(attached) = event else {
+        return Ok(Some(event));
+    };
+    let AttachedTuiEvent { attachment, event } = *attached;
+    if matches!(event, TuiEvent::SessionAttachmentActivated) {
+        state.active_session_attachment = attachment;
+        return Ok(None);
+    }
+    if attachment.is_some() && attachment != state.active_session_attachment {
+        return Err(());
+    }
+    Ok(Some(event))
+}
+
+#[cfg(test)]
+fn reduce_attached_tui_event(state: &mut AppState, event: AttachedTuiEvent) -> bool {
+    match accept_attached_tui_event(state, TuiEvent::Attached(Box::new(event))) {
+        Ok(Some(event)) => {
+            state.update(event);
+            true
+        }
+        Ok(None) => true,
+        Err(()) => false,
+    }
+}
+
+fn spawn_attached_event_sender(
+    root_event_tx: mpsc::Sender<TuiEvent>,
+    attachment: SessionAttachmentId,
+) -> mpsc::Sender<TuiEvent> {
+    let (event_tx, event_rx) = mpsc::bounded(crate::channels::TUI_EVENT_CAPACITY);
+    event_tx
+        .send(TuiEvent::SessionAttachmentActivated)
+        .expect("new attachment relay has a live receiver");
+    std::thread::Builder::new()
+        .name(format!("orca-tui-attachment-{}", attachment.value()))
+        .spawn(move || {
+            while let Ok(event) = event_rx.recv() {
+                if root_event_tx
+                    .send(TuiEvent::Attached(Box::new(AttachedTuiEvent {
+                        attachment: Some(attachment),
+                        event,
+                    })))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .expect("spawn TUI attachment relay");
+    event_tx
+}
+
+fn rotate_attached_event_sender(
+    root_event_tx: &mpsc::Sender<TuiEvent>,
+    attachment: &mut SessionAttachmentId,
+    event_tx: &mut mpsc::Sender<TuiEvent>,
+) {
+    *attachment = attachment.next();
+    *event_tx = spawn_attached_event_sender(root_event_tx.clone(), *attachment);
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -559,91 +627,102 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
                                     }
                                 }
                             },
-                            IterationEvent::Runtime(tui_event) => match tui_event {
-                                TuiEvent::HistoryLoaded { .. } => {
-                                    handle_runtime_event(
-                                        tui_event,
-                                        &mut state,
-                                        &action_tx,
-                                        &pending_workflow_notifications,
-                                        &mut textarea,
-                                        &mut vim_state,
-                                        &theme,
-                                        presentation,
-                                    );
-                                    if let Some(prompt) = pending_initial_prompt.take() {
-                                        state.push_message(ChatMessage::User(prompt.clone()));
-                                        state.enter_running();
-                                        let _ = action_tx.send(UserAction::Submit(prompt));
+                            IterationEvent::Runtime(tui_event) => {
+                                let tui_event =
+                                    match accept_attached_tui_event(&mut state, tui_event) {
+                                        Ok(Some(tui_event)) => tui_event,
+                                        Ok(None) | Err(()) => return Ok(None),
+                                    };
+                                match tui_event {
+                                    TuiEvent::HistoryLoaded { .. } => {
+                                        handle_runtime_event(
+                                            tui_event,
+                                            &mut state,
+                                            &action_tx,
+                                            &pending_workflow_notifications,
+                                            &mut textarea,
+                                            &mut vim_state,
+                                            &theme,
+                                            presentation,
+                                        );
+                                        if let Some(prompt) = pending_initial_prompt.take() {
+                                            state.push_message(ChatMessage::User(prompt.clone()));
+                                            state.enter_running();
+                                            let _ = action_tx.send(UserAction::Submit(prompt));
+                                        }
+                                    }
+                                    TuiEvent::MentionSearchDirty { generation } => {
+                                        let text = textarea_text(&textarea);
+                                        let cursor = textarea_cursor_byte_index(&textarea);
+                                        mention_search.consume_dirty_at_cursor(
+                                            generation, &text, cursor, &mut state,
+                                        );
+                                    }
+                                    TuiEvent::MentionCatalogDirty { generation } => {
+                                        mention_search
+                                            .consume_catalog_dirty(generation, &mut state);
+                                    }
+                                    TuiEvent::MentionRuntimeReady(thread) => {
+                                        active_session_id =
+                                            thread.session_id().map(ToOwned::to_owned);
+                                        mention_search.install_runtime_actions(
+                                            TuiSurfaceActions::new(thread),
+                                        );
+                                    }
+                                    TuiEvent::NewSessionStarted { session_id } => {
+                                        config.history_mode = HistoryMode::Record;
+                                        active_session_id = Some(session_id.clone());
+                                        handle_runtime_event(
+                                            TuiEvent::NewSessionStarted { session_id },
+                                            &mut state,
+                                            &action_tx,
+                                            &pending_workflow_notifications,
+                                            &mut textarea,
+                                            &mut vim_state,
+                                            &theme,
+                                            presentation,
+                                        );
+                                    }
+                                    TuiEvent::SettingsUpdated {
+                                        model,
+                                        reasoning_effort,
+                                        approval_mode,
+                                    } => {
+                                        config.model =
+                                            orca_core::model::ModelSelection::from_unchecked(Some(
+                                                model.clone(),
+                                            ));
+                                        config.reasoning_effort = reasoning_effort;
+                                        config.approval_mode = approval_mode;
+                                        handle_runtime_event(
+                                            TuiEvent::SettingsUpdated {
+                                                model,
+                                                reasoning_effort,
+                                                approval_mode,
+                                            },
+                                            &mut state,
+                                            &action_tx,
+                                            &pending_workflow_notifications,
+                                            &mut textarea,
+                                            &mut vim_state,
+                                            &theme,
+                                            presentation,
+                                        );
+                                    }
+                                    tui_event => {
+                                        handle_runtime_event(
+                                            tui_event,
+                                            &mut state,
+                                            &action_tx,
+                                            &pending_workflow_notifications,
+                                            &mut textarea,
+                                            &mut vim_state,
+                                            &theme,
+                                            presentation,
+                                        );
                                     }
                                 }
-                                TuiEvent::MentionSearchDirty { generation } => {
-                                    let text = textarea_text(&textarea);
-                                    let cursor = textarea_cursor_byte_index(&textarea);
-                                    mention_search.consume_dirty_at_cursor(
-                                        generation, &text, cursor, &mut state,
-                                    );
-                                }
-                                TuiEvent::MentionCatalogDirty { generation } => {
-                                    mention_search.consume_catalog_dirty(generation, &mut state);
-                                }
-                                TuiEvent::MentionRuntimeReady(thread) => {
-                                    active_session_id = thread.session_id().map(ToOwned::to_owned);
-                                    mention_search
-                                        .install_runtime_actions(TuiSurfaceActions::new(thread));
-                                }
-                                TuiEvent::NewSessionStarted { session_id } => {
-                                    config.history_mode = HistoryMode::Record;
-                                    active_session_id = Some(session_id.clone());
-                                    handle_runtime_event(
-                                        TuiEvent::NewSessionStarted { session_id },
-                                        &mut state,
-                                        &action_tx,
-                                        &pending_workflow_notifications,
-                                        &mut textarea,
-                                        &mut vim_state,
-                                        &theme,
-                                        presentation,
-                                    );
-                                }
-                                TuiEvent::SettingsUpdated {
-                                    model,
-                                    reasoning_effort,
-                                    approval_mode,
-                                } => {
-                                    config.model = orca_core::model::ModelSelection::from_unchecked(
-                                        Some(model.clone()),
-                                    );
-                                    config.reasoning_effort = reasoning_effort;
-                                    config.approval_mode = approval_mode;
-                                    handle_runtime_event(
-                                        TuiEvent::SettingsUpdated {
-                                            model,
-                                            reasoning_effort,
-                                            approval_mode,
-                                        },
-                                        &mut state,
-                                        &action_tx,
-                                        &pending_workflow_notifications,
-                                        &mut textarea,
-                                        &mut vim_state,
-                                        &theme,
-                                        presentation,
-                                    );
-                                }
-                                tui_event => {
-                                    handle_runtime_event(
-                                        tui_event,
-                                        &mut state,
-                                        &action_tx,
-                                        &pending_workflow_notifications,
-                                        &mut textarea,
-                                        &mut vim_state,
-                                        &theme,
-                                        presentation,
-                                    );
-                                }
-                            },
+                            }
                         }
                         Ok(None)
                     },
@@ -994,6 +1073,35 @@ fn run_manual_compaction_with_events(
 }
 
 #[cfg(test)]
+fn spawn_unwrapped_tui_test_event_sender(
+    output_tx: mpsc::Sender<TuiEvent>,
+) -> mpsc::Sender<TuiEvent> {
+    let (event_tx, event_rx) = mpsc::unbounded();
+    std::thread::Builder::new()
+        .name("orca-tui-test-event-unwrapper".to_string())
+        .spawn(move || {
+            while let Ok(event) = event_rx.recv() {
+                let event = match event {
+                    TuiEvent::Attached(attached) => {
+                        let AttachedTuiEvent { event, .. } = *attached;
+                        if matches!(event, TuiEvent::SessionAttachmentActivated) {
+                            continue;
+                        }
+                        event
+                    }
+                    TuiEvent::SessionAttachmentActivated => continue,
+                    event => event,
+                };
+                if output_tx.send(event).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("spawn TUI test event unwrapper");
+    event_tx
+}
+
+#[cfg(test)]
 fn spawn_hosted_tui_test_runtime(
     config: Arc<Mutex<RunConfig>>,
     preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
@@ -1013,6 +1121,7 @@ fn spawn_hosted_tui_test_runtime_with_background_capacity(
     action_rx: mpsc::Receiver<UserAction>,
     background_capacity: usize,
 ) -> TuiAgentRuntime {
+    let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
     let pending = bridge::PendingWorkflowNotifications::new();
     let registry = orca_mcp::initialize_registry(&[]);
     let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
@@ -1049,6 +1158,7 @@ fn spawn_legacy_feature_test_runtime(
     event_tx: mpsc::Sender<TuiEvent>,
     action_rx: mpsc::Receiver<UserAction>,
 ) -> TuiAgentRuntime {
+    let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
     let pending = bridge::PendingWorkflowNotifications::new();
     let registry = orca_mcp::initialize_registry(&[]);
     let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
@@ -2881,6 +2991,201 @@ mod tests {
     }
 
     #[test]
+    fn stale_attachment_events_do_not_mutate_switched_session() {
+        let (mut state, _rx) = test_state();
+        let attachment_a = SessionAttachmentId::new(1);
+        let attachment_b = SessionAttachmentId::new(2);
+        let apply = |state: &mut AppState, attachment, event| {
+            reduce_attached_tui_event(
+                state,
+                AttachedTuiEvent {
+                    attachment: Some(attachment),
+                    event,
+                },
+            )
+        };
+
+        assert!(apply(
+            &mut state,
+            attachment_a,
+            TuiEvent::SessionAttachmentActivated,
+        ));
+        assert!(apply(
+            &mut state,
+            attachment_b,
+            TuiEvent::SessionAttachmentActivated,
+        ));
+
+        let goal_b = orca_core::goal_types::ThreadGoal {
+            session_id: "session-b".to_string(),
+            objective: "goal-b".to_string(),
+            status: orca_core::goal_types::ThreadGoalStatus::Active,
+            token_budget: Some(1_000),
+            tokens_used: 10,
+            time_used_seconds: 2,
+            created_at: 1,
+            updated_at: 2,
+        };
+        let operation_b = orca_runtime::surface::SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 0x0b,
+        ])
+        .unwrap();
+        for event in [
+            TuiEvent::HistoryLoaded {
+                messages: vec![ChatMessage::Assistant("transcript-b".to_string())],
+                plan: None,
+                label: "loaded-b".to_string(),
+            },
+            TuiEvent::SessionIdentityUpdated {
+                session_id: "session-b".to_string(),
+                title: "title-b".to_string(),
+            },
+            TuiEvent::WorkflowTasksUpdated {
+                tasks: vec![workflow_task("task-b", "workflow-b")],
+            },
+            TuiEvent::UsageUpdated {
+                revision: 20,
+                usage: orca_core::cost_types::UsageTotals {
+                    input_tokens: 200,
+                    output_tokens: 50,
+                    cache_tokens: 0,
+                    estimated_cost_usd: 0.25,
+                },
+            },
+            TuiEvent::GoalUpdated(goal_b),
+            TuiEvent::TurnStarted {
+                turn: 3,
+                task: None,
+            },
+            TuiEvent::RecoveryAvailable {
+                operation_id: operation_b,
+            },
+        ] {
+            assert!(apply(&mut state, attachment_b, event));
+        }
+
+        let messages = format!("{:?}", state.messages);
+        let tasks = state.workflow_panel.tasks.clone();
+        let usage = state.usage.clone();
+        let goal = state.current_goal.clone();
+        let identity = (
+            state.current_session_id.clone(),
+            state.current_session_title.clone(),
+        );
+        let status = state.status;
+        let recovery = state.recoverable_operation_id.clone();
+
+        let goal_a = orca_core::goal_types::ThreadGoal {
+            session_id: "session-a".to_string(),
+            objective: "stale-goal-a".to_string(),
+            status: orca_core::goal_types::ThreadGoalStatus::Complete,
+            token_budget: None,
+            tokens_used: 999,
+            time_used_seconds: 99,
+            created_at: 1,
+            updated_at: 99,
+        };
+        for event in [
+            TuiEvent::HistoryLoaded {
+                messages: vec![ChatMessage::Assistant("stale-transcript-a".to_string())],
+                plan: None,
+                label: "stale-loaded-a".to_string(),
+            },
+            TuiEvent::SessionIdentityUpdated {
+                session_id: "session-a".to_string(),
+                title: "stale-title-a".to_string(),
+            },
+            TuiEvent::WorkflowTasksUpdated {
+                tasks: vec![workflow_task("task-a", "stale-workflow-a")],
+            },
+            TuiEvent::UsageUpdated {
+                revision: 99,
+                usage: orca_core::cost_types::UsageTotals {
+                    input_tokens: 9_999,
+                    output_tokens: 9_999,
+                    cache_tokens: 0,
+                    estimated_cost_usd: 99.0,
+                },
+            },
+            TuiEvent::GoalUpdated(goal_a),
+            TuiEvent::MessageDelta("stale-delta-a".to_string()),
+            TuiEvent::SessionCompleted {
+                status: "failed".to_string(),
+            },
+        ] {
+            assert!(!apply(&mut state, attachment_a, event));
+        }
+
+        assert_eq!(format!("{:?}", state.messages), messages);
+        assert_eq!(state.workflow_panel.tasks, tasks);
+        assert_eq!(state.usage, usage);
+        assert_eq!(state.current_goal, goal);
+        assert_eq!(
+            (
+                state.current_session_id.clone(),
+                state.current_session_title.clone(),
+            ),
+            identity
+        );
+        assert_eq!(state.status, status);
+        assert_eq!(state.recoverable_operation_id, recovery);
+    }
+
+    #[test]
+    fn attachment_relay_preserves_source_generation_after_rotation() {
+        let (root_event_tx, root_event_rx) = mpsc::unbounded();
+        let mut attachment = SessionAttachmentId::new(1);
+        let mut event_tx = spawn_attached_event_sender(root_event_tx.clone(), attachment);
+
+        let receive_attached = || match root_event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("attached TUI event")
+        {
+            TuiEvent::Attached(attached) => *attached,
+            event => panic!("expected attached TUI event, got {event:?}"),
+        };
+
+        let activated_a = receive_attached();
+        assert_eq!(activated_a.attachment, Some(SessionAttachmentId::new(1)));
+        assert!(matches!(
+            activated_a.event,
+            TuiEvent::SessionAttachmentActivated
+        ));
+
+        let stale_event_tx = event_tx.clone();
+        rotate_attached_event_sender(&root_event_tx, &mut attachment, &mut event_tx);
+        let activated_b = receive_attached();
+        assert_eq!(activated_b.attachment, Some(SessionAttachmentId::new(2)));
+        assert!(matches!(
+            activated_b.event,
+            TuiEvent::SessionAttachmentActivated
+        ));
+
+        stale_event_tx
+            .send(TuiEvent::MessageDelta("from-a".to_string()))
+            .unwrap();
+        event_tx
+            .send(TuiEvent::MessageDelta("from-b".to_string()))
+            .unwrap();
+
+        let delivered = [receive_attached(), receive_attached()];
+        assert!(delivered.iter().any(|attached| {
+            attached.attachment == Some(SessionAttachmentId::new(1))
+                && matches!(
+                    &attached.event,
+                    TuiEvent::MessageDelta(text) if text == "from-a"
+                )
+        }));
+        assert!(delivered.iter().any(|attached| {
+            attached.attachment == Some(SessionAttachmentId::new(2))
+                && matches!(
+                    &attached.event,
+                    TuiEvent::MessageDelta(text) if text == "from-b"
+                )
+        }));
+    }
+
+    #[test]
     fn workflows_panel_keys_move_selected_task() {
         let (mut state, _rx) = test_state();
         state.show_workflows();
@@ -3371,6 +3676,7 @@ mod tests {
             let preloaded = Arc::new(Mutex::new(None));
             let pending = test_pending_workflow_notifications();
             let (event_tx, event_rx) = mpsc::unbounded();
+            let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
             let (action_tx, action_rx) = mpsc::unbounded();
             let registry = orca_mcp::initialize_registry(&[]);
             let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
@@ -4073,6 +4379,7 @@ mod tests {
             let preloaded = Arc::new(Mutex::new(None));
             let pending = test_pending_workflow_notifications();
             let (event_tx, event_rx) = mpsc::unbounded();
+            let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
             let (action_tx, action_rx) = mpsc::unbounded();
             let registry = orca_mcp::initialize_registry(&[]);
             let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
@@ -4470,6 +4777,7 @@ mod tests {
             let preloaded = Arc::new(Mutex::new(None));
             let pending = test_pending_workflow_notifications();
             let (event_tx, event_rx) = mpsc::unbounded();
+            let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
             let (action_tx, action_rx) = mpsc::unbounded();
             let registry = orca_mcp::initialize_registry(&[]);
             let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
@@ -7682,6 +7990,9 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
     host: RuntimeHostHandle,
     ordinary_turn_runner: OrdinaryTurnRunner,
 ) {
+    let root_event_tx = event_tx;
+    let mut session_attachment = SessionAttachmentId::new(1);
+    let mut event_tx = spawn_attached_event_sender(root_event_tx.clone(), session_attachment);
     let mut thread: Option<RuntimeThreadHandle> = None;
 
     let startup_history_mode = config.lock().unwrap().history_mode.clone();
@@ -7739,9 +8050,17 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &preloaded,
                     &mcp_registry,
                     &pending_workflow_notifications,
-                    &event_tx,
                 ) {
                     Ok(session_id) => {
+                        rotate_attached_event_sender(
+                            &root_event_tx,
+                            &mut session_attachment,
+                            &mut event_tx,
+                        );
+                        announce_runtime_ready(
+                            thread.as_ref().expect("new hosted thread"),
+                            &event_tx,
+                        );
                         let _ = event_tx.send(TuiEvent::NewSessionStarted { session_id });
                     }
                     Err(error) => {
@@ -7757,10 +8076,18 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &preloaded,
                     &mcp_registry,
                     &pending_workflow_notifications,
-                    &event_tx,
                     title,
                 ) {
                     Ok((_mode, session_id, title)) => {
+                        rotate_attached_event_sender(
+                            &root_event_tx,
+                            &mut session_attachment,
+                            &mut event_tx,
+                        );
+                        announce_runtime_ready(
+                            thread.as_ref().expect("forked hosted thread"),
+                            &event_tx,
+                        );
                         let _ = event_tx.send(TuiEvent::SessionForked { session_id, title });
                     }
                     Err(error) => {
@@ -7798,11 +8125,18 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &preloaded,
                     &mcp_registry,
                     &pending_workflow_notifications,
-                    &event_tx,
                     HistoryMode::Resume(session_id),
                     None,
                 ) {
                     Ok(mode) => {
+                        rotate_attached_event_sender(
+                            &root_event_tx,
+                            &mut session_attachment,
+                            &mut event_tx,
+                        );
+                        if let Some(runtime_thread) = thread.as_ref() {
+                            announce_runtime_ready(runtime_thread, &event_tx);
+                        }
                         if let Some(runtime_thread) = thread.as_ref()
                             && let Err(error) =
                                 emit_typed_history_snapshot(runtime_thread, &mode, &event_tx)
@@ -7825,22 +8159,27 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &preloaded,
                     &mcp_registry,
                     &pending_workflow_notifications,
-                    &event_tx,
                     HistoryMode::Fork(session_id),
                     None,
                 ) {
                     Ok(_) => {
-                        if let Some(runtime_thread) = thread.as_ref()
-                            && let (Some(fork_id), Ok(snapshot)) = (
+                        rotate_attached_event_sender(
+                            &root_event_tx,
+                            &mut session_attachment,
+                            &mut event_tx,
+                        );
+                        if let Some(runtime_thread) = thread.as_ref() {
+                            announce_runtime_ready(runtime_thread, &event_tx);
+                            if let (Some(fork_id), Ok(snapshot)) = (
                                 runtime_thread.session_id(),
                                 TuiSurfaceActions::new(runtime_thread.typed_surface())
                                     .read_snapshot(),
-                            )
-                        {
-                            let _ = event_tx.send(TuiEvent::SessionForked {
-                                session_id: fork_id.to_string(),
-                                title: snapshot.thread.title.as_str().to_string(),
-                            });
+                            ) {
+                                let _ = event_tx.send(TuiEvent::SessionForked {
+                                    session_id: fork_id.to_string(),
+                                    title: snapshot.thread.title.as_str().to_string(),
+                                });
+                            }
                         }
                     }
                     Err(error) => {
@@ -7851,11 +8190,11 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
             Ok(UserAction::RenameSavedSession { session_id, title }) => {
                 match TuiHostActions::rename_saved_session(&session_id, &title) {
                     Ok(()) => refresh_saved_session_picker(
-                        &event_tx,
+                        &root_event_tx,
                         format!("Renamed conversation to {title}."),
                     ),
                     Err(error) => {
-                        let _ = event_tx.send(TuiEvent::SavedSessionActionFailed(format!(
+                        let _ = root_event_tx.send(TuiEvent::SavedSessionActionFailed(format!(
                             "failed to rename conversation: {error}"
                         )));
                     }
@@ -7867,18 +8206,18 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     .and_then(RuntimeThreadHandle::session_id)
                     .is_some_and(|current| current == session_id)
                 {
-                    let _ = event_tx.send(TuiEvent::SavedSessionActionFailed(
+                    let _ = root_event_tx.send(TuiEvent::SavedSessionActionFailed(
                         "cannot archive the current conversation".to_string(),
                     ));
                     continue;
                 }
                 match TuiHostActions::archive_saved_session(&session_id) {
                     Ok(()) => refresh_saved_session_picker(
-                        &event_tx,
+                        &root_event_tx,
                         "Archived saved conversation.".to_string(),
                     ),
                     Err(error) => {
-                        let _ = event_tx.send(TuiEvent::SavedSessionActionFailed(format!(
+                        let _ = root_event_tx.send(TuiEvent::SavedSessionActionFailed(format!(
                             "failed to archive conversation: {error}"
                         )));
                     }
@@ -7890,18 +8229,18 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     .and_then(RuntimeThreadHandle::session_id)
                     .is_some_and(|current| current == session_id)
                 {
-                    let _ = event_tx.send(TuiEvent::SavedSessionActionFailed(
+                    let _ = root_event_tx.send(TuiEvent::SavedSessionActionFailed(
                         "cannot delete the current conversation".to_string(),
                     ));
                     continue;
                 }
                 match TuiHostActions::delete_saved_session(&session_id) {
                     Ok(()) => refresh_saved_session_picker(
-                        &event_tx,
+                        &root_event_tx,
                         "Deleted saved conversation.".to_string(),
                     ),
                     Err(error) => {
-                        let _ = event_tx.send(TuiEvent::SavedSessionActionFailed(format!(
+                        let _ = root_event_tx.send(TuiEvent::SavedSessionActionFailed(format!(
                             "failed to delete conversation: {error}"
                         )));
                     }
@@ -8396,7 +8735,6 @@ fn start_new_hosted_session(
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     mcp_registry: &orca_mcp::McpRegistry,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
-    event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<String, String> {
     ensure_current_session_switchable(thread.as_ref())?;
 
@@ -8429,7 +8767,6 @@ fn start_new_hosted_session(
     *config.lock().unwrap() = next_config;
     *preloaded.lock().unwrap() = None;
     pending_workflow_notifications.clear();
-    announce_runtime_ready(&started, event_tx);
     *thread = Some(started);
     Ok(session_id)
 }
@@ -8483,7 +8820,6 @@ fn start_forked_hosted_session(
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     mcp_registry: &orca_mcp::McpRegistry,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
-    event_tx: &mpsc::Sender<TuiEvent>,
     title: Option<String>,
 ) -> Result<(HistoryMode, String, String), String> {
     ensure_current_session_switchable(thread.as_ref())?;
@@ -8523,7 +8859,6 @@ fn start_forked_hosted_session(
     *config.lock().unwrap() = next_config;
     *preloaded.lock().unwrap() = None;
     pending_workflow_notifications.clear();
-    announce_runtime_ready(&started, event_tx);
     *thread = Some(started);
     Ok((mode, session_id, fork_title))
 }
@@ -8536,7 +8871,6 @@ fn switch_saved_hosted_session(
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     mcp_registry: &orca_mcp::McpRegistry,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
-    event_tx: &mpsc::Sender<TuiEvent>,
     mode: HistoryMode,
     title: Option<String>,
 ) -> Result<HistoryMode, String> {
@@ -8580,7 +8914,6 @@ fn switch_saved_hosted_session(
     *config.lock().unwrap() = next_config;
     *preloaded.lock().unwrap() = None;
     pending_workflow_notifications.clear();
-    announce_runtime_ready(&started, event_tx);
     *thread = Some(started);
     Ok(mode)
 }

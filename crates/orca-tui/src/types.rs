@@ -293,9 +293,37 @@ fn push_pending_workflow_notification_unique(
     true
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct SessionAttachmentId(u64);
+
+impl SessionAttachmentId {
+    pub(crate) const fn new(value: u64) -> Self {
+        assert!(value != 0, "session attachment ids start at one");
+        Self(value)
+    }
+
+    pub(crate) fn next(self) -> Self {
+        Self(self.0.wrapping_add(1).max(1))
+    }
+
+    pub(crate) const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AttachedTuiEvent {
+    pub(crate) attachment: Option<SessionAttachmentId>,
+    pub(crate) event: TuiEvent,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum TuiEvent {
+    #[doc(hidden)]
+    Attached(Box<AttachedTuiEvent>),
+    #[doc(hidden)]
+    SessionAttachmentActivated,
     TurnStarted {
         turn: u32,
         task: Option<TuiTaskLifecycle>,
@@ -849,6 +877,7 @@ pub struct AppState {
     pub cwd: String,
     pub current_session_id: Option<String>,
     pub current_session_title: Option<String>,
+    pub(crate) active_session_attachment: Option<SessionAttachmentId>,
     pub(crate) workspace_git: Option<GitIdentity>,
     #[allow(dead_code)]
     pub event_tx: mpsc::Sender<UserAction>,
@@ -1012,6 +1041,7 @@ impl AppState {
             cwd,
             current_session_id: None,
             current_session_title: None,
+            active_session_attachment: None,
             workspace_git: None,
             event_tx,
             approval_dialog: None,
@@ -2418,6 +2448,10 @@ impl AppState {
     pub fn update(&mut self, event: TuiEvent) {
         self.reconcile_message_tracking();
         match event {
+            TuiEvent::Attached(_) => {
+                unreachable!("attached TUI events must be fenced before AppState reduction")
+            }
+            TuiEvent::SessionAttachmentActivated => {}
             TuiEvent::NewSessionStarted { session_id } => {
                 self.current_session_id = Some(session_id);
                 self.current_session_title = Some("New conversation".to_string());
