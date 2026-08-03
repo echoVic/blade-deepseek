@@ -1811,6 +1811,63 @@ mod tests {
     }
 
     #[test]
+    fn non_streaming_length_finish_reason_is_a_truncation_error() {
+        // finish_reason=length means the model hit max_tokens. It is a terminal
+        // error (no retry) that must surface the truncation guidance verbatim.
+        let truncated = r#"{"choices":[{"message":{"content":"partial answer"},"finish_reason":"length"}],"usage":{"prompt_tokens":9,"completion_tokens":6,"prompt_cache_hit_tokens":4}}"#;
+        let (base_url, bodies) = spawn_response_sequence_server(vec![truncated]);
+        let mut conversation = Conversation::new();
+        conversation.add_user("write a long essay".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        let error = request_chat(&conversation, &config).expect_err("length must be an error");
+
+        assert_eq!(error.message, length_finish_reason_error());
+        // Usage from the truncated response is preserved so callers still bill it.
+        assert_eq!(
+            error.usage,
+            Some(Usage {
+                input_tokens: 9,
+                output_tokens: 6,
+                cache_tokens: 4,
+            })
+        );
+        // Terminal error: exactly one request, no retry.
+        assert_eq!(bodies.lock().expect("lock captured bodies").len(), 1);
+    }
+
+    #[test]
+    fn non_streaming_content_filter_finish_reason_is_an_error() {
+        let filtered = r#"{"choices":[{"message":{"content":""},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":8,"completion_tokens":0,"prompt_cache_hit_tokens":3}}"#;
+        let (base_url, bodies) = spawn_response_sequence_server(vec![filtered]);
+        let mut conversation = Conversation::new();
+        conversation.add_user("blocked prompt".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        let error =
+            request_chat(&conversation, &config).expect_err("content_filter must be an error");
+
+        assert_eq!(error.message, "Response blocked by content filter");
+        assert_eq!(bodies.lock().expect("lock captured bodies").len(), 1);
+    }
+
+    #[test]
     fn non_streaming_tool_call_without_reasoning_does_not_fabricate_replay_state() {
         let missing_reasoning = r#"{"choices":[{"message":{"content":null,"reasoning_content":"   ","tool_calls":[{"id":"call_missing_reasoning","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]},"finish_reason":"tool_calls"}]}"#;
         let (base_url, _bodies) = spawn_response_sequence_server(vec![missing_reasoning]);
@@ -1959,6 +2016,73 @@ mod tests {
             bodies.lock().expect("lock captured bodies").len(),
             EMPTY_RESPONSE_RETRIES + 1
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_length_finish_reason_is_a_truncation_error() {
+        // A streamed finish_reason=length must terminate as the same truncation
+        // error as the non-streaming path, carrying the streamed usage.
+        let truncated = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n\
+                         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+                         data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":8,\"prompt_cache_hit_tokens\":6}}\n\n\
+                         data: [DONE]\n\n";
+        let (base_url, bodies) = spawn_streaming_response_sequence_server(vec![truncated]);
+        let mut conversation = Conversation::new();
+        conversation.add_user("write a long essay".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+
+        let error = request_chat_streaming(&conversation, &config, &cancel, &mut |_| {})
+            .await
+            .expect_err("length must be an error");
+
+        assert_eq!(error.message, length_finish_reason_error());
+        assert_eq!(
+            error.usage,
+            Some(Usage {
+                input_tokens: 10,
+                output_tokens: 8,
+                cache_tokens: 6,
+            })
+        );
+        // Terminal error: exactly one request, no retry.
+        assert_eq!(bodies.lock().expect("lock captured bodies").len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_content_filter_finish_reason_is_an_error() {
+        let filtered = "data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n\
+                        data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n\
+                        data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":0,\"prompt_cache_hit_tokens\":2}}\n\n\
+                        data: [DONE]\n\n";
+        let (base_url, bodies) = spawn_streaming_response_sequence_server(vec![filtered]);
+        let mut conversation = Conversation::new();
+        conversation.add_user("blocked prompt".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+
+        let error = request_chat_streaming(&conversation, &config, &cancel, &mut |_| {})
+            .await
+            .expect_err("content_filter must be an error");
+
+        assert_eq!(error.message, "Response blocked by content filter");
+        assert_eq!(bodies.lock().expect("lock captured bodies").len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

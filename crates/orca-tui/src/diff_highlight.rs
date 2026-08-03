@@ -2450,8 +2450,22 @@ diff --git a/value.rs b/value.rs
     }
 
     #[test]
-    fn zero_width_hunk_forces_first_paint_raw_fallback() {
-        assert_malformed_raw_fallback(
+    fn malformed_hunk_ranges_force_first_paint_raw_fallback() {
+        // Each case is a distinct way a hunk's coordinates can be malformed;
+        // all must fall back to raw first-paint rendering. Table-driven so a new
+        // malformed shape is one row, not another near-identical test function.
+        // The helper prints the offending diff on failure, so cases stay
+        // identifiable without a separate label.
+        let overflow_endpoint = format!(
+            "--- a/value.rs\n+++ b/value.rs\n@@ -{},2 +1,2 @@\n-old = 1\n-old = 2\n+value = 2\n+new = 2\n",
+            usize::MAX
+        );
+        let overflow_zero_anchor = format!(
+            "--- a/value.rs\n+++ b/value.rs\n@@ -{},0 +1 @@\n+let value = 2\n",
+            usize::MAX
+        );
+        let cases: &[&str] = &[
+            // zero-width hunk
             "\
 --- a/value.rs
 +++ b/value.rs
@@ -2460,32 +2474,11 @@ diff --git a/value.rs b/value.rs
 -let old = 1;
 +let value = 2;
 ",
-        );
-    }
-
-    #[test]
-    fn overflowing_hunk_endpoint_forces_first_paint_raw_fallback() {
-        let diff = format!(
-            "--- a/value.rs\n+++ b/value.rs\n@@ -{},2 +1,2 @@\n-old = 1\n-old = 2\n+value = 2\n+new = 2\n",
-            usize::MAX
-        );
-
-        assert_malformed_raw_fallback(&diff);
-    }
-
-    #[test]
-    fn overflowing_zero_count_anchor_forces_first_paint_raw_fallback() {
-        let diff = format!(
-            "--- a/value.rs\n+++ b/value.rs\n@@ -{},0 +1 @@\n+let value = 2\n",
-            usize::MAX
-        );
-
-        assert_malformed_raw_fallback(&diff);
-    }
-
-    #[test]
-    fn duplicate_hunk_ranges_force_first_paint_raw_fallback() {
-        assert_malformed_raw_fallback(
+            // overflowing hunk endpoint
+            overflow_endpoint.as_str(),
+            // overflowing zero-count anchor
+            overflow_zero_anchor.as_str(),
+            // duplicate hunk ranges
             "\
 --- a/value.rs
 +++ b/value.rs
@@ -2496,12 +2489,7 @@ diff --git a/value.rs b/value.rs
 -old = 1
 +value = 2
 ",
-        );
-    }
-
-    #[test]
-    fn backward_hunk_forces_first_paint_raw_fallback() {
-        assert_malformed_raw_fallback(
+            // backward hunk ordering
             "\
 --- a/value.rs
 +++ b/value.rs
@@ -2512,12 +2500,7 @@ diff --git a/value.rs b/value.rs
 -old = 1
 +value = 2
 ",
-        );
-    }
-
-    #[test]
-    fn old_side_overlap_forces_first_paint_raw_fallback() {
-        assert_malformed_raw_fallback(
+            // old-side range overlap
             "\
 --- a/value.rs
 +++ b/value.rs
@@ -2529,12 +2512,7 @@ diff --git a/value.rs b/value.rs
 -old = 2
 +value = 2
 ",
-        );
-    }
-
-    #[test]
-    fn new_side_overlap_forces_first_paint_raw_fallback() {
-        assert_malformed_raw_fallback(
+            // new-side range overlap
             "\
 --- a/value.rs
 +++ b/value.rs
@@ -2546,12 +2524,7 @@ diff --git a/value.rs b/value.rs
 -old = 2
 +value = 2
 ",
-        );
-    }
-
-    #[test]
-    fn zero_count_old_anchor_cannot_be_reused_by_later_positive_range() {
-        assert_malformed_raw_fallback(
+            // zero-count old anchor reused by a later positive range
             "\
 --- a/value.rs
 +++ b/value.rs
@@ -2561,12 +2534,7 @@ diff --git a/value.rs b/value.rs
 -let old = 1;
 +let value = 2;
 ",
-        );
-    }
-
-    #[test]
-    fn zero_count_new_anchor_cannot_be_reused_by_later_positive_range() {
-        assert_malformed_raw_fallback(
+            // zero-count new anchor reused by a later positive range
             "\
 --- a/value.rs
 +++ b/value.rs
@@ -2576,7 +2544,11 @@ diff --git a/value.rs b/value.rs
 -let other = 3;
 +let value = 2;
 ",
-        );
+        ];
+
+        for diff in cases {
+            assert_malformed_raw_fallback(diff);
+        }
     }
 
     #[test]

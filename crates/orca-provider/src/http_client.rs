@@ -388,4 +388,127 @@ mod tests {
             "cancelled request left the TCP connection owned by a detached worker"
         );
     }
+
+    /// Serve exactly `retryable_count` responses with `status_line` (each
+    /// carrying `Retry-After: 0` so the blocking backoff stays near-instant),
+    /// then, if `then_succeed` is true, serve one final `200 OK`. The listener
+    /// is non-blocking with a bounded deadline so the server thread can never
+    /// block `join()` waiting for a connection the client will not open (e.g.
+    /// once the client has already succeeded or exhausted its retries).
+    fn spawn_flaky_blocking_server(
+        retryable_count: usize,
+        status_line: &'static str,
+        then_succeed: bool,
+    ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind flaky endpoint");
+        listener
+            .set_nonblocking(true)
+            .expect("set flaky endpoint nonblocking");
+        let address = listener.local_addr().expect("flaky endpoint address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let expected = retryable_count + usize::from(then_succeed);
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut served = 0;
+            while served < expected {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let index = server_requests.fetch_add(1, Ordering::SeqCst);
+                        let mut request = [0u8; 4 * 1024];
+                        let _ = stream.read(&mut request);
+                        let response = if index < retryable_count {
+                            format!(
+                                "HTTP/1.1 {status_line}\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                        } else {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                                .to_string()
+                        };
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        served += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "flaky server only saw {served}/{expected} requests before timeout"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept flaky request: {error}"),
+                }
+            }
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    #[test]
+    fn blocking_retry_recovers_after_retryable_statuses() {
+        // Two 503s (with Retry-After: 0) then a 200: the retry loop must retry
+        // through both and return the eventual success rather than the 503.
+        let (base, requests, server) =
+            spawn_flaky_blocking_server(2, "503 Service Unavailable", true);
+        let url = format!("{base}/retry");
+
+        let result = execute_with_retry(|client| client.get(&url));
+
+        server.join().expect("flaky server");
+        assert!(result.is_ok(), "expected eventual success, got {result:?}");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            3,
+            "must retry both 503s before the successful attempt"
+        );
+    }
+
+    #[test]
+    fn blocking_retry_reports_exhaustion_after_max_retries() {
+        // Every attempt returns a retryable status, so the loop must give up
+        // after MAX_RETRIES and surface the last status instead of looping
+        // forever. Retry-After: 0 keeps the exhaustion path near-instant.
+        let attempts = (MAX_RETRIES as usize) + 1;
+        let (base, requests, server) =
+            spawn_flaky_blocking_server(attempts, "500 Internal Server Error", false);
+        let url = format!("{base}/exhaust");
+
+        let error = execute_with_retry(|client| client.get(&url)).expect_err("should exhaust");
+
+        server.join().expect("flaky server");
+        assert_eq!(
+            error,
+            "max retries exceeded (last status: 500 Internal Server Error)"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            attempts,
+            "must stop after the initial attempt plus MAX_RETRIES"
+        );
+    }
+
+    #[test]
+    fn retry_after_header_drives_the_blocking_backoff_delay() {
+        // A 429 carrying Retry-After: 0 must be honored (parsed and used as the
+        // sleep) so the loop retries immediately and then succeeds.
+        let (base, requests, server) =
+            spawn_flaky_blocking_server(1, "429 Too Many Requests", true);
+        let url = format!("{base}/throttle");
+
+        let started = Instant::now();
+        let result = execute_with_retry(|client| client.get(&url));
+        let elapsed = started.elapsed();
+
+        server.join().expect("flaky server");
+        assert!(
+            result.is_ok(),
+            "expected success after honoring Retry-After"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "one retry then success");
+        // Retry-After: 0 must short-circuit the exponential backoff (which would
+        // otherwise sleep ~1s on the first retry).
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "Retry-After: 0 should bypass the ~1s exponential backoff, took {elapsed:?}"
+        );
+    }
 }
