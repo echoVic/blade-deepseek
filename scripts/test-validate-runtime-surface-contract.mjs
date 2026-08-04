@@ -8,8 +8,13 @@ import { fileURLToPath } from "node:url";
 import * as validator from "./validate-runtime-surface-contract.mjs";
 
 const {
+  assertNoProductionRuntimeSurfaceSiblingGlobs,
   parseManifestText,
+  parseRuntimeSurfacePublicExports,
+  parseSurfaceFacadeExports,
+  unstableSurfaceReferenceLines,
   validateArtifactBundle,
+  validateArtifactDigest,
   validateCurrentInventories,
   validateManifestStructure,
   validateRuntimeSurfaceContract,
@@ -19,6 +24,10 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const manifestPath = path.join(
   repoRoot,
   "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json",
+);
+const digestPath = path.join(
+  repoRoot,
+  "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.digest.json",
 );
 const baseline = JSON.parse(readFileSync(manifestPath, "utf8"));
 const productionMutationSites = [
@@ -42,6 +51,55 @@ function expectReviewedDrift(label, mutate) {
   mutate(manifest);
   expectFailure(label, () => validateCandidate(manifest), /reviewed manifest .* drift/);
 }
+
+expectFailure(
+  "wildcard runtime-surface exports are rejected",
+  () => parseRuntimeSurfacePublicExports("pub use commands::*;"),
+  /public exports must be explicit.*commands::\*/,
+);
+
+assert.deepEqual(
+  parseRuntimeSurfacePublicExports(
+    "pub use commands::{AdmissionOutput, SurfaceCommand};\npub use store::{SurfaceStore};",
+  ),
+  {
+    commands: ["AdmissionOutput", "SurfaceCommand"],
+    store: ["SurfaceStore"],
+  },
+);
+assert.deepEqual(parseRuntimeSurfacePublicExports("pub use host::RuntimeHost;"), {
+  host: ["RuntimeHost"],
+});
+assert.deepEqual(
+  parseSurfaceFacadeExports(
+    "pub mod surface { pub use crate::runtime_surface::{SurfaceCursor, SurfaceEvent}; }",
+  ),
+  ["SurfaceCursor", "SurfaceEvent"],
+);
+expectFailure(
+  "wildcard surface facade exports are rejected",
+  () => parseSurfaceFacadeExports("pub use crate::runtime_surface::*;"),
+  /facade exports must be explicit/,
+);
+
+expectFailure(
+  "production sibling globs are rejected",
+  () => assertNoProductionRuntimeSurfaceSiblingGlobs("use super::*;", "commands"),
+  /production imports must be explicit.*use super::\*/,
+);
+assert.doesNotThrow(() =>
+  assertNoProductionRuntimeSurfaceSiblingGlobs(
+    "#[cfg(test)]\nmod tests { use super::*; }",
+    "commands",
+  ),
+);
+
+assert.deepEqual(
+  unstableSurfaceReferenceLines(
+    "// unstable_surface in a comment\nconst NAME: &str = \"unstable_surface\";\nuse crate::unstable_surface::SurfaceCursor;",
+  ),
+  [3],
+);
 
 function appSourceOverride(extraSource) {
   const relativePath = "crates/orca-tui/src/app.rs";
@@ -85,6 +143,16 @@ expectFailure(
     "artifact hash mismatches are rejected",
     () => validateArtifactBundle(manifest, { repoRoot }),
     /private contract SHA-256 mismatch/,
+  );
+}
+
+{
+  const digest = JSON.parse(readFileSync(digestPath, "utf8"));
+  digest.artifacts[0].sha256 = "0".repeat(64);
+  expectFailure(
+    "reviewed artifact digest mismatches are rejected without commit metadata",
+    () => validateArtifactDigest(digest, { repoRoot }),
+    /artifact digest SHA-256 mismatch for .*private-contract\.md/,
   );
 }
 
@@ -321,6 +389,28 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 
 {
   const manifest = cloneManifest();
+  const sessionActions = new Set([
+    "ForkCurrentSession",
+    "RenameCurrentSession",
+    "ResumeSavedSession",
+    "ForkSavedSession",
+    "RenameSavedSession",
+    "ArchiveSavedSession",
+    "DeleteSavedSession",
+  ]);
+  manifest.closed_inventory.current_tui_user_actions =
+    manifest.closed_inventory.current_tui_user_actions.filter(
+      (action) => !sessionActions.has(action),
+    );
+  expectFailure(
+    "inventory drift lists all seven missing current session actions",
+    () => validateCurrentInventories(manifest, { repoRoot }),
+    /missing: ForkCurrentSession, RenameCurrentSession, ResumeSavedSession, ForkSavedSession, RenameSavedSession, ArchiveSavedSession, DeleteSavedSession/,
+  );
+}
+
+{
+  const manifest = cloneManifest();
   manifest.tui_entrypoints.pop();
   expectFailure(
     "mutation-capable TUI entrypoints are exact",
@@ -332,15 +422,22 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 {
   const relativePath = "crates/orca-tui/src/slash_command_actions.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const sourceWithCrLf = source.replace(/\r?\n/g, "\r\n");
+  const appPath = "crates/orca-tui/src/app.rs";
+  const appWithCrLf = readFileSync(path.join(repoRoot, appPath), "utf8").replace(
+    /\r?\n/g,
+    "\r\n",
+  );
   assert.doesNotThrow(
     () =>
       validateCurrentInventories(cloneManifest(), {
         repoRoot,
         sourceOverrides: new Map([
-          [relativePath, `// inserted without changing an entrypoint\n${source}`],
+          [relativePath, `// inserted without changing an entrypoint\r\n${sourceWithCrLf}`],
+          [appPath, appWithCrLf],
         ]),
       }),
-    "entrypoint validation follows the declared source file when a reviewed line drifts",
+    "entrypoint validation ignores checkout line endings when a reviewed line drifts",
   );
 }
 
@@ -1065,6 +1162,96 @@ const IGNORED_LITERAL: &str = ".mutate(";\n`;
     productionMutationSites,
     "comment and string contents do not create mutation-capable TUI entrypoints",
   );
+}
+
+{
+  const relativePath = "crates/orca-tui/src/synthetic/scanner.rs";
+  const source = String.raw`
+trait BodylessDeclarations {
+    async fn wait_for<'a>(&'a self, callback: fn(char)) -> Result<(), Error>;
+    fn array(&self, bytes: [u8; 32]);
+}
+
+#[cfg(all(test, target_os = "windows"))]
+#[allow(clippy::let_unit_value)]
+fn ignored_test_only<'a>(value: &'a str) {
+    let _character = '\u{7b}';
+    runtime_thread.mutate(mutation);
+}
+
+#[inline(always)]
+fn discovered_mixed_syntax<'a>(value: &'a str) {
+    let _raw = r###"fn fake() { runtime_thread.mutate(mutation); }"###;
+    let _character = '\x7b';
+    nested_macro!({ inner_macro!({ value.len() }) });
+    /* fn commented() { runtime_thread.mutate(mutation); } */
+    runtime_thread.mutate(mutation);
+}
+`;
+  assert.deepEqual(
+    [...validator.scanTuiMutationEntrypoints({
+      repoRoot,
+      sourcePaths: [relativePath],
+      sourceOverrides: new Map([[relativePath, source]]),
+    })],
+    [[`${relativePath}:discovered_mixed_syntax:thread.mutate`, 1]],
+    "Rust scanning handles attributes, bodyless declarations, raw strings, nested macro tokens, comments, lifetimes, character literals, and cfg(test)",
+  );
+}
+
+for (const [relativePath, minimumOccurrences] of [
+  [".github/workflows/release.yml", 1],
+  [".github/workflows/windows-ci.yml", 2],
+]) {
+  const workflow = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const fullHistoryCheckouts = workflow.match(
+    /- uses: actions\/checkout@v5\r?\n\s+with:\r?\n\s+fetch-depth: 0/g,
+  );
+  assert.ok(
+    (fullHistoryCheckouts?.length ?? 0) >= minimumOccurrences,
+    `${relativePath} must fetch full history for every runtime contract job`,
+  );
+  for (const command of [
+    "node --test scripts/test-validate-runtime-surface-contract.mjs",
+    "node scripts/validate-runtime-surface-contract.mjs",
+  ]) {
+    assert.ok(
+      workflow.split(command).length - 1 >= minimumOccurrences,
+      `${relativePath} must run ${command} in every required job`,
+    );
+  }
+}
+
+{
+  const attributes = readFileSync(path.join(repoRoot, ".gitattributes"), "utf8");
+  for (const rule of [
+    "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-* text eol=lf",
+    "docs/superpowers/plans/2026-07-21-runtime-owned-typed-surface-implementation.md text eol=lf",
+  ]) {
+    assert.ok(
+      attributes.split(/\r?\n/).includes(rule),
+      `reviewed artifact bytes require ${rule}`,
+    );
+  }
+}
+
+{
+  const workflow = readFileSync(
+    path.join(repoRoot, ".github/workflows/runtime-contract.yml"),
+    "utf8",
+  );
+  assert.match(
+    workflow,
+    /- uses: actions\/checkout@v5\r?\n\s+with:\r?\n\s+fetch-depth: 0/,
+    "runtime contract workflow must fetch the reviewed design commit",
+  );
+  for (const command of [
+    "node --test scripts/test-validate-runtime-surface-contract.mjs",
+    "node scripts/validate-runtime-surface-contract.mjs",
+    "cargo test -p orca-tui runtime_surface_contract --lib --locked",
+  ]) {
+    assert.ok(workflow.includes(command), `runtime contract workflow must run ${command}`);
+  }
 }
 
 assert.equal(typeof validator.parseRustEnum, "function", "the Rust enum parser is testable");

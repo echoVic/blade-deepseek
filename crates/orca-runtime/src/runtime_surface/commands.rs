@@ -1,4 +1,56 @@
-use super::*;
+use super::hub::{
+    AcpReadTextFileDispatchReceiver, AcpReadTextFileSettlement, AcpTerminalCleanupDispatchReceiver,
+    AcpTerminalCleanupSettlement, AcpTerminalCreateDispatchReceiver, AcpTerminalCreateSettlement,
+    AcpTerminalObservationDispatchReceiver, AcpTerminalObservationSettlement,
+    AcpWriteTextFileDispatchReceiver, AcpWriteTextFileSettlement, SurfaceHub,
+    SurfaceSubscriptionReceiver,
+};
+use super::identity::{
+    BootstrapCredentialRevision, CanonicalPath, CanonicalUri, CapabilityRevision, CommitClass,
+    ContextRevision, DisplayText, DurableRevision, DurationMillis, GoalCatalogRevision,
+    GoalObjectiveRevision, GoalOwnerEpoch, GoalRevision, HostIncarnation, HostLifecycleRevision,
+    HostRevisionWitness, InputCatalogRevision, InteractionRevision, McpCatalogRevision,
+    MemoryRevision, NonEmptySet, NonEmptyText, NonEmptyVec, OpaqueToken,
+    OptionalProcessLocalCancel, PinnedContextRevision, PlanRevision, PolicyEpoch,
+    ProjectRootMemoryRevision, ResponseRouteEpoch, Rfc3339Timestamp, SequenceNumber,
+    SessionCatalogRevision, SessionMetadataRevision, Set, SettingsRevision, Sha256Digest,
+    SurfaceAdmissionLeaseId, SurfaceAttachmentGrant, SurfaceAttachmentId, SurfaceAttachmentRole,
+    SurfaceBackgroundFence, SurfaceBoundCaller, SurfaceCapability, SurfaceCapabilityCallId,
+    SurfaceCatalogEntryId, SurfaceCommitId, SurfaceConnectionId, SurfaceCursor, SurfaceEventId,
+    SurfaceFinalizeIntentId, SurfaceGenerationId, SurfaceGoalFence, SurfaceGoalId,
+    SurfaceHostBoundCaller, SurfaceIncarnation, SurfaceInteractionId, SurfaceItemId,
+    SurfaceOperationFence, SurfaceOperationId, SurfaceRequestId, SurfaceResponseGrantToken,
+    SurfaceResponseId, SurfaceResponseToken, SurfaceScope, SurfaceSettlementId, SurfaceTaskFence,
+    SurfaceTaskId, SurfaceThreadId, SurfaceUnavailableReason, SurfaceValueError,
+    SurfaceWorkflowFence, SurfaceWorkflowRunId, TaskRevision, ThreadOwnerEpoch, TrustRevision,
+    UnixMillis, UsageRevision, UuidV7, WorkflowCatalogRevision, WorkflowRevision,
+    ZeroizingProcessLocalSecret,
+};
+use super::interaction::{
+    BoundInteractionResponse, BrokerInteractionAnswerPolicy, InteractionPatch,
+    SurfaceClientInteractionAnswer, SurfaceDataValue, SurfaceInteractionKind,
+    SurfaceInteractionResolutionReceipt, SurfaceInteractionView,
+};
+use super::operation::{
+    FinalizationStartedAtCursor, GenerationPhase, InterruptSettlement, LastUserTurn, LegacyTurnId,
+    OperationFinalizationCause, OperationKind, OperationPhase, OperationRecord,
+    OperationRequestIntent, OperationTerminal, Replayability, ReservationLease,
+    RuntimeSettingsPatch, SurfaceActivePermissionProfile, SurfaceAdditionalWorkingDirectory,
+    SurfaceApprovalMode, SurfaceInputBindingKind, SurfaceInputRequest, SurfaceNetworkPermissions,
+    SurfacePermissionRuleSet, SurfaceRuntimeSettings,
+};
+use super::projection::{
+    AssistantPatch, FirstOperationCompletionPolicy, GoalPatchEnvelope, ItemPatch, McpCatalogPatch,
+    OperationPatch, PinnedContextPatch, SessionPatch, SettingsPatch, SubagentPatch,
+    SurfaceAssistantStream, SurfaceBackgroundOperation, SurfaceContextSnapshot, SurfaceFactFamily,
+    SurfaceGoal, SurfaceGoalStoreReceipt, SurfaceItem, SurfaceMcpCatalogSnapshot,
+    SurfaceMcpResource, SurfaceMcpResourceTemplate, SurfaceMcpTool, SurfacePinnedContextEntry,
+    SurfacePinnedContextSnapshot, SurfacePlanSnapshot, SurfaceSessionHealth,
+    SurfaceSettingsSnapshot, SurfaceSubagent, SurfaceTask, SurfaceThreadSnapshot, SurfaceToolView,
+    SurfaceUsageSnapshot, SurfaceWorkflow, TaskPatch, ThreadPersistence, ToolInvocationStarted,
+    ToolPatch, ToolTerminalSource, WorkflowPatch,
+};
+use super::reducer::canonical_replayability_digest;
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
@@ -498,6 +550,14 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         patch: NonEmptyVec<RuntimeSettingsPatch>,
     ) -> Result<MutationReply<SettingsMutationOutput>, SurfaceClientCommandError>;
 
+    fn update_session_metadata(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        precondition: SessionMetadataPrecondition,
+        patch: SessionMetadataPatch,
+    ) -> Result<MutationReply<()>, SurfaceClientCommandError>;
+
     fn pinned_context_mutation(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -893,6 +953,18 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .update_settings(self.clone(), request_id, expected_thread_revision, patch)
+    }
+
+    pub fn update_session_metadata(
+        &self,
+        request_id: SurfaceRequestId,
+        precondition: SessionMetadataPrecondition,
+        patch: SessionMetadataPatch,
+    ) -> Result<MutationReply<()>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .update_session_metadata(self.clone(), request_id, precondition, patch)
     }
 
     pub fn pinned_context_mutation(
@@ -4198,6 +4270,21 @@ pub enum StoreProviderCredentialResult {
 #[cfg(test)]
 mod closed_command_domain_tests {
     use super::*;
+    use crate::runtime_surface::identity::{
+        CursorSourceRevision, HostMonotonicClockId, MonotonicInstant, MonotonicTick,
+        SurfaceResponseReceiptId,
+    };
+    use crate::runtime_surface::interaction::{
+        ApplicableAuthorityFingerprint, SurfaceInteractionSafeProjection, SurfaceUserInputDecision,
+    };
+    use crate::runtime_surface::operation::{
+        OperationIngressCorrelation, OperationSettingsPreparation, ReplayabilityRequest,
+        SurfaceInputRequestBlock, SurfaceReasoningEffort, UsageTotals,
+    };
+    use crate::runtime_surface::projection::{
+        GoalUsage, SurfaceGoalReceiptState, SurfaceGoalState, SurfaceTaskStatus, SurfaceTaskType,
+        SurfaceWorkflowStatus,
+    };
     use std::collections::{BTreeSet, HashSet};
 
     fn uuid_v7_bytes(seed: u8) -> [u8; 16] {
@@ -4418,6 +4505,7 @@ mod closed_command_domain_tests {
             goal_revision: GoalRevision::try_new(1).unwrap(),
             goal_owner_epoch: GoalOwnerEpoch::try_new(1).unwrap(),
             catalog_revision: GoalCatalogRevision::try_new(1).unwrap(),
+            receipt_digest: digest(seed),
             objective: NonEmptyText::try_new("finish typed surface").unwrap(),
             objective_revision: GoalObjectiveRevision::new(1),
             state: SurfaceGoalState::Active,

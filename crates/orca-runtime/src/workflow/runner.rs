@@ -1414,6 +1414,8 @@ impl WorkflowRunner {
             hooks: &hooks,
             cancel,
             lifecycle: Some(&mut lifecycle),
+            task_registry: None,
+            root_task_id: None,
             executor: self.child_executor,
         });
         let (result, child_cost_tracker) =

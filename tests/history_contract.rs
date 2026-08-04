@@ -4,6 +4,30 @@ use std::process::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 
+static ORCA_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes direct runtime-host access to the process-wide ORCA_HOME value.
+/// Tests in this binary must use Command::env or acquire this helper before
+/// reading or mutating ORCA_HOME.
+fn with_process_orca_home<T>(home: &Path, run: impl FnOnce() -> T) -> T {
+    let _guard = ORCA_HOME_LOCK.lock().expect("ORCA_HOME lock");
+    let previous = std::env::var_os("ORCA_HOME");
+    unsafe {
+        std::env::set_var("ORCA_HOME", home);
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+    unsafe {
+        match previous {
+            Some(previous) => std::env::set_var("ORCA_HOME", previous),
+            None => std::env::remove_var("ORCA_HOME"),
+        }
+    }
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 fn trust_project(home: &std::path::Path, project: &std::path::Path) {
     orca_core::config::folder_trust::set_trust_with_config_dir(
         project,
@@ -166,6 +190,148 @@ fn exec_resume_injects_prior_conversation() {
         .expect("assistant message");
     let text = message["payload"]["text"].as_str().unwrap_or_default();
     assert!(text.contains("first prompt | mock_history_echo"));
+}
+
+#[test]
+fn session_fork_copies_history_and_keeps_source_durable() {
+    let home = TempDir::new().expect("temp home");
+
+    let first = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args(["exec", "--provider", "mock", "fork source prompt"])
+        .output()
+        .expect("run source conversation");
+    assert_eq!(first.status.code(), Some(0));
+
+    let source_documents = session_documents(home.path());
+    let source_id = source_documents
+        .iter()
+        .flat_map(|(_, records)| records)
+        .find(|record| record["type"] == "session.meta")
+        .and_then(|record| record["session_id"].as_str())
+        .expect("source session metadata")
+        .to_string();
+    let source_path = source_documents
+        .iter()
+        .find(|(_, records)| {
+            records.iter().any(|record| {
+                record["type"] == "session.meta"
+                    && record["session_id"].as_str() == Some(source_id.as_str())
+            })
+        })
+        .map(|(path, _)| path)
+        .expect("source session document");
+    let source_before = std::fs::read_to_string(source_path).expect("read source document");
+
+    let forked = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--provider",
+            "mock",
+            "--fork",
+            &source_id,
+            "fork child prompt",
+        ])
+        .output()
+        .expect("run forked conversation");
+    assert_eq!(forked.status.code(), Some(0));
+
+    let documents = session_documents(home.path());
+    assert_eq!(
+        documents.len(),
+        2,
+        "source and fork must both remain durable"
+    );
+    let fork_records = documents
+        .iter()
+        .map(|(_, records)| records)
+        .find(|records| {
+            records.iter().any(|record| {
+                record["type"] == "session.meta"
+                    && record["parent_id"].as_str() == Some(source_id.as_str())
+            })
+        })
+        .expect("fork metadata with source parent");
+    let fork_id = fork_records
+        .iter()
+        .find(|record| record["type"] == "session.meta")
+        .and_then(|record| record["session_id"].as_str())
+        .expect("fork session id");
+    assert_ne!(fork_id, source_id);
+    let fork_text = fork_records
+        .iter()
+        .map(|record| record.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(fork_text.contains("fork source prompt"));
+    assert!(fork_text.contains("fork child prompt"));
+    let source_after = documents
+        .iter()
+        .find(|(_, records)| {
+            records.iter().any(|record| {
+                record["type"] == "session.meta"
+                    && record["session_id"].as_str() == Some(source_id.as_str())
+            })
+        })
+        .map(|(path, _)| std::fs::read_to_string(path).expect("read source after fork"))
+        .expect("source document after fork");
+    assert_eq!(source_after, source_before);
+}
+
+#[test]
+fn session_archive_and_delete_update_the_durable_catalog() {
+    let home = TempDir::new().expect("temp home");
+    for prompt in ["archive this conversation", "delete this conversation"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+            .env("ORCA_HOME", home.path())
+            .args(["exec", "--provider", "mock", prompt])
+            .output()
+            .expect("run saved conversation");
+        assert_eq!(output.status.code(), Some(0));
+    }
+    let documents = session_documents(home.path());
+    let session_ids = documents
+        .iter()
+        .filter_map(|(_, records)| {
+            records
+                .iter()
+                .find(|record| record["type"] == "session.meta")
+                .and_then(|record| record["session_id"].as_str())
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(session_ids.len(), 2);
+
+    with_process_orca_home(home.path(), || {
+        let archived_path =
+            orca_runtime::surface::RuntimeSurfaceHostHandle::archive_saved_session(&session_ids[0])
+                .expect("archive saved conversation");
+        assert!(archived_path.starts_with(home.path().join("archive")));
+        assert!(archived_path.exists());
+        assert!(
+            orca_runtime::surface::RuntimeSurfaceHostHandle::list_saved_sessions(10)
+                .expect("list active conversations")
+                .iter()
+                .all(|session| session.session_id != session_ids[0])
+        );
+
+        let deleted_archive =
+            orca_runtime::surface::RuntimeSurfaceHostHandle::delete_saved_session(&session_ids[0])
+                .expect("delete archived conversation");
+        assert_eq!(deleted_archive, archived_path);
+        assert!(!deleted_archive.exists());
+
+        let deleted_active =
+            orca_runtime::surface::RuntimeSurfaceHostHandle::delete_saved_session(&session_ids[1])
+                .expect("delete active conversation");
+        assert!(!deleted_active.exists());
+        assert!(
+            orca_runtime::surface::RuntimeSurfaceHostHandle::list_saved_sessions(10)
+                .expect("list empty conversation catalog")
+                .is_empty()
+        );
+    });
 }
 
 #[test]

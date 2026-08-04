@@ -2,6 +2,7 @@ use std::io::{self, BufRead, Read as _, Write as _};
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 const MAX_FORWARDED_STDIN_BYTES: usize = 64 * 1024;
 #[cfg_attr(not(windows), allow(dead_code))]
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -111,6 +112,7 @@ fn write_response(response: &LaunchResponse) -> io::Result<()> {
     stdout.flush()
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn read_forwarded_stdin(reader: &mut impl io::Read) -> io::Result<Vec<u8>> {
     let mut input = Vec::new();
     reader

@@ -6,7 +6,37 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::tempdir;
 
+use orca_core::task_types::TaskStatus;
+use orca_runtime::tasks::TaskRegistry;
+
 static SUBAGENT_CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn foreground_cancel_stops_async_subagent_tree_only() {
+    let registry = TaskRegistry::new("foreground-cancel-contract".to_string());
+    let foreground = registry.create_main_session("foreground turn".to_string());
+    registry.mark_running(&foreground.id).unwrap();
+    let owned = registry.create_subagent_with_parent(
+        "owned async subagent".to_string(),
+        None,
+        Some(foreground.id.clone()),
+    );
+    registry.mark_running(&owned.id).unwrap();
+    let detached = registry.create_subagent("detached async subagent".to_string(), None);
+    registry.mark_running(&detached.id).unwrap();
+
+    let stopped = registry.request_stop_tree(&foreground.id).unwrap();
+
+    assert!(stopped.contains(&owned.id));
+    assert_eq!(
+        registry.get(&owned.id).unwrap().status,
+        TaskStatus::Stopping
+    );
+    assert_eq!(
+        registry.get(&detached.id).unwrap().status,
+        TaskStatus::Running
+    );
+}
 
 #[test]
 fn subagent_tool_runs_child_agent_and_emits_events() {

@@ -293,9 +293,55 @@ fn push_pending_workflow_notification_unique(
     true
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct SessionAttachmentId(u64);
+
+impl SessionAttachmentId {
+    pub(crate) const fn new(value: u64) -> Self {
+        assert!(value != 0, "session attachment ids start at one");
+        Self(value)
+    }
+
+    pub(crate) fn next(self) -> Self {
+        Self(self.0.wrapping_add(1).max(1))
+    }
+
+    pub(crate) const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AttachedTuiEvent {
+    pub(crate) attachment: Option<SessionAttachmentId>,
+    pub(crate) event: TuiEvent,
+}
+
+/// Runtime-derived values that the TUI must keep in lockstep with the
+/// authoritative surface reducer after each projected batch.
+#[derive(Clone, Debug, PartialEq)]
+#[doc(hidden)]
+pub struct SurfaceProjectionState {
+    pub(crate) session_id: String,
+    pub(crate) title: String,
+    pub(crate) usage_revision: u64,
+    pub(crate) usage: UsageTotals,
+    pub(crate) context_used_tokens: usize,
+    pub(crate) context_limit_tokens: usize,
+    pub(crate) workflow_tasks: Vec<BackgroundTaskSummary>,
+    pub(crate) current_goal: Option<ThreadGoal>,
+    pub(crate) foreground_operation_id: Option<SurfaceOperationId>,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum TuiEvent {
+    #[doc(hidden)]
+    Attached(Box<AttachedTuiEvent>),
+    #[doc(hidden)]
+    SessionAttachmentActivated,
+    #[doc(hidden)]
+    SurfaceProjectionSynced(Box<SurfaceProjectionState>),
     TurnStarted {
         turn: u32,
         task: Option<TuiTaskLifecycle>,
@@ -398,6 +444,10 @@ pub enum TuiEvent {
     NewSessionStarted {
         session_id: String,
     },
+    SessionProjectionReset {
+        session_id: String,
+        title: String,
+    },
     SessionIdentityUpdated {
         session_id: String,
         title: String,
@@ -433,7 +483,10 @@ pub enum TuiEvent {
     },
     OperationRejected(String),
     Error(String),
-    UsageUpdated(UsageTotals),
+    UsageUpdated {
+        revision: u64,
+        usage: UsageTotals,
+    },
     ContextUpdated {
         used_tokens: usize,
         limit_tokens: usize,
@@ -818,6 +871,7 @@ type EditHighlightDrain = fn(&mut EditHighlightRuntime) -> DrainResults;
 pub struct AppState {
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) message_revisions: Vec<u64>,
+    tool_call_indices: HashMap<String, usize>,
     next_message_revision: u64,
     pub(crate) transcript_render_cache: TranscriptRenderCache,
     pub(crate) transcript_search: TranscriptSearchState,
@@ -845,6 +899,7 @@ pub struct AppState {
     pub cwd: String,
     pub current_session_id: Option<String>,
     pub current_session_title: Option<String>,
+    pub(crate) active_session_attachment: Option<SessionAttachmentId>,
     pub(crate) workspace_git: Option<GitIdentity>,
     #[allow(dead_code)]
     pub event_tx: mpsc::Sender<UserAction>,
@@ -872,6 +927,7 @@ pub struct AppState {
     pub session_picker_phase: SessionPickerPhase,
     pub session_picker_error: Option<String>,
     pub usage: UsageTotals,
+    usage_revision: Option<u64>,
     pub context_used_tokens: usize,
     pub context_limit_tokens: usize,
     pub slash_menu: Option<SlashMenu>,
@@ -885,6 +941,7 @@ pub struct AppState {
     /// showing outdated statuses. Cleared by the next successful update.
     pub plan_update_failed: bool,
     pub current_goal: Option<ThreadGoal>,
+    active_surface_operation_id: Option<SurfaceOperationId>,
     pub recoverable_operation_id: Option<SurfaceOperationId>,
     pub recovery_prompt_visible: bool,
     pub recovery_prompt_selected: usize,
@@ -987,6 +1044,7 @@ impl AppState {
         Self {
             messages: Vec::new(),
             message_revisions: Vec::new(),
+            tool_call_indices: HashMap::new(),
             next_message_revision: 1,
             transcript_render_cache: TranscriptRenderCache::default(),
             transcript_search: TranscriptSearchState::default(),
@@ -1006,6 +1064,7 @@ impl AppState {
             cwd,
             current_session_id: None,
             current_session_title: None,
+            active_session_attachment: None,
             workspace_git: None,
             event_tx,
             approval_dialog: None,
@@ -1030,6 +1089,7 @@ impl AppState {
             session_picker_phase: SessionPickerPhase::Browsing,
             session_picker_error: None,
             usage: UsageTotals::default(),
+            usage_revision: None,
             context_used_tokens: 0,
             context_limit_tokens: 0,
             slash_menu: None,
@@ -1041,6 +1101,7 @@ impl AppState {
             assistant_stream_tail: None,
             plan_update_failed: false,
             current_goal: None,
+            active_surface_operation_id: None,
             recoverable_operation_id: None,
             recovery_prompt_visible: false,
             recovery_prompt_selected: 0,
@@ -1581,6 +1642,7 @@ impl AppState {
     }
 
     pub(crate) fn reconcile_message_tracking(&mut self) {
+        let structure_changed = self.message_revisions.len() != self.messages.len();
         if self.message_revisions.len() > self.messages.len() {
             self.message_revisions.truncate(self.messages.len());
             self.transcript_render_cache.truncate(self.messages.len());
@@ -1592,6 +1654,10 @@ impl AppState {
         }
         self.transcript_render_cache
             .reconcile_len(self.messages.len());
+        if structure_changed {
+            self.rebuild_tool_call_indices();
+            self.assert_tool_call_index_consistent();
+        }
     }
 
     fn reset_message_tracking(&mut self) {
@@ -1603,20 +1669,122 @@ impl AppState {
         }
         self.transcript_render_cache
             .reconcile_len(self.messages.len());
+        self.rebuild_tool_call_indices();
+        self.assert_tool_call_index_consistent();
     }
+
+    fn rebuild_tool_call_indices(&mut self) {
+        self.tool_call_indices.clear();
+        for (index, message) in self.messages.iter().enumerate() {
+            if let ChatMessage::ToolCall { id, .. } = message {
+                self.tool_call_indices.entry(id.clone()).or_insert(index);
+            }
+        }
+    }
+
+    fn tool_call_message_index(&self, id: &str) -> Option<usize> {
+        self.tool_call_indices.get(id).copied()
+    }
+
+    fn receiving_tool_call_message_index(&self, id: &str) -> Option<usize> {
+        let is_receiving = |message: &ChatMessage| {
+            matches!(
+                message,
+                ChatMessage::ToolCall {
+                    id: existing_id,
+                    status,
+                    ..
+                } if existing_id == id && status == "receiving"
+            )
+        };
+        let first = self.tool_call_message_index(id)?;
+        let first_message = self.messages.get(first)?;
+        if is_receiving(first_message) {
+            return Some(first);
+        }
+        self.messages
+            .get(first + 1..)?
+            .iter()
+            .rposition(is_receiving)
+            .map(|offset| first + 1 + offset)
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn assert_tool_call_index_consistent(&self) {
+        let mut canonical = HashMap::new();
+        for (index, message) in self.messages.iter().enumerate() {
+            if let ChatMessage::ToolCall { id, .. } = message {
+                canonical.entry(id.clone()).or_insert(index);
+            }
+        }
+        debug_assert_eq!(self.tool_call_indices, canonical);
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    fn assert_tool_call_index_consistent(&self) {}
+
+    fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) {
+        if self.current_session_id.as_deref() == Some(projection.session_id.as_str())
+            && self
+                .usage_revision
+                .is_some_and(|revision| projection.usage_revision < revision)
+        {
+            return;
+        }
+        self.current_session_id = Some(projection.session_id.clone());
+        self.current_session_title = Some(projection.title.clone());
+        self.usage = projection.usage.clone();
+        self.usage_revision = Some(projection.usage_revision);
+        self.context_used_tokens = projection.context_used_tokens;
+        self.context_limit_tokens = projection.context_limit_tokens;
+        self.current_goal = projection.current_goal.clone();
+        self.active_surface_operation_id = projection.foreground_operation_id.clone();
+        self.apply_workflow_tasks_update(projection.workflow_tasks.clone());
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn assert_surface_projection_consistent(&self, projection: &SurfaceProjectionState) {
+        debug_assert_eq!(
+            self.current_session_id.as_deref(),
+            Some(projection.session_id.as_str())
+        );
+        debug_assert_eq!(
+            self.current_session_title.as_deref(),
+            Some(projection.title.as_str())
+        );
+        debug_assert_eq!(self.usage, projection.usage);
+        debug_assert_eq!(self.usage_revision, Some(projection.usage_revision));
+        debug_assert_eq!(self.context_used_tokens, projection.context_used_tokens);
+        debug_assert_eq!(self.context_limit_tokens, projection.context_limit_tokens);
+        debug_assert_eq!(
+            self.workflow_panel.tasks,
+            sort_workflow_tasks_for_panel(projection.workflow_tasks.clone())
+        );
+        debug_assert_eq!(self.current_goal, projection.current_goal);
+        debug_assert_eq!(
+            self.active_surface_operation_id,
+            projection.foreground_operation_id
+        );
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    fn assert_surface_projection_consistent(&self, _projection: &SurfaceProjectionState) {}
 
     pub(crate) fn push_message(&mut self, message: ChatMessage) {
         self.reconcile_message_tracking();
         if let ChatMessage::ToolCall { id, .. } = &message {
-            let reused_tool_id = self.messages.iter().any(
-                |existing| matches!(existing, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == id),
-            );
+            let reused_tool_id = self.tool_call_message_index(id).is_some();
             self.remove_applied_highlights_for_tool_id(id);
             if reused_tool_id {
                 self.clear_pending_edit_highlights();
             }
         }
         let revision = self.allocate_message_revision();
+        if let ChatMessage::ToolCall { id, .. } = &message {
+            self.tool_call_indices
+                .entry(id.clone())
+                .or_insert(self.messages.len());
+        }
         self.messages.push(message);
         self.message_revisions.push(revision);
         self.transcript_render_cache
@@ -1647,6 +1815,7 @@ impl AppState {
         self.transcript_search.reset();
         self.messages.clear();
         self.message_revisions.clear();
+        self.tool_call_indices.clear();
         self.transcript_render_cache.clear();
         self.applied_diff_highlights.clear();
         self.clear_pending_edit_highlights();
@@ -1654,6 +1823,49 @@ impl AppState {
         self.flushed_count = 0;
         self.unseen_messages = 0;
         self.invalidate_selection();
+    }
+
+    pub(crate) fn reset_session_projection(&mut self, session_id: String, title: String) {
+        self.current_session_id = Some(session_id);
+        self.current_session_title = Some(title);
+        self.clear_messages();
+        self.current_plan = None;
+        self.proposed_plan_parser = ProposedPlanStreamParser::default();
+        self.plan_update_failed = false;
+        self.current_goal = None;
+        self.active_surface_operation_id = None;
+        self.recoverable_operation_id = None;
+        self.recovery_prompt_visible = false;
+        self.usage = UsageTotals::default();
+        self.usage_revision = None;
+        self.context_used_tokens = 0;
+        self.context_limit_tokens = 0;
+        self.approval_dialog = None;
+        self.pending_input = None;
+        self.approval_allowlist.clear();
+        self.session_picker_sessions.clear();
+        self.session_picker_selected = 0;
+        self.session_picker_query.clear();
+        self.session_picker_phase = SessionPickerPhase::Browsing;
+        self.session_picker_error = None;
+        self.slash_menu = None;
+        self.mention = MentionPopupState::default();
+        self.mention_bindings.clear();
+        self.pending_pastes.clear();
+        self.reset_history_navigation();
+        self.last_ctrl_c = None;
+        self.panel_mode = PanelMode::Conversation;
+        self.workflow_panel = WorkflowPanelState::default();
+        self.pending_workflow_notifications.clear();
+        self.suppress_background_main_session_output = false;
+        self.last_completed_at = None;
+        self.pending_clipboard_copy = None;
+        self.last_left_click = None;
+        self.copy_notice = None;
+        self.composer_mouse_selecting = false;
+        self.scroll_offset = 0;
+        self.auto_scroll = true;
+        self.set_status(AppStatus::Idle);
     }
 
     pub(crate) fn truncate_messages(&mut self, len: usize) {
@@ -1664,7 +1876,8 @@ impl AppState {
             self.reset_assistant_stream();
         }
         self.reconcile_message_tracking();
-        if len < self.messages.len() {
+        let did_truncate = len < self.messages.len();
+        if did_truncate {
             self.invalidate_selection();
             self.clear_pending_edit_highlights();
         }
@@ -1674,6 +1887,9 @@ impl AppState {
         self.finalized_count = self.finalized_count.min(len);
         self.flushed_count = self.flushed_count.min(len);
         self.prune_applied_diff_highlights();
+        if did_truncate {
+            self.rebuild_tool_call_indices();
+        }
     }
 
     pub(crate) fn replace_message(&mut self, index: usize, message: ChatMessage) -> bool {
@@ -1682,7 +1898,18 @@ impl AppState {
             return false;
         }
         self.remove_applied_highlight_for_message(index);
+        let previous_tool_id = self.messages.get(index).and_then(|message| match message {
+            ChatMessage::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        });
+        let next_tool_id = match &message {
+            ChatMessage::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        };
         self.messages[index] = message;
+        if previous_tool_id != next_tool_id {
+            self.rebuild_tool_call_indices();
+        }
         self.touch_message(index);
         true
     }
@@ -1694,7 +1921,18 @@ impl AppState {
     ) -> Option<R> {
         self.reconcile_message_tracking();
         self.remove_applied_highlight_for_message(index);
+        let previous_tool_id = self.messages.get(index).and_then(|message| match message {
+            ChatMessage::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        });
         let result = mutate(self.messages.get_mut(index)?);
+        let current_tool_id = self.messages.get(index).and_then(|message| match message {
+            ChatMessage::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        });
+        if previous_tool_id != current_tool_id {
+            self.rebuild_tool_call_indices();
+        }
         self.touch_message(index);
         Some(result)
     }
@@ -1749,6 +1987,7 @@ impl AppState {
             }
         }
         self.transcript_render_cache.retain(&retained_mask);
+        self.rebuild_tool_call_indices();
         if active_tail.is_some() {
             if retained_tail.is_some() {
                 self.assistant_stream_tail = retained_tail;
@@ -1766,6 +2005,7 @@ impl AppState {
             self.prune_applied_diff_highlights();
             self.invalidate_selection();
         }
+        self.assert_tool_call_index_consistent();
     }
 
     pub fn enter_running(&mut self) {
@@ -2330,46 +2570,20 @@ impl AppState {
     }
 
     pub fn update(&mut self, event: TuiEvent) {
+        self.reconcile_message_tracking();
         match event {
+            TuiEvent::Attached(_) => {
+                eprintln!("orca: ignored an attached TUI event that bypassed attachment fencing");
+            }
+            TuiEvent::SessionAttachmentActivated => {}
+            TuiEvent::SurfaceProjectionSynced(projection) => {
+                self.apply_surface_projection_state(*projection);
+            }
             TuiEvent::NewSessionStarted { session_id } => {
-                self.current_session_id = Some(session_id);
-                self.current_session_title = Some("New conversation".to_string());
-                self.clear_messages();
-                self.current_plan = None;
-                self.proposed_plan_parser = ProposedPlanStreamParser::default();
-                self.plan_update_failed = false;
-                self.current_goal = None;
-                self.recoverable_operation_id = None;
-                self.recovery_prompt_visible = false;
-                self.usage = UsageTotals::default();
-                self.context_used_tokens = 0;
-                self.context_limit_tokens = 0;
-                self.approval_dialog = None;
-                self.pending_input = None;
-                self.approval_allowlist.clear();
-                self.session_picker_sessions.clear();
-                self.session_picker_selected = 0;
-                self.session_picker_query.clear();
-                self.session_picker_phase = SessionPickerPhase::Browsing;
-                self.session_picker_error = None;
-                self.slash_menu = None;
-                self.mention = MentionPopupState::default();
-                self.mention_bindings.clear();
-                self.pending_pastes.clear();
-                self.reset_history_navigation();
-                self.last_ctrl_c = None;
-                self.panel_mode = PanelMode::Conversation;
-                self.workflow_panel = WorkflowPanelState::default();
-                self.pending_workflow_notifications.clear();
-                self.suppress_background_main_session_output = false;
-                self.last_completed_at = None;
-                self.pending_clipboard_copy = None;
-                self.last_left_click = None;
-                self.copy_notice = None;
-                self.composer_mouse_selecting = false;
-                self.scroll_offset = 0;
-                self.auto_scroll = true;
-                self.set_status(AppStatus::Idle);
+                self.reset_session_projection(session_id, "New conversation".to_string());
+            }
+            TuiEvent::SessionProjectionReset { session_id, title } => {
+                self.reset_session_projection(session_id, title);
             }
             TuiEvent::SessionIdentityUpdated { session_id, title } => {
                 self.current_session_id = Some(session_id);
@@ -2470,9 +2684,7 @@ impl AppState {
                 if name == "subagent" || name == "update_plan" {
                     return;
                 }
-                if let Some(index) = self.messages.iter().rposition(|message| {
-                    matches!(message, ChatMessage::ToolCall { id: existing_id, status, .. } if existing_id == &id && status == "receiving")
-                }) {
+                if let Some(index) = self.receiving_tool_call_message_index(&id) {
                     self.mutate_message(index, |message| {
                         let ChatMessage::ToolCall {
                             name: existing_name,
@@ -2519,9 +2731,7 @@ impl AppState {
                     "receiving arguments... {}",
                     format_argument_bytes(arguments_bytes)
                 ));
-                if let Some(index) = self.messages.iter().rposition(|message| {
-                    matches!(message, ChatMessage::ToolCall { id: existing_id, status, .. } if existing_id == &id && status == "receiving")
-                }) {
+                if let Some(index) = self.receiving_tool_call_message_index(&id) {
                     self.mutate_message(index, |message| {
                         let ChatMessage::ToolCall {
                             name: existing_name,
@@ -2909,12 +3119,14 @@ impl AppState {
             TuiEvent::MentionSearchDirty { .. }
             | TuiEvent::MentionCatalogDirty { .. }
             | TuiEvent::MentionRuntimeReady(_) => {}
-            TuiEvent::UsageUpdated(usage) => {
-                self.usage.input_tokens = self.usage.input_tokens.max(usage.input_tokens);
-                self.usage.output_tokens = self.usage.output_tokens.max(usage.output_tokens);
-                self.usage.cache_tokens = self.usage.cache_tokens.max(usage.cache_tokens);
-                self.usage.estimated_cost_usd =
-                    self.usage.estimated_cost_usd.max(usage.estimated_cost_usd);
+            TuiEvent::UsageUpdated { revision, usage } => {
+                if self
+                    .usage_revision
+                    .is_none_or(|current_revision| revision > current_revision)
+                {
+                    self.usage = usage;
+                    self.usage_revision = Some(revision);
+                }
             }
             TuiEvent::ContextUpdated {
                 used_tokens,
@@ -3044,30 +3256,22 @@ impl AppState {
             .iter()
             .rposition(|item| matches!(item, ChatMessage::User(_)));
         if let Some(last_user) = last_user {
-            let old_messages = std::mem::take(&mut self.messages);
-            self.messages = old_messages
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, item)| {
-                    if index <= last_user
-                        || !matches!(
-                            item,
-                            ChatMessage::Reasoning(_)
-                                | ChatMessage::Assistant(_)
-                                | ChatMessage::ProposedPlan(_)
-                        )
-                    {
-                        Some(item)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let mut index = 0;
+            self.retain_messages(|item| {
+                let keep = index <= last_user
+                    || !matches!(
+                        item,
+                        ChatMessage::Reasoning(_)
+                            | ChatMessage::Assistant(_)
+                            | ChatMessage::ProposedPlan(_)
+                    );
+                index += 1;
+                keep
+            });
         }
         self.proposed_plan_parser = ProposedPlanStreamParser::default();
         if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
-            self.messages
-                .push(ChatMessage::Reasoning(reasoning.to_string()));
+            self.push_message(ChatMessage::Reasoning(reasoning.to_string()));
         }
         if let Some(message) = message.filter(|text| !text.is_empty()) {
             self.handle_message_delta(message);
@@ -4153,23 +4357,18 @@ mod tests {
 
     #[test]
     fn workflow_notification_action_carries_notification_boundary() {
-        let source = include_str!("types.rs");
-        let user_action = source
-            .split("pub enum UserAction {")
-            .nth(1)
-            .expect("UserAction enum")
-            .split("pub enum ApprovalOption")
-            .next()
-            .expect("UserAction enum body");
+        let expected = PendingWorkflowNotification {
+            id: "notice-1".to_string(),
+            prompt: "continue the workflow".to_string(),
+        };
+        let action = UserAction::SubmitWorkflowNotification(expected.clone());
 
-        assert!(
-            user_action.contains("SubmitWorkflowNotification(PendingWorkflowNotification)"),
-            "workflow notification actions should carry the typed notification boundary"
-        );
-        assert!(
-            !user_action.contains("SubmitWorkflowNotification { id: String, prompt: String }"),
-            "workflow notification actions should not split notification id and prompt"
-        );
+        match action {
+            UserAction::SubmitWorkflowNotification(actual) => {
+                assert_eq!(actual, expected);
+            }
+            _ => unreachable!("constructed the workflow notification variant"),
+        }
     }
 
     #[test]
@@ -5395,25 +5594,133 @@ mod tests {
     }
 
     #[test]
-    fn usage_updates_merge_monotonically_across_out_of_order_events() {
+    fn usage_update_allows_compaction_drop_and_rejects_stale_revision() {
         let mut state = state();
-        state.update(TuiEvent::UsageUpdated(UsageTotals {
-            input_tokens: 300,
-            output_tokens: 80,
-            cache_tokens: 40,
-            estimated_cost_usd: 0.003,
-        }));
-        state.update(TuiEvent::UsageUpdated(UsageTotals {
-            input_tokens: 200,
-            output_tokens: 120,
-            cache_tokens: 20,
-            estimated_cost_usd: 0.002,
-        }));
+        let before_compaction = UsageTotals {
+            input_tokens: 50_000,
+            output_tokens: 800,
+            cache_tokens: 400,
+            estimated_cost_usd: 0.03,
+        };
+        let after_compaction = UsageTotals {
+            input_tokens: 8_000,
+            output_tokens: 900,
+            cache_tokens: 450,
+            estimated_cost_usd: 0.035,
+        };
+        let stale = UsageTotals {
+            input_tokens: 60_000,
+            output_tokens: 700,
+            cache_tokens: 350,
+            estimated_cost_usd: 0.025,
+        };
 
-        assert_eq!(state.usage.input_tokens, 300);
-        assert_eq!(state.usage.output_tokens, 120);
-        assert_eq!(state.usage.cache_tokens, 40);
-        assert_eq!(state.usage.estimated_cost_usd, 0.003);
+        state.update(TuiEvent::UsageUpdated {
+            revision: 10,
+            usage: before_compaction,
+        });
+        state.update(TuiEvent::UsageUpdated {
+            revision: 11,
+            usage: after_compaction.clone(),
+        });
+        state.update(TuiEvent::UsageUpdated {
+            revision: 9,
+            usage: stale,
+        });
+
+        assert_eq!(state.usage, after_compaction);
+    }
+
+    #[test]
+    fn surface_projection_consistency_reconciles_session_scoped_state() {
+        let mut state = state();
+        state.update(TuiEvent::SessionProjectionReset {
+            session_id: "stale-session".to_string(),
+            title: "stale title".to_string(),
+        });
+        state.update(TuiEvent::ToolRequested {
+            id: "tool-1".to_string(),
+            name: "shell".to_string(),
+            target: None,
+        });
+
+        let operation_id = SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1,
+        ])
+        .expect("valid surface operation id");
+        let goal = ThreadGoal {
+            session_id: "canonical-session".to_string(),
+            objective: "keep the projection canonical".to_string(),
+            status: orca_core::goal_types::ThreadGoalStatus::Active,
+            token_budget: Some(10_000),
+            tokens_used: 42,
+            time_used_seconds: 3,
+            created_at: 1,
+            updated_at: 2,
+        };
+        let expected = SurfaceProjectionState {
+            session_id: "canonical-session".to_string(),
+            title: "canonical title".to_string(),
+            usage_revision: 7,
+            usage: UsageTotals {
+                input_tokens: 700,
+                output_tokens: 70,
+                cache_tokens: 7,
+                estimated_cost_usd: 0.007,
+            },
+            context_used_tokens: 700,
+            context_limit_tokens: 1_000,
+            workflow_tasks: vec![workflow_task_summary("task-1", "Canonical task")],
+            current_goal: Some(goal),
+            foreground_operation_id: Some(operation_id),
+        };
+
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            expected.clone(),
+        )));
+
+        assert_eq!(
+            state.current_session_id.as_deref(),
+            Some("canonical-session")
+        );
+        assert_eq!(
+            state.current_session_title.as_deref(),
+            Some("canonical title")
+        );
+        assert_eq!(state.usage, expected.usage);
+        assert_eq!(state.context_used_tokens, expected.context_used_tokens);
+        assert_eq!(state.context_limit_tokens, expected.context_limit_tokens);
+        assert_eq!(state.workflow_panel.tasks, expected.workflow_tasks);
+        assert_eq!(state.current_goal, expected.current_goal);
+        assert_eq!(
+            state.active_surface_operation_id,
+            expected.foreground_operation_id
+        );
+        state.assert_surface_projection_consistent(&expected);
+
+        let mut stale = expected.clone();
+        stale.usage_revision = 6;
+        stale.title = "stale projection title".to_string();
+        stale.usage.input_tokens = 1;
+        stale.foreground_operation_id = None;
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(stale)));
+        assert_eq!(
+            state.current_session_title.as_deref(),
+            Some("canonical title")
+        );
+        assert_eq!(state.usage, expected.usage);
+        assert_eq!(
+            state.active_surface_operation_id,
+            expected.foreground_operation_id
+        );
+
+        state.update(TuiEvent::SessionProjectionReset {
+            session_id: "next-session".to_string(),
+            title: "next title".to_string(),
+        });
+        assert!(state.active_surface_operation_id.is_none());
+        assert!(state.current_goal.is_none());
+        assert!(state.workflow_panel.tasks.is_empty());
     }
 
     #[test]
@@ -5460,6 +5767,54 @@ mod tests {
             }
             other => panic!("expected tool call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_call_index_matches_canonical_scan_after_mutations() {
+        fn tool_call(id: &str) -> ChatMessage {
+            ChatMessage::ToolCall {
+                id: id.to_string(),
+                name: "bash".to_string(),
+                target: None,
+                status: "completed".to_string(),
+                output: None,
+                diff: None,
+                kind: None,
+                expanded: false,
+            }
+        }
+
+        fn assert_matches_canonical_scan(state: &AppState, ids: &[&str]) {
+            state.assert_tool_call_index_consistent();
+            for id in ids {
+                let canonical = state.messages.iter().position(|message| {
+                    matches!(message, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == id)
+                });
+                assert_eq!(state.tool_call_message_index(id), canonical, "id={id}");
+            }
+        }
+
+        let mut state = state();
+        state.push_message(tool_call("first"));
+        state.push_message(ChatMessage::System("between".to_string()));
+        state.push_message(tool_call("duplicate"));
+        state.push_message(tool_call("duplicate"));
+        assert_matches_canonical_scan(&state, &["first", "duplicate", "missing"]);
+
+        assert!(state.replace_message(0, tool_call("replacement")));
+        assert_matches_canonical_scan(&state, &["first", "replacement", "duplicate", "missing"]);
+
+        state.truncate_messages(3);
+        assert_matches_canonical_scan(&state, &["replacement", "duplicate"]);
+
+        state.retain_messages(|message| !matches!(message, ChatMessage::System(_)));
+        assert_matches_canonical_scan(&state, &["replacement", "duplicate"]);
+
+        state.replace_messages([tool_call("history"), tool_call("history")]);
+        assert_matches_canonical_scan(&state, &["replacement", "history"]);
+
+        state.clear_messages();
+        assert_matches_canonical_scan(&state, &["history"]);
     }
 
     #[test]

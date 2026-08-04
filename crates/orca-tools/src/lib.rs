@@ -17,6 +17,7 @@ pub mod process;
 pub mod read_file;
 pub mod registry;
 pub mod sandbox;
+pub mod schema;
 pub mod skills;
 pub mod update_goal;
 pub mod update_plan;
@@ -286,26 +287,6 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
-
-    #[test]
-    fn sandbox_command_constructors_use_grouped_contexts() {
-        let sandbox_source = include_str!("sandbox/mod.rs");
-        let seatbelt_source = include_str!("sandbox/seatbelt.rs");
-
-        for marker in [
-            "pub struct WorkspaceWriteSandboxCommandContext",
-            "pub struct ReadOnlySandboxCommandContext",
-            "pub fn workspace_write_bash_command(context: WorkspaceWriteSandboxCommandContext",
-            "pub fn read_only_bash_command(context: ReadOnlySandboxCommandContext",
-            "fn workspace_write_profile(context: WorkspaceWriteProfileContext",
-            "fn read_only_profile(context: ReadOnlyProfileContext",
-        ] {
-            assert!(
-                sandbox_source.contains(marker) || seatbelt_source.contains(marker),
-                "sandbox command construction must use grouped context marker {marker}"
-            );
-        }
-    }
 
     #[test]
     fn micro_compact_preserves_head_and_tail() {

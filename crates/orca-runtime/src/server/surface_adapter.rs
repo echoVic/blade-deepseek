@@ -20,12 +20,7 @@ use crate::protocol::ServerEvent;
 use crate::runtime_host::{
     HostedOperationWriter, RuntimeHost, RuntimeHostError, RuntimeThreadStartRequest,
 };
-use crate::thread_store::{
-    SortDirection, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchPage,
-    StoredThreadSummaryPage, StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch,
-    ThreadSortKey, TurnItemsView,
-};
-use crate::unstable_surface::{
+use crate::surface::{
     AssistantChannel, AssistantPatch, AttachResult, DetachRequest, DisplayText, FreshAttachRequest,
     InteractionPatch, LegacyTurnId, MutationReply, NonEmptyVec, OperationIngressCorrelation,
     OperationKind, OperationPatch, OperationRequestIntent, OperationSettingsPreparation,
@@ -37,6 +32,11 @@ use crate::unstable_surface::{
     SurfaceRequestId, SurfaceScope, SurfaceSubscriptionItem, SurfaceSubscriptionReceiver,
     SurfaceToolRequest, SurfaceToolResultKind, SurfaceWorkflowResultStatus, ToolPatch,
     ToolTerminalSource, UncommittedMutation, WorkflowPatch,
+};
+use crate::thread_store::{
+    SortDirection, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchPage,
+    StoredThreadSummaryPage, StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch,
+    ThreadSortKey, TurnItemsView,
 };
 
 #[derive(Clone)]
@@ -171,7 +171,7 @@ impl JsonlSurfaceAdapter {
         result
     }
 
-    pub(crate) fn connection_id(&self) -> Option<crate::unstable_surface::SurfaceConnectionId> {
+    pub(crate) fn connection_id(&self) -> Option<crate::surface::SurfaceConnectionId> {
         self.surface_host.connection_id().cloned()
     }
 
@@ -327,13 +327,10 @@ impl JsonlSurfaceAdapter {
             .any(|operation| {
                 (!active_only || operation.terminal.is_none())
                     && match &operation.intent.origin {
-                        crate::unstable_surface::OperationOrigin::JsonlThreadTurn {
-                            legacy_turn_id,
-                            ..
+                        crate::surface::OperationOrigin::JsonlThreadTurn {
+                            legacy_turn_id, ..
                         } => legacy_turn_id.0.as_str() == turn_id,
-                        crate::unstable_surface::OperationOrigin::JsonlStatelessSubmit {
-                            ..
-                        } => operation
+                        crate::surface::OperationOrigin::JsonlStatelessSubmit { .. } => operation
                             .initial_logical_turn_id
                             .as_ref()
                             .is_some_and(|logical_turn_id| logical_turn_id.to_string() == turn_id),
@@ -470,9 +467,9 @@ impl JsonlSurfaceAdapter {
         &self,
         thread_id: Option<&str>,
         turn_id: &str,
-        action: crate::unstable_surface::JsonlTurnControlAction,
+        action: crate::surface::JsonlTurnControlAction,
         preferred_client: Option<RuntimeSurfaceClientHandle>,
-    ) -> io::Result<crate::unstable_surface::JsonlTurnControlResult> {
+    ) -> io::Result<crate::surface::JsonlTurnControlResult> {
         let candidate_ids = match thread_id {
             Some(thread_id) => vec![thread_id.to_string()],
             None => {
@@ -525,10 +522,10 @@ impl JsonlSurfaceAdapter {
                 let client = attachment.client;
                 let keep_attached = matches!(
                     result.as_ref(),
-                    Ok(crate::unstable_surface::JsonlTurnControlResult::Resolved {
+                    Ok(crate::surface::JsonlTurnControlResult::Resolved {
                         mutation: MutationReply::Committed { value, .. }
                     }) if value.echo.status
-                        == crate::unstable_surface::JsonlResolvedTurnControlStatus::Resumed
+                        == crate::surface::JsonlResolvedTurnControlStatus::Resumed
                 );
                 if !keep_attached {
                     let _ = surface.detach(
@@ -543,28 +540,28 @@ impl JsonlSurfaceAdapter {
             if thread_id.is_some()
                 || matches!(
                     result,
-                    crate::unstable_surface::JsonlTurnControlResult::Resolved { .. }
+                    crate::surface::JsonlTurnControlResult::Resolved { .. }
                 )
             {
                 return Ok(result);
             }
         }
-        Ok(crate::unstable_surface::JsonlTurnControlResult::Idle {
+        Ok(crate::surface::JsonlTurnControlResult::Idle {
             request_id: SurfaceRequestId::new(),
-            echo: crate::unstable_surface::JsonlIdleTurnControlWireEcho {
+            echo: crate::surface::JsonlIdleTurnControlWireEcho {
                 legacy_turn_id,
                 action: match action {
-                    crate::unstable_surface::JsonlTurnControlAction::Interrupt => {
-                        crate::unstable_surface::JsonlTurnControlWireAction::Interrupt
+                    crate::surface::JsonlTurnControlAction::Interrupt => {
+                        crate::surface::JsonlTurnControlWireAction::Interrupt
                     }
-                    crate::unstable_surface::JsonlTurnControlAction::Resume => {
-                        crate::unstable_surface::JsonlTurnControlWireAction::Resume
+                    crate::surface::JsonlTurnControlAction::Resume => {
+                        crate::surface::JsonlTurnControlWireAction::Resume
                     }
-                    crate::unstable_surface::JsonlTurnControlAction::Steer { .. } => {
-                        crate::unstable_surface::JsonlTurnControlWireAction::Steer
+                    crate::surface::JsonlTurnControlAction::Steer { .. } => {
+                        crate::surface::JsonlTurnControlWireAction::Steer
                     }
                 },
-                status: crate::unstable_surface::JsonlIdleTurnControlStatus::Idle,
+                status: crate::surface::JsonlIdleTurnControlStatus::Idle,
                 legacy_input: None,
             },
         })
@@ -699,7 +696,7 @@ impl JsonlSurfaceAdapter {
             .start_thread_with_request(
                 RuntimeThreadStartRequest::new(config.clone(), "(stateless submit)")
                     .with_ephemeral_non_catalogued_one_shot(
-                        crate::unstable_surface::FirstOperationCompletionPolicy::Terminal,
+                        crate::surface::FirstOperationCompletionPolicy::Terminal,
                     ),
             )
             .map_err(runtime_host_error)?;
@@ -761,7 +758,7 @@ impl JsonlSurfaceAdapter {
             kind: OperationKind::UserTurn,
             input: Some(input),
             replayability: ReplayabilityRequest::NonReplayable {
-                reason: crate::unstable_surface::NonReplayableReason::HistoryDisabled,
+                reason: crate::surface::NonReplayableReason::HistoryDisabled,
             },
             settings_preparation: settings_preparation(
                 &config,
@@ -903,16 +900,14 @@ impl JsonlSurfaceAdapter {
                         }
                         continue;
                     }
-                    let path = crate::unstable_surface::CanonicalPath::try_new(path)
+                    let path = crate::surface::CanonicalPath::try_new(path)
                         .map_err(|error| io::Error::other(error.to_string()))?;
                     if !directories.iter().any(|directory| directory.path == path) {
-                        directories.push(
-                            crate::unstable_surface::SurfaceAdditionalWorkingDirectory {
-                                path,
-                                source: crate::unstable_surface::NonEmptyText::try_new("session")
-                                    .expect("session permission source is non-empty"),
-                            },
-                        );
+                        directories.push(crate::surface::SurfaceAdditionalWorkingDirectory {
+                            path,
+                            source: crate::surface::NonEmptyText::try_new("session")
+                                .expect("session permission source is non-empty"),
+                        });
                     }
                 }
             }
@@ -923,14 +918,14 @@ impl JsonlSurfaceAdapter {
                 network.enabled = requested.enabled;
             }
             for (domain, access) in &requested.domains {
-                let domain = crate::unstable_surface::CanonicalDomainName::try_new(domain.clone())
+                let domain = crate::surface::CanonicalDomainName::try_new(domain.clone())
                     .map_err(|error| io::Error::other(error.to_string()))?;
                 let access = match access {
                     orca_core::config::PermissionProfileNetworkAccess::Allow => {
-                        crate::unstable_surface::SurfaceNetworkDomainAccess::Allow
+                        crate::surface::SurfaceNetworkDomainAccess::Allow
                     }
                     orca_core::config::PermissionProfileNetworkAccess::Deny => {
-                        crate::unstable_surface::SurfaceNetworkDomainAccess::Deny
+                        crate::surface::SurfaceNetworkDomainAccess::Deny
                     }
                 };
                 if let Some(existing) = network
@@ -942,10 +937,7 @@ impl JsonlSurfaceAdapter {
                 } else {
                     network
                         .domains
-                        .push(crate::unstable_surface::SurfaceNetworkDomainPermission {
-                            domain,
-                            access,
-                        });
+                        .push(crate::surface::SurfaceNetworkDomainPermission { domain, access });
                 }
             }
             network
@@ -966,10 +958,10 @@ impl JsonlSurfaceAdapter {
                 (
                     permission.domain.as_str().to_string(),
                     match permission.access {
-                        crate::unstable_surface::SurfaceNetworkDomainAccess::Allow => {
+                        crate::surface::SurfaceNetworkDomainAccess::Allow => {
                             orca_core::config::PermissionProfileNetworkAccess::Allow
                         }
-                        crate::unstable_surface::SurfaceNetworkDomainAccess::Deny => {
+                        crate::surface::SurfaceNetworkDomainAccess::Deny => {
                             orca_core::config::PermissionProfileNetworkAccess::Deny
                         }
                     },
@@ -1024,7 +1016,7 @@ impl JsonlSurfaceAdapter {
 
 fn apply_surface_settings_to_run_config(
     config: &mut RunConfig,
-    settings: &crate::unstable_surface::SurfaceRuntimeSettings,
+    settings: &crate::surface::SurfaceRuntimeSettings,
 ) -> io::Result<()> {
     config.cwd = Some(settings.cwd.as_path().to_path_buf());
     config.runtime_workspace_roots = Some(
@@ -1035,18 +1027,16 @@ fn apply_surface_settings_to_run_config(
             .collect(),
     );
     config.approval_mode = match settings.approval_mode {
-        crate::unstable_surface::SurfaceApprovalMode::Suggest => {
+        crate::surface::SurfaceApprovalMode::Suggest => {
             orca_core::approval_types::ApprovalMode::Suggest
         }
-        crate::unstable_surface::SurfaceApprovalMode::AutoEdit => {
+        crate::surface::SurfaceApprovalMode::AutoEdit => {
             orca_core::approval_types::ApprovalMode::AutoEdit
         }
-        crate::unstable_surface::SurfaceApprovalMode::FullAuto => {
+        crate::surface::SurfaceApprovalMode::FullAuto => {
             orca_core::approval_types::ApprovalMode::FullAuto
         }
-        crate::unstable_surface::SurfaceApprovalMode::Plan => {
-            orca_core::approval_types::ApprovalMode::Plan
-        }
+        crate::surface::SurfaceApprovalMode::Plan => orca_core::approval_types::ApprovalMode::Plan,
     };
     config.active_permission_profile = settings.active_permission_profile.as_ref().map(|profile| {
         orca_core::config::ActivePermissionProfile {
@@ -1067,13 +1057,13 @@ fn apply_surface_settings_to_run_config(
                     rule.tool.as_str(),
                     rule.pattern.as_str(),
                     match rule.decision {
-                        crate::unstable_surface::SurfacePermissionDecision::Allow => {
+                        crate::surface::SurfacePermissionDecision::Allow => {
                             orca_core::approval_types::Decision::Allow
                         }
-                        crate::unstable_surface::SurfacePermissionDecision::Prompt => {
+                        crate::surface::SurfacePermissionDecision::Prompt => {
                             orca_core::approval_types::Decision::Prompt
                         }
-                        crate::unstable_surface::SurfacePermissionDecision::Deny => {
+                        crate::surface::SurfacePermissionDecision::Deny => {
                             orca_core::approval_types::Decision::Deny
                         }
                     },
@@ -1090,16 +1080,10 @@ fn apply_surface_settings_to_run_config(
         })
         .collect();
     config.reasoning_effort = match settings.reasoning_effort {
-        crate::unstable_surface::SurfaceReasoningEffort::Low => {
-            orca_core::config::ReasoningEffort::Low
-        }
-        crate::unstable_surface::SurfaceReasoningEffort::High => {
-            orca_core::config::ReasoningEffort::High
-        }
-        crate::unstable_surface::SurfaceReasoningEffort::Max => {
-            orca_core::config::ReasoningEffort::Max
-        }
-        crate::unstable_surface::SurfaceReasoningEffort::Medium => {
+        crate::surface::SurfaceReasoningEffort::Low => orca_core::config::ReasoningEffort::Low,
+        crate::surface::SurfaceReasoningEffort::High => orca_core::config::ReasoningEffort::High,
+        crate::surface::SurfaceReasoningEffort::Max => orca_core::config::ReasoningEffort::Max,
+        crate::surface::SurfaceReasoningEffort::Medium => {
             return Err(io::Error::other(
                 "JSONL fork source uses an unsupported reasoning effort",
             ));
@@ -1393,8 +1377,8 @@ impl JsonlSurfaceAdapter {
         &self,
         thread_id: Option<&str>,
         turn_id: &str,
-        action: crate::unstable_surface::JsonlTurnControlAction,
-    ) -> io::Result<crate::unstable_surface::JsonlTurnControlResult> {
+        action: crate::surface::JsonlTurnControlAction,
+    ) -> io::Result<crate::surface::JsonlTurnControlResult> {
         self.control_turn_inner(thread_id, turn_id, action, None)
     }
 
@@ -2303,9 +2287,9 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
                     serde_json::json!({
                         "step": item.step.as_str(),
                         "status": match item.status {
-                            crate::unstable_surface::SurfacePlanStatus::Pending => "pending",
-                            crate::unstable_surface::SurfacePlanStatus::InProgress => "in_progress",
-                            crate::unstable_surface::SurfacePlanStatus::Completed => "completed",
+                            crate::surface::SurfacePlanStatus::Pending => "pending",
+                            crate::surface::SurfacePlanStatus::InProgress => "in_progress",
+                            crate::surface::SurfacePlanStatus::Completed => "completed",
                         },
                     })
                 })
@@ -2489,7 +2473,7 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
                         return Ok(false);
                     };
                     let (mode, url, requested_schema) = match request {
-                        crate::unstable_surface::SurfaceMcpElicitationRequest::Form {
+                        crate::surface::SurfaceMcpElicitationRequest::Form {
                             requested_schema,
                             ..
                         } => (
@@ -2500,7 +2484,7 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
                                 .map(surface_data_wire)
                                 .unwrap_or(serde_json::Value::Null),
                         ),
-                        crate::unstable_surface::SurfaceMcpElicitationRequest::Url {
+                        crate::surface::SurfaceMcpElicitationRequest::Url {
                             raw_url,
                             requested_schema,
                         } => (
@@ -2546,34 +2530,34 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
 fn register_or_settle_unavailable(
     registration: io::Result<String>,
     projector: &JsonlSurfaceProjector,
-    interaction: &crate::unstable_surface::SurfaceInteractionView,
+    interaction: &crate::surface::SurfaceInteractionView,
 ) -> io::Result<Option<String>> {
     let Err(registration_error) = registration else {
         return Ok(registration.ok());
     };
     let answer = match &interaction.request {
         SurfaceInteractionRequest::ToolApproval { .. } => {
-            crate::unstable_surface::SurfaceClientInteractionAnswer::ToolApproval {
-                decision: crate::unstable_surface::SurfaceAllowDeny::Deny,
+            crate::surface::SurfaceClientInteractionAnswer::ToolApproval {
+                decision: crate::surface::SurfaceAllowDeny::Deny,
             }
         }
         SurfaceInteractionRequest::PermissionRequest { permissions, .. } => {
-            crate::unstable_surface::SurfaceClientInteractionAnswer::PermissionRequest {
-                decision: crate::unstable_surface::SurfacePermissionClientDecision::Deny {
-                    scope: crate::unstable_surface::PermissionGrantScope::Turn,
+            crate::surface::SurfaceClientInteractionAnswer::PermissionRequest {
+                decision: crate::surface::SurfacePermissionClientDecision::Deny {
+                    scope: crate::surface::PermissionGrantScope::Turn,
                     permissions: permissions.clone(),
                     strict_auto_review: false,
                 },
             }
         }
         SurfaceInteractionRequest::UserInput { .. } => {
-            crate::unstable_surface::SurfaceClientInteractionAnswer::UserInput {
-                decision: crate::unstable_surface::SurfaceUserInputDecision::Cancel,
+            crate::surface::SurfaceClientInteractionAnswer::UserInput {
+                decision: crate::surface::SurfaceUserInputDecision::Cancel,
             }
         }
         SurfaceInteractionRequest::McpElicitation { .. } => {
-            crate::unstable_surface::SurfaceClientInteractionAnswer::McpElicitation {
-                decision: crate::unstable_surface::SurfaceMcpElicitationDecision::Decline,
+            crate::surface::SurfaceClientInteractionAnswer::McpElicitation {
+                decision: crate::surface::SurfaceMcpElicitationDecision::Decline,
             }
         }
         SurfaceInteractionRequest::BackgroundApproval { .. } => {
@@ -2594,28 +2578,20 @@ fn register_or_settle_unavailable(
     }
 }
 
-fn surface_data_wire(value: &crate::unstable_surface::SurfaceDataValue) -> serde_json::Value {
+fn surface_data_wire(value: &crate::surface::SurfaceDataValue) -> serde_json::Value {
     match value {
-        crate::unstable_surface::SurfaceDataValue::Null => serde_json::Value::Null,
-        crate::unstable_surface::SurfaceDataValue::Boolean(value) => {
-            serde_json::Value::Bool(*value)
-        }
-        crate::unstable_surface::SurfaceDataValue::Integer(value) => {
-            serde_json::Value::from(value.get())
-        }
-        crate::unstable_surface::SurfaceDataValue::Unsigned(value) => {
-            serde_json::Value::from(*value)
-        }
-        crate::unstable_surface::SurfaceDataValue::Number(value) => {
+        crate::surface::SurfaceDataValue::Null => serde_json::Value::Null,
+        crate::surface::SurfaceDataValue::Boolean(value) => serde_json::Value::Bool(*value),
+        crate::surface::SurfaceDataValue::Integer(value) => serde_json::Value::from(value.get()),
+        crate::surface::SurfaceDataValue::Unsigned(value) => serde_json::Value::from(*value),
+        crate::surface::SurfaceDataValue::Number(value) => {
             serde_json::json!(value.get())
         }
-        crate::unstable_surface::SurfaceDataValue::String(value) => {
-            serde_json::Value::from(value.as_str())
-        }
-        crate::unstable_surface::SurfaceDataValue::Array(values) => {
+        crate::surface::SurfaceDataValue::String(value) => serde_json::Value::from(value.as_str()),
+        crate::surface::SurfaceDataValue::Array(values) => {
             serde_json::Value::Array(values.iter().map(surface_data_wire).collect())
         }
-        crate::unstable_surface::SurfaceDataValue::Object(properties) => serde_json::Value::Object(
+        crate::surface::SurfaceDataValue::Object(properties) => serde_json::Value::Object(
             properties
                 .iter()
                 .map(|property| {
@@ -2645,7 +2621,7 @@ fn routes_interaction(
 }
 
 fn surface_permissions_wire(
-    permissions: &crate::unstable_surface::SurfacePermissionProfile,
+    permissions: &crate::surface::SurfacePermissionProfile,
 ) -> serde_json::Value {
     let file_system = permissions.file_system.as_ref().map(|profile| {
         serde_json::json!({
@@ -2661,8 +2637,8 @@ fn surface_permissions_wire(
                 (
                     domain.0.as_str().to_string(),
                     serde_json::Value::from(match access {
-                        crate::unstable_surface::SurfaceAllowDeny::Allow => "allow",
-                        crate::unstable_surface::SurfaceAllowDeny::Deny => "deny",
+                        crate::surface::SurfaceAllowDeny::Allow => "allow",
+                        crate::surface::SurfaceAllowDeny::Deny => "deny",
                     }),
                 )
             })
@@ -2721,7 +2697,7 @@ fn terminal_status(terminal: &OperationTerminal) -> &'static str {
         OperationTerminal::BudgetExhausted { .. } => "budget_exhausted",
         OperationTerminal::NotAdmitted { .. } => "not_admitted",
         OperationTerminal::Failed {
-            class: crate::unstable_surface::FailureClass::LegacyApprovalRequired,
+            class: crate::surface::FailureClass::LegacyApprovalRequired,
             ..
         } => "approval_required",
         OperationTerminal::Failed { .. }
@@ -2756,7 +2732,7 @@ fn tool_result_kind(kind: SurfaceToolResultKind) -> &'static str {
 fn settings_preparation(
     config: &RunConfig,
     permissions: PermissionProfileOverride,
-    snapshot: &crate::unstable_surface::SurfaceSnapshot,
+    snapshot: &crate::surface::SurfaceSnapshot,
 ) -> io::Result<OperationSettingsPreparation> {
     let mut updated = config.clone();
     apply_surface_settings_to_run_config(&mut updated, &snapshot.settings.effective)?;
@@ -2781,22 +2757,20 @@ fn settings_preparation(
 
 fn settings_patches(
     config: &RunConfig,
-    snapshot: &crate::unstable_surface::SurfaceSnapshot,
+    snapshot: &crate::surface::SurfaceSnapshot,
 ) -> io::Result<Vec<RuntimeSettingsPatch>> {
     let mut patches = Vec::new();
     let approval_mode = match config.approval_mode {
         orca_core::approval_types::ApprovalMode::Suggest => {
-            crate::unstable_surface::SurfaceApprovalMode::Suggest
+            crate::surface::SurfaceApprovalMode::Suggest
         }
         orca_core::approval_types::ApprovalMode::AutoEdit => {
-            crate::unstable_surface::SurfaceApprovalMode::AutoEdit
+            crate::surface::SurfaceApprovalMode::AutoEdit
         }
         orca_core::approval_types::ApprovalMode::FullAuto => {
-            crate::unstable_surface::SurfaceApprovalMode::FullAuto
+            crate::surface::SurfaceApprovalMode::FullAuto
         }
-        orca_core::approval_types::ApprovalMode::Plan => {
-            crate::unstable_surface::SurfaceApprovalMode::Plan
-        }
+        orca_core::approval_types::ApprovalMode::Plan => crate::surface::SurfaceApprovalMode::Plan,
     };
     if snapshot.settings.effective.approval_mode != approval_mode {
         patches.push(RuntimeSettingsPatch::SetApprovalMode {
@@ -2807,7 +2781,7 @@ fn settings_patches(
         let roots = roots
             .iter()
             .cloned()
-            .map(crate::unstable_surface::CanonicalPath::try_new)
+            .map(crate::surface::CanonicalPath::try_new)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| io::Error::other(error.to_string()))?;
         if snapshot.settings.effective.workspace_roots != roots {
@@ -2818,19 +2792,17 @@ fn settings_patches(
         .active_permission_profile
         .as_ref()
         .map(|profile| {
-            Ok(crate::unstable_surface::SurfaceActivePermissionProfile {
-                id: crate::unstable_surface::NonEmptyText::try_new(profile.id.clone())?,
+            Ok(crate::surface::SurfaceActivePermissionProfile {
+                id: crate::surface::NonEmptyText::try_new(profile.id.clone())?,
                 extends: profile
                     .extends
                     .as_ref()
-                    .map(|value| crate::unstable_surface::NonEmptyText::try_new(value.clone()))
+                    .map(|value| crate::surface::NonEmptyText::try_new(value.clone()))
                     .transpose()?,
             })
         })
         .transpose()
-        .map_err(|error: crate::unstable_surface::SurfaceValueError| {
-            io::Error::other(error.to_string())
-        })?;
+        .map_err(|error: crate::surface::SurfaceValueError| io::Error::other(error.to_string()))?;
     if snapshot.settings.effective.active_permission_profile != profile {
         patches.push(RuntimeSettingsPatch::SetActivePermissionProfile { profile });
     }
@@ -2839,23 +2811,23 @@ fn settings_patches(
         .rules
         .iter()
         .map(|rule| {
-            Ok(crate::unstable_surface::SurfacePermissionRule {
-                tool: crate::unstable_surface::NonEmptyText::try_new(rule.tool.clone())?,
-                pattern: crate::unstable_surface::NonEmptyText::try_new(rule.pattern.clone())?,
+            Ok(crate::surface::SurfacePermissionRule {
+                tool: crate::surface::NonEmptyText::try_new(rule.tool.clone())?,
+                pattern: crate::surface::NonEmptyText::try_new(rule.pattern.clone())?,
                 decision: match rule.decision {
                     orca_core::approval_types::Decision::Allow => {
-                        crate::unstable_surface::SurfacePermissionDecision::Allow
+                        crate::surface::SurfacePermissionDecision::Allow
                     }
                     orca_core::approval_types::Decision::Prompt => {
-                        crate::unstable_surface::SurfacePermissionDecision::Prompt
+                        crate::surface::SurfacePermissionDecision::Prompt
                     }
                     orca_core::approval_types::Decision::Deny => {
-                        crate::unstable_surface::SurfacePermissionDecision::Deny
+                        crate::surface::SurfacePermissionDecision::Deny
                     }
                 },
             })
         })
-        .collect::<Result<Vec<_>, crate::unstable_surface::SurfaceValueError>>()
+        .collect::<Result<Vec<_>, crate::surface::SurfaceValueError>>()
         .map_err(|error| io::Error::other(error.to_string()))?;
     if snapshot.settings.effective.permission_rules.ordered_rules != rules {
         patches.push(RuntimeSettingsPatch::ReplacePermissionRules { rules });
@@ -2864,12 +2836,12 @@ fn settings_patches(
         .additional_working_directories
         .iter()
         .map(|directory| {
-            Ok(crate::unstable_surface::SurfaceAdditionalWorkingDirectory {
-                path: crate::unstable_surface::CanonicalPath::try_new(directory.path.clone())?,
-                source: crate::unstable_surface::NonEmptyText::try_new(directory.source.clone())?,
+            Ok(crate::surface::SurfaceAdditionalWorkingDirectory {
+                path: crate::surface::CanonicalPath::try_new(directory.path.clone())?,
+                source: crate::surface::NonEmptyText::try_new(directory.source.clone())?,
             })
         })
-        .collect::<Result<Vec<_>, crate::unstable_surface::SurfaceValueError>>()
+        .collect::<Result<Vec<_>, crate::surface::SurfaceValueError>>()
         .map_err(|error| io::Error::other(error.to_string()))?;
     if snapshot.settings.effective.additional_working_directories != directories {
         patches.push(RuntimeSettingsPatch::ReplaceAdditionalWorkingDirectories { directories });
@@ -2878,7 +2850,7 @@ fn settings_patches(
 }
 
 fn committed<T>(
-    result: Result<MutationReply<T>, crate::unstable_surface::SurfaceClientCommandError>,
+    result: Result<MutationReply<T>, crate::surface::SurfaceClientCommandError>,
     action: &str,
 ) -> io::Result<T> {
     match result.map_err(|error| io::Error::other(format!("{action} failed: {error:?}")))? {

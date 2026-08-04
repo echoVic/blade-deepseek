@@ -2612,13 +2612,11 @@ mod tests {
         let acp = attachment_id(1);
         let other = attachment_id(2);
         let acp_route = SurfaceInteractionRoute::Exclusive {
-            epoch: crate::unstable_surface::ResponseRouteEpoch::try_new(1)
-                .expect("valid route epoch"),
+            epoch: crate::surface::ResponseRouteEpoch::try_new(1).expect("valid route epoch"),
             attachment_id: acp.clone(),
         };
         let other_route = SurfaceInteractionRoute::Exclusive {
-            epoch: crate::unstable_surface::ResponseRouteEpoch::try_new(1)
-                .expect("valid route epoch"),
+            epoch: crate::surface::ResponseRouteEpoch::try_new(1).expect("valid route epoch"),
             attachment_id: other,
         };
 

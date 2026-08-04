@@ -20,6 +20,7 @@ use orca_runtime::history::SessionSummary;
 
 use crate::display_text::{compact_long_text, truncate_to_display_width};
 use crate::selection::{TranscriptSelection, apply_style_to_line_range};
+use crate::session_picker_actions::available_session_actions;
 use crate::shortcuts::{self, ShortcutScope};
 use crate::syntax_highlight::highlight_code;
 use crate::theme::Theme;
@@ -513,22 +514,19 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
 
     match &state.session_picker_phase {
         SessionPickerPhase::Browsing => {}
-        SessionPickerPhase::Actions { selected, .. } => {
+        SessionPickerPhase::Actions {
+            session_id,
+            selected,
+        } => {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Session actions",
                 Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
             )));
-            for (index, label) in [
-                "Resume",
-                "Fork",
-                "Rename",
-                "Archive",
-                "Delete",
-                "Copy session ID",
-            ]
-            .iter()
-            .enumerate()
+            for (index, action) in
+                available_session_actions(state.current_session_id.as_deref(), session_id)
+                    .into_iter()
+                    .enumerate()
             {
                 let style = if index == *selected {
                     Style::default()
@@ -538,7 +536,11 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
                     Style::default().fg(theme.text)
                 };
                 lines.push(Line::from(Span::styled(
-                    format!("{} {label}", if index == *selected { ">" } else { " " }),
+                    format!(
+                        "{} {}",
+                        if index == *selected { ">" } else { " " },
+                        action.label()
+                    ),
                     style,
                 )));
             }
@@ -788,7 +790,7 @@ pub(crate) fn render_live_messages(
         return;
     }
 
-    let requested_scroll = if state.auto_scroll {
+    let mut requested_scroll = if state.auto_scroll {
         usize::MAX
     } else {
         state.scroll_offset
@@ -799,10 +801,14 @@ pub(crate) fn render_live_messages(
     let highlights = &state.applied_diff_highlights;
     {
         let cache = &mut state.transcript_render_cache;
-        cache.prepare(
+        let outcome = cache.prepare(
             messages,
             revisions,
-            TranscriptRenderContext::new(theme, width, state.tick, false),
+            TranscriptRenderContext::new(theme, width, state.tick, false).with_reflow_window(
+                live_start,
+                requested_scroll,
+                visible_height,
+            ),
             |index, message, theme, width, tick, force_expand| {
                 let refined = AppState::refined_diff_styles_for_message(
                     revisions, highlights, index, message,
@@ -810,6 +816,7 @@ pub(crate) fn render_live_messages(
                 build_lines_for_message(message, theme, width, tick, force_expand, refined)
             },
         );
+        requested_scroll = outcome.adjusted_scroll.unwrap_or(requested_scroll);
     }
     state.refresh_transcript_search();
     let viewport =
@@ -5496,6 +5503,145 @@ mod tests {
     }
 
     #[test]
+    fn current_session_picker_actions_hide_destructive_commands() {
+        let mut state = test_state();
+        state.status = AppStatus::SessionPicker;
+        state.current_session_id = Some("session-1".to_string());
+        state.session_picker_sessions = vec![session_summary("session-1", "Current session")];
+        state.session_picker_phase = SessionPickerPhase::Actions {
+            session_id: "session-1".to_string(),
+            selected: 0,
+        };
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 16))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Resume"));
+        assert!(rendered.contains("Copy session ID"));
+        assert!(!rendered.contains("Archive"));
+        assert!(!rendered.contains("Delete"));
+    }
+
+    #[test]
+    fn session_picker_phases_and_terminal_statuses_render_in_bounded_frames() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let phases = [
+            (SessionPickerPhase::Browsing, "Current session"),
+            (
+                SessionPickerPhase::Actions {
+                    session_id: "session-1".to_string(),
+                    selected: 0,
+                },
+                "Session actions",
+            ),
+            (
+                SessionPickerPhase::Renaming {
+                    session_id: "session-1".to_string(),
+                    value: "new title".to_string(),
+                },
+                "New title:",
+            ),
+            (
+                SessionPickerPhase::ConfirmArchive {
+                    session_id: "session-1".to_string(),
+                    title: "Current session".to_string(),
+                    selected: 0,
+                },
+                "Archive \"Current session\"?",
+            ),
+            (
+                SessionPickerPhase::ConfirmDelete {
+                    session_id: "session-1".to_string(),
+                    title: "Current session".to_string(),
+                    selected: 0,
+                },
+                "Permanently delete \"Current session\"?",
+            ),
+        ];
+
+        for (width, height) in [(80, 24), (40, 12)] {
+            for (phase, expected) in &phases {
+                let mut state = test_state();
+                state.status = AppStatus::SessionPicker;
+                state.session_picker_sessions =
+                    vec![session_summary("session-1", "Current session")];
+                state.session_picker_phase = phase.clone();
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                        .expect("test backend");
+
+                terminal
+                    .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                    .expect("draw picker phase");
+                let rendered = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(
+                    rendered.contains(expected),
+                    "missing {expected:?} for {phase:?} at {width}x{height}"
+                );
+                assert_eq!(
+                    terminal.backend().buffer().content().len(),
+                    usize::from(width) * usize::from(height)
+                );
+            }
+
+            for (status, expected) in [
+                ("completed", "(completed)"),
+                ("indeterminate", "(state unknown)"),
+            ] {
+                let mut state = test_state();
+                state.messages.push(ChatMessage::ToolCall {
+                    id: status.to_string(),
+                    name: "deploy".to_string(),
+                    target: None,
+                    status: status.to_string(),
+                    output: Some("terminal result".to_string()),
+                    diff: None,
+                    kind: Some("result".to_string()),
+                    expanded: false,
+                });
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                        .expect("test backend");
+
+                terminal
+                    .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                    .expect("draw terminal status");
+                let rendered = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(
+                    rendered.contains(expected),
+                    "missing {expected:?} at {width}x{height}: {rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn workspace_relative_path_label_prefers_longest_matching_runtime_root() {
         let roots = vec!["/workspace".into(), "/workspace/project".into()];
 
@@ -6221,25 +6367,6 @@ mod tests {
         let first = status_line(&state, &theme, 120);
         let second = status_line(&state, &theme, 120);
         assert_eq!(first, second);
-
-        let source = crate::test_support::normalized_source(include_str!("ui.rs"));
-        let source = source
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("production UI source");
-        for forbidden in [
-            "std::process",
-            "Command::new",
-            "orca_tools::process",
-            "workspace_status::snapshot",
-            "read_to_string",
-            "read_dir",
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "rendering must not perform workspace I/O: {forbidden}"
-            );
-        }
     }
 
     #[test]

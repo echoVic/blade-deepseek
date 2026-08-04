@@ -1,4 +1,4 @@
-use orca_runtime::unstable_surface::*;
+use orca_runtime::surface::*;
 use sha2::Digest;
 
 const MANIFEST: &str = include_str!(concat!(
@@ -599,12 +599,74 @@ impl SurfaceCommitLedger for FakeLedger {
         Ok(())
     }
 
-    fn probe_commit(&self, _id: &SurfaceCommitId, _digest: &Sha256Digest) -> CommitProbe {
-        self.receipt
-            .clone()
-            .map(CommitProbe::Present)
-            .unwrap_or(CommitProbe::Absent)
+    fn probe_commit(&self, id: &SurfaceCommitId, digest: &Sha256Digest) -> CommitProbe {
+        let Some(receipt) = self.receipt.clone() else {
+            return CommitProbe::Absent;
+        };
+        let (stored_id, stored_digest) = match &receipt {
+            SurfaceBatchReceipt::Recorded(receipt) => (&receipt.commit_id, &receipt.batch_digest),
+            SurfaceBatchReceipt::Ephemeral(receipt) => (&receipt.commit_id, &receipt.batch_digest),
+        };
+        if stored_id != id {
+            CommitProbe::Absent
+        } else if stored_digest == digest {
+            CommitProbe::Present(receipt)
+        } else {
+            CommitProbe::Conflict
+        }
     }
+}
+
+#[test]
+fn commit_controller_trace_equivalence() {
+    let (_owner_dir, owner) = test_owner_lease();
+    let mut coordinator = RuntimeCommitCoordinator::new_with_owner_lease(
+        FakeLedger {
+            fault: Some(Fault::Failed),
+            ..FakeLedger::default()
+        },
+        SurfaceReducerState::new(snapshot()),
+        &owner,
+    )
+    .unwrap();
+    let prepared = batch(9);
+    let commit_id = match &prepared.commit_class {
+        CommitClass::Recorded { commit_id, .. } => commit_id.clone(),
+        CommitClass::Ephemeral { .. } => unreachable!(),
+    };
+
+    assert!(coordinator.commit_actor_batch(&prepared).is_err());
+    assert_eq!(coordinator.state().snapshot().cursor.next_seq.get(), 0);
+    assert_eq!(coordinator.ledger().events, [LedgerEvent::Append]);
+
+    coordinator.ledger_mut().fault = None;
+    coordinator.commit_actor_batch(&prepared).unwrap();
+    assert_eq!(
+        coordinator.ledger().events,
+        [
+            LedgerEvent::Append,
+            LedgerEvent::Append,
+            LedgerEvent::Checkpoint
+        ]
+    );
+    assert_eq!(coordinator.state().snapshot().cursor, prepared.cursor_after);
+    assert!(matches!(
+        coordinator
+            .ledger()
+            .probe_commit(&commit_id, &prepared.batch_digest),
+        CommitProbe::Present(_)
+    ));
+    let unrelated = batch(10);
+    let unrelated_id = match &unrelated.commit_class {
+        CommitClass::Recorded { commit_id, .. } => commit_id,
+        CommitClass::Ephemeral { .. } => unreachable!(),
+    };
+    assert_eq!(
+        coordinator
+            .ledger()
+            .probe_commit(unrelated_id, &unrelated.batch_digest),
+        CommitProbe::Absent
+    );
 }
 
 #[test]

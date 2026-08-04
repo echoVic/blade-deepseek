@@ -2,9 +2,7 @@ use std::path::Path;
 
 use chrono::Local;
 use orca_platform::shell::{ShellKind, ShellResolver, ShellSpec};
-use orca_tools::registry;
-
-use crate::tool_schema::{ToolSchemaMode, tool_visible_in_schema_mode};
+use orca_tools::schema::{ToolPolicy, canonical_tool_definitions};
 
 pub fn build_system_prompt(cwd: &Path) -> String {
     let shell = ShellResolver::for_current_host()
@@ -154,13 +152,10 @@ fn render_shell_guidance(shell: Option<&ShellSpec>) -> &'static str {
 }
 
 fn render_tool_prompt_section() -> String {
-    let registry = registry::default_tool_registry();
+    let registry = orca_tools::registry::default_tool_registry();
     let mut output = String::new();
-    for tool in registry
-        .model_visible_tools()
-        .filter(|tool| tool_visible_in_schema_mode(tool.name(), ToolSchemaMode::Base))
-    {
-        output.push_str(&format!("\n### {}\n{}\n", tool.name(), tool.description(),));
+    for tool in canonical_tool_definitions(&ToolPolicy::base(), registry) {
+        output.push_str(&format!("\n### {}\n{}\n", tool.name, tool.description));
     }
     output
 }

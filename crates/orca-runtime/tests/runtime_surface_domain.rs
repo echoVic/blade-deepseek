@@ -269,8 +269,8 @@ fn goal_set_and_run_commits_the_goal_store_binding_and_requested_operation_atomi
     );
     assert!(matches!(
         settled_goal.state,
-        orca_runtime::unstable_surface::SurfaceGoalState::Paused {
-            reason: orca_runtime::unstable_surface::SurfaceGoalPauseReason::NoProgress,
+        orca_runtime::surface::SurfaceGoalState::Paused {
+            reason: orca_runtime::surface::SurfaceGoalPauseReason::NoProgress,
             ..
         }
     ));
@@ -279,18 +279,21 @@ fn goal_set_and_run_commits_the_goal_store_binding_and_requested_operation_atomi
         .current_surface_receipt_digest(thread.thread_id())
         .unwrap()
         .expect("settled Goal receipt digest");
+    assert_eq!(
+        settled_goal.receipt_digest.as_bytes(),
+        &set_again_digest,
+        "the surface projection and durable Goal fence must expose the same receipt"
+    );
     let set_again = match attachment
         .client
         .goal_mutation(
             SurfaceRequestId::new(),
             GoalMutationAction::SetAndRun {
-                expected_goal: ExpectedGoal::Exact(
-                    orca_runtime::unstable_surface::SurfaceGoalFence {
-                        goal_id: settled_goal.goal_id.clone(),
-                        goal_revision: settled_goal.goal_revision,
-                        goal_owner_epoch: settled_goal.goal_owner_epoch,
-                    },
-                ),
+                expected_goal: ExpectedGoal::Exact(orca_runtime::surface::SurfaceGoalFence {
+                    goal_id: settled_goal.goal_id.clone(),
+                    goal_revision: settled_goal.goal_revision,
+                    goal_owner_epoch: settled_goal.goal_owner_epoch,
+                }),
                 objective: NonEmptyText::try_new("ship the replacement typed Goal").unwrap(),
                 token_budget: Some(30_000),
                 input: GoalRunInput::DerivedFromGoal {
@@ -349,7 +352,7 @@ fn goal_set_and_run_commits_the_goal_store_binding_and_requested_operation_atomi
         .goal_mutation(
             SurfaceRequestId::new(),
             GoalMutationAction::ResumeAndRun {
-                fence: orca_runtime::unstable_surface::SurfaceGoalFence {
+                fence: orca_runtime::surface::SurfaceGoalFence {
                     goal_id: set_again_goal.goal_id.clone(),
                     goal_revision: set_again_goal.goal_revision,
                     goal_owner_epoch: set_again_goal.goal_owner_epoch,
@@ -407,8 +410,8 @@ fn goal_set_and_run_commits_the_goal_store_binding_and_requested_operation_atomi
     );
     assert!(matches!(
         recovered_goal.state,
-        orca_runtime::unstable_surface::SurfaceGoalState::Paused {
-            reason: orca_runtime::unstable_surface::SurfaceGoalPauseReason::NoProgress,
+        orca_runtime::surface::SurfaceGoalState::Paused {
+            reason: orca_runtime::surface::SurfaceGoalPauseReason::NoProgress,
             ..
         }
     ));
@@ -458,7 +461,7 @@ fn goal_set_and_run_commits_the_goal_store_binding_and_requested_operation_atomi
         .goal_mutation(
             SurfaceRequestId::new(),
             GoalMutationAction::Edit {
-                fence: orca_runtime::unstable_surface::SurfaceGoalFence {
+                fence: orca_runtime::surface::SurfaceGoalFence {
                     goal_id: recovered_goal.goal_id.clone(),
                     goal_revision: recovered_goal.goal_revision,
                     goal_owner_epoch: recovered_goal.goal_owner_epoch,
@@ -479,7 +482,7 @@ fn goal_set_and_run_commits_the_goal_store_binding_and_requested_operation_atomi
         .goal_mutation(
             SurfaceRequestId::new(),
             GoalMutationAction::Clear {
-                fence: orca_runtime::unstable_surface::SurfaceGoalFence {
+                fence: orca_runtime::surface::SurfaceGoalFence {
                     goal_id: edited_goal.goal_id.clone(),
                     goal_revision: edited_goal.goal_revision,
                     goal_owner_epoch: edited_goal.goal_owner_epoch,
@@ -567,7 +570,7 @@ fn goal_pause_commits_goal_state_and_operation_cancellation_before_terminal_wake
         .client
         .pause_goal_operation(
             SurfaceRequestId::new(),
-            orca_runtime::unstable_surface::SurfaceGoalFence {
+            orca_runtime::surface::SurfaceGoalFence {
                 goal_id: live_goal.goal_id.clone(),
                 goal_revision: live_goal.goal_revision,
                 goal_owner_epoch: live_goal.goal_owner_epoch,
@@ -580,14 +583,14 @@ fn goal_pause_commits_goal_state_and_operation_cancellation_before_terminal_wake
     };
     assert!(matches!(
         paused.goal.state,
-        orca_runtime::unstable_surface::SurfaceGoalState::Paused {
-            reason: orca_runtime::unstable_surface::SurfaceGoalPauseReason::User,
+        orca_runtime::surface::SurfaceGoalState::Paused {
+            reason: orca_runtime::surface::SurfaceGoalPauseReason::User,
             ..
         }
     ));
     assert!(matches!(
         paused.operation,
-        orca_runtime::unstable_surface::PauseGoalOperationOutput::Cancelling {
+        orca_runtime::surface::PauseGoalOperationOutput::Cancelling {
             operation_id: ref cancelling,
             ..
         } if cancelling == &operation_id
@@ -608,7 +611,7 @@ fn goal_pause_commits_goal_state_and_operation_cancellation_before_terminal_wake
     assert!(matches!(
         value.terminal,
         orca_runtime::surface::OperationTerminal::Cancelled {
-            reason: orca_runtime::unstable_surface::CancelReason::GoalPause,
+            reason: orca_runtime::surface::CancelReason::GoalPause,
         }
     ));
     let settled = attach_snapshot(&thread.surface());
@@ -616,8 +619,8 @@ fn goal_pause_commits_goal_state_and_operation_cancellation_before_terminal_wake
         goal.current_run.is_none()
             && matches!(
                 goal.state,
-                orca_runtime::unstable_surface::SurfaceGoalState::Paused {
-                    reason: orca_runtime::unstable_surface::SurfaceGoalPauseReason::User,
+                orca_runtime::surface::SurfaceGoalState::Paused {
+                    reason: orca_runtime::surface::SurfaceGoalPauseReason::User,
                     ..
                 }
             )
@@ -644,8 +647,8 @@ fn goal_pause_commits_goal_state_and_operation_cancellation_before_terminal_wake
         goal.current_run.is_none()
             && matches!(
                 goal.state,
-                orca_runtime::unstable_surface::SurfaceGoalState::Paused {
-                    reason: orca_runtime::unstable_surface::SurfaceGoalPauseReason::User,
+                orca_runtime::surface::SurfaceGoalState::Paused {
+                    reason: orca_runtime::surface::SurfaceGoalPauseReason::User,
                     ..
                 }
             )
@@ -658,7 +661,7 @@ fn goal_pause_commits_goal_state_and_operation_cancellation_before_terminal_wake
                     .as_ref()
                     .map(|terminal| &terminal.terminal),
                 Some(orca_runtime::surface::OperationTerminal::Cancelled {
-                    reason: orca_runtime::unstable_surface::CancelReason::GoalPause,
+                    reason: orca_runtime::surface::CancelReason::GoalPause,
                 })
             )
     }));
@@ -815,7 +818,7 @@ fn quiescent_goal_pause_commits_without_fabricating_an_operation_and_survives_re
         .client
         .pause_goal_operation(
             SurfaceRequestId::new(),
-            orca_runtime::unstable_surface::SurfaceGoalFence {
+            orca_runtime::surface::SurfaceGoalFence {
                 goal_id: goal.goal_id.clone(),
                 goal_revision: goal.goal_revision,
                 goal_owner_epoch: goal.goal_owner_epoch,
@@ -828,14 +831,14 @@ fn quiescent_goal_pause_commits_without_fabricating_an_operation_and_survives_re
     };
     assert!(matches!(
         paused.goal.state,
-        orca_runtime::unstable_surface::SurfaceGoalState::Paused {
-            reason: orca_runtime::unstable_surface::SurfaceGoalPauseReason::User,
+        orca_runtime::surface::SurfaceGoalState::Paused {
+            reason: orca_runtime::surface::SurfaceGoalPauseReason::User,
             ..
         }
     ));
     assert!(matches!(
         paused.operation,
-        orca_runtime::unstable_surface::PauseGoalOperationOutput::None
+        orca_runtime::surface::PauseGoalOperationOutput::None
     ));
     let snapshot = attach_snapshot(&thread.surface());
     assert!(snapshot.foreground_operation.is_none());
@@ -856,8 +859,8 @@ fn quiescent_goal_pause_commits_without_fabricating_an_operation_and_survives_re
         goal.current_run.is_none()
             && matches!(
                 goal.state,
-                orca_runtime::unstable_surface::SurfaceGoalState::Paused {
-                    reason: orca_runtime::unstable_surface::SurfaceGoalPauseReason::User,
+                orca_runtime::surface::SurfaceGoalState::Paused {
+                    reason: orca_runtime::surface::SurfaceGoalPauseReason::User,
                     ..
                 }
             )

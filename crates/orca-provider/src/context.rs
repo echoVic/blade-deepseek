@@ -323,12 +323,9 @@ fn tools_schema_tokens_with_counter(
     provider_config: &ProviderConfig,
     counter: &impl TokenCounter,
 ) -> usize {
-    let tools = provider_config.tools_override.clone().unwrap_or_else(|| {
-        crate::tool_schema::deepseek_tools_schema_with_mcp_and_external(
-            provider_config.mcp_registry.as_ref(),
-            &provider_config.external_tools,
-        )
-    });
+    let tools = crate::tool_schema::deepseek_tools_schema(
+        provider_config.tools_override.as_deref().unwrap_or(&[]),
+    );
     if tools.is_empty() {
         return 0;
     }
@@ -1404,17 +1401,15 @@ mod tests {
             base_url: None,
             model: None,
             reasoning_effort: orca_core::config::ReasoningEffort::Max,
-            tools_override: Some(vec![serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": "large_tool",
-                    "description": "schema ".repeat(300),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {}
-                    }
-                }
-            })]),
+            tools_override: Some(vec![crate::tool_schema::ProviderToolDefinition {
+                name: "large_tool".to_string(),
+                description: "schema ".repeat(300),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+                strict_capable: false,
+            }]),
             mcp_registry: None,
             external_tools: Vec::new(),
         };

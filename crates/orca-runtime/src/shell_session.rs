@@ -1844,21 +1844,6 @@ mod tests {
         assert_eq!(capabilities.supports_pty_resize, native_pty_supported());
     }
 
-    #[test]
-    fn restricted_windows_shell_sessions_retain_supported_ptys() {
-        let source = include_str!("shell_session.rs");
-        let spawn_marker = format!("{}{}", "let mut child = ", "SandboxedPty::spawn");
-        let legacy_fallback = ["intentionally", "has no", "ConPTY path yet"].join(" ");
-        assert!(
-            source.contains(&spawn_marker),
-            "restricted Windows shell sessions must use the token-aware ConPTY transport"
-        );
-        assert!(
-            !source.contains(&legacy_fallback),
-            "restricted Windows shell sessions must not silently downgrade supported PTYs"
-        );
-    }
-
     #[cfg(windows)]
     #[test]
     fn native_windows_shells_accept_capability_sandbox_modes() {

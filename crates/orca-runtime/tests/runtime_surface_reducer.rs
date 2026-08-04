@@ -1,4 +1,4 @@
-use orca_runtime::unstable_surface::*;
+use orca_runtime::surface::*;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 
@@ -1568,6 +1568,66 @@ fn generation_owned_families_reject_stale_exact_fences() {
         reduce_batch(SurfaceReduceMode::Live, &interaction_state, &interaction),
         SurfaceReducerErrorCode::ScopeMismatch,
     );
+}
+
+#[test]
+fn assistant_delta_append_is_linear_and_uses_utf8_byte_offsets() {
+    let (initial, active_generation) = active_generation_state();
+    let stream_id = SurfaceStreamId::try_from_bytes(uuid_v7_bytes(41_232)).unwrap();
+    let mut stream_snapshot = initial.snapshot().clone();
+    stream_snapshot
+        .assistant_streams
+        .push(SurfaceAssistantStream {
+            stream_id: stream_id.clone(),
+            fence: active_generation.fence.clone(),
+            turn_id: active_generation.logical_turn_id.clone(),
+            item_id: SurfaceItemId::new(),
+            channel: AssistantChannel::Message,
+            next_offset: ByteOffset::new(0),
+            text: DisplayText::new(""),
+            state: SurfaceAssistantStreamState::Open,
+        });
+    let mut state = SurfaceReducerState::new(stream_snapshot.clone());
+    let mut replayed = SurfaceReducerState::new(stream_snapshot);
+    let mut offset = 0_u64;
+    let mut expected = String::new();
+    for (index, delta) in ["hello", " ", "\u{4e16}\u{754c}", " ", "\u{1f680}"]
+        .into_iter()
+        .chain(std::iter::repeat_n("0123456789", 1_000))
+        .enumerate()
+    {
+        let update = batch(
+            &state,
+            41_233 + index as u32,
+            vec![(
+                SurfaceScope::Generation {
+                    fence: active_generation.fence.clone(),
+                },
+                SurfaceEvent::Assistant(AssistantPatch::Delta {
+                    stream_id: stream_id.clone(),
+                    offset: ByteOffset::new(offset),
+                    text: DisplayText::new(delta),
+                }),
+            )],
+        );
+        state = applied(reduce_batch(SurfaceReduceMode::Live, &state, &update));
+        replayed = applied(reduce_batch(
+            SurfaceReduceMode::Rematerialization,
+            &replayed,
+            &update,
+        ));
+        expected.push_str(delta);
+        offset += delta.len() as u64;
+    }
+
+    let stream = &state.snapshot().assistant_streams[0];
+    assert_eq!(stream.text.as_str(), expected);
+    assert_eq!(stream.next_offset.get(), expected.len() as u64);
+    assert_eq!(
+        expected.len() - "hello \u{4e16}\u{754c} \u{1f680}".len(),
+        10_000
+    );
+    assert!(replayed.snapshot() == state.snapshot());
 }
 
 #[test]
@@ -7063,6 +7123,7 @@ fn goal_with_predecessor(predecessor: &SurfaceGoalGenerationIdentity) -> Surface
         goal_revision: GoalRevision::try_new(1).unwrap(),
         goal_owner_epoch: GoalOwnerEpoch::try_new(1).unwrap(),
         catalog_revision: GoalCatalogRevision::try_new(1).unwrap(),
+        receipt_digest: digest(1),
         objective: NonEmptyText::try_new("finish reducer").unwrap(),
         objective_revision: GoalObjectiveRevision::new(1),
         state: SurfaceGoalState::Active,
@@ -8130,6 +8191,15 @@ fn goal_continuation_replay_is_batch_exact_and_receipt_must_match() {
             .goal_revision
             .get(),
         3
+    );
+    assert_eq!(
+        applied_state
+            .snapshot()
+            .goal
+            .as_ref()
+            .unwrap()
+            .receipt_digest,
+        digest(80)
     );
 
     let first_commit_id = match &first.commit_class {

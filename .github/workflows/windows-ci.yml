@@ -50,6 +50,9 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
@@ -62,6 +65,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
+          node --test scripts/test-validate-runtime-surface-contract.mjs
+          node scripts/validate-runtime-surface-contract.mjs
           node scripts/test-validate-windows-platform-boundaries.mjs
           node scripts/validate-windows-platform-boundaries.mjs
       - name: Check the full workspace
@@ -111,6 +116,9 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-pc-windows-msvc
@@ -125,6 +133,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
+          node --test scripts/test-validate-runtime-surface-contract.mjs
+          node scripts/validate-runtime-surface-contract.mjs
           node scripts/test-validate-windows-platform-boundaries.mjs
           node scripts/validate-windows-platform-boundaries.mjs
       - name: Check the native ARM64 workspace

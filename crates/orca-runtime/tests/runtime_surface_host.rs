@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
-use orca_runtime::unstable_surface::{
+use orca_runtime::surface::{
     FirstOperationCompletionPolicy, NonReplayableReason, OperationIngressCorrelation,
     OperationKind, OperationRequestIntent, OperationSettingsPreparation, ReplayabilityRequest,
     SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceSubscriptionSealReason,

@@ -100,6 +100,18 @@ Completions，并按 DeepSeek 要求在工具调用轮次完整回传服务端�
 - [动态工作流设计](docs/claude-code-workflow-parity.md)
 - [生产路线图](docs/production-roadmap.md)
 
+## 可靠性
+
+- TUI、Headless、ACP 和 JSONL 会话共用同一个 Runtime Host，统一负责 turn
+  生命周期、取消、持久化与终态。
+- Goal 和会话存储在异步 Actor 循环之外执行；即使磁盘变慢或 SQLite 忙碌，
+  取消、状态查询等无关控制也不会被一起卡住。
+- 取消前台 turn 时，会同时停止它拥有的子智能体任务树，但不会误伤无关任务。
+- 切换会话时先启动新 Runtime，再关闭当前 Runtime。重命名、分叉、归档与删除
+  经过 revision 校验和持久化提交，旧会话附件排队中的事件不会污染新会话。
+- Runtime Surface 与平台边界契约会在 CI 中验证，通过后才构建 macOS、Linux
+  和 Windows 发布产物。
+
 ## 社区
 
 - QQ 群：`472309526`

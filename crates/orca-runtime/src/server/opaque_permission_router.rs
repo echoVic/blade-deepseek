@@ -7,7 +7,7 @@ use std::time::Instant;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::unstable_surface::{
+use crate::surface::{
     DeferredMutation, JSONL_LIVE_REQUEST_LIMIT, JSONL_REPAIR_AUTHORITY_LIMIT,
     JSONL_REQUEST_TOMBSTONE_LIMIT, JSONL_REQUEST_TOMBSTONE_TTL_MS, RuntimeSurfaceClientHandle,
     SurfaceConnectionId, SurfaceInteractionId, SurfaceInteractionKind,
@@ -404,8 +404,8 @@ enum JsonlPermissionPublicationState {
 enum JsonlPermissionRouteState {
     Routed,
     CommittedPending {
-        request_id: crate::unstable_surface::SurfaceRequestId,
-        commit_id: crate::unstable_surface::SurfaceCommitId,
+        request_id: crate::surface::SurfaceRequestId,
+        commit_id: crate::surface::SurfaceCommitId,
         response_digest: JsonlResponseDigest,
     },
 }
@@ -572,8 +572,8 @@ impl<T: Clone> JsonlOpaquePermissionRouter<T> {
     fn mark_committed_pending_witness(
         &self,
         request_id: &str,
-        mutation_request_id: crate::unstable_surface::SurfaceRequestId,
-        commit_id: crate::unstable_surface::SurfaceCommitId,
+        mutation_request_id: crate::surface::SurfaceRequestId,
+        commit_id: crate::surface::SurfaceCommitId,
         response_digest: JsonlResponseDigest,
     ) -> io::Result<()> {
         let mut routes = self.routes.lock().map_err(lock_error)?;
@@ -891,8 +891,8 @@ mod tests {
         router
             .mark_committed_pending_witness(
                 "permission",
-                crate::unstable_surface::SurfaceRequestId::new(),
-                crate::unstable_surface::SurfaceCommitId::try_from_bytes([
+                crate::surface::SurfaceRequestId::new(),
+                crate::surface::SurfaceCommitId::try_from_bytes([
                     1, 159, 161, 19, 220, 41, 112, 211, 145, 70, 17, 0, 120, 212, 79, 246,
                 ])
                 .unwrap(),

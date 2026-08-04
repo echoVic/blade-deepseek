@@ -1,4 +1,60 @@
-use super::*;
+use super::commands::{
+    MutationCommitAck, SURFACE_COMMIT_BATCH_BYTE_LIMIT, SURFACE_COMMIT_BATCH_EVENT_LIMIT,
+    SurfaceCommitBatch, SurfaceCommitBatchPreflightErrorCode, SurfaceCommitBatchPreflightResult,
+    SurfaceEvent, SurfaceEventEnvelope, SurfaceSnapshot,
+};
+use super::identity::{
+    ByteCount, ByteOffset, CanonicalBackgroundFenceV1, CanonicalSurfaceScopeV1, CommitClass,
+    CursorSourceRevision, DisplayText, InteractionRevision, NonEmptyText,
+    PinnedContextSourceRevision, ResponseRouteEpoch, SafeDiagnosticText, SequenceNumber,
+    Sha256Digest, SurfaceCommitId, SurfaceCursor, SurfaceEventId, SurfaceFinalizeIntentId,
+    SurfaceGenerationId, SurfaceGoalId, SurfaceGoalIntentId, SurfaceGoalOuterTurnId,
+    SurfaceGoalRunId, SurfaceInteractionId, SurfaceItemId, SurfaceOperationFence,
+    SurfaceOperationId, SurfaceRequestId, SurfaceScope, SurfaceSettlementId, SurfaceSubagentId,
+    SurfaceTaskFence, SurfaceTaskId, SurfaceToolCallId, SurfaceTurnId, SurfaceWorkflowFence,
+    SurfaceWorkflowRunId, TaskRevision, ThreadOwnerEpoch, UnixMillis, UuidV7, WorkflowRevision,
+    canonical_background_fence_v1, canonical_surface_scope_v1,
+};
+use super::interaction::{
+    AuthorityFingerprint, CanonicalInteractionPatchV1, InteractionCancelReason,
+    InteractionExpiryAuthorityFailure, InteractionPatch, InteractionUnavailableDisposition,
+    SurfaceInteractionKind, SurfaceInteractionLifecycle, SurfaceInteractionRequest,
+    SurfaceInteractionRoute, SurfaceInteractionSafeProjection, SurfaceInteractionView,
+    SurfaceToolAction, SurfaceToolRequest, canonical_interaction_patch_v1,
+};
+use super::operation::{
+    AdmissionRejectionReason, AdmittedInput, CancelReason, FailureClass, FinalizationDegradedCause,
+    FinalizationStartedAtCursor, GenerationAttempt, GenerationCompletionStatus,
+    GenerationExecutionFailureClass, GenerationInputState, GenerationPhase, GenerationRecord,
+    GenerationStartedWitness, GenerationStopReason, GoalOuterTurnOrigin, InputResolutionErrorCode,
+    LiveOperationCapsule, NonReplayableReason, NotAdmittedReason, NotStartedReason,
+    OperationBudget, OperationFinalizationCause, OperationFinalizationRecord, OperationKind,
+    OperationPhase, OperationRecord, OperationTerminal, OperationTerminalRecord,
+    PendingControlIntent, Replayability, ReservationFinalizerReason, SurfaceAgentLoopTurn,
+    SurfaceGoalGenerationIdentity, SurfaceResolvedInputFact, SurfaceSettlementReceipt,
+    SurfaceShutdownReason, SuspendedFinalizationCause, SuspensionCause, TerminalizationCause,
+    TurnRequestBudgetScope, UsageTotals,
+};
+use super::projection::{
+    AssistantChannel, AssistantPatch, CapabilityCallResult, CompactionReason, CompactionState,
+    ExternalEffectKind, GoalContinuationDecision, GoalContinuationStopReason, GoalPatch,
+    GoalPatchEnvelope, GoalUsage, ItemPatch, ItemRemovalReason, McpCatalogPatch, OperationPatch,
+    PinnedContextPatch, SessionPatch, SettingsPatch, SubagentPatch, SurfaceAssistantStreamState,
+    SurfaceBackgroundOperation, SurfaceCapabilityCall, SurfaceCapabilityCallKind,
+    SurfaceCapabilityCallState, SurfaceCompletedModelResponse, SurfaceContextSnapshot,
+    SurfaceFactFamily, SurfaceGoal, SurfaceGoalCloseReason, SurfaceGoalClosedRunReceipt,
+    SurfaceGoalIntent, SurfaceGoalIntentAck, SurfaceGoalOuterTurnReceipt,
+    SurfaceGoalOuterTurnReceiptOrigin, SurfaceGoalPauseReason, SurfaceGoalReceiptState,
+    SurfaceGoalRun, SurfaceGoalRunOrigin, SurfaceGoalRunPhase, SurfaceGoalState,
+    SurfaceGoalStoreReceipt, SurfaceHealthIssue, SurfaceHealthIssueId, SurfaceItem,
+    SurfaceItemOrigin, SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfacePlanSnapshot,
+    SurfaceRemoteTerminalLease, SurfaceRemoteTerminalLeaseState, SurfaceSubagentStatus,
+    SurfaceSubagentTerminalStatus, SurfaceTask, SurfaceTaskStatus, SurfaceTaskType,
+    SurfaceToolResultKind, SurfaceToolView, SurfaceToolViewState, SurfaceUsageSnapshot,
+    SurfaceUserInputState, SurfaceVerificationResult, SurfaceWorkflow, SurfaceWorkflowAgent,
+    SurfaceWorkflowAgentStatus, SurfaceWorkflowStatus, TaskPatch, ToolInvocationStarted, ToolPatch,
+    WorkflowPatch,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -3619,7 +3675,7 @@ fn apply_assistant_patch(
                     "assistant delta offset is not contiguous",
                 ));
             }
-            stream.text = DisplayText::new(format!("{}{}", stream.text.as_str(), text.as_str()));
+            stream.text.push_str(text.as_str());
             stream.next_offset = ByteOffset::new(offset.get() + text.as_str().len() as u64);
             Ok(())
         }
@@ -6254,7 +6310,9 @@ fn apply_goal_patch(
                     "created goal does not match the receipt post-state",
                 ));
             }
-            state.snapshot.goal = Some(goal.clone());
+            let mut goal = goal.clone();
+            goal.receipt_digest = receipt.receipt_digest.clone();
+            state.snapshot.goal = Some(goal);
             return Ok(());
         }
         GoalPatch::Edited {
@@ -6324,7 +6382,9 @@ fn apply_goal_patch(
                     "edited goal does not match the receipt post-state",
                 ));
             }
-            state.snapshot.goal = Some(goal.clone());
+            let mut goal = goal.clone();
+            goal.receipt_digest = receipt.receipt_digest.clone();
+            state.snapshot.goal = Some(goal);
             return Ok(());
         }
         GoalPatch::Removed {
@@ -7031,6 +7091,7 @@ fn apply_goal_patch(
     goal.objective_revision = goal_envelope.receipt.objective_revision;
     goal.catalog_revision = goal_envelope.receipt.catalog_revision;
     goal.goal_owner_epoch = goal_envelope.receipt.goal_owner_epoch;
+    goal.receipt_digest = goal_envelope.receipt.receipt_digest;
     goal.state = next_state.clone();
     goal.current_run = current_run.clone();
     if successor_authorization.is_some() {
@@ -7076,6 +7137,7 @@ fn goal_with_present_receipt(
     goal.objective_revision = receipt.objective_revision;
     goal.catalog_revision = receipt.catalog_revision;
     goal.goal_owner_epoch = receipt.goal_owner_epoch;
+    goal.receipt_digest = receipt.receipt_digest.clone();
     goal.state = state.clone();
     goal.current_run = current_run.clone();
     goal
@@ -7984,6 +8046,23 @@ fn goal_patch_id(patch: &GoalPatch) -> &SurfaceGoalId {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::runtime_surface::identity::{
+        ContextRevision, DurableRevision, HostIncarnation, HostMonotonicClockId,
+        McpCatalogRevision, MonotonicInstant, MonotonicTick, NonEmptyVec, PinnedContextRevision,
+        PlanRevision, PolicyEpoch, SessionHealthRevision, SessionMetadataRevision,
+        SettingsRevision, SurfaceAdmissionLeaseId, SurfaceBackgroundFence,
+        SurfaceBackgroundOwnerToken, SurfaceIncarnation, SurfaceThreadId, UsageRevision,
+    };
+    use crate::runtime_surface::operation::{
+        BusyDisposition, InterruptSettlement, LegacyVisibility, ManualCompactionReason,
+        OperationIntent, OperationOrigin, OperationSettingsPreparationReceipt, ReservationLease,
+        SurfaceApprovalMode, SurfaceNetworkPermissions, SurfacePermissionRuleSet,
+        SurfaceReasoningEffort, SurfaceRuntimeSettings,
+    };
+    use crate::runtime_surface::projection::{
+        ProviderReplayHealth, SurfaceMcpCatalogSnapshot, SurfacePinnedContextSnapshot,
+        SurfaceSessionHealth, SurfaceSettingsSnapshot, SurfaceThreadSnapshot, ThreadPersistence,
+    };
     use std::collections::BTreeSet;
 
     pub(crate) fn uuid_v7_bytes(seed: u8) -> [u8; 16] {
@@ -8319,6 +8398,17 @@ pub(crate) mod tests {
             finalization: None,
             terminal: None,
         }
+    }
+
+    #[test]
+    fn assistant_delta_append_counts_only_delta_bytes() {
+        let mut text = DisplayText::new("");
+        DisplayText::reset_appended_byte_count();
+        for _ in 0..1_000 {
+            text.push_str("0123456789");
+        }
+        assert_eq!(text.as_str().len(), 10_000);
+        assert_eq!(DisplayText::appended_byte_count(), 10_000);
     }
 
     #[test]

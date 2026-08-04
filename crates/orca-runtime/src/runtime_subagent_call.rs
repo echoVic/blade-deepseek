@@ -25,6 +25,7 @@ use crate::memory::MemoryBlock;
 use crate::runtime_tool_call::RuntimeToolCallRuntime;
 use crate::schema_validation::validate_json_schema_subset;
 use crate::subagent::{SubagentIsolation, SubagentRequest};
+use crate::tasks::TaskRegistry;
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 
@@ -40,6 +41,8 @@ pub(crate) struct RuntimeSubagentInvocation {
     pub(crate) workflow_ipc: Option<WorkflowIpcContext>,
     pub(crate) child_depth: u32,
     pub(crate) child_executor: ChildAgentExecutor<io::Sink>,
+    pub(crate) task_registry: TaskRegistry,
+    pub(crate) root_task_id: Option<String>,
 }
 
 impl RuntimeSubagentInvocation {
@@ -56,6 +59,8 @@ impl RuntimeSubagentInvocation {
         workflow_ipc: Option<&WorkflowIpcContext>,
         child_depth: u32,
         child_executor: ChildAgentExecutor<io::Sink>,
+        task_registry: &TaskRegistry,
+        root_task_id: Option<&str>,
     ) -> Self {
         Self {
             tool_request,
@@ -69,6 +74,8 @@ impl RuntimeSubagentInvocation {
             workflow_ipc: workflow_ipc.cloned(),
             child_depth,
             child_executor,
+            task_registry: task_registry.clone(),
+            root_task_id: root_task_id.map(str::to_string),
         }
     }
 }
@@ -263,6 +270,8 @@ fn run_subagent_worker(
         workflow_ipc,
         child_depth,
         child_executor,
+        task_registry,
+        root_task_id,
     } = invocation;
     let SubagentRequest {
         description,
@@ -321,6 +330,8 @@ fn run_subagent_worker(
             hooks: &hooks,
             cancel: &cancel,
             lifecycle: Some(&mut lifecycle),
+            task_registry: Some(&task_registry),
+            root_task_id: root_task_id.as_deref(),
             executor: child_executor,
         });
         run_child_agent(&config, &child_request, &mut runtime)

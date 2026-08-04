@@ -8,7 +8,31 @@ import { fileURLToPath } from "node:url";
 
 const DEFAULT_MANIFEST =
   "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json";
-const PLAN_SUFFIX = "runtime-owned-typed-surface-implementation.md";
+const DEFAULT_DIGEST =
+  "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.digest.json";
+const REVIEWED_ARTIFACT_PATHS = [
+  "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
+  DEFAULT_MANIFEST,
+  "docs/superpowers/plans/2026-07-21-runtime-owned-typed-surface-implementation.md",
+];
+const RUNTIME_SURFACE_MODULES = [
+  "commands",
+  "commit",
+  "host",
+  "hub",
+  "identity",
+  "ingress",
+  "interaction",
+  "operation",
+  "projection",
+  "reducer",
+  "store",
+];
+const UNSTABLE_SURFACE_SOURCE_ROOTS = [
+  "crates/orca-runtime/src",
+  "crates/orca-runtime/tests",
+  "crates/orca-tui/src",
+];
 
 const TABLES = {
   source_fact_columns: "source_facts",
@@ -382,7 +406,7 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
   ],
   ["recovered_background_scan", /notify_recovered_background_approvals_for_tui/],
   ["startup_session_mcp", /needs_setup|startup_preloaded_transcript|initialize_registry/],
-  ["session_picker_transition", /fn resume_selected_session|Session picker/],
+  ["session_picker_transition", /fn handle_session_picker_key|Session picker/],
   [
     "goal_callbacks",
     /fn update_goal_status_for_session|fn show_hosted_goal|fn resume_latest_active_goal_hosted/,
@@ -635,7 +659,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
     "crates/orca-tui/src/app.rs:hosted_tui_controller_loop_with_ordinary_turn_runner:thread.shutdown",
     1,
   ],
-  ["crates/orca-tui/src/app.rs:resume_latest_active_goal_hosted:thread.shutdown", 3],
+  ["crates/orca-tui/src/app.rs:resume_latest_active_goal_hosted:thread.shutdown", 2],
   [
     "crates/orca-tui/src/app.rs:hosted_tui_controller_loop_with_ordinary_turn_runner:thread.launch_workflow",
     1,
@@ -646,6 +670,10 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ],
   ["crates/orca-tui/src/app.rs:ensure_hosted_thread:host.start_thread_with_request", 1],
   ["crates/orca-tui/src/app.rs:resume_latest_active_goal_hosted:host.start_thread_with_request", 1],
+  ["crates/orca-tui/src/app.rs:start_new_hosted_session:host.start_thread_with_request", 1],
+  ["crates/orca-tui/src/app.rs:start_forked_hosted_session:host.start_thread_with_request", 1],
+  ["crates/orca-tui/src/app.rs:switch_saved_hosted_session:host.start_thread_with_request", 1],
+  ["crates/orca-tui/src/app.rs:reap_hosted_thread:thread.shutdown", 2],
   ["crates/orca-tui/src/app.rs:run_tui_inner:user_action.route", 2],
   ["crates/orca-tui/src/app.rs:run_tui_inner:host.shutdown", 1],
   ["crates/orca-tui/src/app.rs:run_hosted_operation:operation.interrupt", 1],
@@ -657,7 +685,6 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
     "crates/orca-tui/src/app.rs:hosted_tui_controller_loop_with_ordinary_turn_runner:background_approval.respond",
     1,
   ],
-  ["crates/orca-tui/src/app.rs:run_tui_inner:catalog.mutate", 1],
   ["crates/orca-tui/src/approval_actions.rs:resolve_approval:user_action.route", 2],
   ["crates/orca-tui/src/approval_actions.rs:resolve_approval_option:approval_allowlist.insert", 2],
   ["crates/orca-tui/src/approval_mode_actions.rs:cycle_approval_mode:user_action.route", 1],
@@ -685,15 +712,19 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/runtime_interaction_adapter.rs:request_user_input:interaction_projection.mutate", 4],
   ["crates/orca-tui/src/runtime_interaction_adapter.rs:request_mcp_elicitation:interaction_projection.mutate", 4],
   ["crates/orca-tui/src/runtime_interaction_adapter.rs:project_pending_interaction:interaction_projection.mutate", 1],
-  ["crates/orca-tui/src/session_picker_actions.rs:handle_session_picker_key:session.resume", 1],
+  ["crates/orca-tui/src/session_picker_actions.rs:handle_session_picker_key:user_action.route", 3],
+  ["crates/orca-tui/src/session_picker_actions.rs:activate_action:user_action.route", 2],
+  ["crates/orca-tui/src/session_picker_actions.rs:dispatch_selected_resume:user_action.route", 1],
   ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:credentials.update", 2],
   ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:user_action.route", 1],
-  ["crates/orca-tui/src/slash_command_actions.rs:handle_slash_command:user_action.route", 8],
+  ["crates/orca-tui/src/slash_command_actions.rs:handle_slash_command:user_action.route", 10],
   ["crates/orca-tui/src/slash_command_actions.rs:handle_slash_command:input_history.record", 1],
   ["crates/orca-tui/src/slash_menu_actions.rs:handle_slash_menu_key:user_action.route", 1],
+  ["crates/orca-tui/src/status_key_actions.rs:handle_recovery_prompt_key:user_action.route", 1],
   ["crates/orca-tui/src/surface_actions.rs:backtrack_last_user:thread.backtrack_last_user", 1],
   ["crates/orca-tui/src/surface_actions.rs:remember:memory.update", 2],
   ["crates/orca-tui/src/surface_actions.rs:save_api_key:credentials.update", 2],
+  ["crates/orca-tui/src/types.rs:commit_queued_submission_admission:input_history.record", 1],
   ["crates/orca-tui/src/workflow_notifications.rs:submit_pending_workflow_notification:user_action.route", 1],
   ["crates/orca-tui/src/workflow_panel_actions.rs:handle_workflows_panel_key:user_action.route", 2],
 ]);
@@ -703,13 +734,34 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
 const RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS = new Map([]);
 
 const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
-  ["crates/orca-tui/src/app.rs:run_tui_inner:terminal.clear", 1],
+  ["crates/orca-tui/src/app.rs:install_hosted_session:pending_workflow_notifications.clear", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:mention_search.shutdown", 1],
-  ["crates/orca-tui/src/app.rs:clear_terminal_scrollback:terminal.clear", 1],
+  ["crates/orca-tui/src/app.rs:run_tui_inner:terminal.clear", 1],
+  ["crates/orca-tui/src/app.rs:start_forked_hosted_session:next_config.prompt.clear", 1],
+  ["crates/orca-tui/src/app.rs:start_new_hosted_session:next_config.prompt.clear", 1],
+  ["crates/orca-tui/src/app.rs:switch_saved_hosted_session:next_config.prompt.clear", 1],
+  ["crates/orca-tui/src/capability_backend.rs:clear:self.inner.clear", 1],
+  ["crates/orca-tui/src/commands/mod.rs:builtin_command_names:names.insert", 1],
   ["crates/orca-tui/src/commands/mod.rs:collect_workflow_dir:seen.insert", 1],
-  ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:state.pending_pastes.clear", 2],
-  ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:state.mention_bindings.clear", 2],
+  ["crates/orca-tui/src/diff_highlight.rs:accepts:self.hunk_ranges.insert", 1],
+  ["crates/orca-tui/src/diff_highlight.rs:cluster_inline_segments:segments.insert", 4],
+  ["crates/orca-tui/src/diff_highlight.rs:compute_file_scoped_styles_with:expected.insert", 1],
+  ["crates/orca-tui/src/diff_highlight.rs:compute_file_scoped_styles_with:refined.insert", 1],
+  ["crates/orca-tui/src/diff_highlight.rs:reset:self.hunk_ranges.clear", 1],
+  ["crates/orca-tui/src/edit_highlight_worker.rs:clear_pending:self.pending.clear", 1],
+  ["crates/orca-tui/src/edit_highlight_worker.rs:coalesce_jobs:positions.insert", 2],
+  ["crates/orca-tui/src/edit_highlight_worker.rs:submit:self.pending.clear", 1],
+  ["crates/orca-tui/src/edit_highlight_worker.rs:submit:self.pending.insert", 1],
+  ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:state.mention_bindings.clear", 3],
+  ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:state.pending_pastes.clear", 3],
+  ["crates/orca-tui/src/input_adapter.rs:adapt_key:modifiers.insert", 1],
+  ["crates/orca-tui/src/input_adapter.rs:adapt_key:state.insert", 2],
+  ["crates/orca-tui/src/input_adapter.rs:adapt_modifiers:adapted.insert", 1],
+  ["crates/orca-tui/src/input_adapter.rs:adapt:key.modifiers.insert", 1],
+  ["crates/orca-tui/src/input_runtime.rs:drive_terminal:driver.resume", 1],
+  ["crates/orca-tui/src/input_runtime.rs:resume:self.session.resume", 1],
   ["crates/orca-tui/src/mention_search_manager.rs:drop:self.shutdown", 1],
+  ["crates/orca-tui/src/mention_search_manager.rs:sync_at_cursor:state.mention.candidates.clear", 1],
   [
     "crates/orca-tui/src/operation_controller.rs:shutdown:hosted.surface_delivery_watermarks.clear",
     1,
@@ -726,26 +778,66 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
     "crates/orca-tui/src/operation_controller.rs:remember_surface_terminal_delivery:self.lock_hosted().surface_terminal_deliveries.insert",
     1,
   ],
-  ["crates/orca-tui/src/session_picker_actions.rs:handle_session_picker_key:state.session_picker_sessions.clear", 1],
-  ["crates/orca-tui/src/session_picker_actions.rs:handle_session_picker_key:state.session_picker_query.clear", 1],
+  ["crates/orca-tui/src/queued_input_actions.rs:enqueue_composer_follow_up:state.mention_bindings.clear", 1],
+  ["crates/orca-tui/src/queued_input_actions.rs:enqueue_composer_follow_up:state.pending_pastes.clear", 1],
+  ["crates/orca-tui/src/session_picker_actions.rs:close_picker:state.session_picker_query.clear", 1],
+  ["crates/orca-tui/src/session_picker_actions.rs:close_picker:state.session_picker_sessions.clear", 1],
   ["crates/orca-tui/src/shortcuts.rs:normalize_key_parts:modifiers.insert", 1],
+  ["crates/orca-tui/src/streaming_markdown.rs:finish:self.current_block.clear", 1],
+  ["crates/orca-tui/src/streaming_markdown.rs:finish:self.partial_line.clear", 1],
   ["crates/orca-tui/src/surface_client.rs:parse_workflow_args:args.insert", 2],
+  ["crates/orca-tui/src/terminal_presentation.rs:write_pending:self.pending_notifications.clear", 1],
+  ["crates/orca-tui/src/terminal_presentation.rs:write_reset_title:self.pending_notifications.clear", 1],
+  ["crates/orca-tui/src/transcript_search.rs:clear_matches:self.matches.clear", 1],
+  ["crates/orca-tui/src/transcript_search.rs:clear_query:self.matches.clear", 1],
+  ["crates/orca-tui/src/transcript_search.rs:clear_query:self.query.clear", 1],
+  ["crates/orca-tui/src/transcript_search.rs:insert_char:self.query.insert", 1],
+  ["crates/orca-tui/src/transcript_search.rs:open_new:self.matches.clear", 1],
+  ["crates/orca-tui/src/transcript_search.rs:open_new:self.query.clear", 1],
+  ["crates/orca-tui/src/transcript_search.rs:replace_query:self.query.clear", 1],
+  ["crates/orca-tui/src/transcript_view.rs:extract_text:current_line.clear", 1],
+  ["crates/orca-tui/src/transcript_view.rs:invalidate:self.dirty_indices.insert", 1],
+  ["crates/orca-tui/src/transcript_view.rs:prepare_entry:self.spinner_indices.insert", 1],
+  ["crates/orca-tui/src/transcript_view.rs:rebuild_cumulative_heights:self.cumulative_heights.clear", 1],
+  ["crates/orca-tui/src/transcript_view.rs:reconcile_len:self.dirty_indices.insert", 1],
+  ["crates/orca-tui/src/transcript_view.rs:retain:self.dirty_indices.insert", 1],
+  ["crates/orca-tui/src/transcript_view.rs:retain:self.spinner_indices.insert", 1],
+  ["crates/orca-tui/src/transcript_view.rs:search:search_index.entries.clear", 1],
+  ["crates/orca-tui/src/types.rs:append_input_history:std::fs::OpenOptions::new().create", 1],
+  ["crates/orca-tui/src/types.rs:apply_edit_highlight_result:self.applied_diff_highlights.insert", 1],
+  ["crates/orca-tui/src/types.rs:clear_messages:self.applied_diff_highlights.clear", 1],
   ["crates/orca-tui/src/types.rs:clear_projection:self.candidates.clear", 1],
-  ["crates/orca-tui/src/types.rs:reset_message_tracking:self.message_revisions.clear", 1],
-  ["crates/orca-tui/src/types.rs:reset_message_tracking:self.transcript_render_cache.clear", 1],
   ["crates/orca-tui/src/types.rs:clear_messages:self.messages.clear", 1],
   ["crates/orca-tui/src/types.rs:clear_messages:self.message_revisions.clear", 1],
+  ["crates/orca-tui/src/types.rs:clear_messages:self.tool_call_indices.clear", 1],
   ["crates/orca-tui/src/types.rs:clear_messages:self.transcript_render_cache.clear", 1],
+  ["crates/orca-tui/src/types.rs:clear:queue.clear", 1],
+  ["crates/orca-tui/src/types.rs:configure_syntax_highlighting:self.applied_diff_highlights.clear", 1],
   ["crates/orca-tui/src/types.rs:load_input_history:seen.insert", 2],
-  ["crates/orca-tui/src/types.rs:append_input_history:std::fs::OpenOptions::new().create", 1],
+  ["crates/orca-tui/src/types.rs:rebuild_tool_call_indices:self.tool_call_indices.clear", 1],
+  ["crates/orca-tui/src/types.rs:replace_messages:self.applied_diff_highlights.clear", 1],
+  ["crates/orca-tui/src/types.rs:reset_message_tracking:self.message_revisions.clear", 1],
+  ["crates/orca-tui/src/types.rs:reset_message_tracking:self.transcript_render_cache.clear", 1],
+  ["crates/orca-tui/src/types.rs:reset_queued_user_messages:self.queued_user_messages.clear", 1],
+  ["crates/orca-tui/src/types.rs:reset_session_projection:self.approval_allowlist.clear", 1],
+  ["crates/orca-tui/src/types.rs:reset_session_projection:self.mention_bindings.clear", 1],
+  ["crates/orca-tui/src/types.rs:reset_session_projection:self.pending_pastes.clear", 1],
+  ["crates/orca-tui/src/types.rs:reset_session_projection:self.pending_workflow_notifications.clear", 1],
+  ["crates/orca-tui/src/types.rs:reset_session_projection:self.session_picker_query.clear", 1],
+  ["crates/orca-tui/src/types.rs:reset_session_projection:self.session_picker_sessions.clear", 1],
   ["crates/orca-tui/src/types.rs:update:self.mention_bindings.clear", 1],
+  ["crates/orca-tui/src/ui.rs:append_code_block:source_line.insert", 1],
+  ["crates/orca-tui/src/ui.rs:append_proposed_plan_lines:line.spans.insert", 1],
   ["crates/orca-tui/src/ui.rs:render_markdown:opts.insert", 1],
   ["crates/orca-tui/src/ui.rs:render_markdown:current_cell.clear", 1],
   ["crates/orca-tui/src/ui.rs:render_markdown:table_rows.clear", 2],
   ["crates/orca-tui/src/ui.rs:render_table_as_records:lines.insert", 1],
+  ["crates/orca-tui/src/ui.rs:render_textarea_visual_line:attached_zero_width.clear", 1],
 ]);
 
 const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_ITEM_SITES = new Map([
+  ["crates/orca-tui/src/app.rs:clear_terminal_scrollback:Terminal::clear", 1],
+  ["crates/orca-tui/src/app.rs:resume_terminal_render:Terminal::clear", 1],
   [
     "crates/orca-tui/src/surface_actions.rs:launch_workflow:crate::surface_client::launch_workflow",
     1,
@@ -757,29 +849,15 @@ const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_ITEM_SITES = new Map([
 ]);
 const BASELINE_UNRESOLVED_USER_ACTION_SEND_SITES = new Map([]);
 
-const BASELINE_HARMLESS_SAME_NAME_FUNCTION_SHA256 = new Map([
-  ["crates/orca-tui/src/app.rs:run_tui_inner", "78b0388cb092eebccc6613093f09592a5e40d015d6d4fc9ae89bb15d4d3f0dde"],
-  ["crates/orca-tui/src/app.rs:clear_terminal_scrollback", "bb80acbf783b75a196169182fec5eab27dbf00ce5186a096d0d16a4b788c1336"],
-  ["crates/orca-tui/src/commands/mod.rs:collect_workflow_dir", "5ff2d53152274d162938b826d93207487a4a70e0c56dfe26967d5fa0e81befe2"],
-  ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit", "ce293ae54519035f0310812943fe1b2173026e496ba75bea3019a45548024833"],
-  ["crates/orca-tui/src/mention_search_manager.rs:drop", "811fcf29ec41cdabc9a1aa66c4ec1ee2f671c8da2b2fd346b05173268c3569ce"],
-  ["crates/orca-tui/src/operation_controller.rs:shutdown", "f5692902b3b5d1acbf62de47ed96db76d5806fc7d46e492c1a262d927059aa16"],
-  ["crates/orca-tui/src/operation_controller.rs:remember_surface_delivery_watermark", "772312ab96bdfe762ed68b356a26a904f7a656709f8b27d47347350884c92602"],
-  ["crates/orca-tui/src/operation_controller.rs:remember_surface_terminal_delivery", "2e5cea80cd4a2b5c616f47340599649a8a67b0759412d9b621a2b72e61fc1344"],
-  ["crates/orca-tui/src/session_picker_actions.rs:handle_session_picker_key", "4fd9fd44d409176ef41c576496fdea65b16d38c08c5b2b6a75d1189a1bb8d578"],
-  ["crates/orca-tui/src/shortcuts.rs:normalize_key_parts", "73d844ca3283aa368759c2d87008fa123eec3bbf2a7ff0f981931a741a95944c"],
-  ["crates/orca-tui/src/surface_client.rs:parse_workflow_args", "4d21ed0233bca3d7b6cb2e5a3f3fcc2551369b797c0181e9f007d767227e2803"],
-  ["crates/orca-tui/src/types.rs:clear_projection", "ed71bb1c512daf63cdf14e2b1810f6bdc4ecaf617b3b131c157ed9fba1801879"],
-  ["crates/orca-tui/src/types.rs:reset_message_tracking", "633316c1f2ea3e9e68bf6e7905f66b9a2210bb5961f0af5abb94e143a0b61c09"],
-  ["crates/orca-tui/src/types.rs:clear_messages", "5cda88c94e6601f2707b73f0faae255acc19e644e826f02b14b293310f0171e3"],
-  ["crates/orca-tui/src/types.rs:load_input_history", "2a3ff85622fead59fa1741adbadcf9bef43e17295c3bbc7fce081640a66553ef"],
-  ["crates/orca-tui/src/types.rs:append_input_history", "25aa6ffa36a7cb1ba514d054f715c15821126d97fc519abfbe2a4a62d339174f"],
-  ["crates/orca-tui/src/types.rs:update", "163c25cf2f8bcedaf8b7a67cabf43c54b647101de9d31f02aff550801851ffc0"],
-  ["crates/orca-tui/src/ui.rs:render_markdown", "82a2db5cec2e638d93105e1d8bd19f1accf51e14458c05c0adcc2e07d0ccbbb9"],
-  ["crates/orca-tui/src/ui.rs:render_table_as_records", "19c22351863dcfa582b38b37441aada9e28d55a267a5dcfb38d58986167cf593"],
-]);
-
 const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_SHA256 = new Map([
+  [
+    "crates/orca-tui/src/app.rs:clear_terminal_scrollback",
+    "11b29531e3da780b33bfc28b127c19c2e1ee203dcd99c5fccaf26846417d571d",
+  ],
+  [
+    "crates/orca-tui/src/app.rs:resume_terminal_render",
+    "8ff17eeb9d82b6b0f014b64e21d1813e4f26880ffeddee8971da8aac661813dc",
+  ],
   [
     "crates/orca-tui/src/surface_actions.rs:launch_workflow",
     "580c07fc16f85dd8fcab1fc16c56b3647a6d550a9a5aef0c5889c68041c151dc",
@@ -823,7 +901,17 @@ function assertExactArray(actual, expected, label) {
   ) {
     if (label.includes("EventType")) fail("source_facts does not match current EventType");
     if (label.includes("UserAction")) {
-      fail("current_tui_user_actions does not match current UserAction");
+      const missing = expected.filter((value) => !actual.includes(value));
+      const unexpected = actual.filter((value) => !expected.includes(value));
+      const details = [
+        missing.length > 0 ? `missing: ${missing.join(", ")}` : undefined,
+        unexpected.length > 0 ? `unexpected: ${unexpected.join(", ")}` : undefined,
+      ].filter(Boolean);
+      fail(
+        `current_tui_user_actions does not match current UserAction${
+          details.length > 0 ? `; ${details.join("; ")}` : ""
+        }`,
+      );
     }
     fail(`${label} does not match the baseline inventory`);
   }
@@ -915,6 +1003,10 @@ export function canonicalSha256(content) {
   return createHash("sha256").update(content).digest("hex");
 }
 
+function canonicalSourceSha256(content) {
+  return canonicalSha256(content.replace(/\r\n?/g, "\n"));
+}
+
 export function parseManifestText(text) {
   try {
     return JSON.parse(text);
@@ -983,6 +1075,37 @@ function validateClosedInventories(manifest) {
       fail(`${id} has unknown materialization ${materialization}`);
     }
   }
+}
+
+function validateRuntimeSurfacePublicExportManifest(manifest) {
+  const exportsByModule = requireObject(
+    manifest.runtime_surface_public_exports,
+    "runtime_surface_public_exports",
+  );
+  assertExactArray(
+    Object.keys(exportsByModule),
+    RUNTIME_SURFACE_MODULES,
+    "runtime_surface_public_exports modules",
+  );
+  for (const moduleName of RUNTIME_SURFACE_MODULES) {
+    const names = requireArray(
+      exportsByModule[moduleName],
+      `runtime_surface_public_exports.${moduleName}`,
+    );
+    names.forEach((name, index) =>
+      requireNonemptyString(name, `runtime_surface_public_exports.${moduleName}[${index}]`),
+    );
+    assertUnique(names, `runtime_surface_public_exports.${moduleName}`);
+    assertExactArray(
+      names,
+      [...names].sort(),
+      `runtime_surface_public_exports.${moduleName} sorted order`,
+    );
+  }
+  assertUnique(
+    RUNTIME_SURFACE_MODULES.flatMap((moduleName) => exportsByModule[moduleName]),
+    "runtime_surface_public_exports flattened names",
+  );
 }
 
 function validateCommands(manifest, tableKey, inventoryKey, dispositionKey) {
@@ -1175,11 +1298,11 @@ function invariantRegistry() {
       },
     ],
     [
-      "closed_inventory.current_tui_user_actions has exactly 23 unique variants matching UserAction at baseline",
+      "closed_inventory.current_tui_user_actions has exactly 32 unique variants matching UserAction at baseline",
       (manifest) => {
         assertCondition(
-          manifest.closed_inventory.current_tui_user_actions.length === 23,
-          "current_tui_user_actions must contain 23 variants",
+          manifest.closed_inventory.current_tui_user_actions.length === 32,
+          "current_tui_user_actions must contain 32 variants",
         );
         assertUnique(
           manifest.closed_inventory.current_tui_user_actions,
@@ -2050,6 +2173,7 @@ export function validateManifestStructure(manifest, { reviewedManifest } = {}) {
   requireNonemptyString(manifest.normative_document, "normative_document");
   validateTables(manifest);
   validateClosedInventories(manifest);
+  validateRuntimeSurfacePublicExportManifest(manifest);
   validateCommands(manifest, "thread_commands", "surface_commands", "thread_command_dispositions");
   validateCommands(manifest, "host_commands", "surface_host_commands", "host_dispositions");
   validateAcpDispositions(manifest);
@@ -2130,60 +2254,31 @@ export function validateArtifactBundle(manifest, { repoRoot }) {
   }
 }
 
-function parseReviewTrailers(message) {
-  const trailers = new Map();
-  for (const line of message.split(/\r?\n/)) {
-    const match = line.trim().match(/^(private|manifest|plan)-sha256:\s*([0-9a-f]{64})$/);
-    if (match) trailers.set(match[1], match[2]);
-  }
-  for (const key of ["private", "manifest", "plan"]) {
-    if (!trailers.has(key)) fail(`review commit is missing ${key}-sha256 metadata`);
-  }
-  return trailers;
-}
-
-function loadReviewedManifest(repoRoot, manifestPath) {
-  const manifestRelative = relativeRepoPath(repoRoot, manifestPath);
-  const reviewCommit = git(repoRoot, ["log", "-1", "--format=%H", "--", manifestRelative]).trim();
-  if (!reviewCommit) fail("manifest has no review commit");
-  const trailers = parseReviewTrailers(git(repoRoot, ["show", "-s", "--format=%B", reviewCommit]));
-  const bytes = git(repoRoot, ["show", `${reviewCommit}:${manifestRelative}`], {
-    encoding: "buffer",
-  });
-  if (canonicalSha256(bytes) !== trailers.get("manifest")) {
-    fail("review commit manifest SHA-256 metadata mismatch");
-  }
-  return {
-    manifest: parseManifestText(bytes.toString("utf8")),
-    reviewCommit,
-    trailers,
-  };
-}
-
-function validateReviewedBundle(manifest, { repoRoot, manifestPath, reviewedBundle }) {
-  const { reviewCommit, trailers } =
-    reviewedBundle ?? loadReviewedManifest(repoRoot, manifestPath);
-  if (canonicalSha256(readFileSync(manifestPath)) !== trailers.get("manifest")) {
-    fail("reviewed manifest SHA-256 mismatch");
-  }
-
-  const privatePath = checkedRepoFile(
-    repoRoot,
-    manifest.artifact_bundle.private_contract_path,
-    "private contract path",
+export function validateArtifactDigest(digest, { repoRoot, sourceOverrides }) {
+  requireObject(digest, "artifact digest");
+  if (digest.schema_version !== 1) fail("artifact digest schema_version must be 1");
+  if (digest.algorithm !== "sha256") fail("artifact digest algorithm must be sha256");
+  const artifacts = requireArray(digest.artifacts, "artifact digest artifacts");
+  assertExactArray(
+    artifacts.map((artifact) => artifact.path),
+    REVIEWED_ARTIFACT_PATHS,
+    "artifact digest paths",
   );
-  if (canonicalSha256(readFileSync(privatePath)) !== trailers.get("private")) {
-    fail("reviewed private contract SHA-256 mismatch");
-  }
-
-  const committedPaths = git(repoRoot, ["show", "--format=", "--name-only", reviewCommit])
-    .split(/\r?\n/)
-    .filter(Boolean);
-  const planPaths = committedPaths.filter((candidate) => candidate.endsWith(PLAN_SUFFIX));
-  if (planPaths.length !== 1) fail("review commit must contain exactly one implementation plan");
-  const planPath = checkedRepoFile(repoRoot, planPaths[0], "reviewed implementation plan");
-  if (canonicalSha256(readFileSync(planPath)) !== trailers.get("plan")) {
-    fail("reviewed implementation plan SHA-256 mismatch");
+  for (const [index, artifact] of artifacts.entries()) {
+    requireObject(artifact, `artifact digest row ${index}`);
+    const artifactPath = requireNonemptyString(
+      artifact.path,
+      `artifact digest row ${index} path`,
+    );
+    if (!/^[0-9a-f]{64}$/.test(artifact.sha256 ?? "")) {
+      fail(`artifact digest row ${index} must contain a lowercase SHA-256`);
+    }
+    const bytes = sourceOverrides?.has(artifactPath)
+      ? Buffer.from(sourceOverrides.get(artifactPath), "utf8")
+      : readFileSync(checkedRepoFile(repoRoot, artifactPath, `${artifactPath} digest source`));
+    if (canonicalSha256(bytes) !== artifact.sha256) {
+      fail(`artifact digest SHA-256 mismatch for ${artifactPath}`);
+    }
   }
 }
 
@@ -2378,6 +2473,74 @@ export function parseRustEnum(source, declaration) {
   return variants;
 }
 
+export function parseRuntimeSurfacePublicExports(source) {
+  const code = maskRustNonCode(source);
+  const exportsByModule = {};
+  const declarations = [...code.matchAll(/\bpub\s+use\s+([a-z_][a-z0-9_]*)\s*::/g)];
+  for (const declaration of declarations) {
+    const moduleName = declaration[1];
+    const bodyStart = declaration.index + declaration[0].length;
+    const declarationEnd = code.indexOf(";", bodyStart);
+    if (declarationEnd < 0) fail(`unterminated public export for ${moduleName}`);
+    const body = code.slice(bodyStart, declarationEnd).trim();
+    if (body === "*") {
+      fail(`runtime-surface public exports must be explicit; found pub use ${moduleName}::*`);
+    }
+    if (exportsByModule[moduleName]) {
+      fail(`runtime-surface module ${moduleName} has more than one public export declaration`);
+    }
+    const names = (body.startsWith("{") && body.endsWith("}")
+      ? body.slice(1, -1)
+      : body
+    )
+      .split(",")
+      .map((name) => name.trim())
+      .filter(Boolean);
+    for (const name of names) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+        fail(`runtime-surface public export ${moduleName}::${name} is not an exact identifier`);
+      }
+    }
+    assertUnique(names, `runtime-surface ${moduleName} public exports`);
+    exportsByModule[moduleName] = names;
+  }
+  return exportsByModule;
+}
+
+export function parseSurfaceFacadeExports(source) {
+  const code = maskRustNonCode(source);
+  const declaration = /\bpub\s+use\s+crate::runtime_surface::\s*\{/.exec(code);
+  if (!declaration) {
+    if (/\bpub\s+use\s+crate::runtime_surface::\s*\*/.test(code)) {
+      fail("surface facade exports must be explicit");
+    }
+    fail("surface facade export declaration is missing");
+  }
+  const bodyStart = declaration.index + declaration[0].lastIndexOf("{");
+  const bodyEnd = matchingBraceEnd(code, bodyStart, "surface facade export");
+  const names = code
+    .slice(bodyStart + 1, bodyEnd - 1)
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+  for (const name of names) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      fail(`surface facade export ${name} is not an exact identifier`);
+    }
+  }
+  assertUnique(names, "surface facade exports");
+  return names;
+}
+
+export function assertNoProductionRuntimeSurfaceSiblingGlobs(source, moduleName) {
+  const production = maskCfgTestItems(source);
+  for (const declaration of rustUseDeclarations(production)) {
+    if (declaration.path === "super::*") {
+      fail(`runtime-surface ${moduleName} production imports must be explicit; found use super::*`);
+    }
+  }
+}
+
 function readRepoSource(repoRoot, relativePath, sourceOverrides) {
   const normalized = relativePath.split(path.sep).join("/");
   if (sourceOverrides?.has(normalized)) return sourceOverrides.get(normalized);
@@ -2403,8 +2566,7 @@ function validateSourceReference(repoRoot, reference, label, sourceOverrides) {
   };
 }
 
-function tuiRustSourcePaths(repoRoot) {
-  const sourceRoot = path.join(repoRoot, "crates/orca-tui/src");
+function rustSourcePaths(repoRoot, sourceRoots) {
   const paths = [];
   const visit = (directory) => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -2415,8 +2577,35 @@ function tuiRustSourcePaths(repoRoot) {
       }
     }
   };
-  visit(sourceRoot);
+  for (const sourceRoot of sourceRoots) visit(path.join(repoRoot, sourceRoot));
   return paths.sort();
+}
+
+function tuiRustSourcePaths(repoRoot) {
+  return rustSourcePaths(repoRoot, ["crates/orca-tui/src"]);
+}
+
+export function unstableSurfaceReferenceLines(source) {
+  const code = maskRustNonCode(source);
+  const references = [];
+  for (const match of code.matchAll(/\bunstable_surface\b/g)) {
+    references.push(code.slice(0, match.index).split("\n").length);
+  }
+  return references;
+}
+
+function validateNoUnstableSurfaceReferences(repoRoot, sourceOverrides) {
+  const references = [];
+  for (const relativePath of rustSourcePaths(repoRoot, UNSTABLE_SURFACE_SOURCE_ROOTS)) {
+    for (const line of unstableSurfaceReferenceLines(
+      readRepoSource(repoRoot, relativePath, sourceOverrides),
+    )) {
+      references.push(`${relativePath}:${line}`);
+    }
+  }
+  if (references.length > 0) {
+    fail(`unstable_surface references must be removed:\n${references.join("\n")}`);
+  }
 }
 
 function cfgPredicateTokens(predicate) {
@@ -2540,21 +2729,22 @@ function cfgPredicateImpliesTest(predicate) {
 }
 
 function cfgAttributes(source) {
+  const code = maskRustNonCode(source);
   const attributes = [];
   const startPattern = /#\s*\[\s*cfg\s*\(/g;
-  for (const match of source.matchAll(startPattern)) {
+  for (const match of code.matchAll(startPattern)) {
     const predicateStart = match.index + match[0].length;
     let depth = 1;
     let index = predicateStart;
-    while (index < source.length && depth > 0) {
-      if (source[index] === "(") depth += 1;
-      else if (source[index] === ")") depth -= 1;
+    while (index < code.length && depth > 0) {
+      if (code[index] === "(") depth += 1;
+      else if (code[index] === ")") depth -= 1;
       index += 1;
     }
     if (depth !== 0) continue;
     let end = index;
-    while (/\s/.test(source[end] ?? "")) end += 1;
-    if (source[end] !== "]") continue;
+    while (/\s/.test(code[end] ?? "")) end += 1;
+    if (code[end] !== "]") continue;
     attributes.push({
       start: match.index,
       end: end + 1,
@@ -2613,7 +2803,7 @@ function cfgTestExternalModulePaths(repoRoot, sourcePaths, sourceOverrides) {
   for (const relativePath of sourcePaths) {
     const source = stripRustComments(readRepoSource(repoRoot, relativePath, sourceOverrides));
     const code = maskRustNonCode(source);
-    for (const attribute of cfgAttributes(code)) {
+    for (const attribute of cfgAttributes(source)) {
       if (!cfgPredicateImpliesTest(attribute.predicate)) continue;
       const declaration = code
         .slice(attribute.end)
@@ -2752,7 +2942,7 @@ function maskRustNonCode(source) {
   return output;
 }
 
-function matchingBraceEnd(source, bodyStart) {
+function matchingBraceEnd(source, bodyStart, label = "Rust item") {
   let depth = 0;
   for (let index = bodyStart; index < source.length; index += 1) {
     if (source[index] === "{") depth += 1;
@@ -2761,23 +2951,62 @@ function matchingBraceEnd(source, bodyStart) {
       if (depth === 0) return index + 1;
     }
   }
-  fail("unterminated cfg(test) item body");
+  fail(`unterminated ${label} body`);
+}
+
+function itemBodyStart(source, itemStart) {
+  let parentheses = 0;
+  let brackets = 0;
+  for (let index = itemStart; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === "(") parentheses += 1;
+    else if (character === ")") parentheses = Math.max(0, parentheses - 1);
+    else if (character === "[") brackets += 1;
+    else if (character === "]") brackets = Math.max(0, brackets - 1);
+    else if (parentheses === 0 && brackets === 0) {
+      if (character === ";") return undefined;
+      if (character === "{") return index;
+    }
+  }
+  return undefined;
+}
+
+function skipRustAttributes(source, start) {
+  let index = start;
+  while (index < source.length) {
+    while (/\s/.test(source[index] ?? "")) index += 1;
+    if (source[index] !== "#") return index;
+    let bracket = index + 1;
+    while (/\s/.test(source[bracket] ?? "")) bracket += 1;
+    if (source[bracket] !== "[") return index;
+    let depth = 1;
+    index = bracket + 1;
+    while (index < source.length && depth > 0) {
+      if (source[index] === "[") depth += 1;
+      else if (source[index] === "]") depth -= 1;
+      index += 1;
+    }
+    if (depth !== 0) return source.length;
+  }
+  return index;
 }
 
 function maskCfgTestItems(source) {
+  const code = maskRustNonCode(source);
   const ranges = [];
   for (const attribute of cfgAttributes(source)) {
     if (!cfgPredicateImpliesTest(attribute.predicate)) continue;
-    const itemStart = attribute.end;
-    const bodyStart = source.indexOf("{", itemStart);
-    const statementEnd = source.indexOf(";", itemStart);
-    if (bodyStart < 0 || (statementEnd >= 0 && statementEnd < bodyStart)) continue;
-    const header = source.slice(itemStart, bodyStart);
-    if (!/\b(?:fn|mod|impl)\b/.test(header)) continue;
-    ranges.push([attribute.start, matchingBraceEnd(source, bodyStart)]);
+    const itemStart = skipRustAttributes(code, attribute.end);
+    const declaration = code.slice(itemStart).match(
+      /^(?:(?:pub(?:\s*\([^)]*\))?|async|const|unsafe|extern(?:\s+"[^"]*")?)\s+)*(?:fn|mod|impl)\b/,
+    );
+    if (!declaration) continue;
+    const bodyStart = itemBodyStart(code, itemStart);
+    if (bodyStart === undefined) continue;
+    ranges.push([attribute.start, matchingBraceEnd(code, bodyStart)]);
   }
-  if (ranges.length === 0) return source;
-  const characters = source.split("");
+  if (ranges.length === 0) return code;
+  const characters = code.split("");
   for (const [start, end] of ranges) {
     for (let index = start; index < end; index += 1) {
       if (characters[index] !== "\n") characters[index] = " ";
@@ -3025,13 +3254,17 @@ function sourceFunctions(source) {
   for (const declaration of source.matchAll(
     /\bfn\s+([A-Za-z][A-Za-z0-9_]*)\s*(?:<[^>{}]*>)?\s*\(/g,
   )) {
-    const bodyStart = source.indexOf("{", declaration.index + declaration[0].length);
-    if (bodyStart < 0) continue;
+    const bodyStart = itemBodyStart(source, declaration.index);
+    if (bodyStart === undefined) continue;
     functions.push({
       name: declaration[1],
       declarationStart: declaration.index,
       bodyStart,
-      bodyEnd: matchingBraceEnd(source, bodyStart),
+      bodyEnd: matchingBraceEnd(
+        source,
+        bodyStart,
+        `function ${declaration[1]} at line ${source.slice(0, declaration.index).split("\n").length}`,
+      ),
     });
   }
   return functions;
@@ -3044,8 +3277,14 @@ function authorityApiForExpression(expression, aliases) {
   return name ? unqualifiedAuthorityApi(name) : undefined;
 }
 
-function scanAuthorityFunctionAliasFlow(source, importedAliases, recordSite) {
-  for (const functionInfo of sourceFunctions(source)) {
+function scanAuthorityFunctionAliasFlow(source, importedAliases, recordSite, relativePath) {
+  let functions;
+  try {
+    functions = sourceFunctions(source);
+  } catch (error) {
+    fail(`${relativePath}: ${error.message}`);
+  }
+  for (const functionInfo of functions) {
     const aliases = new Map(importedAliases);
     const body = source.slice(functionInfo.bodyStart + 1, functionInfo.bodyEnd - 1);
     for (const statement of body.matchAll(/[^;]*;/gs)) {
@@ -3253,7 +3492,7 @@ function receiverFamiliesAtCall(source, callIndex, receiver, relativePath) {
   return {
     families: resolve(receiver),
     functionName: functionInfo.name,
-    functionSha256: canonicalSha256(
+    functionSha256: canonicalSourceSha256(
       source.slice(functionInfo.declarationStart, functionInfo.bodyEnd),
     ),
   };
@@ -3276,7 +3515,7 @@ function scanTuiMutationSurface({ repoRoot, sourceOverrides, sourcePaths: suppli
   for (const relativePath of sourcePaths) {
     if (cfgTestModules.has(relativePath)) continue;
     const source = maskCfgTestItems(
-      maskRustNonCode(readRepoSource(repoRoot, relativePath, sourceOverrides)),
+      readRepoSource(repoRoot, relativePath, sourceOverrides),
     );
     const typeAliases = associatedTypeAliases(source);
     const associatedSource = maskRustUseDeclarations(source);
@@ -3288,6 +3527,7 @@ function scanTuiMutationSurface({ repoRoot, sourceOverrides, sourcePaths: suppli
       source,
       authorityFunctionImportAliases(source),
       recordSite,
+      relativePath,
     );
     for (const [api, patterns] of TUI_RUNTIME_MUTATION_APIS) {
       for (const pattern of patterns) {
@@ -3321,7 +3561,7 @@ function scanTuiMutationSurface({ repoRoot, sourceOverrides, sourcePaths: suppli
         harmlessAssociatedSites.set(key, (harmlessAssociatedSites.get(key) ?? 0) + 1);
         harmlessAssociatedFunctionHashes.set(
           `${relativePath}:${functionInfo.name}`,
-          canonicalSha256(
+          canonicalSourceSha256(
             source.slice(functionInfo.declarationStart, functionInfo.bodyEnd),
           ),
         );
@@ -3344,7 +3584,7 @@ function scanTuiMutationSurface({ repoRoot, sourceOverrides, sourcePaths: suppli
         );
         unresolvedUserActionSendFunctionHashes.set(
           `${relativePath}:${functionInfo.name}`,
-          canonicalSha256(
+          canonicalSourceSha256(
             source.slice(functionInfo.declarationStart, functionInfo.bodyEnd),
           ),
         );
@@ -3461,16 +3701,6 @@ function validateTuiMutationScan(repoRoot, sourceOverrides) {
       fail(`missing harmless same-name TUI method classification ${site}`);
     }
   }
-  for (const [functionSite, hash] of harmlessSameNameFunctionHashes) {
-    if (BASELINE_HARMLESS_SAME_NAME_FUNCTION_SHA256.get(functionSite) !== hash) {
-      fail(`harmless same-name TUI function drifted for ${functionSite}`);
-    }
-  }
-  for (const functionSite of BASELINE_HARMLESS_SAME_NAME_FUNCTION_SHA256.keys()) {
-    if (!harmlessSameNameFunctionHashes.has(functionSite)) {
-      fail(`missing harmless same-name TUI function classification ${functionSite}`);
-    }
-  }
   for (const [site, count] of harmlessAssociatedSites) {
     if (!BASELINE_HARMLESS_ASSOCIATED_FUNCTION_ITEM_SITES.has(site)) {
       fail(`unclassified associated TUI function item ${site.split(":", 2)[1]}`);
@@ -3520,6 +3750,43 @@ function validateTuiMutationScan(repoRoot, sourceOverrides) {
 }
 
 export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides }) {
+  validateNoUnstableSurfaceReferences(repoRoot, sourceOverrides);
+
+  assertExactArray(
+    parseSurfaceFacadeExports(
+      readRepoSource(repoRoot, "crates/orca-runtime/src/lib.rs", sourceOverrides),
+    ),
+    RUNTIME_SURFACE_MODULES.flatMap(
+      (moduleName) => manifest.runtime_surface_public_exports[moduleName],
+    ).sort(),
+    "current surface facade exports",
+  );
+
+  const runtimeSurfaceModulePath = "crates/orca-runtime/src/runtime_surface/mod.rs";
+  const runtimeSurfaceExports = parseRuntimeSurfacePublicExports(
+    readRepoSource(repoRoot, runtimeSurfaceModulePath, sourceOverrides),
+  );
+  assertExactArray(
+    Object.keys(runtimeSurfaceExports),
+    RUNTIME_SURFACE_MODULES,
+    "current runtime-surface public export modules",
+  );
+  for (const moduleName of RUNTIME_SURFACE_MODULES) {
+    assertExactArray(
+      runtimeSurfaceExports[moduleName],
+      manifest.runtime_surface_public_exports[moduleName],
+      `current runtime-surface ${moduleName} public exports`,
+    );
+    assertNoProductionRuntimeSurfaceSiblingGlobs(
+      readRepoSource(
+        repoRoot,
+        `crates/orca-runtime/src/runtime_surface/${moduleName}.rs`,
+        sourceOverrides,
+      ),
+      moduleName,
+    );
+  }
+
   const eventSchemaPath = checkedRepoFile(
     repoRoot,
     "crates/orca-core/src/event_schema.rs",
@@ -3544,10 +3811,7 @@ export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides
     "pub enum UserAction {",
   );
   assertExactArray(
-    [
-      ...manifest.closed_inventory.current_tui_user_actions,
-      ...manifest.closed_inventory.required_tui_user_action_additions,
-    ],
+    manifest.closed_inventory.current_tui_user_actions,
     userActions,
     "current_tui_user_actions current UserAction",
   );
@@ -3603,17 +3867,15 @@ export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides
 export function validateRuntimeSurfaceContract({
   repoRoot,
   manifestPath = path.join(repoRoot, DEFAULT_MANIFEST),
+  digestPath = path.join(repoRoot, DEFAULT_DIGEST),
   emitSuccess = true,
 }) {
   const absoluteManifestPath = path.resolve(manifestPath);
   const manifest = parseManifestText(readFileSync(absoluteManifestPath, "utf8"));
-  const reviewedBundle = loadReviewedManifest(repoRoot, absoluteManifestPath);
-  validateManifestStructure(manifest, { reviewedManifest: reviewedBundle.manifest });
+  validateManifestStructure(manifest);
   validateArtifactBundle(manifest, { repoRoot });
-  validateReviewedBundle(manifest, {
+  validateArtifactDigest(JSON.parse(readFileSync(path.resolve(digestPath), "utf8")), {
     repoRoot,
-    manifestPath: absoluteManifestPath,
-    reviewedBundle,
   });
   validateCurrentInventories(manifest, { repoRoot });
   if (emitSuccess) console.log("runtime surface contract validated");
@@ -3623,13 +3885,19 @@ export function validateRuntimeSurfaceContract({
 function parseArguments(argv) {
   let repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   let manifestPath;
+  let digestPath;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--repo-root") repoRoot = path.resolve(argv[++index]);
     else if (argument === "--manifest") manifestPath = path.resolve(argv[++index]);
+    else if (argument === "--digest") digestPath = path.resolve(argv[++index]);
     else fail(`unknown argument ${argument}`);
   }
-  return { repoRoot, manifestPath: manifestPath ?? path.join(repoRoot, DEFAULT_MANIFEST) };
+  return {
+    repoRoot,
+    manifestPath: manifestPath ?? path.join(repoRoot, DEFAULT_MANIFEST),
+    digestPath: digestPath ?? path.join(repoRoot, DEFAULT_DIGEST),
+  };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

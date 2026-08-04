@@ -8,13 +8,8 @@ use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
-use orca_provider::tool_schema::{
-    deepseek_goal_tools_schema_with_mcp_and_external,
-    deepseek_tools_schema_for_allowed_names_with_mcp_and_external,
-    deepseek_tools_schema_for_type_with_mcp_and_external,
-    deepseek_tools_schema_with_mcp_and_external,
-};
-use serde_json::Value;
+use orca_provider::tool_schema::ProviderToolDefinition;
+use orca_tools::schema::{ToolPolicy, canonical_tool_definitions, normalize_tool_request};
 
 use crate::hooks::{HookOutcome, tool_request_with_hook_outcome};
 
@@ -96,32 +91,31 @@ pub(crate) fn provider_tool_schema_override(
     tool_policy: AgentToolPolicyContext<'_>,
     mcp_registry: &McpRegistry,
     external_tools: &[ExternalToolConfig],
-) -> Option<Vec<Value>> {
-    if let Some(allowed_tools) = tool_policy.allowed_tools() {
-        Some(
-            deepseek_tools_schema_for_allowed_names_with_mcp_and_external(
-                allowed_tools,
-                Some(mcp_registry),
-                external_tools,
-            ),
-        )
+) -> Option<Vec<ProviderToolDefinition>> {
+    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        Some(mcp_registry),
+        external_tools,
+    );
+    let policy = if let Some(allowed_tools) = tool_policy.allowed_tools() {
+        ToolPolicy::allowed(allowed_tools)
     } else if subagent_depth > 0 {
-        Some(deepseek_tools_schema_for_type_with_mcp_and_external(
-            subagent_type,
-            Some(mcp_registry),
-            external_tools,
-        ))
+        ToolPolicy::for_subagent(subagent_type)
     } else if tool_policy.is_goal_mode() {
-        Some(deepseek_goal_tools_schema_with_mcp_and_external(
-            Some(mcp_registry),
-            external_tools,
-        ))
+        ToolPolicy::goal()
     } else {
-        Some(deepseek_tools_schema_with_mcp_and_external(
-            Some(mcp_registry),
-            external_tools,
-        ))
-    }
+        ToolPolicy::base()
+    };
+    Some(
+        canonical_tool_definitions(&policy, &registry)
+            .into_iter()
+            .map(|definition| ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+                strict_capable: definition.strict_capable,
+            })
+            .collect(),
+    )
 }
 
 pub(crate) fn provider_config_for_agent_loop(
@@ -216,21 +210,26 @@ pub fn prepare_tool_invocation(
     mcp_registry: &McpRegistry,
     config: &RunConfig,
 ) -> ToolInvocation {
-    let action = if tool_request.name == ToolName::Subagent
-        && subagent_depth >= config.subagents.max_depth
-    {
-        None
-    } else {
-        Some(orca_tools::canonical_action_kind_with_mcp_and_external(
-            tool_request,
-            Some(mcp_registry),
-            &config.external_tools,
-        ))
-    };
+    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        Some(mcp_registry),
+        &config.external_tools,
+    );
+    let effective =
+        normalize_tool_request(&registry, tool_request).unwrap_or_else(|_| tool_request.clone());
+    let action =
+        if effective.name == ToolName::Subagent && subagent_depth >= config.subagents.max_depth {
+            None
+        } else {
+            Some(orca_tools::canonical_action_kind_with_mcp_and_external(
+                &effective,
+                Some(mcp_registry),
+                &config.external_tools,
+            ))
+        };
 
     ToolInvocation {
         requested: tool_request.clone(),
-        effective: tool_request.clone(),
+        effective,
         action,
     }
 }
@@ -242,12 +241,17 @@ pub fn prepare_tool_invocation_with_external(
     mcp_registry: &McpRegistry,
     external_tools: &[ExternalToolConfig],
 ) -> ToolInvocation {
-    let action = if tool_request.name == ToolName::Subagent && subagent_depth >= max_subagent_depth
-    {
+    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        Some(mcp_registry),
+        external_tools,
+    );
+    let effective =
+        normalize_tool_request(&registry, tool_request).unwrap_or_else(|_| tool_request.clone());
+    let action = if effective.name == ToolName::Subagent && subagent_depth >= max_subagent_depth {
         None
     } else {
         Some(orca_tools::canonical_action_kind_with_mcp_and_external(
-            tool_request,
+            &effective,
             Some(mcp_registry),
             external_tools,
         ))
@@ -255,7 +259,7 @@ pub fn prepare_tool_invocation_with_external(
 
     ToolInvocation {
         requested: tool_request.clone(),
-        effective: tool_request.clone(),
+        effective,
         action,
     }
 }
@@ -329,11 +333,11 @@ pub fn approval_request_for_invocation(invocation: &ToolInvocation) -> Option<Ap
         action,
         description: format!(
             "{} requested {}",
-            invocation.requested.name.as_str(),
+            invocation.effective.name.as_str(),
             action.as_str()
         ),
-        tool: Some(invocation.requested.name.as_str().to_string()),
-        target: invocation.requested.target.clone(),
+        tool: Some(invocation.effective.name.as_str().to_string()),
+        target: invocation.effective.target.clone(),
         preview: None,
     })
 }
@@ -359,9 +363,9 @@ mod tests {
     use crate::hooks::HookOutcome;
 
     use super::{
-        AgentToolPolicyContext, apply_pre_tool_outcome, approval_request_for_invocation,
-        prepare_tool_invocation, provider_config_for_agent_loop, provider_tool_schema_override,
-        tool_requests_from_provider_steps, validate_tool_invocation,
+        AgentToolPolicyContext, ProviderToolDefinition, apply_pre_tool_outcome,
+        approval_request_for_invocation, prepare_tool_invocation, provider_config_for_agent_loop,
+        provider_tool_schema_override, tool_requests_from_provider_steps, validate_tool_invocation,
     };
 
     fn config_with_external(external_tools: Vec<ExternalToolConfig>) -> RunConfig {
@@ -420,11 +424,8 @@ mod tests {
         }
     }
 
-    fn schema_names(tools: &[serde_json::Value]) -> Vec<&str> {
-        tools
-            .iter()
-            .filter_map(|tool| tool["function"]["name"].as_str())
-            .collect()
+    fn schema_names(tools: &[ProviderToolDefinition]) -> Vec<&str> {
+        tools.iter().map(|tool| tool.name.as_str()).collect()
     }
 
     #[test]
@@ -605,6 +606,27 @@ mod tests {
         assert_eq!(approval.tool, Some("bash".to_string()));
         assert_eq!(approval.target, Some("echo hi".to_string()));
         assert_eq!(approval.preview, None);
+    }
+
+    #[test]
+    fn approval_names_the_effective_tool_after_rewrite() {
+        let invocation = super::ToolInvocation {
+            requested: request(ToolName::Bash, ActionKind::Shell, Some("echo hi"), None),
+            effective: request(
+                ToolName::ReadFile,
+                ActionKind::Read,
+                Some("notes.txt"),
+                None,
+            ),
+            action: Some(ActionKind::Read),
+        };
+
+        let approval = approval_request_for_invocation(&invocation).expect("approval");
+
+        assert_eq!(approval.id, "approval-tool-1");
+        assert_eq!(approval.description, "read_file requested read");
+        assert_eq!(approval.tool.as_deref(), Some("read_file"));
+        assert_eq!(approval.target.as_deref(), Some("notes.txt"));
     }
 
     #[test]

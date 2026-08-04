@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "algorithm": "sha256",
+  "artifacts": [
+    {
+      "path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
+      "sha256": "98905848cb51dccd09fd343ea631c2c6d40b3022aa29697bb5ef0b8a3b4c8dfe"
+    },
+    {
+      "path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json",
+      "sha256": "bebd8fab3e2aa39bafc511a1f323546e6d34f7f0dfa97ea1db503e6a89a4e7ab"
+    },
+    {
+      "path": "docs/superpowers/plans/2026-07-21-runtime-owned-typed-surface-implementation.md",
+      "sha256": "b3a65907ccf1a4ee402ad3fd76f479b1912fdc4ee33d6e753de66d086fdc6e3d"
+    }
+  ]
+}

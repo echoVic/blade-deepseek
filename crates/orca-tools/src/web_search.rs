@@ -1,5 +1,7 @@
 use serde::Deserialize;
 use serde_json::Value;
+use std::future::Future;
+use std::time::Duration;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, truncate_output};
 
@@ -18,20 +20,60 @@ struct SearchResult {
     description: String,
 }
 
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(25);
+const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+enum SearchError {
+    Cancelled,
+    Failed(String),
+}
+
 pub fn execute(request: &ToolRequest, max_bytes: usize) -> ToolResult {
+    execute_or_cancel(request, max_bytes, || false)
+}
+
+pub fn execute_or_cancel(
+    request: &ToolRequest,
+    max_bytes: usize,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let args = match parse_args(request) {
         Ok(args) => args,
         Err(error) => return ToolResult::failed(request, error, None),
     };
+    if should_cancel() {
+        return ToolResult::cancelled_before_start(request, "web search was cancelled");
+    }
 
-    let results = match std::env::var("BRAVE_SEARCH_API_KEY") {
-        Ok(key) if !key.trim().is_empty() => search_brave(&args, &key),
-        _ => search_exa(&args),
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return ToolResult::failed(
+                request,
+                format!("failed to start web search runtime: {error}"),
+                None,
+            );
+        }
     };
+
+    let results = runtime.block_on(async {
+        match std::env::var("BRAVE_SEARCH_API_KEY") {
+            Ok(key) if !key.trim().is_empty() => {
+                search_brave_or_cancel(&args, &key, &should_cancel).await
+            }
+            _ => search_exa_or_cancel(&args, &should_cancel).await,
+        }
+    });
 
     let results = match results {
         Ok(results) => results,
-        Err(error) => return ToolResult::failed(request, error, None),
+        Err(SearchError::Cancelled) => {
+            return ToolResult::cancelled(request, "web search was cancelled", None);
+        }
+        Err(SearchError::Failed(error)) => return ToolResult::failed(request, error, None),
     };
 
     let output = if results.is_empty() {
@@ -76,24 +118,35 @@ struct BraveResult {
     description: Option<String>,
 }
 
-fn search_brave(args: &SearchArgs, api_key: &str) -> Result<Vec<SearchResult>, String> {
+async fn search_brave_or_cancel(
+    args: &SearchArgs,
+    api_key: &str,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Vec<SearchResult>, SearchError> {
     let count = args.count.clamp(1, 10);
     let query_params = brave_query_params(args, count);
-    let response = reqwest::blocking::Client::new()
-        .get("https://api.search.brave.com/res/v1/web/search")
-        .header("X-Subscription-Token", api_key)
-        .query(&query_params)
-        .send()
-        .map_err(|e| format!("web search request failed: {e}"))?;
+    let client = search_client()?;
+    let response = await_or_cancel(
+        client
+            .get("https://api.search.brave.com/res/v1/web/search")
+            .header("X-Subscription-Token", api_key)
+            .query(&query_params)
+            .send(),
+        should_cancel,
+    )
+    .await?
+    .map_err(|e| SearchError::Failed(format!("web search request failed: {e}")))?;
 
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("web search request failed with {status}"));
+        return Err(SearchError::Failed(format!(
+            "web search request failed with {status}"
+        )));
     }
 
-    let body: BraveResponse = response
-        .json()
-        .map_err(|e| format!("invalid web search response: {e}"))?;
+    let body: BraveResponse = await_or_cancel(response.json(), should_cancel)
+        .await?
+        .map_err(|e| SearchError::Failed(format!("invalid web search response: {e}")))?;
 
     Ok(body
         .web
@@ -122,7 +175,18 @@ fn brave_query_params(args: &SearchArgs, count: usize) -> Vec<(&'static str, Str
 
 // --- Exa MCP fallback (no API key required) ---
 
-fn search_exa(args: &SearchArgs) -> Result<Vec<SearchResult>, String> {
+async fn search_exa_or_cancel(
+    args: &SearchArgs,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Vec<SearchResult>, SearchError> {
+    search_exa_at_or_cancel_async(args, "https://mcp.exa.ai/mcp", should_cancel).await
+}
+
+async fn search_exa_at_or_cancel_async(
+    args: &SearchArgs,
+    endpoint: &str,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Vec<SearchResult>, SearchError> {
     let count = args.count.clamp(1, 10);
     let query = exa_query(args);
     let request_body = serde_json::json!({
@@ -139,25 +203,101 @@ fn search_exa(args: &SearchArgs) -> Result<Vec<SearchResult>, String> {
         }
     });
 
-    let response = reqwest::blocking::Client::new()
-        .post("https://mcp.exa.ai/mcp")
-        .header("Accept", "application/json, text/event-stream")
-        .header("Content-Type", "application/json")
-        .timeout(std::time::Duration::from_secs(25))
-        .json(&request_body)
-        .send()
-        .map_err(|e| format!("Exa search failed: {e}"))?;
+    let client = search_client()?;
+    let response = await_or_cancel(
+        client
+            .post(endpoint)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send(),
+        should_cancel,
+    )
+    .await?
+    .map_err(|e| SearchError::Failed(format!("Exa search failed: {e}")))?;
 
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("Exa search failed with {status}"));
+        return Err(SearchError::Failed(format!(
+            "Exa search failed with {status}"
+        )));
     }
 
-    let text = response
-        .text()
-        .map_err(|e| format!("failed to read Exa response: {e}"))?;
+    let text = await_or_cancel(response.text(), should_cancel)
+        .await?
+        .map_err(|e| SearchError::Failed(format!("failed to read Exa response: {e}")))?;
 
-    parse_exa_response(&text)
+    parse_exa_response(&text).map_err(SearchError::Failed)
+}
+
+fn search_client() -> Result<reqwest::Client, SearchError> {
+    let builder = reqwest::Client::builder().timeout(SEARCH_TIMEOUT);
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+    builder
+        .build()
+        .map_err(|error| SearchError::Failed(format!("failed to build web search client: {error}")))
+}
+
+async fn await_or_cancel<T>(
+    future: impl Future<Output = T>,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<T, SearchError> {
+    tokio::pin!(future);
+    loop {
+        if should_cancel() {
+            return Err(SearchError::Cancelled);
+        }
+        tokio::select! {
+            output = &mut future => return Ok(output),
+            _ = tokio::time::sleep(CANCELLATION_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+fn execute_exa_at_or_cancel(
+    request: &ToolRequest,
+    max_bytes: usize,
+    endpoint: &str,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
+    let args = match parse_args(request) {
+        Ok(args) => args,
+        Err(error) => return ToolResult::failed(request, error, None),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test search runtime");
+    match runtime.block_on(search_exa_at_or_cancel_async(
+        &args,
+        endpoint,
+        &should_cancel,
+    )) {
+        Ok(results) => {
+            let output = results
+                .into_iter()
+                .enumerate()
+                .map(|(index, result)| {
+                    format!(
+                        "{}. {}\n{}\n{}",
+                        index + 1,
+                        result.title,
+                        result.description,
+                        result.url
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let (output, truncated) = truncate_output(output, max_bytes);
+            ToolResult::completed(request, output, truncated)
+        }
+        Err(SearchError::Cancelled) => {
+            ToolResult::cancelled(request, "web search was cancelled", None)
+        }
+        Err(SearchError::Failed(error)) => ToolResult::failed(request, error, None),
+    }
 }
 
 fn parse_exa_response(text: &str) -> Result<Vec<SearchResult>, String> {
@@ -315,7 +455,12 @@ fn exa_query(args: &SearchArgs) -> String {
 mod tests {
     use super::*;
     use orca_core::approval_types::ActionKind;
-    use orca_core::tool_types::ToolName;
+    use orca_core::tool_types::{ToolName, ToolStatus};
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     fn request(raw_arguments: Option<String>, target: Option<String>) -> ToolRequest {
         ToolRequest {
@@ -325,6 +470,45 @@ mod tests {
             target,
             raw_arguments,
         }
+    }
+
+    #[test]
+    fn web_search_cancellation_preempts_http_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind withheld-response server");
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().expect("accept request");
+            let mut request = [0u8; 4096];
+            let _ = connection.read(&mut request);
+            accepted_tx.send(()).expect("announce accepted request");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker = std::thread::spawn(move || {
+            execute_exa_at_or_cancel(
+                &request(Some(r#"{"query":"rust","count":3}"#.to_string()), None),
+                16_384,
+                &endpoint,
+                || worker_cancelled.load(Ordering::Acquire),
+            )
+        });
+
+        accepted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("search request reaches withheld server");
+        let cancelled_at = Instant::now();
+        cancelled.store(true, Ordering::Release);
+        let result = worker.join().expect("search worker joins");
+
+        assert_eq!(result.status, ToolStatus::Cancelled);
+        assert!(
+            cancelled_at.elapsed() < Duration::from_millis(250),
+            "cancellation took {:?}",
+            cancelled_at.elapsed()
+        );
+        server.join().expect("withheld-response server joins");
     }
 
     #[test]

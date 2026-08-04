@@ -21,9 +21,9 @@ use orca_runtime::runtime_host::{
     GenerationContext, HostedTurnRequest, RuntimeHost, RuntimeHostError, RuntimeThreadHandle,
     ThreadOperationExecutor, ThreadOperationOutcome,
 };
+use orca_runtime::surface::*;
 use orca_runtime::thread::RuntimeThread;
 use orca_runtime::thread_store::{SessionStore, ThreadStore};
-use orca_runtime::unstable_surface::*;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const RESTART_CHILD_ENV: &str = "ORCA_SURFACE_OPERATION_RESTART_CHILD";

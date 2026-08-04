@@ -46,11 +46,11 @@ fn run_mcp_elicitation_respond<W: Write>(
         "content": &content_json,
     }))?;
     let decision = if accepted {
-        crate::unstable_surface::SurfaceMcpElicitationDecision::Accept {
+        crate::surface::SurfaceMcpElicitationDecision::Accept {
             content: json_to_surface_data(content_json.unwrap_or_else(|| json!({})))?,
         }
     } else {
-        crate::unstable_surface::SurfaceMcpElicitationDecision::Decline
+        crate::surface::SurfaceMcpElicitationDecision::Decline
     };
     let pending = state.direct_interactions.published_route(
         request_id,
@@ -92,14 +92,14 @@ fn run_mcp_elicitation_respond<W: Write>(
             ),
         };
     };
-    let response_request_id = crate::unstable_surface::SurfaceRequestId::new();
+    let response_request_id = crate::surface::SurfaceRequestId::new();
     match pending.0.respond_interaction_by_id(
         response_request_id,
         pending.1,
-        crate::unstable_surface::SurfaceClientInteractionAnswer::McpElicitation { decision },
+        crate::surface::SurfaceClientInteractionAnswer::McpElicitation { decision },
     ) {
-        Ok(crate::unstable_surface::MutationReply::Committed { .. }) => {}
-        Ok(crate::unstable_surface::MutationReply::Deferred { mutation, .. }) => {
+        Ok(crate::surface::MutationReply::Committed { .. }) => {}
+        Ok(crate::surface::MutationReply::Deferred { mutation, .. }) => {
             state.direct_interactions.mark_committed_pending(
                 request_id,
                 &mutation,
@@ -113,7 +113,7 @@ fn run_mcp_elicitation_respond<W: Write>(
                 )),
             );
         }
-        Ok(crate::unstable_surface::MutationReply::Uncommitted { .. }) | Err(_) => {
+        Ok(crate::surface::MutationReply::Uncommitted { .. }) | Err(_) => {
             return protocol::write_server_event(
                 writer,
                 &id,
@@ -136,21 +136,21 @@ fn run_mcp_elicitation_respond<W: Write>(
     )
 }
 
-fn json_to_surface_data(value: Value) -> io::Result<crate::unstable_surface::SurfaceDataValue> {
+fn json_to_surface_data(value: Value) -> io::Result<crate::surface::SurfaceDataValue> {
     Ok(match value {
-        Value::Null => crate::unstable_surface::SurfaceDataValue::Null,
-        Value::Bool(value) => crate::unstable_surface::SurfaceDataValue::Boolean(value),
+        Value::Null => crate::surface::SurfaceDataValue::Null,
+        Value::Bool(value) => crate::surface::SurfaceDataValue::Boolean(value),
         Value::Number(value) => {
             if let Some(value) = value.as_u64() {
-                crate::unstable_surface::SurfaceDataValue::Unsigned(value)
+                crate::surface::SurfaceDataValue::Unsigned(value)
             } else if let Some(value) = value.as_i64().filter(|value| *value < 0) {
-                crate::unstable_surface::SurfaceDataValue::Integer(
-                    crate::unstable_surface::NegativeI64::try_new(value)
+                crate::surface::SurfaceDataValue::Integer(
+                    crate::surface::NegativeI64::try_new(value)
                         .map_err(|error| io::Error::other(error.to_string()))?,
                 )
             } else {
-                crate::unstable_surface::SurfaceDataValue::Number(
-                    crate::unstable_surface::FiniteF64::try_new(
+                crate::surface::SurfaceDataValue::Number(
+                    crate::surface::FiniteF64::try_new(
                         value
                             .as_f64()
                             .ok_or_else(|| io::Error::other("invalid MCP response number"))?,
@@ -159,21 +159,21 @@ fn json_to_surface_data(value: Value) -> io::Result<crate::unstable_surface::Sur
                 )
             }
         }
-        Value::String(value) => crate::unstable_surface::SurfaceDataValue::String(
-            crate::unstable_surface::DisplayText::new(value),
-        ),
-        Value::Array(values) => crate::unstable_surface::SurfaceDataValue::Array(
+        Value::String(value) => {
+            crate::surface::SurfaceDataValue::String(crate::surface::DisplayText::new(value))
+        }
+        Value::Array(values) => crate::surface::SurfaceDataValue::Array(
             values
                 .into_iter()
                 .map(json_to_surface_data)
                 .collect::<io::Result<Vec<_>>>()?,
         ),
-        Value::Object(values) => crate::unstable_surface::SurfaceDataValue::Object(
+        Value::Object(values) => crate::surface::SurfaceDataValue::Object(
             values
                 .into_iter()
                 .map(|(name, value)| {
-                    Ok(crate::unstable_surface::SurfaceDataProperty {
-                        name: crate::unstable_surface::DisplayText::new(name),
+                    Ok(crate::surface::SurfaceDataProperty {
+                        name: crate::surface::DisplayText::new(name),
                         value: Box::new(json_to_surface_data(value)?),
                     })
                 })

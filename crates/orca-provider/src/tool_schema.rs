@@ -1,321 +1,173 @@
-use std::collections::HashSet;
+use serde_json::{Value, json};
 
-use serde_json::Value;
-
-use orca_core::external_config::ExternalToolConfig;
-use orca_core::subagent_types::SubagentType;
-use orca_mcp::McpRegistry;
-use orca_tools::registry::{self, ToolRegistry};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ToolSchemaMode {
-    Base,
-    Goal,
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub strict_capable: bool,
 }
 
-pub fn deepseek_tools_schema_with_mcp_and_external(
-    mcp_registry: Option<&McpRegistry>,
-    external_tools: &[ExternalToolConfig],
-) -> Vec<Value> {
-    deepseek_tools_schema_with_mcp_external_and_mode(
-        mcp_registry,
-        external_tools,
-        ToolSchemaMode::Base,
-    )
+pub fn deepseek_tools_schema(definitions: &[ProviderToolDefinition]) -> Vec<Value> {
+    definitions.iter().map(deepseek_tool_schema).collect()
 }
 
-pub fn deepseek_goal_tools_schema_with_mcp_and_external(
-    mcp_registry: Option<&McpRegistry>,
-    external_tools: &[ExternalToolConfig],
-) -> Vec<Value> {
-    deepseek_tools_schema_with_mcp_external_and_mode(
-        mcp_registry,
-        external_tools,
-        ToolSchemaMode::Goal,
-    )
-}
-
-fn deepseek_tools_schema_with_mcp_external_and_mode(
-    mcp_registry: Option<&McpRegistry>,
-    external_tools: &[ExternalToolConfig],
-    mode: ToolSchemaMode,
-) -> Vec<Value> {
-    if mcp_registry.is_none() {
-        let registry = registry::tool_registry_with_mcp_and_external(None, external_tools);
-        return deepseek_tools_schema_from_registry_with_mode(&registry, mode);
+pub fn deepseek_strict_tools_schema_for_endpoint(
+    definitions: &[ProviderToolDefinition],
+    base_url: &str,
+) -> Option<Vec<Value>> {
+    if !is_strict_capable_endpoint(base_url)
+        || !definitions
+            .iter()
+            .any(|definition| definition.strict_capable)
+    {
+        return None;
     }
 
-    let registry = registry::tool_registry_with_mcp_and_external(mcp_registry, external_tools);
-    deepseek_tools_schema_from_registry_with_mode(&registry, mode)
+    Some(
+        definitions
+            .iter()
+            .map(|definition| {
+                let mut tool = deepseek_tool_schema(definition);
+                if definition.strict_capable {
+                    let function = tool["function"]
+                        .as_object_mut()
+                        .expect("provider-generated function object");
+                    require_all_properties(
+                        function
+                            .get_mut("parameters")
+                            .expect("provider-generated parameters"),
+                    );
+                    function.insert("strict".to_string(), Value::Bool(true));
+                }
+                tool
+            })
+            .collect(),
+    )
 }
 
-pub fn deepseek_tools_schema_from_registry(registry: &ToolRegistry) -> Vec<Value> {
-    deepseek_tools_schema_from_registry_with_mode(registry, ToolSchemaMode::Base)
+fn deepseek_tool_schema(definition: &ProviderToolDefinition) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": definition.name,
+            "description": definition.description,
+            "parameters": definition.input_schema,
+        }
+    })
 }
 
-pub fn deepseek_goal_tools_schema_from_registry(registry: &ToolRegistry) -> Vec<Value> {
-    deepseek_tools_schema_from_registry_with_mode(registry, ToolSchemaMode::Goal)
+fn is_strict_capable_endpoint(base_url: &str) -> bool {
+    base_url.trim_end_matches('/').ends_with("/beta")
 }
 
-fn deepseek_tools_schema_from_registry_with_mode(
-    registry: &ToolRegistry,
-    mode: ToolSchemaMode,
-) -> Vec<Value> {
-    registry
-        .model_visible_tools()
-        .filter(|tool| tool_visible_in_schema_mode(tool.name(), mode))
-        .map(|tool| tool.schema())
-        .collect()
-}
+fn require_all_properties(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    let is_typed_object = match object.get("type") {
+        Some(Value::String(kind)) => kind == "object",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind.as_str() == Some("object")),
+        _ => false,
+    };
+    if is_typed_object {
+        object.insert("additionalProperties".to_string(), Value::Bool(false));
+        if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+            let required = properties.keys().cloned().map(Value::String).collect();
+            object.insert("required".to_string(), Value::Array(required));
+        }
+    }
 
-pub fn tool_visible_in_schema_mode(name: &str, mode: ToolSchemaMode) -> bool {
-    mode == ToolSchemaMode::Goal || !matches!(name, "get_goal" | "create_goal" | "update_goal")
-}
-
-pub fn deepseek_tools_schema_for_type_with_mcp_and_external(
-    subagent_type: &SubagentType,
-    mcp_registry: Option<&McpRegistry>,
-    external_tools: &[ExternalToolConfig],
-) -> Vec<Value> {
-    let allowed = subagent_type.allowed_tools();
-    let registry = registry::tool_registry_with_mcp_and_external(mcp_registry, external_tools);
-    let allowed_canonical_names = allowed
-        .iter()
-        .filter_map(|name| {
-            registry
-                .resolve(name)
-                .map(|resolved| resolved.tool.name().to_string())
-        })
-        .collect::<HashSet<_>>();
-
-    registry
-        .model_visible_tools()
-        .filter(|tool| {
-            let name = tool.name();
-            name.starts_with("mcp__")
-                || external_tools.iter().any(|external| external.name == name)
-                || (name != "subagent" && allowed_canonical_names.contains(name))
-        })
-        .map(|tool| tool.schema())
-        .collect()
-}
-
-pub fn deepseek_tools_schema_for_allowed_names_with_mcp_and_external<S: AsRef<str>>(
-    allowed: &[S],
-    mcp_registry: Option<&McpRegistry>,
-    external_tools: &[ExternalToolConfig],
-) -> Vec<Value> {
-    let registry = registry::tool_registry_with_mcp_and_external(mcp_registry, external_tools);
-    let allowed_canonical_names = allowed
-        .iter()
-        .filter_map(|name| {
-            registry
-                .resolve(name.as_ref())
-                .map(|resolved| resolved.tool.name().to_string())
-        })
-        .collect::<HashSet<_>>();
-
-    registry
-        .model_visible_tools()
-        .filter(|tool| allowed_canonical_names.contains(tool.name()))
-        .map(|tool| tool.schema())
-        .collect()
+    if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+        for property in properties.values_mut() {
+            require_all_properties(property);
+        }
+    }
+    if let Some(items) = object.get_mut("items") {
+        require_all_properties(items);
+    }
+    for keyword in ["oneOf", "anyOf", "allOf"] {
+        if let Some(branches) = object.get_mut(keyword).and_then(Value::as_array_mut) {
+            for branch in branches {
+                require_all_properties(branch);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn can_generate_schema_from_tool_registry() {
-        let registry = orca_tools::registry::default_tool_registry();
-        let expected: Vec<Value> = registry
-            .model_visible_tools()
-            .filter(|tool| tool_visible_in_schema_mode(tool.name(), ToolSchemaMode::Base))
-            .map(|tool| tool.schema())
-            .collect();
-
-        assert_eq!(deepseek_tools_schema_from_registry(registry), expected);
-    }
-
-    #[test]
-    fn generated_schema_uses_model_visible_tools_only() {
-        let registry = orca_tools::registry::default_tool_registry();
-        let tools = deepseek_tools_schema_from_registry(registry);
-        let names = tools
-            .iter()
-            .filter_map(|tool| tool["function"]["name"].as_str())
-            .collect::<Vec<_>>();
-
-        assert!(names.contains(&"glob"));
-        assert!(!names.contains(&"list_files"));
-    }
-
-    #[test]
-    fn base_schema_hides_goal_only_tool() {
-        let registry = orca_tools::registry::default_tool_registry();
-        let tools = deepseek_tools_schema_from_registry(registry);
-        let names = tools
-            .iter()
-            .filter_map(|tool| tool["function"]["name"].as_str())
-            .collect::<Vec<_>>();
-
-        assert!(!names.contains(&"get_goal"));
-        assert!(!names.contains(&"create_goal"));
-        assert!(!names.contains(&"update_goal"));
-    }
-
-    #[test]
-    fn base_schema_exposes_async_subagent_and_status_tool() {
-        let registry = orca_tools::registry::default_tool_registry();
-        let tools = deepseek_tools_schema_from_registry(registry);
-        let subagent = tools
-            .iter()
-            .find(|tool| tool["function"]["name"] == "subagent")
-            .expect("subagent schema");
-        let names = tools
-            .iter()
-            .filter_map(|tool| tool["function"]["name"].as_str())
-            .collect::<Vec<_>>();
-
-        assert!(names.contains(&"subagent_status"));
-        assert_eq!(
-            subagent["function"]["parameters"]["properties"]["mode"]["enum"],
-            serde_json::json!(["sync", "async"])
-        );
-    }
-
-    #[test]
-    fn goal_schema_exposes_goal_tools() {
-        let registry = orca_tools::registry::default_tool_registry();
-        let tools = deepseek_goal_tools_schema_from_registry(registry);
-        let names = tools
-            .iter()
-            .filter_map(|tool| tool["function"]["name"].as_str())
-            .collect::<Vec<_>>();
-
-        assert!(names.contains(&"get_goal"));
-        assert!(names.contains(&"create_goal"));
-        assert!(names.contains(&"update_goal"));
-    }
-
-    #[test]
-    fn typed_subagent_schema_resolves_allowed_list_files_alias_to_glob() {
-        let tools = deepseek_tools_schema_for_type_with_mcp_and_external(
-            &SubagentType::CodeReviewer,
-            None,
-            &[],
-        );
-        let names = tools
-            .iter()
-            .filter_map(|tool| tool["function"]["name"].as_str())
-            .collect::<Vec<_>>();
-
-        assert!(names.contains(&"glob"));
-        assert!(!names.contains(&"list_files"));
-        assert!(!names.contains(&"subagent"));
-    }
-
-    #[test]
-    fn explicit_allowed_schema_exposes_only_allowed_tools() {
-        let tools = deepseek_tools_schema_for_allowed_names_with_mcp_and_external(
-            &["read_file".to_string(), "list_files".to_string()],
-            None,
-            &[],
-        );
-        let names = tools
-            .iter()
-            .filter_map(|tool| tool["function"]["name"].as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["read_file", "glob"]);
-        assert!(!names.contains(&"bash"));
-        assert!(!names.contains(&"subagent"));
-    }
-
-    // --- DeepSeek prefix-cache stability locks ---------------------------------
-    //
-    // The tool schema is part of the IMMUTABLE PREFIX sent to DeepSeek on every
-    // turn. If its byte serialization changes between turns the server-side
-    // prefix cache misses for the entire conversation. These tests pin the two
-    // properties that guarantee byte-stability: deterministic tool ordering and
-    // deterministic JSON key ordering.
-
-    fn external_tool(name: &str) -> ExternalToolConfig {
-        ExternalToolConfig {
-            name: name.to_string(),
-            description: format!("external {name}"),
-            action_kind: orca_core::approval_types::ActionKind::Read,
-            command: "true".to_string(),
-            schema: serde_json::json!({}),
+    fn definition(strict_capable: bool) -> ProviderToolDefinition {
+        ProviderToolDefinition {
+            name: "demo".to_string(),
+            description: "demo tool".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "required_value": { "type": "string" },
+                    "optional_value": { "type": ["string", "null"] },
+                    "nested": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" }
+                        }
+                    },
+                    "nullable_nested": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "name": { "type": "string" }
+                        }
+                    }
+                },
+                "required": ["required_value"],
+                "additionalProperties": false
+            }),
+            strict_capable,
         }
     }
 
     #[test]
-    fn builtin_schema_bytes_are_identical_across_rebuilds() {
-        // Two independent builds of the base schema must serialize to the exact
-        // same bytes — anything else means a non-deterministic source crept in
-        // (e.g. a HashMap-backed iteration order).
-        let first = serde_json::to_string(&deepseek_tools_schema_with_mcp_and_external(None, &[]))
-            .expect("serialize first build");
-        let second = serde_json::to_string(&deepseek_tools_schema_with_mcp_and_external(None, &[]))
-            .expect("serialize second build");
+    fn base_lowering_is_deterministic_and_omits_strict() {
+        let definitions = vec![definition(true)];
+        let first = deepseek_tools_schema(&definitions);
+        let second = deepseek_tools_schema(&definitions);
+
         assert_eq!(first, second);
+        assert!(first[0]["function"].get("strict").is_none());
     }
 
     #[test]
-    fn external_tools_keep_config_order_after_builtins() {
-        let externals = [
-            external_tool("zzz_last"),
-            external_tool("aaa_first"),
-            external_tool("mmm_middle"),
-        ];
-        let tools = deepseek_tools_schema_with_mcp_and_external(None, &externals);
-        let names = tools
-            .iter()
-            .filter_map(|tool| tool["function"]["name"].as_str())
-            .collect::<Vec<_>>();
+    fn strict_lowering_uses_definition_metadata_instead_of_tool_names() {
+        let definitions = vec![definition(true)];
+        let tools = deepseek_strict_tools_schema_for_endpoint(
+            &definitions,
+            "https://api.deepseek.com/beta",
+        )
+        .expect("strict tools");
 
-        // Builtins come first; the external block preserves config order rather
-        // than being sorted (sorting would still be stable, but config order is
-        // what the registry guarantees and what we must lock).
-        let external_names: Vec<&str> = names
-            .iter()
-            .copied()
-            .filter(|name| {
-                name.starts_with("zzz") || name.starts_with("aaa") || name.starts_with("mmm")
-            })
-            .collect();
-        assert_eq!(external_names, vec!["zzz_last", "aaa_first", "mmm_middle"]);
-
-        // Re-running with the same input is byte-identical.
-        let again = deepseek_tools_schema_with_mcp_and_external(None, &externals);
+        assert_eq!(tools[0]["function"]["strict"], true);
         assert_eq!(
-            serde_json::to_string(&tools).unwrap(),
-            serde_json::to_string(&again).unwrap()
+            tools[0]["function"]["parameters"]["required"],
+            json!([
+                "nested",
+                "nullable_nested",
+                "optional_value",
+                "required_value"
+            ])
         );
-    }
-
-    #[test]
-    fn json_object_keys_serialize_in_sorted_order() {
-        // serde_json without the `preserve_order` feature serializes object keys
-        // in sorted (BTreeMap) order. If a future dependency change enables
-        // `preserve_order`, key order would become insertion-dependent and the
-        // prefix cache could silently break. This test fails loudly in that case.
-        let value = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "demo",
-                "description": "d",
-                "parameters": { "b": 1, "a": 2 }
-            }
-        });
-        let serialized = serde_json::to_string(&value).unwrap();
-        assert!(
-            serialized.find("\"a\"").unwrap() < serialized.find("\"b\"").unwrap(),
-            "object keys must serialize sorted; got {serialized}"
+        assert_eq!(
+            tools[0]["function"]["parameters"]["properties"]["nested"]["additionalProperties"],
+            false
         );
-        // Top-level: "function" sorts before "type".
-        assert!(serialized.find("\"function\"").unwrap() < serialized.find("\"type\"").unwrap());
+        assert_eq!(
+            tools[0]["function"]["parameters"]["properties"]["nullable_nested"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            tools[0]["function"]["parameters"]["properties"]["nullable_nested"]["required"],
+            json!(["name"])
+        );
     }
 }

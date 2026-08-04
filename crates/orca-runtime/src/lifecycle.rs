@@ -153,6 +153,7 @@ pub(crate) struct RuntimeTurnContext<'a> {
     pub(crate) subagent_depth: u32,
     pub(crate) emit_deltas: bool,
     pub(crate) subagent_type: &'a SubagentType,
+    pub(crate) root_task_id: Option<&'a str>,
     pub(crate) continuation: Option<RuntimeTurnContinuation>,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
     pub(crate) provider_suspension_control: Option<&'a dyn RuntimeProviderSuspensionControl>,
@@ -879,6 +880,11 @@ impl<'a> AgentLoopContext<'a> {
         self
     }
 
+    pub(crate) fn with_root_task_id(mut self, root_task_id: Option<&'a str>) -> Self {
+        self.turn_context = self.turn_context.with_root_task_id(root_task_id);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn turn_deps(&self) -> RuntimeTurnDeps<'a> {
         self.turn_deps.expect("agent loop turn deps")
@@ -1116,6 +1122,7 @@ impl<'a> RuntimeTurnContext<'a> {
             subagent_depth,
             emit_deltas,
             subagent_type,
+            root_task_id: None,
             continuation: None,
             steer_handle: None,
             provider_suspension_control: None,
@@ -1127,6 +1134,11 @@ impl<'a> RuntimeTurnContext<'a> {
 
     pub(crate) fn with_turn_id(mut self, turn_id: TurnId) -> Self {
         self.turn_id = turn_id;
+        self
+    }
+
+    pub(crate) fn with_root_task_id(mut self, root_task_id: Option<&'a str>) -> Self {
+        self.root_task_id = root_task_id;
         self
     }
 

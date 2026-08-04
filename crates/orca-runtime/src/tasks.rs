@@ -42,8 +42,10 @@ static TYPED_PROVIDER_OUTCOME_WRITE_FAILURES: AtomicUsize = AtomicUsize::new(0);
 pub struct TaskRegistry {
     session_id: String,
     inner: Arc<Mutex<HashMap<String, TaskRecord>>>,
+    cancelled_roots: Arc<Mutex<HashSet<String>>>,
     typed_provider_outcomes: Arc<Mutex<HashMap<String, DurableTypedProviderOutcome>>>,
     persistence: Option<Arc<TaskPersistence>>,
+    recover_persisted_active_tasks: bool,
     artifact_storage: Arc<TaskArtifactStorage>,
 }
 
@@ -85,6 +87,7 @@ pub struct TaskTerminalTransition {
 #[derive(Clone, Debug)]
 pub struct TaskRecord {
     pub id: String,
+    pub parent_task_id: Option<String>,
     pub task_type: TaskType,
     pub status: TaskStatus,
     pub is_backgrounded: bool,
@@ -162,6 +165,8 @@ struct TaskPersistence {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedTaskRecord {
     id: String,
+    #[serde(default)]
+    parent_task_id: Option<String>,
     task_type: TaskType,
     status: TaskStatus,
     #[serde(default)]
@@ -262,8 +267,10 @@ impl TaskRegistry {
         Self {
             session_id,
             inner: Arc::new(Mutex::new(HashMap::new())),
+            cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
             typed_provider_outcomes: Arc::new(Mutex::new(HashMap::new())),
             persistence: None,
+            recover_persisted_active_tasks: false,
             artifact_storage: Arc::new(TaskArtifactStorage::ProcessLocal {
                 scratch: Mutex::new(None),
             }),
@@ -271,24 +278,58 @@ impl TaskRegistry {
     }
 
     pub fn new_persistent(session_id: String, root: PathBuf) -> io::Result<Self> {
+        Self::open_persistent(session_id, root, true)
+    }
+
+    fn new_persistent_attached(session_id: String, root: PathBuf) -> io::Result<Self> {
+        Self::open_persistent(session_id, root, false)
+    }
+
+    fn open_persistent(
+        session_id: String,
+        root: PathBuf,
+        recover_interrupted: bool,
+    ) -> io::Result<Self> {
         let persistence = Arc::new(TaskPersistence::new(root, session_id.clone()));
         let typed_provider_outcomes = persistence.load_typed_provider_outcomes(&session_id)?;
-        let mut records = persistence.load_session_records(&session_id)?;
+        let _session_lock = ExclusiveFileLock::acquire(&persistence.session_lock_path(&session_id))
+            .map_err(io::Error::other)?;
+        let mut records = persistence.load_session_records_unlocked(&session_id)?;
         let mut changed = false;
-        for (task_id, record) in &mut records {
-            if !typed_provider_outcomes.contains_key(task_id) {
-                changed |= mark_interrupted_if_active(record);
+        if recover_interrupted {
+            for (task_id, record) in &mut records {
+                if !typed_provider_outcomes.contains_key(task_id) {
+                    changed |= mark_interrupted_if_active(record);
+                }
             }
         }
         if changed {
-            persistence.write_session_records(&session_id, &records)?;
+            persistence.write_session_records_unlocked(&session_id, &records)?;
         }
+        drop(_session_lock);
         Ok(Self {
             session_id,
             inner: Arc::new(Mutex::new(records)),
+            cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
             typed_provider_outcomes: Arc::new(Mutex::new(typed_provider_outcomes)),
             persistence: Some(persistence),
+            recover_persisted_active_tasks: recover_interrupted,
             artifact_storage: Arc::new(TaskArtifactStorage::Recorded),
+        })
+    }
+
+    pub(crate) fn attach_for_cwd(session_id: String, cwd: &Path) -> Self {
+        let Some(root) = task_sessions_root() else {
+            let mut registry = Self::new(session_id);
+            registry.artifact_storage = Arc::new(TaskArtifactStorage::Recorded);
+            return registry;
+        };
+        let legacy_root = legacy_project_task_sessions_root(cwd);
+        let _ = migrate_legacy_task_sessions(&legacy_root, &root);
+        Self::new_persistent_attached(session_id.clone(), root).unwrap_or_else(|_| {
+            let mut registry = Self::new(session_id);
+            registry.artifact_storage = Arc::new(TaskArtifactStorage::Recorded);
+            registry
         })
     }
 
@@ -442,6 +483,7 @@ impl TaskRegistry {
         };
         let record = TaskRecord {
             id: id.clone(),
+            parent_task_id: None,
             task_type: TaskType::Workflow,
             status: TaskStatus::Queued,
             is_backgrounded: false,
@@ -480,7 +522,7 @@ impl TaskRegistry {
                 return Err(format!("task '{id}' already exists"));
             }
             tasks.insert(id.clone(), record);
-            self.persist_current_session(tasks)
+            self.persist_current_task(tasks, &id)
         })
         .map_err(|_| "task registry lock poisoned".to_string())??;
 
@@ -492,6 +534,26 @@ impl TaskRegistry {
     }
 
     pub fn create_subagent(&self, description: String, agent_type: Option<String>) -> TaskHandle {
+        self.create_subagent_with_parent(description, agent_type, None)
+    }
+
+    pub fn create_subagent_with_parent(
+        &self,
+        description: String,
+        agent_type: Option<String>,
+        parent_task_id: Option<String>,
+    ) -> TaskHandle {
+        let mut ancestor_id = parent_task_id.clone();
+        let mut refreshed = HashSet::new();
+        while let Some(id) = ancestor_id {
+            if !refreshed.insert(id.clone()) {
+                break;
+            }
+            ancestor_id = self
+                .refresh_task_from_persistence(&id)
+                .expect("task registry parent refresh failed")
+                .and_then(|record| record.parent_task_id);
+        }
         let id = new_task_id();
         let created_at_ms = now_ms();
         let control = TaskControl {
@@ -501,6 +563,7 @@ impl TaskRegistry {
         };
         let record = TaskRecord {
             id: id.clone(),
+            parent_task_id,
             task_type: TaskType::Subagent,
             status: TaskStatus::Queued,
             is_backgrounded: false,
@@ -534,7 +597,40 @@ impl TaskRegistry {
             control,
         };
 
-        self.insert_task(id.clone(), record)
+        let cancelled_roots = self
+            .cancelled_roots
+            .lock()
+            .expect("cancelled task roots lock poisoned");
+        let mut tasks = self.inner.lock().expect("task registry lock poisoned");
+        let mut ancestor_id = record.parent_task_id.as_deref();
+        let mut inspected = HashSet::new();
+        let mut parent_cancelled = false;
+        while let Some(id) = ancestor_id {
+            if !inspected.insert(id.to_string()) {
+                break;
+            }
+            if cancelled_roots.contains(id)
+                || tasks.get(id).is_some_and(|ancestor| {
+                    is_terminal(ancestor.status)
+                        || ancestor.status == TaskStatus::Stopping
+                        || ancestor.control.cancel.is_cancelled()
+                })
+            {
+                parent_cancelled = true;
+                break;
+            }
+            ancestor_id = tasks
+                .get(id)
+                .and_then(|ancestor| ancestor.parent_task_id.as_deref());
+        }
+        let mut record = record;
+        if parent_cancelled {
+            record.status = TaskStatus::Stopping;
+            record.started_at_ms = Some(now_ms());
+            record.control.cancel.cancel();
+        }
+        tasks.insert(id.clone(), record);
+        self.persist_current_task(&tasks, &id)
             .expect("task registry insert failed");
 
         TaskHandle {
@@ -554,6 +650,7 @@ impl TaskRegistry {
         };
         let record = TaskRecord {
             id: id.clone(),
+            parent_task_id: None,
             task_type: TaskType::MainSession,
             status: TaskStatus::Queued,
             is_backgrounded: false,
@@ -607,6 +704,7 @@ impl TaskRegistry {
         };
         let record = TaskRecord {
             id: id.clone(),
+            parent_task_id: None,
             task_type: TaskType::Shell,
             status: TaskStatus::Queued,
             is_backgrounded: false,
@@ -671,7 +769,9 @@ impl TaskRegistry {
         }
 
         let persistence = self.persistence.as_ref()?;
-        let record = persistence.load_record_by_id(id).ok()??;
+        let record = persistence
+            .load_record_by_id(id, self.recover_persisted_active_tasks, &self.session_id)
+            .ok()??;
         self.with_tasks(|tasks| {
             tasks.insert(id.to_string(), record.clone());
         })
@@ -903,7 +1003,7 @@ impl TaskRegistry {
             let transition = TaskTerminalTransition {
                 is_backgrounded: record.is_backgrounded,
             };
-            self.persist_current_session(tasks)?;
+            self.persist_current_task(tasks, id)?;
             Ok(transition)
         })
         .map_err(|_| "task registry lock poisoned".to_string())?
@@ -983,7 +1083,7 @@ impl TaskRegistry {
                     record.started_at_ms = Some(now_ms());
                 }
                 record.completed_at_ms = None;
-                if let Err(error) = self.persist_current_session(tasks) {
+                if let Err(error) = self.persist_current_task(tasks, id) {
                     let record = tasks.get_mut(id).expect("validated task record");
                     record.worker_pid = previous_pid;
                     record.status = previous_status;
@@ -1266,7 +1366,7 @@ impl TaskRegistry {
             record.worker_pid = None;
             record.last_activity_at_ms = Some(now_ms());
             record.control.pause.store(false, Ordering::Release);
-            self.persist_current_session(tasks)?;
+            self.persist_current_task(tasks, id)?;
             Ok(Some(response))
         })
         .map_err(|_| "task registry lock poisoned".to_string())?
@@ -1414,6 +1514,106 @@ impl TaskRegistry {
         }
     }
 
+    pub fn request_stop_tree(&self, root_id: &str) -> Result<Vec<String>, String> {
+        self.refresh_session_from_persistence()?;
+        let root = self.get(root_id);
+        let root_active = root.as_ref().is_some_and(|root| !is_terminal(root.status));
+        if root.is_none()
+            && !self
+                .cancelled_roots
+                .lock()
+                .map_err(|_| "cancelled task roots lock poisoned".to_string())?
+                .contains(root_id)
+        {
+            return Err(format!("task '{root_id}' not found"));
+        }
+        let mut stopped = Vec::new();
+        if root_active {
+            match self.request_stop(root_id) {
+                Ok(()) => stopped.push(root_id.to_string()),
+                Err(_)
+                    if self
+                        .get(root_id)
+                        .is_some_and(|task| is_terminal(task.status)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let mut seen = stopped.iter().cloned().collect::<HashSet<_>>();
+        loop {
+            self.refresh_session_from_persistence()?;
+            let mut targets = self
+                .with_tasks(|tasks| {
+                    let mut targets = tasks
+                        .values()
+                        .filter(|record| record.id != root_id)
+                        .filter(|record| !seen.contains(&record.id))
+                        .filter_map(|record| {
+                            (!is_terminal(record.status))
+                                .then(|| task_depth_below(tasks, &record.id, root_id))
+                                .flatten()
+                                .map(|depth| (depth, record.id.clone()))
+                        })
+                        .collect::<Vec<_>>();
+                    targets.sort_by(|left, right| {
+                        left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+                    });
+                    targets
+                })
+                .map_err(|_| "task registry lock poisoned".to_string())?;
+            if targets.is_empty() {
+                break;
+            }
+            for (_, task_id) in targets.drain(..) {
+                seen.insert(task_id.clone());
+                match self.request_stop(&task_id) {
+                    Ok(()) => stopped.push(task_id),
+                    Err(_)
+                        if self
+                            .get(&task_id)
+                            .is_some_and(|task| is_terminal(task.status)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(stopped)
+    }
+
+    pub fn signal_stop_tree(&self, root_id: &str) -> Result<Vec<String>, String> {
+        let mut cancelled_roots = self
+            .cancelled_roots
+            .lock()
+            .map_err(|_| "cancelled task roots lock poisoned".to_string())?;
+        cancelled_roots.insert(root_id.to_string());
+        let result = self
+            .with_tasks(|tasks| {
+                let mut targets = tasks
+                    .values()
+                    .filter_map(|record| {
+                        (!is_terminal(record.status))
+                            .then(|| task_depth_below(tasks, &record.id, root_id))
+                            .flatten()
+                            .map(|depth| (depth, record.id.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                targets
+                    .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+                for (_, task_id) in &targets {
+                    let record = tasks
+                        .get_mut(task_id)
+                        .expect("tree target remains registered");
+                    record.status = TaskStatus::Stopping;
+                    if record.started_at_ms.is_none() {
+                        record.started_at_ms = Some(now_ms());
+                    }
+                    record.control.cancel.cancel();
+                }
+                targets.into_iter().map(|(_, task_id)| task_id).collect()
+            })
+            .map_err(|_| "task registry lock poisoned".to_string());
+        drop(cancelled_roots);
+        result
+    }
+
     fn mark_stop_requested(&self, id: &str) -> Result<(), String> {
         self.update_task(id, |record| {
             if is_terminal(record.status) {
@@ -1477,15 +1677,15 @@ impl TaskRegistry {
                 .get_mut(id)
                 .ok_or_else(|| format!("task '{id}' not found"))?;
             update(record)?;
-            self.persist_current_session(tasks)
+            self.persist_current_task(tasks, id)
         })
         .map_err(|_| "task registry lock poisoned".to_string())?
     }
 
     fn insert_task(&self, id: String, record: TaskRecord) -> Result<(), String> {
         self.with_tasks(|tasks| {
-            tasks.insert(id, record);
-            self.persist_current_session(tasks)
+            tasks.insert(id.clone(), record);
+            self.persist_current_task(tasks, &id)
         })
         .map_err(|_| "task registry lock poisoned".to_string())?
     }
@@ -1495,7 +1695,7 @@ impl TaskRegistry {
             return Ok(self.get(id));
         };
         let Some(mut record) = persistence
-            .load_record_by_id(id)
+            .load_record_by_id(id, self.recover_persisted_active_tasks, &self.session_id)
             .map_err(|error| error.to_string())?
         else {
             return Ok(None);
@@ -1510,12 +1710,37 @@ impl TaskRegistry {
         Ok(Some(record))
     }
 
-    fn persist_current_session(&self, tasks: &HashMap<String, TaskRecord>) -> Result<(), String> {
+    fn refresh_session_from_persistence(&self) -> Result<(), String> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        let records = persistence
+            .load_session_records(&self.session_id)
+            .map_err(|error| error.to_string())?;
+        self.with_tasks(|tasks| {
+            for (id, mut record) in records {
+                if let Some(current) = tasks.get(&id) {
+                    record.control = current.control.clone();
+                }
+                tasks.entry(id).or_insert(record);
+            }
+        })
+        .map_err(|_| "task registry lock poisoned".to_string())
+    }
+
+    fn persist_current_task(
+        &self,
+        tasks: &HashMap<String, TaskRecord>,
+        id: &str,
+    ) -> Result<(), String> {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
+        let record = tasks
+            .get(id)
+            .ok_or_else(|| format!("task '{id}' not found"))?;
         persistence
-            .write_current_session(tasks)
+            .write_current_task(record)
             .map_err(|error| error.to_string())
     }
 
@@ -1545,36 +1770,68 @@ impl TaskPersistence {
         Self { root, session_id }
     }
 
-    fn write_current_session(&self, tasks: &HashMap<String, TaskRecord>) -> io::Result<()> {
-        self.write_session_records(&self.session_id, tasks)?;
+    fn write_current_task(&self, record: &TaskRecord) -> io::Result<()> {
         let _index_lock =
             ExclusiveFileLock::acquire(&self.index_lock_path()).map_err(io::Error::other)?;
+        let _session_lock = ExclusiveFileLock::acquire(&self.session_lock_path(&self.session_id))
+            .map_err(io::Error::other)?;
+        let (mut records, _) = self.read_session_records(&self.session_id)?;
+        records.insert(record.id.clone(), record.clone());
+        self.write_session_records_unlocked(&self.session_id, &records)?;
         let mut index = self.load_index()?;
-        for id in tasks.keys() {
-            index.insert(id.clone(), self.session_id.clone());
-        }
+        index.insert(record.id.clone(), self.session_id.clone());
         self.write_index(&index)
     }
 
-    fn load_record_by_id(&self, id: &str) -> io::Result<Option<TaskRecord>> {
+    fn load_record_by_id(
+        &self,
+        id: &str,
+        recover_interrupted: bool,
+        requesting_session_id: &str,
+    ) -> io::Result<Option<TaskRecord>> {
         let index = self.load_index()?;
-        let Some(session_id) = index.get(id) else {
+        let Some(session_id) = index.get(id).cloned() else {
             return Ok(None);
         };
-        let mut records = self.load_session_records(session_id)?;
+        let _session_lock = ExclusiveFileLock::acquire(&self.session_lock_path(&session_id))
+            .map_err(io::Error::other)?;
+        let mut records = self.load_session_records_unlocked(&session_id)?;
         let Some(record) = records.get_mut(id) else {
             return Ok(None);
         };
-        if mark_interrupted_if_active(record) {
-            self.write_session_records(session_id, &records)?;
+        if recover_interrupted
+            && session_id != requesting_session_id
+            && mark_interrupted_if_active(record)
+        {
+            self.write_session_records_unlocked(&session_id, &records)?;
         }
-        Ok(records.get(id).cloned())
+        Ok(records.remove(id))
     }
 
     fn load_session_records(&self, session_id: &str) -> io::Result<HashMap<String, TaskRecord>> {
+        let _session_lock = ExclusiveFileLock::acquire(&self.session_lock_path(session_id))
+            .map_err(io::Error::other)?;
+        self.load_session_records_unlocked(session_id)
+    }
+
+    fn load_session_records_unlocked(
+        &self,
+        session_id: &str,
+    ) -> io::Result<HashMap<String, TaskRecord>> {
+        let (records, changed) = self.read_session_records(session_id)?;
+        if changed {
+            self.write_session_records_unlocked(session_id, &records)?;
+        }
+        Ok(records)
+    }
+
+    fn read_session_records(
+        &self,
+        session_id: &str,
+    ) -> io::Result<(HashMap<String, TaskRecord>, bool)> {
         let path = self.session_tasks_path(session_id);
         if !path.exists() {
-            return Ok(HashMap::new());
+            return Ok((HashMap::new(), false));
         }
         let persisted: HashMap<String, PersistedTaskRecord> = read_json(&path)?;
         let mut changed = false;
@@ -1586,13 +1843,10 @@ impl TaskPersistence {
                 (id, record)
             })
             .collect::<HashMap<_, _>>();
-        if changed {
-            self.write_session_records(session_id, &records)?;
-        }
-        Ok(records)
+        Ok((records, changed))
     }
 
-    fn write_session_records(
+    fn write_session_records_unlocked(
         &self,
         session_id: &str,
         records: &HashMap<String, TaskRecord>,
@@ -1676,6 +1930,12 @@ impl TaskPersistence {
             .join("typed-provider-outcomes.json")
     }
 
+    fn session_lock_path(&self, session_id: &str) -> PathBuf {
+        self.root
+            .join(safe_path_component(session_id))
+            .join("tasks.lock")
+    }
+
     fn index_path(&self) -> PathBuf {
         self.root.join("task-index.json")
     }
@@ -1726,6 +1986,7 @@ impl PersistedTaskRecord {
             .transpose();
         let mut record = TaskRecord {
             id: self.id,
+            parent_task_id: self.parent_task_id,
             task_type: self.task_type,
             status: self.status,
             is_backgrounded: self.is_backgrounded,
@@ -1783,6 +2044,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
     fn from(record: &TaskRecord) -> Self {
         Self {
             id: record.id.clone(),
+            parent_task_id: record.parent_task_id.clone(),
             task_type: record.task_type,
             status: record.status,
             is_backgrounded: record.is_backgrounded,
@@ -2209,6 +2471,26 @@ fn new_task_id() -> String {
     format!("task-{}", uuid::Uuid::new_v4())
 }
 
+fn task_depth_below(
+    tasks: &HashMap<String, TaskRecord>,
+    task_id: &str,
+    root_id: &str,
+) -> Option<usize> {
+    let mut current = task_id;
+    let mut depth = 0usize;
+    let mut visited = HashSet::new();
+    loop {
+        if current == root_id {
+            return Some(depth);
+        }
+        if !visited.insert(current) {
+            return None;
+        }
+        current = tasks.get(current)?.parent_task_id.as_deref()?;
+        depth = depth.checked_add(1)?;
+    }
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2358,7 +2640,9 @@ fn migrate_legacy_task_sessions(legacy_root: &Path, target_root: &Path) -> io::R
             continue;
         }
 
-        let mut target_records = target.load_session_records(&session_id)?;
+        let _session_lock = ExclusiveFileLock::acquire(&target.session_lock_path(&session_id))
+            .map_err(io::Error::other)?;
+        let mut target_records = target.load_session_records_unlocked(&session_id)?;
         let mut changed_session = false;
         for (id, record) in legacy_records {
             if legacy_index.get(&id) != Some(&session_id) || target_index.contains_key(&id) {
@@ -2371,7 +2655,7 @@ fn migrate_legacy_task_sessions(legacy_root: &Path, target_root: &Path) -> io::R
         }
 
         if changed_session {
-            target.write_session_records(&session_id, &target_records)?;
+            target.write_session_records_unlocked(&session_id, &target_records)?;
         }
     }
 
@@ -3266,6 +3550,132 @@ mod tests {
         let record = registry.get(&task.id).unwrap();
         assert_eq!(record.status, TaskStatus::Stopping);
         assert!(record.control.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn request_stop_tree_stops_active_descendants_and_leaves_detached_tasks_running() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let root = registry.create_main_session("foreground turn".to_string());
+        registry.mark_running(&root.id).unwrap();
+        let child = registry.create_subagent_with_parent(
+            "owned child".to_string(),
+            None,
+            Some(root.id.clone()),
+        );
+        registry.mark_running(&child.id).unwrap();
+        let grandchild = registry.create_subagent_with_parent(
+            "owned grandchild".to_string(),
+            None,
+            Some(child.id.clone()),
+        );
+        registry.mark_running(&grandchild.id).unwrap();
+        let detached = registry.create_subagent("detached child".to_string(), None);
+        registry.mark_running(&detached.id).unwrap();
+
+        let stopped = registry.request_stop_tree(&root.id).unwrap();
+
+        assert_eq!(
+            stopped,
+            vec![root.id, child.id.clone(), grandchild.id.clone()]
+        );
+        assert_eq!(
+            registry.get(&grandchild.id).unwrap().status,
+            TaskStatus::Stopping
+        );
+        assert_eq!(
+            registry.get(&child.id).unwrap().status,
+            TaskStatus::Stopping
+        );
+        assert_eq!(
+            registry.get(&detached.id).unwrap().status,
+            TaskStatus::Running
+        );
+        assert!(!registry.is_cancelled(&detached.id));
+    }
+
+    #[test]
+    fn persistent_stop_tree_discovers_descendants_created_by_attached_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("tasks");
+        let owner =
+            TaskRegistry::new_persistent("shared-session".to_string(), root_path.clone()).unwrap();
+        let root = owner.create_main_session("foreground turn".to_string());
+        owner.mark_running(&root.id).unwrap();
+        let detached = owner.create_subagent("detached background".to_string(), None);
+        owner.mark_running(&detached.id).unwrap();
+
+        let worker =
+            TaskRegistry::new_persistent_attached("shared-session".to_string(), root_path.clone())
+                .unwrap();
+        assert_eq!(worker.get(&root.id).unwrap().status, TaskStatus::Running);
+        let child = worker.create_subagent_with_parent(
+            "worker child".to_string(),
+            None,
+            Some(root.id.clone()),
+        );
+        worker.mark_running(&child.id).unwrap();
+        let grandchild = worker.create_subagent_with_parent(
+            "worker grandchild".to_string(),
+            None,
+            Some(child.id.clone()),
+        );
+        worker.mark_running(&grandchild.id).unwrap();
+        assert_eq!(owner.get(&child.id).unwrap().status, TaskStatus::Running);
+        assert!(
+            owner.list().iter().all(|task| task.id != grandchild.id),
+            "the owner has not loaded the worker-created grandchild yet"
+        );
+
+        let stopped = owner.request_stop_tree(&root.id).unwrap();
+
+        assert_eq!(
+            stopped,
+            vec![root.id, child.id.clone(), grandchild.id.clone()]
+        );
+        assert_eq!(owner.get(&child.id).unwrap().status, TaskStatus::Stopping);
+        assert_eq!(
+            owner.get(&grandchild.id).unwrap().status,
+            TaskStatus::Stopping
+        );
+        assert_eq!(owner.get(&detached.id).unwrap().status, TaskStatus::Running);
+        let persisted =
+            TaskRegistry::new_persistent_attached("shared-session".to_string(), root_path).unwrap();
+        assert_eq!(
+            persisted.get(&child.id).unwrap().status,
+            TaskStatus::Stopping
+        );
+        assert_eq!(
+            persisted.get(&grandchild.id).unwrap().status,
+            TaskStatus::Stopping
+        );
+        assert_eq!(
+            persisted.get(&detached.id).unwrap().status,
+            TaskStatus::Running
+        );
+    }
+
+    #[test]
+    fn persistent_child_creation_refreshes_cancelled_parent_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("tasks");
+        let owner =
+            TaskRegistry::new_persistent("shared-session".to_string(), root_path.clone()).unwrap();
+        let root = owner.create_main_session("foreground turn".to_string());
+        owner.mark_running(&root.id).unwrap();
+        let worker =
+            TaskRegistry::new_persistent_attached("shared-session".to_string(), root_path).unwrap();
+        assert_eq!(worker.get(&root.id).unwrap().status, TaskStatus::Running);
+
+        owner.request_stop(&root.id).unwrap();
+        let child = worker.create_subagent_with_parent(
+            "late worker child".to_string(),
+            None,
+            Some(root.id),
+        );
+
+        let child = worker.get(&child.id).unwrap();
+        assert_eq!(child.status, TaskStatus::Stopping);
+        assert!(child.control.cancel.is_cancelled());
     }
 
     #[cfg(unix)]

@@ -14,14 +14,16 @@ use orca_runtime::surface::{
     NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationPatch,
     OperationRequestIntent, OperationSettingsPreparation, OperationTerminal, PinnedContextAction,
     PinnedContextSourceRevision, PinnedUserRevision, ReplayabilityRequest, RuntimeSettingsPatch,
-    RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle, Sha256Digest,
-    SurfaceAllowDeny, SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId,
-    SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceGoal, SurfaceGoalFence,
-    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
-    SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
-    SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceUnavailableReason,
-    SurfaceWorkflowRunId, TaskControlAction, TransferBackgroundOutput, WaitOperationTerminalResult,
-    WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
+    RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle,
+    SessionMetadataPatch, SessionMetadataPrecondition, SessionMetadataRevision, Sha256Digest,
+    StaleMutationError, SurfaceAllowDeny, SurfaceAttachmentRole, SurfaceCapability,
+    SurfaceCatalogEntryId, SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceGoal,
+    SurfaceGoalFence, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
+    SurfaceOperationId, SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId,
+    SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence,
+    SurfaceUnavailableReason, SurfaceWorkflowRunId, TaskControlAction, TransferBackgroundOutput,
+    UncommittedMutation, WaitOperationTerminalResult, WorkflowCatalogRevision,
+    WorkflowControlAction, WorkflowPatch,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -44,6 +46,42 @@ impl fmt::Display for TerminalRecoveryRequired {
 }
 
 impl Error for TerminalRecoveryRequired {}
+
+#[derive(Debug)]
+pub(crate) enum SessionMetadataUpdateError {
+    Stale { error: StaleMutationError },
+    Other(io::Error),
+}
+
+impl SessionMetadataUpdateError {
+    pub(crate) fn is_stale(&self) -> bool {
+        matches!(self, Self::Stale { .. })
+    }
+}
+
+impl fmt::Display for SessionMetadataUpdateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stale { error } => formatter.write_str(error.error().message.as_str()),
+            Self::Other(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for SessionMetadataUpdateError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Stale { .. } => None,
+            Self::Other(error) => Some(error),
+        }
+    }
+}
+
+impl From<io::Error> for SessionMetadataUpdateError {
+    fn from(error: io::Error) -> Self {
+        Self::Other(error)
+    }
+}
 
 pub(crate) fn is_terminal_recovery_error(error: &io::Error) -> bool {
     error
@@ -360,6 +398,79 @@ pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<S
     let snapshot = (*attachment.baseline.snapshot).clone();
     detach(&surface, &attachment.client);
     Ok(snapshot)
+}
+
+pub(crate) fn update_session_metadata(
+    thread: &RuntimeSurfaceThreadHandle,
+    expected_revision: SessionMetadataRevision,
+    patch: SessionMetadataPatch,
+) -> Result<SessionMetadataRevision, SessionMetadataUpdateError> {
+    let committed_revision = SessionMetadataRevision::try_new(
+        expected_revision
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("session metadata revision overflow"))?,
+    )
+    .map_err(|error| io::Error::other(format!("invalid session metadata revision: {error}")))?;
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::ManageThreadSettings,
+        ]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        AttachResult::Denied { reason } => {
+            return Err(io::Error::other(format!(
+                "typed TUI metadata attachment denied: {reason:?}"
+            ))
+            .into());
+        }
+        AttachResult::Unavailable { reason } => {
+            return Err(io::Error::other(format!(
+                "typed TUI metadata attachment unavailable: {reason:?}"
+            ))
+            .into());
+        }
+        AttachResult::ThreadClosed { .. } => {
+            return Err(io::Error::other("typed TUI metadata thread is closed").into());
+        }
+        AttachResult::CursorAttached { .. }
+        | AttachResult::SnapshotRequired { .. }
+        | AttachResult::InvalidCursor { .. } => {
+            return Err(io::Error::other(
+                "typed TUI metadata attachment returned an invalid fresh-attach result",
+            )
+            .into());
+        }
+    };
+    let result = attachment.client.update_session_metadata(
+        SurfaceRequestId::new(),
+        SessionMetadataPrecondition::Exact {
+            revision: expected_revision,
+        },
+        patch,
+    );
+    detach(&surface, &attachment.client);
+    let result = result.map_err(|error| {
+        io::Error::other(format!("typed TUI metadata update failed: {error:?}"))
+    })?;
+    match result {
+        MutationReply::Committed { .. } => Ok(committed_revision),
+        MutationReply::Uncommitted {
+            mutation: UncommittedMutation::Stale { error, .. },
+        } => Err(SessionMetadataUpdateError::Stale { error }),
+        MutationReply::Uncommitted { mutation } => Err(io::Error::other(format!(
+            "typed TUI metadata update did not commit: {mutation:?}"
+        ))
+        .into()),
+        MutationReply::Deferred { .. } => {
+            Err(io::Error::other("typed TUI metadata update deferred").into())
+        }
+    }
 }
 
 pub(crate) fn stop_task(
@@ -1032,20 +1143,26 @@ pub(crate) fn set_goal_and_run(
     controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
-    run_goal_mutation(thread, controller, event_tx, move |snapshot| {
-        let objective = NonEmptyText::try_new(objective)
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        Ok(GoalMutationAction::SetAndRun {
-            expected_goal: snapshot
-                .goal
-                .as_ref()
-                .map(|goal| ExpectedGoal::Exact(goal_fence(goal)))
-                .unwrap_or(ExpectedGoal::None),
-            token_budget: snapshot.goal.as_ref().and_then(|goal| goal.token_budget),
-            input: supplied_goal_input(objective.as_str())?,
-            objective,
-        })
-    })
+    run_goal_mutation(
+        thread,
+        controller,
+        event_tx,
+        || {},
+        move |snapshot| {
+            let objective = NonEmptyText::try_new(objective)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            Ok(GoalMutationAction::SetAndRun {
+                expected_goal: snapshot
+                    .goal
+                    .as_ref()
+                    .map(|goal| ExpectedGoal::Exact(goal_fence(goal)))
+                    .unwrap_or(ExpectedGoal::None),
+                token_budget: snapshot.goal.as_ref().and_then(|goal| goal.token_budget),
+                input: supplied_goal_input(objective.as_str())?,
+                objective,
+            })
+        },
+    )
 }
 
 pub(crate) fn resume_goal_and_run(
@@ -1054,7 +1171,32 @@ pub(crate) fn resume_goal_and_run(
     controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
-    run_goal_mutation(thread, controller, event_tx, move |snapshot| {
+    run_goal_mutation(
+        thread,
+        controller,
+        event_tx,
+        || {},
+        move |snapshot| {
+            let goal = snapshot
+                .goal
+                .as_ref()
+                .ok_or_else(|| io::Error::other("no goal is currently set"))?;
+            Ok(GoalMutationAction::ResumeAndRun {
+                fence: goal_fence(goal),
+                input: supplied_goal_input(&prompt)?,
+            })
+        },
+    )
+}
+
+pub(crate) fn resume_goal_and_run_with_started(
+    thread: &RuntimeSurfaceThreadHandle,
+    prompt: String,
+    controller: &TuiSurfaceTaskControl,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    started: impl FnOnce(),
+) -> io::Result<TuiHostedOperationOutcome> {
+    run_goal_mutation(thread, controller, event_tx, started, move |snapshot| {
         let goal = snapshot
             .goal
             .as_ref()
@@ -1070,6 +1212,7 @@ fn run_goal_mutation(
     thread: &RuntimeSurfaceThreadHandle,
     controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
+    started: impl FnOnce(),
     action: impl FnOnce(&SurfaceSnapshot) -> io::Result<GoalMutationAction>,
 ) -> io::Result<TuiHostedOperationOutcome> {
     let mut activation = SurfaceActivationGuard::begin(controller)?;
@@ -1103,6 +1246,7 @@ fn run_goal_mutation(
         operation_id.clone(),
         goal_fence(goal),
     )?;
+    started();
     activation.disarm();
     guard.controller_installed();
     let result = drain_operation(
@@ -1301,7 +1445,7 @@ pub(crate) fn launch_workflow(
                         });
                         let workflow_terminal =
                             batch_contains_workflow_terminal(&batch, &monitor_workflow_run_id);
-                        match projection.reduce_typed_batch(&batch) {
+                        match projection.project_typed_batch(&batch) {
                             Ok(events) => {
                                 for event in events {
                                     let _ = monitor_events.send(event);
@@ -1960,7 +2104,7 @@ fn drain_operation_with_boundary(
                             }
                         }
                     }
-                    match projection.reduce_typed_batch(&batch) {
+                    match projection.project_typed_batch(&batch) {
                         Ok(events) => {
                             for event in events {
                                 if matches!(event, TuiEvent::SessionCompleted { .. }) {
@@ -2236,11 +2380,15 @@ fn monitor_background_presentation(
                                 if &record.operation_id == operation_id
                         )
                     });
-                    projection.reduce_typed_batch(&batch).map_err(|error| {
-                        io::Error::other(format!(
-                            "background presentation projection failed: {error:?}"
-                        ))
-                    })?;
+                    let projection_events =
+                        projection.project_typed_batch(&batch).map_err(|error| {
+                            io::Error::other(format!(
+                                "background presentation projection failed: {error:?}"
+                            ))
+                        })?;
+                    let projection_sync = projection_events
+                        .into_iter()
+                        .find(|event| matches!(event, TuiEvent::SurfaceProjectionSynced(_)));
                     let current_task =
                         projection.background_task_summary_for_operation(operation_id);
                     if last_task.as_ref() != Some(&current_task) {
@@ -2255,6 +2403,16 @@ fn monitor_background_presentation(
                             break false;
                         }
                         last_task = Some(current_task);
+                    }
+                    if let Some(event) = projection_sync
+                        && !send_background_presentation_event(
+                            event_tx,
+                            controller,
+                            cancellation,
+                            event,
+                        )
+                    {
+                        break false;
                     }
                     if terminal {
                         break false;
@@ -2509,12 +2667,9 @@ mod tests {
     }
     use orca_core::config::HistoryMode;
     use orca_runtime::runtime_host::{RuntimeHost, RuntimeThreadHandle};
-    use std::sync::Mutex;
     use std::time::Instant;
 
     use crate::types::TuiTaskLifecycle;
-
-    static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn run_through_dispatch(
         thread: &RuntimeThreadHandle,
@@ -2529,7 +2684,7 @@ mod tests {
 
     #[test]
     fn typed_ordinary_turn_projects_terminal_and_assistant_output() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -2571,6 +2726,17 @@ mod tests {
         assert!(events.iter().any(
             |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
         ));
+        let projection = events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                TuiEvent::SurfaceProjectionSynced(projection) => Some(projection.as_ref()),
+                _ => None,
+            })
+            .expect("typed projection must finish each batch with a reducer snapshot");
+        assert_eq!(projection.title, "typed TUI turn");
+        assert!(projection.usage_revision > 0);
+        assert!(projection.foreground_operation_id.is_none());
         assert!(controller.current_id().is_none());
         assert!(!controller.has_surface_active());
 
@@ -2584,7 +2750,7 @@ mod tests {
 
     #[test]
     fn typed_manual_compaction_projects_durable_lifecycle() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -2635,7 +2801,7 @@ mod tests {
 
     #[test]
     fn typed_ordinary_turn_interrupt_uses_surface_cancel() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -2691,7 +2857,7 @@ mod tests {
 
     #[test]
     fn typed_ordinary_turn_backgrounds_only_after_durable_surface_handoff() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -2800,7 +2966,9 @@ mod tests {
         assert!(
             background_monitor_events.iter().all(|event| matches!(
                 event,
-                TuiEvent::WorkflowTasksUpdated { .. } | TuiEvent::Notice(_)
+                TuiEvent::WorkflowTasksUpdated { .. }
+                    | TuiEvent::Notice(_)
+                    | TuiEvent::SurfaceProjectionSynced(_)
             )),
             "background observer must not project a later foreground operation: \
              {background_monitor_events:?}"
@@ -2842,7 +3010,7 @@ mod tests {
 
     #[test]
     fn sessionless_foreground_preserves_legacy_task_control() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let mut config = crate::test_support::test_run_config();
         config.cwd = Some(home.path().to_path_buf());
@@ -2875,7 +3043,7 @@ mod tests {
 
     #[test]
     fn foreground_after_background_before_first_delta_hydrates_typed_output_and_terminal() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3021,7 +3189,7 @@ mod tests {
 
     #[test]
     fn foregrounded_provider_can_be_backgrounded_again_without_changing_execution_owner() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3179,7 +3347,7 @@ mod tests {
 
     #[test]
     fn typed_background_approval_suspends_original_operation_and_requests_bound_interaction() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3313,7 +3481,7 @@ mod tests {
         if !orca_runtime::workflow::host::WorkflowHost::node_available() {
             return;
         }
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let workflow_dir = cwd.path().join(".orca").join("workflows");
@@ -3424,7 +3592,7 @@ mod tests {
 
     #[test]
     fn typed_late_interrupt_does_not_cancel_next_turn() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3479,7 +3647,7 @@ mod tests {
 
     #[test]
     fn typed_failed_prearmed_activation_does_not_cancel_next_turn() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3539,7 +3707,7 @@ mod tests {
 
     #[test]
     fn typed_ordinary_turn_routes_tool_approval_through_runtime_surface() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3604,7 +3772,7 @@ mod tests {
 
     #[test]
     fn typed_ordinary_turn_routes_permission_through_runtime_surface() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3669,7 +3837,7 @@ mod tests {
 
     #[test]
     fn typed_ordinary_turn_routes_user_input_through_runtime_surface() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3734,7 +3902,7 @@ mod tests {
 
     #[test]
     fn typed_ordinary_turn_reloads_and_runs_after_runtime_restart() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3807,7 +3975,7 @@ mod tests {
 
     #[test]
     fn typed_background_owner_is_terminalized_before_restart_reopens_the_thread() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -3901,7 +4069,7 @@ mod tests {
 
     #[test]
     fn typed_cancelled_turn_restarts_and_next_turn_commits() {
-        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };

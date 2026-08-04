@@ -8,6 +8,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{Ordering, compiler_fence};
 
+#[cfg(test)]
+thread_local! {
+    static DISPLAY_TEXT_APPENDED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub const SAFE_DIAGNOSTIC_TEXT_BYTE_LIMIT: usize = 4_096;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -48,6 +53,23 @@ impl DisplayText {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub(crate) fn push_str(&mut self, value: &str) {
+        #[cfg(test)]
+        DISPLAY_TEXT_APPENDED_BYTES
+            .with(|bytes| bytes.set(bytes.get().saturating_add(value.len())));
+        self.0.push_str(value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_appended_byte_count() {
+        DISPLAY_TEXT_APPENDED_BYTES.with(|bytes| bytes.set(0));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn appended_byte_count() -> usize {
+        DISPLAY_TEXT_APPENDED_BYTES.with(std::cell::Cell::get)
     }
 }
 
@@ -859,13 +881,17 @@ impl ZeroizingProcessLocalSecret {
     }
 }
 
+fn zeroize_process_local_secret(value: &mut [u8]) {
+    for byte in value {
+        // SAFETY: `byte` is a valid, uniquely borrowed byte in this owned buffer.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
 impl Drop for ZeroizingProcessLocalSecret {
     fn drop(&mut self) {
-        for byte in &mut self.0 {
-            // SAFETY: `byte` is a valid, uniquely borrowed byte in this owned buffer.
-            unsafe { std::ptr::write_volatile(byte, 0) };
-        }
-        compiler_fence(Ordering::SeqCst);
+        zeroize_process_local_secret(&mut self.0);
     }
 }
 
@@ -1203,5 +1229,12 @@ mod tests {
     fn opaque_tokens_compare_without_exposing_bytes() {
         assert!(OpaqueToken::new([1; 32]) == OpaqueToken::new([1; 32]));
         assert!(OpaqueToken::new([1; 32]) != OpaqueToken::new([2; 32]));
+    }
+
+    #[test]
+    fn process_local_secret_zeroization_clears_every_byte() {
+        let mut bytes = vec![1, 2, 3, 4];
+        zeroize_process_local_secret(&mut bytes);
+        assert_eq!(bytes, [0, 0, 0, 0]);
     }
 }

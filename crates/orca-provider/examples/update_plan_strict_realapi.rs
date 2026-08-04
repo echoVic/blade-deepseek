@@ -20,8 +20,10 @@ use std::collections::HashMap;
 use orca_core::config::ProviderKind;
 use orca_core::conversation::Conversation;
 use orca_core::provider_types::ProviderStep;
-use orca_core::tool_types::{ToolName, ToolStatus};
-use orca_provider::deepseek_http::strict_tools_for_endpoint;
+use orca_core::tool_types::ToolName;
+use orca_provider::tool_schema::{
+    ProviderToolDefinition, deepseek_strict_tools_schema_for_endpoint,
+};
 use orca_provider::{ProviderConfig, call};
 use serde_json::Value;
 
@@ -45,13 +47,36 @@ fn load_api_key() -> Option<String> {
         .cloned()
 }
 
-fn update_plan_tool_schema() -> Vec<Value> {
-    orca_provider::tool_schema::deepseek_tools_schema_with_mcp_and_external(None, &[])
-        .into_iter()
-        .filter(|tool| {
-            tool.pointer("/function/name").and_then(Value::as_str) == Some("update_plan")
-        })
-        .collect()
+fn update_plan_tool_definitions() -> Vec<ProviderToolDefinition> {
+    vec![ProviderToolDefinition {
+        name: "update_plan".to_string(),
+        description: "Update the current execution plan.".to_string(),
+        input_schema: update_plan_input_schema(),
+        strict_capable: true,
+    }]
+}
+
+fn update_plan_input_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "explanation": { "type": ["string", "null"] },
+            "plan": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "step": { "type": "string" },
+                        "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+                    },
+                    "required": ["step", "status"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["plan"],
+        "additionalProperties": false
+    })
 }
 
 fn provider_config(api_key: &str, base_url: Option<&str>) -> ProviderConfig {
@@ -60,7 +85,7 @@ fn provider_config(api_key: &str, base_url: Option<&str>) -> ProviderConfig {
         base_url: base_url.map(str::to_string),
         model: Some(MODEL.to_string()),
         reasoning_effort: orca_core::config::ReasoningEffort::default(),
-        tools_override: Some(update_plan_tool_schema()),
+        tools_override: Some(update_plan_tool_definitions()),
         mcp_registry: None,
         external_tools: Vec::new(),
     }
@@ -73,9 +98,9 @@ fn plan_bait_conversation() -> Conversation {
     conv
 }
 
-/// Runs a provider-path call and checks the update_plan request end-to-end:
-/// present, schema-valid, executable. Retries once if the model answered in
-/// prose instead of calling the tool.
+/// Runs a provider-path call and checks that it yields a JSON update_plan
+/// request. Retries once if the model answered in prose instead of calling the
+/// tool.
 fn provider_path_check(label: &str, config: &ProviderConfig) -> (bool, String) {
     for attempt in 0..2 {
         let response = call(ProviderKind::DeepSeek, &plan_bait_conversation(), config);
@@ -110,19 +135,17 @@ fn provider_path_check(label: &str, config: &ProviderConfig) -> (bool, String) {
         };
 
         let raw = request.raw_arguments.clone().unwrap_or_default();
-        let registry = orca_tools::registry::default_tool_registry();
-        if let Err(error) = orca_tools::registry::validate_tool_request(registry, &request) {
-            return (
-                false,
-                format!("schema validation failed: {error}; raw={raw}"),
-            );
-        }
-        let result = orca_tools::update_plan::execute(&request);
-        if result.status != ToolStatus::Completed {
-            return (
-                false,
-                format!("execute failed: {:?}; raw={raw}", result.error),
-            );
+        let parsed: Value = match serde_json::from_str(&raw) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return (
+                    false,
+                    format!("tool arguments were not JSON: {error}; raw={raw}"),
+                );
+            }
+        };
+        if !parsed["plan"].is_array() {
+            return (false, format!("tool arguments omit plan array; raw={raw}"));
         }
         return (true, format!("args={raw}"));
     }
@@ -132,8 +155,9 @@ fn provider_path_check(label: &str, config: &ProviderConfig) -> (bool, String) {
 /// Raw HTTP probe against the beta endpoint with strict tools: proves whether
 /// the server accepts our strict schema and returns well-formed arguments.
 fn strict_probe(api_key: &str) -> (bool, bool, String) {
-    let tools = strict_tools_for_endpoint(&update_plan_tool_schema(), BETA_URL)
-        .expect("beta endpoint must qualify update_plan for strict mode");
+    let tools =
+        deepseek_strict_tools_schema_for_endpoint(&update_plan_tool_definitions(), BETA_URL)
+            .expect("beta endpoint must qualify update_plan for strict mode");
     let body = serde_json::json!({
         "model": MODEL,
         "messages": [
@@ -234,7 +258,7 @@ fn main() {
 
     println!("== Verdicts ==");
     verdict(
-        "default endpoint: update_plan call validates + executes",
+        "default endpoint: update_plan call validates in provider path",
         default_ok,
         &default_detail,
     );

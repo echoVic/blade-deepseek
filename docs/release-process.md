@@ -4,9 +4,11 @@
 
 Every release must complete these steps in order.
 
-### 1. Code changes
+### 1. Integrate code changes
 
-Make and commit all code changes on `main`.
+Develop and verify changes on a branch. Merge through a reviewed pull request;
+do not version or tag from an unintegrated branch. Before tagging, local
+`main`, `origin/main`, and the intended release commit must match.
 
 ### 2. Bump versions
 
@@ -37,12 +39,27 @@ git commit -m "docs: add vX.Y.Z release notes"  # or include in step 2 commit
 ### 4. Run pre-release checks
 
 ```sh
-cargo fmt -- --check
-cargo test -p orca-tools sandbox -- --nocapture
-cargo clippy --workspace --all-targets
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -j 1
+node --test scripts/test-validate-runtime-surface-contract.mjs
+node scripts/validate-runtime-surface-contract.mjs
+node --test scripts/test-validate-windows-platform-boundaries.mjs
+node scripts/validate-windows-platform-boundaries.mjs
+cargo nextest run -p orca-tui --lib --locked --profile ci-serial
+cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
+node scripts/release/test-verify-version-sync.mjs
 node scripts/release/test-stage-npm.mjs
 node scripts/release/test-verify-published.mjs
+npm --prefix site run build
+npm --prefix site run check:seo
+git diff --check
 ```
+
+Run this matrix before and after the version commit. Focused latency,
+durability, dependency, and Windows behavior gates remain required even when a
+broad workspace run passes. Clippy warnings are tracked separately from release
+failures; do not hide them with a global allow, and do not turn a patch release
+into an unrelated public-API cleanup merely to satisfy a newer toolchain lint.
 
 ### 5. Update the website
 
@@ -67,26 +84,25 @@ git add site/src/shared.ts site/src/changelog/Changelog.tsx
 git commit -m "chore(site): add vX.Y.Z to changelog and release list"
 ```
 
-### 6. Tag and push
+### 6. Push, merge, and tag
 
 ```sh
-git push origin main
+git push -u origin <release-branch>
+# open the pull request, wait for required Linux and Windows checks, then merge
+git switch main
+git pull --ff-only origin main
 git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-**Never `--force` push `main` or an existing tag.** If a tag already exists at the wrong commit, delete it locally and remotely before re-tagging:
-
-```sh
-git tag -d vX.Y.Z
-git push origin :refs/tags/vX.Y.Z
-git tag vX.Y.Z
-git push origin vX.Y.Z
-```
+**Never force-push `main`, delete a published tag, or recreate an existing
+tag.** Resolve the tag and remote target before creating it. If the intended
+version already exists or points elsewhere, stop and choose a new version.
 
 ### 7. CI publishes automatically
 
-The `release.yml` workflow triggers on the tag push and:
+The `release.yml` workflow is the sole publisher. It triggers on the tag push
+and:
 1. Runs tests
 2. Builds binaries for all six targets, including native Windows x64 and ARM64
 3. Creates a GitHub Release with binary assets
@@ -114,6 +130,6 @@ node scripts/release/verify-published.mjs \
 |---|---|
 | Forgot `Cargo.lock` | `cargo check && git add Cargo.lock && git commit --amend` |
 | Forgot site update | Push a follow-up commit to `site/src/` — pages workflow re-deploys automatically |
-| Force-pushed `main` | Restore with `git push origin <last-good-sha>:refs/heads/main --force` |
-| Tag points to wrong commit | Delete and re-create the tag (see step 6) |
+| Local main differs from origin/main | Stop and reconcile with a non-destructive fast-forward or reviewed PR |
+| Version tag already exists or points elsewhere | Do not move it; select a new patch version |
 | `summaries` missing new version in Changelog.tsx | TypeScript build fails — add entry to both EN and ZH summaries objects |

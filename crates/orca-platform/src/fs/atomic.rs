@@ -31,7 +31,10 @@ pub fn atomic_write_with<F>(
 where
     F: FnOnce(&mut File) -> io::Result<()>,
 {
+    #[cfg(windows)]
     let _write_guard = platform::lock_atomic_write()?;
+    #[cfg(unix)]
+    platform::lock_atomic_write()?;
     let parent = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

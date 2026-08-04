@@ -104,6 +104,7 @@ pub(crate) struct RuntimeNormalToolTurnRequest<'a> {
     pub(crate) emit_deltas: bool,
     pub(crate) goal_mode: bool,
     pub(crate) policy: &'a ApprovalPolicy,
+    pub(crate) root_task_id: Option<&'a str>,
 }
 
 pub(crate) struct RuntimeNormalToolTurnIo<'a, W: io::Write> {
@@ -209,6 +210,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let cwd = step_snapshot.turn_context.cwd;
     let tool_policy = step_snapshot.tool_policy;
     let subagent_depth = step_snapshot.turn_context.subagent_depth;
+    let root_task_id = step_snapshot.turn_context.root_task_id;
     let emit_deltas = step_snapshot.turn_context.emit_deltas;
     let provider_response_ingress = step_snapshot.turn_context.provider_response_ingress();
     let workflow_lifecycle_ingress = step_snapshot.turn_context.workflow_lifecycle_ingress();
@@ -322,6 +324,8 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 },
                 runtime: RuntimeSubagentBatchToolTurnRuntime {
                     cancel,
+                    task_registry,
+                    root_task_id,
                     workflow_ipc,
                 },
                 child_executor: batch_child_executor,
@@ -436,6 +440,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 emit_deltas,
                 goal_mode: tool_policy.is_goal_mode(),
                 policy,
+                root_task_id,
             },
             io: RuntimeNormalToolTurnIo {
                 events,
@@ -671,6 +676,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         emit_deltas,
         goal_mode,
         policy,
+        root_task_id,
     } = request;
     let RuntimeNormalToolTurnExecutors {
         subagent_child_executor,
@@ -733,6 +739,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
     }
     let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
         .with_goal_mode(goal_mode)
+        .with_root_task_id(root_task_id)
         .with_services(instructions, memory, mcp_registry, hooks)
         .with_runtime(
             cost_tracker,
@@ -1072,6 +1079,50 @@ mod tests {
             status: RunStatus::Success,
             final_message: Some("child finished".to_string()),
             error: None,
+        })
+    }
+
+    fn scoped_cancellation_child_executor<W: io::Write>(
+        _config: &RunConfig,
+        _request: &ChildAgentRequest,
+        runtime: &mut ChildAgentRuntime<'_, W>,
+        _child_cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        let root_task_id = runtime
+            .root_task_id
+            .expect("subagent execution must preserve the parent root task id");
+        let registry = runtime
+            .task_registry
+            .expect("subagent execution must preserve the task registry");
+        let descendant = registry.create_subagent_with_parent(
+            "root-scoped descendant".to_string(),
+            Some("general".to_string()),
+            Some(root_task_id.to_string()),
+        );
+        registry
+            .mark_running(&descendant.id)
+            .expect("start root-scoped descendant");
+        let unrelated = registry
+            .list()
+            .into_iter()
+            .find(|task| task.description == "unrelated branch")
+            .expect("unrelated task fixture");
+
+        let stopped = registry
+            .signal_stop_tree(root_task_id)
+            .expect("stop the selected task tree");
+
+        assert!(stopped.iter().any(|task_id| task_id == root_task_id));
+        assert!(stopped.contains(&descendant.id));
+        assert!(!stopped.contains(&unrelated.id));
+        assert_eq!(
+            registry.get(&unrelated.id).expect("unrelated task").status,
+            orca_core::task_types::TaskStatus::Running
+        );
+        Ok(ChildAgentResult {
+            status: RunStatus::Cancelled,
+            final_message: None,
+            error: Some("root-scoped cancellation".to_string()),
         })
     }
 
@@ -1466,6 +1517,7 @@ mod tests {
                 emit_deltas: false,
                 goal_mode: false,
                 policy: &policy,
+                root_task_id: None,
             },
             io: RuntimeNormalToolTurnIo {
                 events: &mut events,
@@ -1509,6 +1561,115 @@ mod tests {
         assert!(
             matches!(&conversation.messages[0], Message::Tool { tool_call_id, content, .. }
                 if tool_call_id == "tool-1" && content.contains("hello"))
+        );
+    }
+
+    #[test]
+    fn run_normal_tool_turn_preserves_root_task_cancellation_scope() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut config = config_with_external(Vec::new());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let request = ToolRequest {
+            id: "scoped-child".to_string(),
+            name: ToolName::Subagent,
+            action: ActionKind::Agent,
+            target: Some("inspect cancellation scope".to_string()),
+            raw_arguments: Some(
+                json!({
+                    "description": "inspect cancellation scope",
+                    "prompt": "inspect cancellation scope",
+                    "mode": "sync"
+                })
+                .to_string(),
+            ),
+        };
+        let policy = policy_for_tool_execution(&config);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("root-task-scope".to_string());
+        let root = task_registry.create_main_session("selected root".to_string());
+        task_registry
+            .mark_running(&root.id)
+            .expect("start root task");
+        let unrelated = task_registry.create_main_session("unrelated branch".to_string());
+        task_registry
+            .mark_running(&unrelated.id)
+            .expect("start unrelated task");
+        let mut events = EventFactory::new("root-task-scope".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+
+        let execution = run_normal_tool_turn(RuntimeNormalToolTurnContext {
+            sampling_state: &mut sampling_state,
+            request: RuntimeNormalToolTurnRequest {
+                config: &config,
+                cwd: cwd.path(),
+                tool_request: &request,
+                subagent_depth: 0,
+                emit_deltas: false,
+                goal_mode: false,
+                policy: &policy,
+                root_task_id: Some(&root.id),
+            },
+            io: RuntimeNormalToolTurnIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                cost_tracker: &mut cost_tracker,
+                background_workflows: &mut background_workflows,
+            },
+            services: RuntimeNormalToolTurnServices {
+                instructions: &instructions,
+                memory: &memory,
+                mcp_registry: &registry,
+                hooks: &hooks,
+            },
+            runtime: RuntimeNormalToolTurnRuntime {
+                cancel: &cancel,
+                task_registry: &task_registry,
+                workflow_ipc: None,
+                workflow_lifecycle_ingress: None,
+                wait_for_background_workflows: true,
+            },
+            interactions: RuntimeNormalToolTurnInteractions {
+                approval_handler: None,
+                permission_handler: None,
+                user_input_handler: None,
+                mcp_elicitation_handler: None,
+                provider_response_ingress: None,
+            },
+            extensions: None,
+            executors: RuntimeNormalToolTurnExecutors {
+                subagent_child_executor: scoped_cancellation_child_executor::<io::Sink>,
+                workflow_child_executor: unused_child_executor,
+            },
+        })
+        .expect("run scoped subagent turn");
+
+        assert!(matches!(
+            execution.outcome,
+            ToolTurnOutcome::Return {
+                status: RunStatus::Cancelled,
+                ..
+            }
+        ));
+        assert_eq!(
+            task_registry.get(&root.id).expect("root task").status,
+            orca_core::task_types::TaskStatus::Stopping
+        );
+        assert_eq!(
+            task_registry
+                .get(&unrelated.id)
+                .expect("unrelated task")
+                .status,
+            orca_core::task_types::TaskStatus::Running
         );
     }
 
@@ -2809,6 +2970,7 @@ mod tests {
                 emit_deltas: false,
                 goal_mode: false,
                 policy: &policy,
+                root_task_id: None,
             },
             io: RuntimeNormalToolTurnIo {
                 events: &mut events,

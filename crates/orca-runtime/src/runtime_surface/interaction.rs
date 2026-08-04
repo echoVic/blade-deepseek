@@ -1,4 +1,14 @@
-use super::*;
+use super::identity::{
+    CanonicalBackgroundFenceV1, CanonicalPath, CanonicalTaskFenceV1, Denied, DisplayText,
+    FiniteF64, HostIncarnation, HostMonotonicClockId, InteractionRevision, MonotonicInstant,
+    NonEmptySet, NonEmptyText, NonEmptyVec, OpaqueToken, PolicyEpoch, ResponseRouteEpoch,
+    Sha256Digest, SurfaceAttachmentId, SurfaceBackgroundFence, SurfaceConnectionId,
+    SurfaceIncarnation, SurfaceInteractionId, SurfaceOperationFence, SurfaceOperationId,
+    SurfaceResponseGrantToken, SurfaceResponseId, SurfaceResponseReceiptId, SurfaceResponseToken,
+    SurfaceTaskFence, SurfaceThreadId, SurfaceToolCallId, SurfaceTurnId, SurfaceValueError,
+    UnixMillis, UuidV7, canonical_background_fence_v1, canonical_task_fence_v1,
+};
+use super::operation::CancelReason;
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -1002,6 +1012,9 @@ pub(super) fn canonical_interaction_patch_v1(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_surface::identity::{
+        SurfaceBackgroundOwnerToken, SurfaceGenerationId, ThreadOwnerEpoch,
+    };
 
     fn uuid_v7_bytes(seed: u8) -> [u8; 16] {
         let mut bytes = [seed; 16];

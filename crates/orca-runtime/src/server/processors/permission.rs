@@ -141,41 +141,39 @@ fn run_permission_respond<W: Write>(
             );
         }
         let answer = match &target {
-            crate::unstable_surface::SurfaceInteractionKind::ToolApproval => {
-                crate::unstable_surface::SurfaceClientInteractionAnswer::ToolApproval {
+            crate::surface::SurfaceInteractionKind::ToolApproval => {
+                crate::surface::SurfaceClientInteractionAnswer::ToolApproval {
                     decision: if allow {
-                        crate::unstable_surface::SurfaceAllowDeny::Allow
+                        crate::surface::SurfaceAllowDeny::Allow
                     } else {
-                        crate::unstable_surface::SurfaceAllowDeny::Deny
+                        crate::surface::SurfaceAllowDeny::Deny
                     },
                 }
             }
-            crate::unstable_surface::SurfaceInteractionKind::PermissionRequest => {
+            crate::surface::SurfaceInteractionKind::PermissionRequest => {
                 let scope = match scope {
                     protocol::PermissionGrantScope::Turn => {
-                        crate::unstable_surface::PermissionGrantScope::Turn
+                        crate::surface::PermissionGrantScope::Turn
                     }
                     protocol::PermissionGrantScope::Session => {
-                        crate::unstable_surface::PermissionGrantScope::Session
+                        crate::surface::PermissionGrantScope::Session
                     }
                 };
                 let permissions = surface_permission_profile(&permissions);
                 let decision = if allow {
-                    crate::unstable_surface::SurfacePermissionClientDecision::Allow {
+                    crate::surface::SurfacePermissionClientDecision::Allow {
                         scope,
                         permissions,
                         strict_auto_review,
                     }
                 } else {
-                    crate::unstable_surface::SurfacePermissionClientDecision::Deny {
+                    crate::surface::SurfacePermissionClientDecision::Deny {
                         scope,
                         permissions,
                         strict_auto_review,
                     }
                 };
-                crate::unstable_surface::SurfaceClientInteractionAnswer::PermissionRequest {
-                    decision,
-                }
+                crate::surface::SurfaceClientInteractionAnswer::PermissionRequest { decision }
             }
             _ => {
                 return protocol::write_server_event(
@@ -187,11 +185,11 @@ fn run_permission_respond<W: Write>(
                 );
             }
         };
-        let response_request_id = crate::unstable_surface::SurfaceRequestId::new();
+        let response_request_id = crate::surface::SurfaceRequestId::new();
         match client.respond_interaction_by_id(response_request_id, interaction_id.clone(), answer)
         {
-            Ok(crate::unstable_surface::MutationReply::Committed { .. }) => {}
-            Ok(crate::unstable_surface::MutationReply::Deferred { mutation, .. }) => {
+            Ok(crate::surface::MutationReply::Committed { .. }) => {}
+            Ok(crate::surface::MutationReply::Deferred { mutation, .. }) => {
                 state.permission_routes.mark_committed_pending(
                     request_id,
                     &mutation,
@@ -205,7 +203,7 @@ fn run_permission_respond<W: Write>(
                     )),
                 );
             }
-            Ok(crate::unstable_surface::MutationReply::Uncommitted { .. }) => {
+            Ok(crate::surface::MutationReply::Uncommitted { .. }) => {
                 return protocol::write_server_event(
                     writer,
                     &id,
@@ -324,16 +322,16 @@ fn materialize_surface_permission_profile(
 
 fn surface_permission_profile(
     permissions: &protocol::RequestPermissionProfile,
-) -> crate::unstable_surface::SurfacePermissionProfile {
-    crate::unstable_surface::SurfacePermissionProfile {
+) -> crate::surface::SurfacePermissionProfile {
+    crate::surface::SurfacePermissionProfile {
         file_system: permissions.file_system.as_ref().map(|file_system| {
-            crate::unstable_surface::SurfaceFileSystemPermissionProfile {
+            crate::surface::SurfaceFileSystemPermissionProfile {
                 read: file_system.read.as_ref().map(|paths| {
                     paths
                         .iter()
                         .map(|path| {
-                            crate::unstable_surface::SurfacePermissionPathLabel(
-                                crate::unstable_surface::DisplayText::new(
+                            crate::surface::SurfacePermissionPathLabel(
+                                crate::surface::DisplayText::new(
                                     path.to_string_lossy().to_string(),
                                 ),
                             )
@@ -344,8 +342,8 @@ fn surface_permission_profile(
                     paths
                         .iter()
                         .map(|path| {
-                            crate::unstable_surface::SurfacePermissionPathLabel(
-                                crate::unstable_surface::DisplayText::new(
+                            crate::surface::SurfacePermissionPathLabel(
+                                crate::surface::DisplayText::new(
                                     path.to_string_lossy().to_string(),
                                 ),
                             )
@@ -355,22 +353,22 @@ fn surface_permission_profile(
             }
         }),
         network: permissions.network.as_ref().map(|network| {
-            crate::unstable_surface::SurfacePermissionNetworkProfile {
+            crate::surface::SurfacePermissionNetworkProfile {
                 enabled: network.enabled,
                 domains: network
                     .domains
                     .iter()
                     .map(|(domain, access)| {
                         (
-                            crate::unstable_surface::SurfacePermissionDomainPattern(
-                                crate::unstable_surface::DisplayText::new(domain.clone()),
+                            crate::surface::SurfacePermissionDomainPattern(
+                                crate::surface::DisplayText::new(domain.clone()),
                             ),
                             match access {
                                 orca_core::config::PermissionProfileNetworkAccess::Allow => {
-                                    crate::unstable_surface::SurfaceAllowDeny::Allow
+                                    crate::surface::SurfaceAllowDeny::Allow
                                 }
                                 orca_core::config::PermissionProfileNetworkAccess::Deny => {
-                                    crate::unstable_surface::SurfaceAllowDeny::Deny
+                                    crate::surface::SurfaceAllowDeny::Deny
                                 }
                             },
                         )
@@ -379,7 +377,7 @@ fn surface_permission_profile(
             }
         }),
         shell: permissions.shell.as_ref().map(|shell| {
-            crate::unstable_surface::SurfaceShellPermissionProfile {
+            crate::surface::SurfaceShellPermissionProfile {
                 unsandboxed: shell.unsandboxed,
             }
         }),

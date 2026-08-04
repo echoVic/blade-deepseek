@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
+use std::time::Duration;
 
 use orca_core::goal_runtime::{
     GoalGap, GoalId, GoalNextAction, GoalOuterTurnId, GoalRecord, GoalState, GoalTurnOrigin,
@@ -25,6 +26,7 @@ use crate::goal_store::{
 use crate::goal_tracker::{GoalTracker, GoalTurnResult, SAME_GAP_STREAK_LIMIT};
 
 const ACTOR_MAILBOX_CAPACITY: usize = 32;
+const GOAL_ACTOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 static GOAL_RUNTIME_LEASES: OnceLock<Mutex<HashMap<PathBuf, Weak<GoalRuntimeLeaseInner>>>> =
     OnceLock::new();
 #[cfg(test)]
@@ -89,6 +91,7 @@ pub struct GoalContinuationSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GoalActorError {
     Closed,
+    Timeout { timeout: Duration },
     Store(String),
     Invalid(String),
     OwnerActive { path: String, message: String },
@@ -98,6 +101,9 @@ impl fmt::Display for GoalActorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Closed => formatter.write_str("goal actor mailbox is closed"),
+            Self::Timeout { timeout } => {
+                write!(formatter, "goal actor reply timed out after {timeout:?}")
+            }
             Self::Store(error) => write!(formatter, "goal actor store error: {error}"),
             Self::Invalid(error) => formatter.write_str(error),
             Self::OwnerActive { path, message } => {
@@ -121,6 +127,7 @@ impl From<GoalStoreError> for GoalActorError {
 #[derive(Clone)]
 pub struct GoalRuntimeHandle {
     sender: SyncSender<GoalActorCommand>,
+    request_timeout: Duration,
 }
 
 impl fmt::Debug for GoalRuntimeHandle {
@@ -717,7 +724,29 @@ enum GoalActorCommand {
         at: i64,
         reply: Reply,
     },
+    #[cfg(test)]
+    DelayForTest {
+        duration: Duration,
+        started: SyncSender<()>,
+        reply: Reply,
+    },
     Shutdown,
+}
+
+impl GoalActorCommand {
+    fn is_read_only(&self) -> bool {
+        match self {
+            Self::Read { .. }
+            | Self::Project { .. }
+            | Self::ContinuationState { .. }
+            | Self::RecentGapFingerprints { .. }
+            | Self::PendingSurfaceMutations { .. }
+            | Self::LatestActive { .. } => true,
+            #[cfg(test)]
+            Self::DelayForTest { .. } => true,
+            _ => false,
+        }
+    }
 }
 
 type Reply = SyncSender<Result<GoalActorReply, GoalActorError>>;
@@ -785,7 +814,23 @@ impl GoalRuntimeHandle {
             .name("orca-goal-actor".to_string())
             .spawn(move || actor.run())
             .expect("goal actor thread must start");
-        (Self { sender }, join)
+        (
+            Self {
+                sender,
+                request_timeout: GOAL_ACTOR_REQUEST_TIMEOUT,
+            },
+            join,
+        )
+    }
+
+    #[cfg(test)]
+    fn spawn_with_request_timeout_for_test(
+        store: GoalStore,
+        request_timeout: Duration,
+    ) -> (Self, thread::JoinHandle<()>) {
+        let (mut handle, join) = Self::spawn(store);
+        handle.request_timeout = request_timeout;
+        (handle, join)
     }
 
     #[cfg(test)]
@@ -805,6 +850,26 @@ impl GoalRuntimeHandle {
             Vec::new()
         };
         Ok(Self::spawn_with_lease(store, Some(lease), recoveries))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delay_for_test(
+        &self,
+        duration: Duration,
+    ) -> Result<thread::JoinHandle<()>, GoalActorError> {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.sender
+            .send(GoalActorCommand::DelayForTest {
+                duration,
+                started: started_tx,
+                reply: reply_tx,
+            })
+            .map_err(|_| GoalActorError::Closed)?;
+        started_rx.recv().map_err(|_| GoalActorError::Closed)?;
+        Ok(thread::spawn(move || {
+            let _ = reply_rx.recv();
+        }))
     }
 
     pub fn read(&self, session_id: &str) -> Result<Option<GoalRecord>, GoalActorError> {
@@ -1537,10 +1602,44 @@ impl GoalRuntimeHandle {
         command: impl FnOnce(Reply) -> GoalActorCommand,
     ) -> Result<GoalActorReply, GoalActorError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.sender
-            .send(command(reply_tx))
-            .map_err(|_| GoalActorError::Closed)?;
-        reply_rx.recv().map_err(|_| GoalActorError::Closed)?
+        let deadline = std::time::Instant::now() + self.request_timeout;
+        let command = command(reply_tx);
+        let read_only = command.is_read_only();
+        let mut pending = Some(command);
+        loop {
+            match self
+                .sender
+                .try_send(pending.take().expect("pending Goal command"))
+            {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(command)) => {
+                    pending = Some(command);
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(GoalActorError::Timeout {
+                            timeout: self.request_timeout,
+                        });
+                    }
+                    thread::sleep(remaining.min(Duration::from_millis(1)));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(GoalActorError::Closed);
+                }
+            }
+        }
+
+        if !read_only {
+            return reply_rx.recv().map_err(|_| GoalActorError::Closed)?;
+        }
+
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match reply_rx.recv_timeout(remaining) {
+            Ok(reply) => reply,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(GoalActorError::Timeout {
+                timeout: self.request_timeout,
+            }),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(GoalActorError::Closed),
+        }
     }
 }
 
@@ -2113,6 +2212,16 @@ impl GoalActor {
                 self.resume(&session_id, origin, at)
                     .map(GoalActorReply::Action),
             ),
+            #[cfg(test)]
+            GoalActorCommand::DelayForTest {
+                duration,
+                started,
+                reply,
+            } => {
+                let _ = started.send(());
+                thread::sleep(duration);
+                (reply, Ok(GoalActorReply::None))
+            }
             GoalActorCommand::Shutdown => unreachable!(),
         };
         let _ = reply.send(result);
@@ -2968,6 +3077,68 @@ mod tests {
     use super::*;
     use orca_core::goal_runtime::{EvidenceItem, GoalPauseReason, GoalRequestedState, IntentId};
     use tempfile::tempdir;
+
+    #[test]
+    fn goal_actor_request_times_out_with_typed_error() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let timeout = std::time::Duration::from_millis(20);
+        let (handle, join) = GoalRuntimeHandle::spawn_with_request_timeout_for_test(store, timeout);
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (delay_reply_tx, delay_reply_rx) = mpsc::sync_channel(1);
+
+        handle
+            .sender
+            .send(GoalActorCommand::DelayForTest {
+                duration: std::time::Duration::from_millis(80),
+                started: started_tx,
+                reply: delay_reply_tx,
+            })
+            .unwrap();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let started_at = std::time::Instant::now();
+        let error = handle.latest_active().unwrap_err();
+        assert!(matches!(
+            error,
+            GoalActorError::Timeout { timeout: actual } if actual == timeout
+        ));
+        assert!(
+            started_at.elapsed() < std::time::Duration::from_millis(200),
+            "goal actor request exceeded its bounded wait"
+        );
+
+        delay_reply_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle.latest_active().unwrap(), None);
+
+        handle.shutdown().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn admitted_goal_mutation_waits_for_an_unambiguous_result() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let timeout = std::time::Duration::from_millis(20);
+        let (handle, join) = GoalRuntimeHandle::spawn_with_request_timeout_for_test(store, timeout);
+        let blocker = handle
+            .delay_for_test(std::time::Duration::from_millis(80))
+            .unwrap();
+
+        let started_at = std::time::Instant::now();
+        let record = create(&handle, "mutation-waits");
+
+        assert_eq!(record.session_id, "mutation-waits");
+        assert!(started_at.elapsed() >= std::time::Duration::from_millis(40));
+        blocker.join().unwrap();
+        handle.shutdown().unwrap();
+        join.join().unwrap();
+    }
 
     fn create(handle: &GoalRuntimeHandle, session_id: &str) -> GoalRecord {
         handle

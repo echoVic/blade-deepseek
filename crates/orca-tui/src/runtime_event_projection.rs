@@ -1,4 +1,3 @@
-use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{
     ContextCompactedPayload, ContextCompactionStartedPayload, EventEnvelope, EventType,
 };
@@ -17,12 +16,9 @@ pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiE
         EventType::AssistantMessageDelta => Some(TuiEvent::MessageDelta(
             event.payload["text"].as_str()?.to_string(),
         )),
-        EventType::UsageUpdated => Some(TuiEvent::UsageUpdated(UsageTotals {
-            input_tokens: event.payload["input_tokens"].as_u64()?,
-            output_tokens: event.payload["output_tokens"].as_u64()?,
-            cache_tokens: event.payload["cache_tokens"].as_u64().unwrap_or_default(),
-            estimated_cost_usd: event.payload["estimated_cost_usd"].as_f64()?,
-        })),
+        // Typed surface usage events carry the authoritative usage revision.
+        // The legacy event sequence is unrelated and must not enter that domain.
+        EventType::UsageUpdated => None,
         EventType::ContextUpdated => Some(TuiEvent::ContextUpdated {
             used_tokens: event.payload["used_tokens"].as_u64()? as usize,
             limit_tokens: event.payload["limit_tokens"].as_u64()? as usize,
@@ -617,26 +613,17 @@ mod tests {
     fn runtime_usage_error_and_completion_events_map_to_tui_events() {
         let mut events = EventFactory::new("tui-runtime-adapter".to_string());
 
-        let usage = project(events.usage_updated(UsageTotals {
+        let usage = project(events.usage_updated(orca_core::cost_types::UsageTotals {
             input_tokens: 10,
             output_tokens: 5,
             cache_tokens: 2,
             estimated_cost_usd: 0.001,
-        }))
-        .expect("usage event");
+        }));
         let error = project(events.error("boom")).expect("error event");
         let completed = project(events.session_completed(RunStatus::BudgetExhausted))
             .expect("completion event");
 
-        match usage {
-            TuiEvent::UsageUpdated(totals) => {
-                assert_eq!(totals.input_tokens, 10);
-                assert_eq!(totals.output_tokens, 5);
-                assert_eq!(totals.cache_tokens, 2);
-                assert_eq!(totals.estimated_cost_usd, 0.001);
-            }
-            other => panic!("expected usage event, got {other:?}"),
-        }
+        assert!(usage.is_none());
         assert!(matches!(error, TuiEvent::Error(message) if message == "boom"));
         assert!(
             matches!(completed, TuiEvent::SessionCompleted { status } if status == "budget_exhausted")

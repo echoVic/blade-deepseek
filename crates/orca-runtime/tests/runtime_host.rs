@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -43,6 +43,12 @@ use orca_runtime::runtime_host::{
 };
 use orca_runtime::runtime_pending_interaction::{
     RuntimePendingInteractionRecord, RuntimePendingInteractionStore,
+};
+use orca_runtime::surface::{
+    AttachResult, CompactionState, FreshAttachRequest, MutationReply, OperationPatch,
+    OperationTerminal as SurfaceOperationTerminal, SurfaceAttachmentRole, SurfaceCapability,
+    SurfaceEvent, SurfaceInteractionKind, SurfaceRequestId, SurfaceSubscriptionItem,
+    WaitOperationTerminalResult,
 };
 use orca_runtime::thread::RuntimeThread;
 
@@ -2857,6 +2863,122 @@ fn runtime_host_owns_suspended_provider_and_releases_actor_for_the_next_turn() {
 }
 
 #[test]
+fn background_controller_trace_equivalence() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf()),
+            "background controller completion trace",
+        )
+        .expect("start hosted runtime thread");
+    let observer = Arc::new(RecordingEventObserver::default());
+    let release_marker = cwd.path().join("background-release");
+    let request = HostedTurnRequest::new(format!(
+        "mock_stream_release_marker {}",
+        release_marker.display()
+    ))
+    .with_task_description("controller-owned background completion")
+    .with_event_observer(observer.clone())
+    .with_generation_handlers(|_fence, _cancel| {
+        HostedGenerationHandlers::default()
+            .with_provider_suspension_control(Arc::new(OneShotProviderSuspension::new()))
+    });
+    let operation = thread
+        .start_turn(request, io::sink())
+        .expect("start backgroundable provider turn");
+    let task_id = match operation
+        .wait_timeout(TEST_TIMEOUT)
+        .expect("background handoff terminal")
+        .outcome()
+    {
+        OperationOutcome::Backgrounded { task_id } => task_id.clone(),
+        other => panic!("expected background handoff, got {other:?}"),
+    };
+    let admitted = thread.task_registry().get(&task_id).unwrap();
+    assert_eq!(admitted.status, TaskStatus::Running);
+    assert!(admitted.is_backgrounded);
+
+    let foreground = thread
+        .start_turn(
+            HostedTurnRequest::new("concurrent foreground").with_event_observer(observer.clone()),
+            io::sink(),
+        )
+        .expect("background ownership releases foreground admission");
+    assert_eq!(
+        thread.task_registry().get(&task_id).unwrap().status,
+        TaskStatus::Running,
+        "background provider must remain in-flight after foreground admission"
+    );
+    std::fs::write(&release_marker, "release").expect("release background completion");
+    assert_eq!(
+        foreground.wait_timeout(TEST_TIMEOUT).unwrap().outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+    wait_until_task_status(&thread, &task_id, TaskStatus::Completed);
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while !observer.events().iter().any(|event| {
+        event.event_type == EventType::TaskStatusUpdated
+            && event.payload["task"]["id"] == task_id
+            && event.payload["task"]["status"] == "completed"
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "missing background completion event"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_one_thread_event_sequence(&observer, thread.thread_id());
+    host.shutdown().expect("shutdown completed background host");
+
+    let cancel_cwd = tempfile::tempdir().unwrap();
+    let cancel_host = RuntimeHost::start().expect("start cancellation host");
+    let cancel_thread = cancel_host
+        .start_thread(
+            test_config(cancel_cwd.path().to_path_buf()),
+            "background controller cancellation trace",
+        )
+        .expect("start cancellation thread");
+    let cancel_operation = cancel_thread
+        .start_turn(
+            HostedTurnRequest::new("mock_stream_delay_ms 5000")
+                .with_task_description("controller-owned background cancellation")
+                .with_generation_handlers(|_fence, _cancel| {
+                    HostedGenerationHandlers::default().with_provider_suspension_control(Arc::new(
+                        OneShotProviderSuspension::new(),
+                    ))
+                }),
+            io::sink(),
+        )
+        .expect("start cancellable provider turn");
+    let cancelled_task_id = match cancel_operation
+        .wait_timeout(TEST_TIMEOUT)
+        .expect("cancellation handoff terminal")
+        .outcome()
+    {
+        OperationOutcome::Backgrounded { task_id } => task_id.clone(),
+        other => panic!("expected background handoff, got {other:?}"),
+    };
+    let started = Instant::now();
+    cancel_host
+        .shutdown()
+        .expect("cancel and join background work");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "background cancellation took {elapsed:?}, reaching the provider's 5 second delay"
+    );
+    assert_eq!(
+        cancel_thread
+            .task_registry()
+            .get(&cancelled_task_id)
+            .unwrap()
+            .status,
+        TaskStatus::Stopped
+    );
+}
+
+#[test]
 fn provider_background_handoff_keeps_one_thread_event_sequence() {
     let cwd = tempfile::tempdir().unwrap();
     let config = test_config(cwd.path().to_path_buf());
@@ -3319,6 +3441,160 @@ fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
 }
 
 #[test]
+fn goal_store_wait_does_not_block_thread_actor() {
+    with_orca_home(|home| {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start runtime host");
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host
+            .start_thread(config, "goal store responsiveness")
+            .expect("start recorded runtime thread");
+
+        let lock = rusqlite::Connection::open(home.join("goals.sqlite3")).unwrap();
+        lock.busy_timeout(TEST_TIMEOUT).unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let goal_thread = thread.clone();
+        let (goal_tx, goal_rx) = std::sync::mpsc::sync_channel(1);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let goal_request = std::thread::spawn(move || {
+            let _ = started_tx.send(());
+            let _ = goal_tx.send(goal_thread.goal_runtime());
+        });
+        started_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("goal runtime request thread did not start");
+        assert!(matches!(
+            goal_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        let snapshot_thread = thread.clone();
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(1);
+        let snapshot_request = std::thread::spawn(move || {
+            let _ = snapshot_tx.send(snapshot_thread.snapshot());
+        });
+        let snapshot = snapshot_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("goal store wait blocked the runtime thread actor");
+        assert!(snapshot.is_ok());
+        assert!(matches!(
+            goal_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        lock.execute_batch("ROLLBACK").unwrap();
+        goal_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("goal runtime request did not settle after releasing SQLite")
+            .expect("goal runtime request failed after releasing SQLite");
+        goal_request.join().unwrap();
+        snapshot_request.join().unwrap();
+        host.shutdown().expect("shutdown runtime host");
+    });
+}
+
+#[test]
+fn capability_controller_trace_equivalence() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.history_mode = HistoryMode::Record;
+    let thread = host
+        .surface_handle()
+        .start_thread(config, "capability controller trace")
+        .expect("start typed runtime thread");
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::SubmitOperation,
+            SurfaceCapability::ControlBoundOperation,
+        ]),
+        interaction_capabilities: BTreeSet::<SurfaceInteractionKind>::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        _ => panic!("typed surface must accept a fresh attachment"),
+    };
+    let expected_context_revision = attachment.baseline.snapshot.context.revision;
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .expect("claim typed subscription");
+    let output = match attachment
+        .client
+        .manual_compact(SurfaceRequestId::new(), expected_context_revision)
+        .expect("commit manual compaction")
+    {
+        MutationReply::Committed { value, .. } => value,
+        _ => panic!("manual compaction must commit"),
+    };
+
+    let first_terminal = attachment
+        .client
+        .wait_operation_terminal(SurfaceRequestId::new(), output.operation_id.clone())
+        .expect("wait for committed terminal");
+    let cached_terminal = attachment
+        .client
+        .wait_operation_terminal(SurfaceRequestId::new(), output.operation_id.clone())
+        .expect("read cached terminal");
+    assert!(first_terminal == cached_terminal);
+    assert!(matches!(
+        first_terminal,
+        WaitOperationTerminalResult::Terminal { value }
+            if matches!(value.terminal, SurfaceOperationTerminal::Succeeded { .. })
+    ));
+
+    let mut trace = Vec::new();
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while !trace.contains(&"terminal_committed") {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "missing terminal projection batch");
+        let Some(item) = subscription.recv_timeout(remaining) else {
+            panic!("missing terminal projection batch");
+        };
+        let SurfaceSubscriptionItem::Batch { batch } = item else {
+            continue;
+        };
+        for envelope in batch.events.as_slice() {
+            match &envelope.event {
+                SurfaceEvent::Context(context) => match &context.compaction {
+                    CompactionState::Running { operation_id, .. }
+                        if operation_id == &output.operation_id =>
+                    {
+                        trace.push("compaction_running");
+                    }
+                    CompactionState::Completed { operation_id, .. }
+                        if operation_id == &output.operation_id =>
+                    {
+                        trace.push("compaction_completed");
+                    }
+                    _ => {}
+                },
+                SurfaceEvent::Operation(OperationPatch::Terminal { record })
+                    if record.operation_id == output.operation_id =>
+                {
+                    trace.push("terminal_committed");
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        trace,
+        vec![
+            "compaction_running",
+            "compaction_completed",
+            "terminal_committed",
+        ]
+    );
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
 fn turn_with_goal_usage_tracking_accounts_tokens_and_flips_budget_limited() {
     with_orca_home(|_home| {
         let executor = Arc::new(ScriptedExecutor::new([
@@ -3468,7 +3744,7 @@ fn composite_goal_run_marks_automatic_outer_turn_as_continuation() {
 }
 
 #[test]
-fn active_goal_run_pause_is_runtime_owned_and_settles_usage_before_closing() {
+fn goal_controller_trace_equivalence() {
     with_orca_home(|home| {
         let gate = CancelJoinGate::new();
         let executor = Arc::new(ScriptedExecutor::new([
@@ -3551,6 +3827,80 @@ fn active_goal_run_pause_is_runtime_owned_and_settles_usage_before_closing() {
         assert_eq!(audit.usage_events, 1);
         assert_eq!(observer.count(EventType::GoalTransitioned), 1);
         assert_eq!(observer.count(EventType::GoalPaused), 1);
+
+        let resumed_at = chrono::Utc::now().timestamp() + 1;
+        assert!(matches!(
+            runtime
+                .resume(
+                    &session_id,
+                    orca_core::goal_runtime::GoalTurnOrigin::Resume,
+                    resumed_at,
+                )
+                .unwrap(),
+            orca_core::goal_runtime::GoalNextAction::Continue {
+                reason: orca_core::goal_runtime::GoalContinuationReason::Resume,
+            }
+        ));
+        runtime
+            .begin_outer_turn(
+                &session_id,
+                orca_core::goal_runtime::GoalTurnOrigin::Resume,
+                "goal-controller-verification",
+                resumed_at + 1,
+            )
+            .unwrap();
+        let intent = orca_core::goal_runtime::GoalUpdateIntent {
+            intent_id: orca_core::goal_runtime::IntentId::new(),
+            requested_state: orca_core::goal_runtime::GoalRequestedState::Complete,
+            reason: "controller trace verified".to_string(),
+            evidence: vec![orca_core::goal_runtime::EvidenceItem::observation(
+                "pause and resume state persisted",
+            )],
+            blocker: None,
+        };
+        assert!(matches!(
+            runtime
+                .submit_intent(&session_id, intent, resumed_at + 2)
+                .unwrap(),
+            orca_core::goal_runtime::GoalUpdateAck::DeferredToTurnEnd { .. }
+        ));
+        assert!(matches!(
+            runtime
+                .finish_outer_turn(
+                    &session_id,
+                    orca_core::goal_runtime::GoalTurnStatus::Success,
+                    orca_runtime::lifecycle::TurnEndReason::Unclassified,
+                    orca_core::goal_runtime::GoalUsage::default(),
+                    1,
+                    1,
+                    None,
+                    resumed_at + 3,
+                )
+                .unwrap(),
+            orca_core::goal_runtime::GoalNextAction::Verify { .. }
+        ));
+        assert!(matches!(
+            runtime
+                .verify(
+                    &session_id,
+                    orca_core::goal_runtime::GoalVerificationResult::Achieved {
+                        evidence: vec![orca_core::goal_runtime::EvidenceItem::observation(
+                            "controller trace terminalized",
+                        )],
+                    },
+                    resumed_at + 4,
+                )
+                .unwrap(),
+            orca_core::goal_runtime::GoalNextAction::Complete { .. }
+        ));
+        assert!(matches!(
+            runtime.read(&session_id).unwrap().unwrap().state,
+            orca_core::goal_runtime::GoalState::Complete { .. }
+        ));
+        let final_audit = store.audit_snapshot(&goal.goal_id).unwrap();
+        assert_eq!(final_audit.outer_turns, 2);
+        assert_eq!(final_audit.intents, 1);
+        assert_eq!(final_audit.in_flight_runs, 0);
 
         host.shutdown().expect("shutdown runtime host");
     });

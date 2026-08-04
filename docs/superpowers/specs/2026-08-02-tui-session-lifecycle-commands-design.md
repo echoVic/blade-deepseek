@@ -1,7 +1,7 @@
 # TUI Session Lifecycle Commands Design
 
 Date: 2026-08-02
-Status: approved for implementation
+Status: implemented; v0.3.3 release verification pending
 Scope: complete Orca's interactive session lifecycle without restoring `/history`
 
 ## Objective
@@ -149,6 +149,26 @@ enum SessionPickerPhase {
 - Clipboard failures remain best-effort through the existing helper, but argument and missing-message failures are visible in the transcript.
 - `/status`, `/copy`, and `/rename` are allowed during active work; `/fork` and session switching are not.
 - No command directly edits transcript JSONL.
+
+## Implemented Transaction Boundary
+
+The shipped implementation binds every projected event to an immutable session
+attachment. A switch activates the replacement attachment, resets session UI,
+and replays its exact history before the source runtime is retired. Events
+already queued by the source attachment are ignored after activation changes.
+
+Rename uses the current runtime metadata revision as a precondition, then
+persists the same title. A durable-write failure applies a second
+revision-checked patch that restores the prior projection, so disk and screen
+cannot silently disagree. Fork preserves the source history, creates a new
+identity through `HistoryMode::Fork`, and projects the copied transcript only
+after the replacement runtime is ready.
+
+The picker derives available actions from both the selected and attached
+session IDs. Archive and Delete are absent for the attached session, operate on
+the captured target ID after confirmation, and refresh from durable storage
+after settlement. Rendering tests cover every picker phase and bounded
+`/status` layouts; history contracts cover archive and delete across reloads.
 
 ## Testing
 

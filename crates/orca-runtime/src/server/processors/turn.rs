@@ -89,15 +89,13 @@ fn run_turn_control<W: Write + Send + 'static>(
     }
     let resolved_thread_id = active_thread_id.or_else(|| thread_id.map(ToString::to_string));
     let surface_action = match action {
-        "interrupt" => crate::unstable_surface::JsonlTurnControlAction::Interrupt,
-        "resume" => crate::unstable_surface::JsonlTurnControlAction::Resume,
-        "steer" => crate::unstable_surface::JsonlTurnControlAction::Steer {
-            input: crate::unstable_surface::SurfaceInputRequest {
-                blocks: crate::unstable_surface::NonEmptyVec::try_new(vec![
-                    crate::unstable_surface::SurfaceInputRequestBlock::Text {
-                        text: crate::unstable_surface::DisplayText::new(
-                            input.cloned().unwrap_or_default(),
-                        ),
+        "interrupt" => crate::surface::JsonlTurnControlAction::Interrupt,
+        "resume" => crate::surface::JsonlTurnControlAction::Resume,
+        "steer" => crate::surface::JsonlTurnControlAction::Steer {
+            input: crate::surface::SurfaceInputRequest {
+                blocks: crate::surface::NonEmptyVec::try_new(vec![
+                    crate::surface::SurfaceInputRequestBlock::Text {
+                        text: crate::surface::DisplayText::new(input.cloned().unwrap_or_default()),
                     },
                 ])
                 .map_err(|error| io::Error::other(error.to_string()))?,
@@ -116,15 +114,13 @@ fn run_turn_control<W: Write + Send + 'static>(
             }
         };
     let (status, steered_item) = match result {
-        crate::unstable_surface::JsonlTurnControlResult::Idle { .. } => ("idle", None),
-        crate::unstable_surface::JsonlTurnControlResult::Resolved { mutation } => match mutation {
-            crate::unstable_surface::MutationReply::Committed { value, .. } => {
+        crate::surface::JsonlTurnControlResult::Idle { .. } => ("idle", None),
+        crate::surface::JsonlTurnControlResult::Resolved { mutation } => match mutation {
+            crate::surface::MutationReply::Committed { value, .. } => {
                 let status = match value.echo.status {
-                    crate::unstable_surface::JsonlResolvedTurnControlStatus::Interrupted => {
-                        "interrupted"
-                    }
-                    crate::unstable_surface::JsonlResolvedTurnControlStatus::Resumed => "resumed",
-                    crate::unstable_surface::JsonlResolvedTurnControlStatus::Steered => "steered",
+                    crate::surface::JsonlResolvedTurnControlStatus::Interrupted => "interrupted",
+                    crate::surface::JsonlResolvedTurnControlStatus::Resumed => "resumed",
+                    crate::surface::JsonlResolvedTurnControlStatus::Steered => "steered",
                 };
                 let steered = value.input_item_id.map(|_| {
                     (
@@ -134,14 +130,14 @@ fn run_turn_control<W: Write + Send + 'static>(
                 });
                 (status, steered)
             }
-            crate::unstable_surface::MutationReply::Deferred { .. } => {
+            crate::surface::MutationReply::Deferred { .. } => {
                 return write_locked_event(
                     &writer,
                     &id,
                     ServerEvent::error("turn control is awaiting durable reconciliation"),
                 );
             }
-            crate::unstable_surface::MutationReply::Uncommitted { .. } => {
+            crate::surface::MutationReply::Uncommitted { .. } => {
                 return write_locked_event(
                     &writer,
                     &id,

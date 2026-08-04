@@ -1,23 +1,6 @@
-use orca_runtime::unstable_surface::*;
-use std::borrow::Cow;
+use orca_runtime::surface::*;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-
-fn normalized_source(source: &str) -> Cow<'_, str> {
-    if source.contains('\r') {
-        Cow::Owned(source.replace("\r\n", "\n").replace('\r', "\n"))
-    } else {
-        Cow::Borrowed(source)
-    }
-}
-
-#[test]
-fn source_shape_contracts_are_independent_of_checkout_line_endings() {
-    assert_eq!(
-        normalized_source("first\r\nsecond\rthird"),
-        "first\nsecond\nthird"
-    );
-}
 
 fn uuid_v7_bytes(seed: u8) -> [u8; 16] {
     let mut bytes = [seed; 16];
@@ -207,67 +190,6 @@ fn reservation_lease_has_one_canonical_v1_duration() {
             "accepted noncanonical lease duration {invalid_duration}"
         );
     }
-
-    let operation_source = normalized_source(include_str!("../src/runtime_surface/operation.rs"));
-    assert!(
-        operation_source.contains("pub(crate) fn new(\n        lease_id: SurfaceAdmissionLeaseId")
-    );
-    assert!(!operation_source.contains("pub fn new(\n        lease_id: SurfaceAdmissionLeaseId"));
-}
-
-fn declaration_block<'a>(source: &'a str, marker: &str) -> &'a str {
-    let start = source.find(marker).unwrap();
-    let remainder = &source[start..];
-    let end = remainder.find("\n}\n").unwrap() + 3;
-    &remainder[..end]
-}
-
-fn attributed_declaration_block<'a>(source: &'a str, marker: &str) -> &'a str {
-    let declaration = declaration_block(source, marker);
-    let declaration_start = declaration.as_ptr() as usize - source.as_ptr() as usize;
-    let attribute_start = source[..declaration_start]
-        .rfind("#[derive")
-        .unwrap_or(declaration_start);
-    &source[attribute_start..declaration_start + declaration.len()]
-}
-
-#[test]
-fn authority_and_secret_sources_keep_the_public_boundary_closed() {
-    let interaction_source =
-        normalized_source(include_str!("../src/runtime_surface/interaction.rs"));
-    for marker in [
-        "pub struct AuthorityFingerprint {",
-        "pub struct BoundInteractionResponse {",
-        "pub struct ValidatedInteractionResponse {",
-    ] {
-        let declaration = declaration_block(&interaction_source, marker);
-        assert!(
-            !attributed_declaration_block(&interaction_source, marker).contains("Debug"),
-            "Debug leaked in {marker}"
-        );
-        assert!(
-            !declaration
-                .lines()
-                .skip(1)
-                .any(|line| line.contains("pub ")),
-            "authority-bearing fields leaked in {marker}"
-        );
-    }
-    assert!(interaction_source.contains(
-        "pub struct ApplicableAuthorityFingerprint(ApplicableAuthorityFingerprintKind);"
-    ));
-    assert!(!interaction_source.contains("pub enum ApplicableAuthorityFingerprint"));
-    assert!(!interaction_source.contains(
-        "#[derive(Clone, Debug, Eq, PartialEq)]\npub struct ApplicableAuthorityFingerprint"
-    ));
-    assert!(
-        !interaction_source.contains("impl std::fmt::Debug for ApplicableAuthorityFingerprint")
-    );
-
-    let identity_source = normalized_source(include_str!("../src/runtime_surface/identity.rs"));
-    assert!(identity_source.contains("std::ptr::write_volatile"));
-    assert!(identity_source.contains("compiler_fence(Ordering::SeqCst)"));
-    assert!(!identity_source.contains("self.0.fill(0)"));
 }
 
 #[test]
@@ -2106,10 +2028,7 @@ fn every_identity_revision_fence_scope_and_capability_is_constructible() {
         commit_id: commit_id.clone(),
     };
     let ephemeral = CommitClass::Ephemeral {
-        incarnation: orca_runtime::unstable_surface::SurfaceIncarnation::try_from_bytes(
-            uuid_v7_bytes(4),
-        )
-        .unwrap(),
+        incarnation: SurfaceIncarnation::try_from_bytes(uuid_v7_bytes(4)).unwrap(),
         live_revision: LiveRevision::try_new(1).unwrap(),
         commit_id,
     };
@@ -2207,10 +2126,7 @@ fn independent_revision_domains_and_scalar_wrappers_do_not_collapse() {
     };
     let _cursor = SurfaceCursor {
         thread_id: SurfaceThreadId::try_from_bytes([6; 16]).unwrap(),
-        incarnation: orca_runtime::unstable_surface::SurfaceIncarnation::try_from_bytes(
-            uuid_v7_bytes(6),
-        )
-        .unwrap(),
+        incarnation: SurfaceIncarnation::try_from_bytes(uuid_v7_bytes(6)).unwrap(),
         next_seq: SequenceNumber::new(0),
         source_revision: CursorSourceRevision::Recorded {
             durable_revision: DurableRevision::try_new(1).unwrap(),

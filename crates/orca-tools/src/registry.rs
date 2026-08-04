@@ -47,17 +47,6 @@ pub trait Tool: Send + Sync {
         &self.spec().description
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "function",
-            "function": {
-                "name": self.name(),
-                "description": self.description(),
-                "parameters": self.spec().input_schema
-            }
-        })
-    }
-
     fn action_kind(&self) -> ActionKind {
         self.spec().capabilities.action_kind()
     }
@@ -244,13 +233,6 @@ impl ToolRegistry {
         resolved.tool.execute(request, ctx)
     }
 }
-
-/// Tools whose input schemas fit the DeepSeek strict-mode JSON Schema subset
-/// (every object lists all properties as required once optional fields are made
-/// nullable, additionalProperties is false throughout, and no unsupported
-/// keywords such as oneOf/minLength/minItems are used). Providers opt these
-/// tools into strict function calling on endpoints that support it.
-pub const STRICT_MODE_TOOL_NAMES: &[&str] = &["glob", "update_goal", "update_plan"];
 
 pub fn validate_tool_request(registry: &ToolRegistry, request: &ToolRequest) -> Result<(), String> {
     let Some(resolved) = registry.resolve(request.name.as_str()) else {
@@ -694,7 +676,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::GitStatus,
     ));
     registry.register(BuiltinTool::new(
-        conservative_builtin_spec(
+        cooperative_builtin_spec(
             "web_search",
             "Search the web for current information using Brave Search. Returns top results with title, summary, and URL.",
             json!({
@@ -1668,7 +1650,11 @@ impl Tool for BuiltinTool {
             }
             BuiltinExecutor::WriteFile => write_file::execute(request, ctx.cwd),
             BuiltinExecutor::GitStatus => git::status(request, ctx.cwd, ctx.max_output_bytes()),
-            BuiltinExecutor::WebSearch => web_search::execute(request, ctx.max_output_bytes()),
+            BuiltinExecutor::WebSearch => {
+                web_search::execute_or_cancel(request, ctx.max_output_bytes(), || {
+                    ctx.is_cancelled()
+                })
+            }
             BuiltinExecutor::Subagent => ToolResult::failed(
                 request,
                 "subagent tool must be executed by the runtime",
@@ -2196,9 +2182,18 @@ mod tests {
             );
         }
 
+        let web_search = registry.resolve("web_search").expect("web search tool");
+        assert_eq!(
+            web_search.spec.interrupt_semantics,
+            InterruptSemantics::CooperativeCancel
+        );
+        assert_eq!(
+            web_search.spec.replay_semantics,
+            ReplaySemantics::IndeterminateAfterStart
+        );
+
         for name in [
             "write_file",
-            "web_search",
             "subagent",
             "request_permissions",
             "request_user_input",

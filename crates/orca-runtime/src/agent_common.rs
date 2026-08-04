@@ -4,11 +4,11 @@ use orca_core::approval_types::{ActionKind, ApprovalMode};
 use orca_core::goal_types::ThreadGoal;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::ToolResult;
-use orca_provider::system_prompt::build_system_prompt;
 use orca_tools::skills;
 
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
+use crate::system_prompt::build_system_prompt;
 
 pub fn build_agent_system_prompt(
     cwd: &Path,

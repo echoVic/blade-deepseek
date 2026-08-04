@@ -152,6 +152,54 @@ fn session_store_thread_store_updates_metadata_by_thread_id() {
 }
 
 #[test]
+fn bounded_session_page_does_not_materialize_all_transcripts() {
+    with_orca_home(|home| {
+        let store = SessionStore::new();
+        let sessions = home.join("sessions").join("bulk");
+        std::fs::create_dir_all(&sessions).expect("create bulk session directory");
+        for index in 0..2_000 {
+            let meta = store.create_meta(
+                home,
+                "mock",
+                None,
+                &format!("metadata-only session {index}"),
+            );
+            let mut wire = serde_json::to_value(meta)
+                .expect("serialize session metadata")
+                .as_object()
+                .cloned()
+                .expect("session metadata is an object");
+            wire.insert(
+                "type".to_string(),
+                serde_json::Value::String("session.meta".to_string()),
+            );
+            std::fs::write(
+                sessions.join(format!("session-{index:04}.jsonl")),
+                format!(
+                    "{}\n{{this transcript body is intentionally invalid\n",
+                    serde_json::Value::Object(wire)
+                ),
+            )
+            .expect("write metadata-only session fixture");
+        }
+
+        let page = store
+            .list_threads(
+                None,
+                25,
+                ThreadListFilters::active(),
+                ThreadSortKey::UpdatedAt,
+                SortDirection::Desc,
+                None,
+            )
+            .expect("bounded metadata-only session page");
+
+        assert_eq!(page.data.len(), 25);
+        assert!(page.next_cursor.is_some());
+    });
+}
+
+#[test]
 fn session_store_thread_store_updates_permission_metadata_by_thread_id() {
     with_orca_home(|home| {
         let store = SessionStore::new();
