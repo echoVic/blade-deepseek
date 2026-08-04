@@ -13953,7 +13953,7 @@ impl ThreadActor {
                 completed,
                 "Goal recovery terminal must complete exactly once"
             );
-            self.surface_terminal_blocked = None;
+            self.refresh_surface_goal_completion_recovery_block();
             return Ok(());
         }
         let fence = operation
@@ -13984,7 +13984,7 @@ impl ThreadActor {
             true,
         ) {
             Ok(_) => {
-                self.surface_terminal_blocked = None;
+                self.refresh_surface_goal_completion_recovery_block();
                 Ok(())
             }
             Err(_)
@@ -14005,6 +14005,15 @@ impl ThreadActor {
         }
     }
 
+    fn refresh_surface_goal_completion_recovery_block(&mut self) {
+        self.surface_terminal_blocked = self.goal_controller.pending_recovery().map(|pending| {
+            format!(
+                "typed Goal completion recovery is pending: {}",
+                pending.message
+            )
+        });
+    }
+
     fn retain_surface_goal_completion_recovery(
         &mut self,
         active: ActiveOperation,
@@ -14018,14 +14027,7 @@ impl ThreadActor {
             message,
             retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
         };
-        if let Err(rejected) = self.goal_controller.set_pending_recovery(pending) {
-            self.surface_terminal_blocked = Some(
-                "typed Goal completion recovery collided with an existing recovery".to_string(),
-            );
-            if self.active.is_none() {
-                self.active = Some(rejected.active);
-            }
-        }
+        self.goal_controller.enqueue_pending_recovery(pending);
     }
 
     fn dispatch_surface_goal_completion_recovery(

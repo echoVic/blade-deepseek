@@ -87,7 +87,7 @@ pub(crate) struct GoalOperationController<
     completion_rx: mpsc::Receiver<Completion>,
     blocking_in_flight: bool,
     deferred_commands: VecDeque<Command>,
-    pending_recovery: Option<PendingRecovery>,
+    pending_recoveries: VecDeque<PendingRecovery>,
     active_control: Option<(OperationId, ActiveControl, Option<GoalTurnContext>)>,
     pending_pause_settlement: Option<(OperationId, PauseEvent)>,
 }
@@ -102,7 +102,7 @@ impl<Command, PendingRecovery, Completion, ActiveControl, PauseEvent>
             completion_rx,
             blocking_in_flight: false,
             deferred_commands: VecDeque::new(),
-            pending_recovery: None,
+            pending_recoveries: VecDeque::new(),
             active_control: None,
             pending_pause_settlement: None,
         }
@@ -140,23 +140,16 @@ impl<Command, PendingRecovery, Completion, ActiveControl, PauseEvent>
         self.deferred_commands.pop_front()
     }
 
-    pub(crate) fn set_pending_recovery(
-        &mut self,
-        pending: PendingRecovery,
-    ) -> Result<(), PendingRecovery> {
-        if self.pending_recovery.is_some() {
-            return Err(pending);
-        }
-        self.pending_recovery = Some(pending);
-        Ok(())
+    pub(crate) fn enqueue_pending_recovery(&mut self, pending: PendingRecovery) {
+        self.pending_recoveries.push_back(pending);
     }
 
     pub(crate) fn pending_recovery(&self) -> Option<&PendingRecovery> {
-        self.pending_recovery.as_ref()
+        self.pending_recoveries.front()
     }
 
     pub(crate) fn take_pending_recovery(&mut self) -> Option<PendingRecovery> {
-        self.pending_recovery.take()
+        self.pending_recoveries.pop_front()
     }
 
     pub(crate) fn bind_active(
@@ -267,7 +260,7 @@ impl<Command, PendingRecovery, Completion, ActiveControl, PauseEvent>
         GoalControllerTrace::new(
             self.blocking_in_flight,
             self.deferred_commands.len(),
-            self.pending_recovery.is_some(),
+            !self.pending_recoveries.is_empty(),
             self.active_control.is_some(),
             self.pending_pause_settlement.is_some(),
         )
@@ -319,7 +312,7 @@ mod tests {
         controller.defer(20);
         trace.push(controller.trace());
 
-        controller.set_pending_recovery(30).unwrap();
+        controller.enqueue_pending_recovery(30);
         trace.push(controller.trace());
         controller.finish_blocking();
         assert_eq!(controller.take_deferred(), Some(10));
@@ -342,9 +335,10 @@ mod tests {
         controller.completion_tx.try_send(40).unwrap();
         assert_eq!(controller.completion_rx.try_recv(), Ok(40));
 
-        controller.set_pending_recovery(31).unwrap();
-        assert_eq!(controller.set_pending_recovery(32), Err(32));
+        controller.enqueue_pending_recovery(31);
+        controller.enqueue_pending_recovery(32);
         assert_eq!(controller.take_pending_recovery(), Some(31));
+        assert_eq!(controller.take_pending_recovery(), Some(32));
 
         let allocator = OperationIdAllocator::new();
         let first = allocator.allocate();

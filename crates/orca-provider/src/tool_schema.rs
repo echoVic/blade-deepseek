@@ -65,7 +65,11 @@ fn require_all_properties(schema: &mut Value) {
     let Some(object) = schema.as_object_mut() else {
         return;
     };
-    let is_typed_object = object.get("type").and_then(Value::as_str) == Some("object");
+    let is_typed_object = match object.get("type") {
+        Some(Value::String(kind)) => kind == "object",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind.as_str() == Some("object")),
+        _ => false,
+    };
     if is_typed_object {
         object.insert("additionalProperties".to_string(), Value::Bool(false));
         if let Some(properties) = object.get("properties").and_then(Value::as_object) {
@@ -109,6 +113,12 @@ mod tests {
                         "properties": {
                             "name": { "type": "string" }
                         }
+                    },
+                    "nullable_nested": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "name": { "type": "string" }
+                        }
                     }
                 },
                 "required": ["required_value"],
@@ -140,11 +150,24 @@ mod tests {
         assert_eq!(tools[0]["function"]["strict"], true);
         assert_eq!(
             tools[0]["function"]["parameters"]["required"],
-            json!(["nested", "optional_value", "required_value"])
+            json!([
+                "nested",
+                "nullable_nested",
+                "optional_value",
+                "required_value"
+            ])
         );
         assert_eq!(
             tools[0]["function"]["parameters"]["properties"]["nested"]["additionalProperties"],
             false
+        );
+        assert_eq!(
+            tools[0]["function"]["parameters"]["properties"]["nullable_nested"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            tools[0]["function"]["parameters"]["properties"]["nullable_nested"]["required"],
+            json!(["name"])
         );
     }
 }

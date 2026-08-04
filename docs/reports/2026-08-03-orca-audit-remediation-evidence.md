@@ -85,6 +85,11 @@ small artifact set to LF and asserts the attributes. A fresh clone with
 `core.autocrlf=true` produced CRLF Rust sources, retained LF reviewed artifacts,
 and passed the live runtime contract.
 
+The final CodeRabbit follow-up added nullable-object strict-schema coverage and
+FIFO Goal recovery collision retention. Both focused red/green regressions,
+the workspace all-target check, validator self-tests and live gates,
+clippy (warnings only), formatting, `actionlint`, and diff checks passed.
+
 The release is incomplete until all table rows are closed and the following are
 independently visible:
 
