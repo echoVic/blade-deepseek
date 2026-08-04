@@ -41,6 +41,25 @@ is an explicit incomplete state, not evidence of success.
 
 ## Public Release Proof
 
+The release gate closed on 2026-08-04. The reviewed merge commit, tag, and
+public artifacts are independently visible:
+
+- GitHub [release `v0.3.3`](https://github.com/echoVic/orca-agent/releases/tag/v0.3.3)
+  is non-draft and targets `d08af0c5cc675c7a10d484e65c758558fdb40e8d`, the
+  merge commit on `main`.
+- The [release workflow run](https://github.com/echoVic/orca-agent/actions/runs/30879238425)
+  completed successfully. Its six native build jobs produced twelve archive
+  and checksum assets; the npm jobs produced seven tarballs and attached them
+  to the same release.
+- `@blade-ai/orca@0.3.3` and all six native npm aliases are visible on the
+  public registry. The repository verifier compared every npm tarball with its
+  GitHub release asset, checked archive/package binary and Windows helper
+  equality, performed a clean isolated install, and confirmed `orca --version`
+  reports `0.3.3`.
+- The final command was:
+  `node scripts/release/verify-published.mjs --version 0.3.3 --repo echoVic/orca-agent --package @blade-ai/orca --bin orca`
+  and exited 0 with `Published release verified: v0.3.3 d08af0c5cc675c7a10d484e65c758558fdb40e8d`.
+
 ## Verification Snapshot
 
 Pre-version verification on 2026-08-04 Asia/Shanghai (2026-08-03 UTC) completed
@@ -90,15 +109,10 @@ FIFO Goal recovery collision retention. Both focused red/green regressions,
 the workspace all-target check, validator self-tests and live gates,
 clippy (warnings only), formatting, `actionlint`, and diff checks passed.
 
-The release is incomplete until all table rows are closed and the following are
-independently visible:
-
-- GitHub tag and non-draft release `v0.3.3` at the same commit. The original
-  `v0.3.2` target was already published from upstream commit `10eef6329` when
-  this branch rebased on 2026-08-03.
-- Six native release archives with checksums and the seven npm tarballs
-  produced by the release workflow.
-- `@blade-ai/orca@0.3.3` plus all six platform packages on the public npm
-  registry.
-- A clean install in an isolated directory where `orca --version` reports
-  `0.3.3` and the binary provenance matches the published artifact.
+Public release verification completed after the tag workflow on 2026-08-04
+Asia/Shanghai. The release workflow's version, test, six build, GitHub Release,
+npm, npm-release-assets, verify, and both Windows verification jobs all exited
+successfully. The public verifier then confirmed the tag/main SHA, all 19
+release assets (12 native archives/checksums plus seven npm tarballs), registry
+integrity, archive/package parity, Windows helpers and license, isolated npm
+installation, and `orca --version` `0.3.3`.
