@@ -50,7 +50,8 @@ public artifacts are independently visible:
 - The [release workflow run](https://github.com/echoVic/orca-agent/actions/runs/30879238425)
   completed successfully. Its six native build jobs produced twelve archive
   and checksum assets; the npm jobs produced seven tarballs and attached them
-  to the same release.
+  to the same release. GitHub also exposes two generated source archives; the
+  verifier intentionally covers the 19 workflow-uploaded assets.
 - `@blade-ai/orca@0.3.3` and all six native npm aliases are visible on the
   public registry. The repository verifier compared every npm tarball with its
   GitHub release asset, checked archive/package binary and Windows helper
@@ -113,6 +114,7 @@ Public release verification completed after the tag workflow on 2026-08-04
 Asia/Shanghai. The release workflow's version, test, six build, GitHub Release,
 npm, npm-release-assets, verify, and both Windows verification jobs all exited
 successfully. The public verifier then confirmed the tag/main SHA, all 19
-release assets (12 native archives/checksums plus seven npm tarballs), registry
-integrity, archive/package parity, Windows helpers and license, isolated npm
-installation, and `orca --version` `0.3.3`.
+workflow-uploaded assets (12 native archives/checksums plus seven npm
+tarballs; the two GitHub-generated source archives are outside its binary
+provenance scope), registry integrity, archive/package parity, Windows helpers
+and license, isolated npm installation, and `orca --version` `0.3.3`.
