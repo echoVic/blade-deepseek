@@ -65,19 +65,8 @@ fn tool_schema_preserves_canonical_definitions_across_agent_policies() {
     assert!(child.iter().any(|tool| tool.name == "read_file"));
     assert!(child.iter().any(|tool| tool.name == "glob"));
     assert!(!child.iter().any(|tool| tool.name == "subagent"));
-    assert_eq!(
-        definition(&child, "mcp__local__inspect").input_schema,
-        serde_json::json!({
-            "type": "object",
-            "properties": { "path": { "type": "string" } },
-            "required": ["path"],
-            "additionalProperties": false
-        })
-    );
-    assert_eq!(
-        definition(&child, "external_lookup").description,
-        "External lookup"
-    );
+    assert!(!child.iter().any(|tool| tool.name == "mcp__local__inspect"));
+    assert!(!child.iter().any(|tool| tool.name == "external_lookup"));
 }
 
 #[test]

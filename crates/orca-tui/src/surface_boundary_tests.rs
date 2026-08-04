@@ -1,10 +1,12 @@
 use std::collections::BTreeSet;
 
+use crate::types::UserAction;
+
 // Exact bytes of the reviewed runtime-surface manifest are the test fixture.
 const MANIFEST: &str = include_str!(
     "../../../docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json"
 );
-const CURRENT_ACTIONS: [(&str, &str); 30] = [
+const CURRENT_ACTIONS: [(&str, &str); 32] = [
     ("NewSession", "host_session_lifecycle_mutation"),
     ("ForkCurrentSession", "host_session_lifecycle_mutation"),
     ("RenameCurrentSession", "host_store_mutation"),
@@ -35,9 +37,48 @@ const CURRENT_ACTIONS: [(&str, &str); 30] = [
     ("BackgroundCurrentTurn", "operation_ownership_mutation"),
     ("Interrupt", "operation_mutation"),
     ("Cancel", "host_lifecycle_mutation"),
+    ("ResumeOperation", "recovery_mutation"),
+    ("CancelOperation", "recovery_mutation"),
 ];
 
-const FUTURE_ACTIONS: [&str; 2] = ["ResumeOperation", "CancelOperation"];
+const FUTURE_ACTIONS: [&str; 0] = [];
+
+fn current_user_action_name(action: &UserAction) -> &'static str {
+    match action {
+        UserAction::NewSession => "NewSession",
+        UserAction::ForkCurrentSession { .. } => "ForkCurrentSession",
+        UserAction::RenameCurrentSession { .. } => "RenameCurrentSession",
+        UserAction::ResumeSavedSession { .. } => "ResumeSavedSession",
+        UserAction::ForkSavedSession { .. } => "ForkSavedSession",
+        UserAction::RenameSavedSession { .. } => "RenameSavedSession",
+        UserAction::ArchiveSavedSession { .. } => "ArchiveSavedSession",
+        UserAction::DeleteSavedSession { .. } => "DeleteSavedSession",
+        UserAction::Submit(_) => "Submit",
+        UserAction::SubmitWithMentions { .. } => "SubmitWithMentions",
+        UserAction::SubmitQueued { .. } => "SubmitQueued",
+        UserAction::SubmitWorkflowNotification(_) => "SubmitWorkflowNotification",
+        UserAction::RunWorkflow { .. } => "RunWorkflow",
+        UserAction::SetModel(_) => "SetModel",
+        UserAction::Remember { .. } => "Remember",
+        UserAction::Compact => "Compact",
+        UserAction::GoalShow => "GoalShow",
+        UserAction::GoalSet(_) => "GoalSet",
+        UserAction::GoalEdit(_) => "GoalEdit",
+        UserAction::GoalClear => "GoalClear",
+        UserAction::GoalPause => "GoalPause",
+        UserAction::GoalResume => "GoalResume",
+        UserAction::ResolveBackgroundApproval { .. } => "ResolveBackgroundApproval",
+        UserAction::StopTask { .. } => "StopTask",
+        UserAction::ForegroundTask { .. } => "ForegroundTask",
+        UserAction::RespondToInteraction { .. } => "RespondToInteraction",
+        UserAction::Backtrack => "Backtrack",
+        UserAction::BackgroundCurrentTurn => "BackgroundCurrentTurn",
+        UserAction::Interrupt => "Interrupt",
+        UserAction::Cancel => "Cancel",
+        UserAction::ResumeOperation { .. } => "ResumeOperation",
+        UserAction::CancelOperation { .. } => "CancelOperation",
+    }
+}
 
 const TUI_ENTRYPOINTS: [&str; 39] = [
     "slash.new",
@@ -83,6 +124,7 @@ const TUI_ENTRYPOINTS: [&str; 39] = [
 
 #[test]
 fn runtime_surface_contract_user_actions_are_exactly_classified_with_required_recovery_variants() {
+    let _exhaustive_inventory = current_user_action_name as fn(&UserAction) -> &'static str;
     let manifest: serde_json::Value = serde_json::from_str(MANIFEST).expect("manifest JSON");
     let rows = manifest["tui_actions"].as_array().expect("tui_actions");
     let current_rows: Vec<(&str, &str)> = rows
@@ -112,7 +154,7 @@ fn runtime_surface_contract_user_actions_are_exactly_classified_with_required_re
 }
 
 #[test]
-fn future_recovery_actions_are_separate_and_exact() {
+fn no_future_recovery_actions_remain() {
     let manifest: serde_json::Value = serde_json::from_str(MANIFEST).expect("manifest JSON");
     let rows = manifest["tui_actions"].as_array().expect("tui_actions");
     let additions: Vec<&str> = rows

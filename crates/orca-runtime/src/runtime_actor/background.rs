@@ -174,10 +174,11 @@ where
         task_id: String,
         task: Task,
     ) -> Result<(), BackgroundAdmissionError> {
-        self.ensure_capacity(1)?;
         if self.tasks.contains_key(&task_id) {
+            task.cancel();
             return Err(BackgroundAdmissionError::DuplicateTask { task_id });
         }
+        self.ensure_capacity(1)?;
         self.tasks.insert(task_id, task);
         Ok(())
     }
@@ -266,6 +267,7 @@ where
         !self.workflow_completions.is_empty()
             || !self.provider_preparations.is_empty()
             || !self.provider_completions.is_empty()
+            || !self.approval_resolutions.is_empty()
     }
 
     #[cfg(test)]
@@ -276,6 +278,7 @@ where
         self.workflow_completions.contains_key(operation_id)
             || self.provider_preparations.contains_key(operation_id)
             || self.provider_completions.contains_key(operation_id)
+            || self.approval_resolutions.contains_key(operation_id)
     }
 
     pub(crate) fn pending_completion_operation_ids(&self) -> Vec<surface::SurfaceOperationId> {
@@ -284,6 +287,7 @@ where
             .keys()
             .chain(self.provider_preparations.keys())
             .chain(self.provider_completions.keys())
+            .chain(self.approval_resolutions.keys())
             .cloned()
             .collect::<Vec<_>>();
         ids.sort();
@@ -610,6 +614,19 @@ mod tests {
         assert!(controller.attach_workflow("first", 9));
         assert_eq!(controller.workflow_for_task("first"), Some(9));
         assert_eq!(controller.provider_for_task("first"), Some(7));
+        let duplicate_cancelled = Arc::new(AtomicBool::new(false));
+        assert!(matches!(
+            controller.admit_task(
+                "first".into(),
+                Task {
+                    cancelled: duplicate_cancelled.clone(),
+                    workflow: None,
+                    provider: None
+                }
+            ),
+            Err(BackgroundAdmissionError::DuplicateTask { task_id }) if task_id == "first"
+        ));
+        assert!(duplicate_cancelled.load(Ordering::Acquire));
         assert!(matches!(
             controller.admit_task(
                 "second".into(),
@@ -625,6 +642,16 @@ mod tests {
 
         let operation_id = operation_id();
         let first_retry = Instant::now();
+        controller.retain_approval_resolution(operation_id.clone(), Retry(first_retry));
+        assert!(controller.has_pending_completion());
+        assert!(controller.has_pending_completion_operation(&operation_id));
+        assert_eq!(
+            controller.pending_completion_operation_ids(),
+            vec![operation_id.clone()]
+        );
+        let approval_key = BackgroundRetryKey::ApprovalResolution(operation_id.clone());
+        let approval_effect = controller.begin_retry(&approval_key).unwrap();
+        controller.resolve_retry(approval_effect, BackgroundRetryResolution::Settled);
         controller.retain_provider_completion(operation_id.clone(), Retry(first_retry));
         trace.push(controller.trace());
         let (_, key) = controller.next_retry().unwrap();

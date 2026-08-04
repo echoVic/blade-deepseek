@@ -333,10 +333,10 @@ pub fn approval_request_for_invocation(invocation: &ToolInvocation) -> Option<Ap
         action,
         description: format!(
             "{} requested {}",
-            invocation.requested.name.as_str(),
+            invocation.effective.name.as_str(),
             action.as_str()
         ),
-        tool: Some(invocation.requested.name.as_str().to_string()),
+        tool: Some(invocation.effective.name.as_str().to_string()),
         target: invocation.effective.target.clone(),
         preview: None,
     })
@@ -606,6 +606,27 @@ mod tests {
         assert_eq!(approval.tool, Some("bash".to_string()));
         assert_eq!(approval.target, Some("echo hi".to_string()));
         assert_eq!(approval.preview, None);
+    }
+
+    #[test]
+    fn approval_names_the_effective_tool_after_rewrite() {
+        let invocation = super::ToolInvocation {
+            requested: request(ToolName::Bash, ActionKind::Shell, Some("echo hi"), None),
+            effective: request(
+                ToolName::ReadFile,
+                ActionKind::Read,
+                Some("notes.txt"),
+                None,
+            ),
+            action: Some(ActionKind::Read),
+        };
+
+        let approval = approval_request_for_invocation(&invocation).expect("approval");
+
+        assert_eq!(approval.id, "approval-tool-1");
+        assert_eq!(approval.description, "read_file requested read");
+        assert_eq!(approval.tool.as_deref(), Some("read_file"));
+        assert_eq!(approval.target.as_deref(), Some("notes.txt"));
     }
 
     #[test]

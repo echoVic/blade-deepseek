@@ -808,7 +808,23 @@ impl TuiSurfaceProjection {
         if self.reducer_state.is_none() {
             return Err(SurfaceProjectionError::MissingReducerSnapshot);
         }
+        let needs_projection_snapshot = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Operation(_)
+                    | SurfaceEvent::Usage(_)
+                    | SurfaceEvent::Context(_)
+                    | SurfaceEvent::Task(_)
+                    | SurfaceEvent::Workflow(_)
+                    | SurfaceEvent::Subagent(_)
+                    | SurfaceEvent::Goal(_)
+                    | SurfaceEvent::Session(_)
+            )
+        });
         let mut projected = self.reduce_typed_batch(batch)?;
+        if !needs_projection_snapshot {
+            return Ok(projected);
+        }
         let Some(state) = self
             .reducer_state
             .as_ref()

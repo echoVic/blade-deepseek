@@ -6,6 +6,9 @@ use tempfile::TempDir;
 
 static ORCA_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Serializes direct runtime-host access to the process-wide ORCA_HOME value.
+/// Tests in this binary must use Command::env or acquire this helper before
+/// reading or mutating ORCA_HOME.
 fn with_process_orca_home<T>(home: &Path, run: impl FnOnce() -> T) -> T {
     let _guard = ORCA_HOME_LOCK.lock().expect("ORCA_HOME lock");
     let previous = std::env::var_os("ORCA_HOME");

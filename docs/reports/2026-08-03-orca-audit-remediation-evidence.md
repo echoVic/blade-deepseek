@@ -12,7 +12,7 @@ is an explicit incomplete state, not evidence of success.
 
 | ID | Finding | Baseline evidence | Regression or gate | Fix commit | Final evidence |
 |---|---|---|---|---|---|
-| C1 | Goal actor synchronous replies can block the single-thread host | `GoalRuntimeHandle::request` called unbounded `reply_rx.recv()` in `crates/orca-runtime/src/goal_actor.rs`; callers are inside the async `ThreadActor` loop | `goal_actor_request_times_out_with_typed_error`; `goal_store_wait_does_not_block_thread_actor` | `bd5acea49` bounds replies with a typed timeout; `61277992b` routes runtime open, set/edit/clear, pause/resume, surface mutation, preview/commit, finish/verify, continuation, and recovery through one bounded typed completion channel and blocking workers; `6264629e3` gates Goal terminal replies on pause/outer-turn settlement while preserving one serialized Goal handle | The responsiveness regression held the Goal actor on a barrier while an unrelated snapshot completed within 100 ms. Goal-focused unit tests passed 82/82; runtime-host Goal/settlement tests passed 14/14 serially and 65/65 in the locked runtime-host integration target. A direct-call audit found Goal Store waits only in startup helpers, blocking worker closures, generation workers, and tests, never inline in a `ThreadActor` command or completion branch. |
+| C1 | Goal actor synchronous replies can block the single-thread host | `GoalRuntimeHandle::request` called unbounded `reply_rx.recv()` in `crates/orca-runtime/src/goal_actor.rs`; callers are inside the async `ThreadActor` loop | `goal_actor_request_times_out_with_typed_error`; `goal_store_wait_does_not_block_thread_actor` | `bd5acea49` bounds replies with a typed timeout; `61277992b` routes runtime open, set/edit/clear, pause/resume, surface mutation, preview/commit, finish/verify, continuation, and recovery through one bounded typed completion channel and blocking workers; `6264629e3` gates Goal terminal replies on pause/outer-turn settlement while preserving one serialized Goal handle | The integration regression holds an exclusive Goal Store transaction, synchronizes the blocked request's start, proves an unrelated actor snapshot completes while the Goal request is still pending, then proves the request settles after the lock is released. Goal-focused unit tests passed 82/82; runtime-host Goal/settlement tests passed 14/14 serially and 65/65 in the locked runtime-host integration target. A direct-call audit found Goal Store waits only in startup helpers, blocking worker closures, generation workers, and tests, never inline in a `ThreadActor` command or completion branch. |
 | C2 | Host supervisor performs session store and unbounded history IO on its async loop | Direct store calls in `crates/orca-runtime/src/runtime_host.rs`; `list_threads` materializes the complete store | `session_listing_does_not_block_host_supervisor`; `bounded_session_page_does_not_materialize_all_transcripts`; `explicit_history_disabled_one_shot_starts_an_ephemeral_typed_surface` | `553a1d0f5` dispatches thread preparation and every JSONL store operation to detached blocking workers with typed replies; `4f9a9ff72` preserves the prepared ephemeral configuration for the actor | FIFO-backed filesystem blocking test passed while an unrelated thread started; 2,000 metadata-only sessions returned a 25-row page without parsing deliberately invalid transcript bodies. The focused ephemeral test and all 18 runtime-host tests passed after moving the actor-config clone after preparation; locked runtime checks passed. |
 | C3 | Blocking web search ignored cooperative cancellation for up to its HTTP timeout | `crates/orca-tools/src/registry.rs` marked web search non-cooperative and `web_search.rs` used blocking reqwest | `web_search_cancellation_preempts_http_timeout` | `7752023ce` gives web search cooperative interrupt semantics and races asynchronous header/body reads against the existing tool cancellation callback while retaining a 25-second fallback timeout | RED failed because no cancellable path existed; a local server withheld its response and cancellation returned `ToolStatus::Cancelled` within 250 ms. All eight web-search tests, registry semantics, all 16 runtime tool-call tests, and locked tools/runtime checks passed. |
 | C4 | Foreground cancellation does not stop spawned subagent task trees | Foreground Esc path cancels generation without requesting task-registry stop in `crates/orca-runtime/src/runtime_host.rs` | `foreground_interrupt_stops_owned_subagent_process_tree_only`; `persistent_stop_tree_discovers_descendants_created_by_attached_worker`; `foreground_cancel_stops_async_subagent_tree_only` | `0138731d8` assigns every operation a task-tree root, propagates that root through sync/batch/async child loops, persists canonical parent IDs, converges cancellation across worker-process registries, and routes legacy, typed-surface, JSONL, and shutdown cancellation through one non-blocking task-tree helper | A host-level Unix fixture proved child and grandchild worker processes were reaped, a detached worker remained live, a post-cancel child inherited `Stopping`, and the operation emitted one stable `Cancelled` terminal. Cross-registry persistence proved worker-created descendants are discovered without misclassifying the active root. Task registry 45/45, subagent contract 13/13, and serial cancellation 58/58 passed; workspace all-target compilation passed before the final persistence refinement and was rerun afterward. |
@@ -43,8 +43,8 @@ is an explicit incomplete state, not evidence of success.
 
 ## Verification Snapshot
 
-Pre-version verification on 2026-08-04 completed every command in Task 23 Step
-3. The TUI serial profile ran 1,023/1,023 tests. The workspace profile ran
+Pre-version verification on 2026-08-04 Asia/Shanghai (2026-08-03 UTC) completed
+every command in Task 23 Step 3. The TUI serial profile ran 1,023/1,023 tests. The workspace profile ran
 2,490/2,490 tests with zero failures and zero skipped tests; nextest reported
 one leaky test process, with no flaky retry or test failure. The only nonzero
 exit was the expected SEO date-alignment check, which passed after the v0.3.3
@@ -59,6 +59,18 @@ the workspace profile passed 2,490/2,490 with zero skipped tests, zero failures,
 zero flaky retries, and no leaky-process report. Formatting, clippy, both
 validator self-tests and live gates, version sync, npm staging, published
 artifact verifier self-tests, site build, SEO, and diff checks all exited 0.
+
+Final review-remediation verification on 2026-08-04 Asia/Shanghai ran against
+the current worktree after the provider-policy and Goal receipt-projection
+fixes. The TUI serial profile passed 1,026/1,026. The workspace profile passed
+2,498/2,498 with no final failures or skipped tests; nextest reported one slow
+test and one runtime-host timing test that passed on its configured second
+attempt. The focused provider-policy test, Goal continuation reducer test, and
+durable Goal/surface receipt consistency test also passed independently before
+the complete run. The four runtime rustdoc compile-fail tests, clippy
+(warnings only), formatting and diff checks, runtime-surface and Windows
+validators, version-sync/npm staging/published-verifier self-tests, site build
+and SEO check, and `actionlint` all exited 0.
 
 The first PR check run exposed two environment assumptions not reproduced by
 the macOS release matrix: Windows CRLF checkouts changed source-function hashes,

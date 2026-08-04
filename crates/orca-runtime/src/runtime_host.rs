@@ -9618,6 +9618,7 @@ fn surface_goal_from_record(
             receipt.catalog_revision,
         ))
         .map_err(surface_goal_value_error)?,
+        receipt_digest: surface::Sha256Digest::new(receipt.receipt_digest),
         objective: surface::NonEmptyText::try_new(record.objective.clone())
             .map_err(surface_goal_value_error)?,
         objective_revision: surface::GoalObjectiveRevision::new(receipt.objective_revision),
@@ -14012,12 +14013,19 @@ impl ThreadActor {
         self.surface_terminal_blocked = Some(format!(
             "typed Goal completion recovery is pending: {message}"
         ));
-        self.goal_controller
-            .set_pending_recovery(PendingSurfaceGoalCompletionRecovery {
-                active,
-                message,
-                retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
-            });
+        let pending = PendingSurfaceGoalCompletionRecovery {
+            active,
+            message,
+            retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+        };
+        if let Err(rejected) = self.goal_controller.set_pending_recovery(pending) {
+            self.surface_terminal_blocked = Some(
+                "typed Goal completion recovery collided with an existing recovery".to_string(),
+            );
+            if self.active.is_none() {
+                self.active = Some(rejected.active);
+            }
+        }
     }
 
     fn dispatch_surface_goal_completion_recovery(
@@ -14536,29 +14544,30 @@ impl ThreadActor {
                 })
                 .cloned()
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-            let (request, expected_receipt_digest) = match input {
-                surface::GoalRunInput::Supplied { request } => (request, None),
+            let request = match input {
+                surface::GoalRunInput::Supplied { request } => request,
                 surface::GoalRunInput::DerivedFromGoal {
                     goal_id,
                     objective_revision,
                     goal_receipt_digest,
                 } => {
-                    if goal_id != goal.goal_id || objective_revision != goal.objective_revision {
+                    if goal_id != goal.goal_id
+                        || objective_revision != goal.objective_revision
+                        || goal_receipt_digest != goal.receipt_digest
+                    {
                         return Err(surface::SurfaceClientCommandError::Unauthorized);
                     }
-                    (
-                        surface::SurfaceInputRequest {
-                            blocks: surface::NonEmptyVec::try_new(vec![
-                                surface::SurfaceInputRequestBlock::Text {
-                                    text: surface::DisplayText::new(objective.as_str()),
-                                },
-                            ])
-                            .expect("Goal objective produces one input block"),
-                        },
-                        Some(*goal_receipt_digest.as_bytes()),
-                    )
+                    surface::SurfaceInputRequest {
+                        blocks: surface::NonEmptyVec::try_new(vec![
+                            surface::SurfaceInputRequestBlock::Text {
+                                text: surface::DisplayText::new(objective.as_str()),
+                            },
+                        ])
+                        .expect("Goal objective produces one input block"),
+                    }
                 }
             };
+            let expected_receipt_digest = *goal.receipt_digest.as_bytes();
             let goal_id = orca_core::goal_runtime::GoalId::parse(goal.goal_id.as_str())
                 .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
             let goal_run_id = orca_core::goal_runtime::GoalRunId::new();
@@ -14700,29 +14709,30 @@ impl ThreadActor {
                 })
                 .cloned()
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-            let (request, expected_receipt_digest) = match input {
-                surface::GoalRunInput::Supplied { request } => (request, None),
+            let request = match input {
+                surface::GoalRunInput::Supplied { request } => request,
                 surface::GoalRunInput::DerivedFromGoal {
                     goal_id,
                     objective_revision,
                     goal_receipt_digest,
                 } => {
-                    if goal_id != goal.goal_id || objective_revision != goal.objective_revision {
+                    if goal_id != goal.goal_id
+                        || objective_revision != goal.objective_revision
+                        || goal_receipt_digest != goal.receipt_digest
+                    {
                         return Err(surface::SurfaceClientCommandError::Unauthorized);
                     }
-                    (
-                        surface::SurfaceInputRequest {
-                            blocks: surface::NonEmptyVec::try_new(vec![
-                                surface::SurfaceInputRequestBlock::Text {
-                                    text: surface::DisplayText::new(goal.objective.as_str()),
-                                },
-                            ])
-                            .expect("Goal objective produces one input block"),
-                        },
-                        Some(*goal_receipt_digest.as_bytes()),
-                    )
+                    surface::SurfaceInputRequest {
+                        blocks: surface::NonEmptyVec::try_new(vec![
+                            surface::SurfaceInputRequestBlock::Text {
+                                text: surface::DisplayText::new(goal.objective.as_str()),
+                            },
+                        ])
+                        .expect("Goal objective produces one input block"),
+                    }
                 }
             };
+            let expected_receipt_digest = *goal.receipt_digest.as_bytes();
             let goal_id = orca_core::goal_runtime::GoalId::parse(goal.goal_id.as_str())
                 .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
             let goal_run_id = orca_core::goal_runtime::GoalRunId::new();
@@ -30422,18 +30432,23 @@ impl ThreadActor {
         let mutation = mutations
             .pop()
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let active_matches = self.active.as_ref().is_some_and(|active| {
+            active
+                .surface_operation
+                .as_ref()
+                .is_some_and(|fence| fence == &operation_fence)
+                && active.request.surface_goal_owned
+                && active.surface_terminalization.is_none()
+        });
+        if !active_matches {
+            self.settle_goal_surface_mutation(&runtime, &mutation)
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
         let mut active = self
             .active
             .take()
-            .filter(|active| {
-                active
-                    .surface_operation
-                    .as_ref()
-                    .is_some_and(|fence| fence == &operation_fence)
-                    && active.request.surface_goal_owned
-                    && active.surface_terminalization.is_none()
-            })
-            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            .expect("running Goal pause active operation was prevalidated");
         let result = (|| {
             let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
             let (committed_goal_fence, receipt_digest, _, goal_scope, goal_event) =
@@ -30747,10 +30762,14 @@ impl ThreadActor {
                 surface::SurfaceCommitError::Ledger(surface::SurfaceLedgerError::CheckpointFailed)
                 | surface::SurfaceCommitError::Ledger(surface::SurfaceLedgerError::PartialAppend),
             ) => {
-                let _ = self
+                if self
                     .resident_surface
                     .commit
-                    .prepare_terminalization(prepared);
+                    .prepare_terminalization(prepared)
+                    .is_err()
+                {
+                    active.surface_terminalization = None;
+                }
                 Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
             }
             Err(_) => {
@@ -31054,9 +31073,16 @@ impl ThreadActor {
             GoalBlockingCompletion::Pause {
                 operation_id,
                 result,
-            } => self
-                .goal_controller
-                .schedule_pause_settlement(operation_id, result),
+            } => {
+                if !self
+                    .goal_controller
+                    .schedule_pause_settlement(operation_id, result)
+                {
+                    eprintln!(
+                        "orca: ignored stale or duplicate goal pause settlement for {operation_id:?}"
+                    );
+                }
+            }
             GoalBlockingCompletion::SurfaceMutation { settlement }
             | GoalBlockingCompletion::PauseResume { settlement }
             | GoalBlockingCompletion::PreviewCommit { settlement }
@@ -32634,8 +32660,11 @@ impl ThreadActor {
                         config.clone(),
                     ),
                 );
-                self.goal_controller
-                    .bind_active(operation_id, goal_control, goal_turn);
+                assert!(
+                    self.goal_controller
+                        .bind_active(operation_id, goal_control, goal_turn),
+                    "idle thread actor cannot replace another goal operation binding"
+                );
                 self.active = Some(ActiveOperation {
                     operation_id,
                     runtime_task_id,
@@ -37823,6 +37852,7 @@ mod tests {
     use orca_core::provider_types::{ProviderResponse, ProviderStep};
     use orca_core::subagent_config::SubagentConfig;
     use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
+    use std::ffi::OsString;
     use std::fs;
     use std::io::Write;
     use std::path::PathBuf;
@@ -37849,6 +37879,25 @@ mod tests {
         "ORCA_RUNTIME_HOST_RESERVATION_TERMINAL_FAILURE_CHILD";
     const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+    struct OrcaHomeRestore(Option<OsString>);
+
+    impl OrcaHomeRestore {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("ORCA_HOME");
+            unsafe { std::env::set_var("ORCA_HOME", path) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for OrcaHomeRestore {
+        fn drop(&mut self) {
+            match self.0.as_ref() {
+                Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+                None => unsafe { std::env::remove_var("ORCA_HOME") },
+            }
+        }
+    }
+
     fn test_absolute_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(name)
     }
@@ -37861,8 +37910,7 @@ mod tests {
 
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let previous_home = std::env::var_os("ORCA_HOME");
-        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let _home = OrcaHomeRestore::set(home.path());
         let sessions = home.path().join("sessions");
         fs::create_dir_all(&sessions).unwrap();
         let fifo = sessions.join("blocked-session.jsonl");
@@ -37914,10 +37962,6 @@ mod tests {
         list_request.join().unwrap();
         start_request.join().unwrap();
         host.shutdown().expect("shutdown runtime host");
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]

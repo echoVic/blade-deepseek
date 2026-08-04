@@ -603,15 +603,13 @@ impl SurfaceCommitLedger for FakeLedger {
         let Some(receipt) = self.receipt.clone() else {
             return CommitProbe::Absent;
         };
-        let matches = match &receipt {
-            SurfaceBatchReceipt::Recorded(receipt) => {
-                &receipt.commit_id == id && &receipt.batch_digest == digest
-            }
-            SurfaceBatchReceipt::Ephemeral(receipt) => {
-                &receipt.commit_id == id && &receipt.batch_digest == digest
-            }
+        let (stored_id, stored_digest) = match &receipt {
+            SurfaceBatchReceipt::Recorded(receipt) => (&receipt.commit_id, &receipt.batch_digest),
+            SurfaceBatchReceipt::Ephemeral(receipt) => (&receipt.commit_id, &receipt.batch_digest),
         };
-        if matches {
+        if stored_id != id {
+            CommitProbe::Absent
+        } else if stored_digest == digest {
             CommitProbe::Present(receipt)
         } else {
             CommitProbe::Conflict
@@ -658,6 +656,17 @@ fn commit_controller_trace_equivalence() {
             .probe_commit(&commit_id, &prepared.batch_digest),
         CommitProbe::Present(_)
     ));
+    let unrelated = batch(10);
+    let unrelated_id = match &unrelated.commit_class {
+        CommitClass::Recorded { commit_id, .. } => commit_id,
+        CommitClass::Ephemeral { .. } => unreachable!(),
+    };
+    assert_eq!(
+        coordinator
+            .ledger()
+            .probe_commit(unrelated_id, &unrelated.batch_digest),
+        CommitProbe::Absent
+    );
 }
 
 #[test]

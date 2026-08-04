@@ -8,6 +8,30 @@ use crate::runtime_host::{
 };
 use crate::runtime_surface as surface;
 
+const CAPABILITY_COMMIT_MAX_ATTEMPTS: u8 = 8;
+const CAPABILITY_COMMIT_INITIAL_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+const CAPABILITY_COMMIT_MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Default)]
+struct CapabilityCommitRetry {
+    attempts: u8,
+}
+
+impl CapabilityCommitRetry {
+    fn register_failure(&mut self) -> Option<std::time::Duration> {
+        self.attempts = self.attempts.saturating_add(1);
+        if self.attempts >= CAPABILITY_COMMIT_MAX_ATTEMPTS {
+            return None;
+        }
+        let exponent = u32::from(self.attempts.saturating_sub(1));
+        Some(
+            CAPABILITY_COMMIT_INITIAL_RETRY
+                .saturating_mul(1_u32 << exponent.min(15))
+                .min(CAPABILITY_COMMIT_MAX_RETRY),
+        )
+    }
+}
+
 pub(crate) enum CapabilityReply {
     ReadTextFile {
         reply: SyncSender<io::Result<String>>,
@@ -113,6 +137,7 @@ pub(crate) struct PendingSurfaceCapabilityTransition {
     waiter_outcome: Option<PendingSurfaceCapabilityWaiterOutcome>,
     deferred_settlement: Option<PendingSurfaceCapabilitySettlement>,
     retry_at: tokio::time::Instant,
+    commit_retry: CapabilityCommitRetry,
 }
 
 impl PendingSurfaceCapabilityTransition {
@@ -405,14 +430,31 @@ impl
         committed: bool,
     ) -> CapabilityCommitResolution {
         if !committed {
-            effect.pending.retry_at =
-                tokio::time::Instant::now() + std::time::Duration::from_millis(100);
-            self.pending_capability_transitions
-                .insert(effect.call_id, effect.pending);
+            if let Some(delay) = effect.pending.commit_retry.register_failure() {
+                effect.pending.retry_at = tokio::time::Instant::now() + delay;
+                self.pending_capability_transitions
+                    .insert(effect.call_id, effect.pending);
+                return CapabilityCommitResolution {
+                    reply: None,
+                    deferred_settlement: None,
+                    retained_for_retry: true,
+                };
+            }
+            let reply = self.apply_committed_transition(
+                &effect.call_id,
+                Some(PendingSurfaceCapabilityWaiterOutcome::Failed {
+                    kind: io::ErrorKind::Other,
+                    message: format!(
+                        "surface capability commit failed after {} attempts",
+                        CAPABILITY_COMMIT_MAX_ATTEMPTS
+                    ),
+                }),
+                effect.physical_write_confirmed,
+            );
             return CapabilityCommitResolution {
-                reply: None,
+                reply,
                 deferred_settlement: None,
-                retained_for_retry: true,
+                retained_for_retry: false,
             };
         }
         let deferred_settlement = effect.pending.deferred_settlement.take();
@@ -515,6 +557,7 @@ impl
                 waiter_outcome,
                 deferred_settlement: None,
                 retry_at: tokio::time::Instant::now(),
+                commit_retry: CapabilityCommitRetry::default(),
             },
         );
     }
@@ -614,11 +657,52 @@ impl
                     reply: waiter,
                     result: Err(io::Error::new(kind, message)),
                 }),
-                _ => None,
+                (waiter, _) => Some(Self::failed_waiter_reply(
+                    waiter,
+                    io::ErrorKind::InvalidData,
+                    "surface capability result did not match its waiter".to_string(),
+                )),
             };
             return reply.map(RuntimeActorEffect::ReplyCapability);
         }
         None
+    }
+
+    fn failed_waiter_reply(
+        waiter: ResidentSurfaceCapabilityWaiter,
+        kind: io::ErrorKind,
+        message: String,
+    ) -> CapabilityReply {
+        match waiter {
+            ResidentSurfaceCapabilityWaiter::ReadTextFile(reply) => CapabilityReply::ReadTextFile {
+                reply,
+                result: Err(io::Error::new(kind, message)),
+            },
+            ResidentSurfaceCapabilityWaiter::WriteTextFile(reply) => {
+                CapabilityReply::WriteTextFile {
+                    reply,
+                    result: Err(io::Error::new(kind, message)),
+                }
+            }
+            ResidentSurfaceCapabilityWaiter::TerminalCreate(reply) => {
+                CapabilityReply::TerminalCreate {
+                    reply,
+                    result: Err(io::Error::new(kind, message)),
+                }
+            }
+            ResidentSurfaceCapabilityWaiter::TerminalObservation(reply) => {
+                CapabilityReply::TerminalObservation {
+                    reply,
+                    result: Err(io::Error::new(kind, message)),
+                }
+            }
+            ResidentSurfaceCapabilityWaiter::TerminalCleanup(reply) => {
+                CapabilityReply::TerminalCleanup {
+                    reply,
+                    result: Err(io::Error::new(kind, message)),
+                }
+            }
+        }
     }
 
     pub(crate) fn cancel_calls(
@@ -699,10 +783,26 @@ mod tests {
     use crate::surface;
 
     use super::{
-        CapabilityControllerTrace, CapabilityReply, PendingSurfaceCapabilityTransition,
-        ResidentSurfaceCapabilityCall, ResidentSurfaceCapabilityWaiter,
-        RuntimeCapabilityController,
+        CAPABILITY_COMMIT_MAX_ATTEMPTS, CapabilityCommitRetry, CapabilityControllerTrace,
+        CapabilityReply, PendingSurfaceCapabilityTransition, ResidentSurfaceCapabilityCall,
+        ResidentSurfaceCapabilityWaiter, RuntimeCapabilityController,
     };
+
+    #[test]
+    fn capability_commit_retry_backs_off_and_stops() {
+        let mut retry = CapabilityCommitRetry::default();
+
+        let delays = (1..CAPABILITY_COMMIT_MAX_ATTEMPTS)
+            .map(|_| retry.register_failure().expect("retry delay"))
+            .collect::<Vec<_>>();
+
+        assert!(delays.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(
+            delays.first().copied(),
+            Some(std::time::Duration::from_millis(100))
+        );
+        assert!(retry.register_failure().is_none());
+    }
 
     #[test]
     fn capability_controller_trace_equivalence() {

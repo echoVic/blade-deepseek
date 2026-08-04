@@ -659,7 +659,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
     "crates/orca-tui/src/app.rs:hosted_tui_controller_loop_with_ordinary_turn_runner:thread.shutdown",
     1,
   ],
-  ["crates/orca-tui/src/app.rs:resume_latest_active_goal_hosted:thread.shutdown", 3],
+  ["crates/orca-tui/src/app.rs:resume_latest_active_goal_hosted:thread.shutdown", 2],
   [
     "crates/orca-tui/src/app.rs:hosted_tui_controller_loop_with_ordinary_turn_runner:thread.launch_workflow",
     1,
@@ -1298,11 +1298,11 @@ function invariantRegistry() {
       },
     ],
     [
-      "closed_inventory.current_tui_user_actions has exactly 30 unique variants matching UserAction at baseline",
+      "closed_inventory.current_tui_user_actions has exactly 32 unique variants matching UserAction at baseline",
       (manifest) => {
         assertCondition(
-          manifest.closed_inventory.current_tui_user_actions.length === 30,
-          "current_tui_user_actions must contain 30 variants",
+          manifest.closed_inventory.current_tui_user_actions.length === 32,
+          "current_tui_user_actions must contain 32 variants",
         );
         assertUnique(
           manifest.closed_inventory.current_tui_user_actions,
@@ -3811,10 +3811,7 @@ export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides
     "pub enum UserAction {",
   );
   assertExactArray(
-    [
-      ...manifest.closed_inventory.current_tui_user_actions,
-      ...manifest.closed_inventory.required_tui_user_action_additions,
-    ],
+    manifest.closed_inventory.current_tui_user_actions,
     userActions,
     "current_tui_user_actions current UserAction",
   );

@@ -2898,10 +2898,6 @@ fn background_controller_trace_equivalence() {
     let admitted = thread.task_registry().get(&task_id).unwrap();
     assert_eq!(admitted.status, TaskStatus::Running);
     assert!(admitted.is_backgrounded);
-    assert!(
-        !release_marker.exists(),
-        "background provider must remain in-flight while foreground admission is attempted"
-    );
 
     let foreground = thread
         .start_turn(
@@ -2909,6 +2905,11 @@ fn background_controller_trace_equivalence() {
             io::sink(),
         )
         .expect("background ownership releases foreground admission");
+    assert_eq!(
+        thread.task_registry().get(&task_id).unwrap().status,
+        TaskStatus::Running,
+        "background provider must remain in-flight after foreground admission"
+    );
     std::fs::write(&release_marker, "release").expect("release background completion");
     assert_eq!(
         foreground.wait_timeout(TEST_TIMEOUT).unwrap().outcome(),
@@ -2962,7 +2963,11 @@ fn background_controller_trace_equivalence() {
     cancel_host
         .shutdown()
         .expect("cancel and join background work");
-    assert!(started.elapsed() < TEST_TIMEOUT);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "background cancellation took {elapsed:?}, reaching the provider's 5 second delay"
+    );
     assert_eq!(
         cancel_thread
             .task_registry()
@@ -3452,10 +3457,18 @@ fn goal_store_wait_does_not_block_thread_actor() {
 
         let goal_thread = thread.clone();
         let (goal_tx, goal_rx) = std::sync::mpsc::sync_channel(1);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
         let goal_request = std::thread::spawn(move || {
+            let _ = started_tx.send(());
             let _ = goal_tx.send(goal_thread.goal_runtime());
         });
-        std::thread::sleep(Duration::from_millis(50));
+        started_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("goal runtime request thread did not start");
+        assert!(matches!(
+            goal_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
 
         let snapshot_thread = thread.clone();
         let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(1);
@@ -3463,9 +3476,13 @@ fn goal_store_wait_does_not_block_thread_actor() {
             let _ = snapshot_tx.send(snapshot_thread.snapshot());
         });
         let snapshot = snapshot_rx
-            .recv_timeout(Duration::from_millis(100))
+            .recv_timeout(TEST_TIMEOUT)
             .expect("goal store wait blocked the runtime thread actor");
         assert!(snapshot.is_ok());
+        assert!(matches!(
+            goal_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
 
         lock.execute_batch("ROLLBACK").unwrap();
         goal_rx
@@ -3531,7 +3548,13 @@ fn capability_controller_trace_equivalence() {
     ));
 
     let mut trace = Vec::new();
-    while let Some(item) = subscription.try_recv() {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while !trace.contains(&"terminal_committed") {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "missing terminal projection batch");
+        let Some(item) = subscription.recv_timeout(remaining) else {
+            panic!("missing terminal projection batch");
+        };
         let SurfaceSubscriptionItem::Batch { batch } = item else {
             continue;
         };

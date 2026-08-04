@@ -1656,8 +1656,8 @@ impl AppState {
             .reconcile_len(self.messages.len());
         if structure_changed {
             self.rebuild_tool_call_indices();
+            self.assert_tool_call_index_consistent();
         }
-        self.assert_tool_call_index_consistent();
     }
 
     fn reset_message_tracking(&mut self) {
@@ -1698,10 +1698,12 @@ impl AppState {
             )
         };
         let first = self.tool_call_message_index(id)?;
-        if is_receiving(&self.messages[first]) {
+        let first_message = self.messages.get(first)?;
+        if is_receiving(first_message) {
             return Some(first);
         }
-        self.messages[first + 1..]
+        self.messages
+            .get(first + 1..)?
             .iter()
             .rposition(is_receiving)
             .map(|offset| first + 1 + offset)
@@ -1722,6 +1724,13 @@ impl AppState {
     fn assert_tool_call_index_consistent(&self) {}
 
     fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) {
+        if self.current_session_id.as_deref() == Some(projection.session_id.as_str())
+            && self
+                .usage_revision
+                .is_some_and(|revision| projection.usage_revision < revision)
+        {
+            return;
+        }
         self.current_session_id = Some(projection.session_id.clone());
         self.current_session_title = Some(projection.title.clone());
         self.usage = projection.usage.clone();
@@ -1731,7 +1740,6 @@ impl AppState {
         self.current_goal = projection.current_goal.clone();
         self.active_surface_operation_id = projection.foreground_operation_id.clone();
         self.apply_workflow_tasks_update(projection.workflow_tasks.clone());
-        self.assert_surface_projection_consistent(&projection);
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -1757,7 +1765,6 @@ impl AppState {
             self.active_surface_operation_id,
             projection.foreground_operation_id
         );
-        self.assert_tool_call_index_consistent();
     }
 
     #[cfg(not(any(test, debug_assertions)))]
@@ -1787,7 +1794,6 @@ impl AppState {
         if !self.auto_scroll {
             self.unseen_messages = self.unseen_messages.saturating_add(1);
         }
-        self.assert_tool_call_index_consistent();
     }
 
     pub(crate) fn replace_messages(&mut self, messages: impl IntoIterator<Item = ChatMessage>) {
@@ -1884,7 +1890,6 @@ impl AppState {
         if did_truncate {
             self.rebuild_tool_call_indices();
         }
-        self.assert_tool_call_index_consistent();
     }
 
     pub(crate) fn replace_message(&mut self, index: usize, message: ChatMessage) -> bool {
@@ -1893,8 +1898,18 @@ impl AppState {
             return false;
         }
         self.remove_applied_highlight_for_message(index);
+        let previous_tool_id = self.messages.get(index).and_then(|message| match message {
+            ChatMessage::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        });
+        let next_tool_id = match &message {
+            ChatMessage::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        };
         self.messages[index] = message;
-        self.rebuild_tool_call_indices();
+        if previous_tool_id != next_tool_id {
+            self.rebuild_tool_call_indices();
+        }
         self.touch_message(index);
         true
     }
@@ -2558,7 +2573,7 @@ impl AppState {
         self.reconcile_message_tracking();
         match event {
             TuiEvent::Attached(_) => {
-                unreachable!("attached TUI events must be fenced before AppState reduction")
+                eprintln!("orca: ignored an attached TUI event that bypassed attachment fencing");
             }
             TuiEvent::SessionAttachmentActivated => {}
             TuiEvent::SurfaceProjectionSynced(projection) => {
@@ -3241,26 +3256,18 @@ impl AppState {
             .iter()
             .rposition(|item| matches!(item, ChatMessage::User(_)));
         if let Some(last_user) = last_user {
-            let old_messages = std::mem::take(&mut self.messages);
-            self.messages = old_messages
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, item)| {
-                    if index <= last_user
-                        || !matches!(
-                            item,
-                            ChatMessage::Reasoning(_)
-                                | ChatMessage::Assistant(_)
-                                | ChatMessage::ProposedPlan(_)
-                        )
-                    {
-                        Some(item)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            self.reset_message_tracking();
+            let mut index = 0;
+            self.retain_messages(|item| {
+                let keep = index <= last_user
+                    || !matches!(
+                        item,
+                        ChatMessage::Reasoning(_)
+                            | ChatMessage::Assistant(_)
+                            | ChatMessage::ProposedPlan(_)
+                    );
+                index += 1;
+                keep
+            });
         }
         self.proposed_plan_parser = ProposedPlanStreamParser::default();
         if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
@@ -5690,6 +5697,22 @@ mod tests {
             expected.foreground_operation_id
         );
         state.assert_surface_projection_consistent(&expected);
+
+        let mut stale = expected.clone();
+        stale.usage_revision = 6;
+        stale.title = "stale projection title".to_string();
+        stale.usage.input_tokens = 1;
+        stale.foreground_operation_id = None;
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(stale)));
+        assert_eq!(
+            state.current_session_title.as_deref(),
+            Some("canonical title")
+        );
+        assert_eq!(state.usage, expected.usage);
+        assert_eq!(
+            state.active_surface_operation_id,
+            expected.foreground_operation_id
+        );
 
         state.update(TuiEvent::SessionProjectionReset {
             session_id: "next-session".to_string(),

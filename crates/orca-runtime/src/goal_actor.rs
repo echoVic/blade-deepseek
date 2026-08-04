@@ -733,6 +733,22 @@ enum GoalActorCommand {
     Shutdown,
 }
 
+impl GoalActorCommand {
+    fn is_read_only(&self) -> bool {
+        match self {
+            Self::Read { .. }
+            | Self::Project { .. }
+            | Self::ContinuationState { .. }
+            | Self::RecentGapFingerprints { .. }
+            | Self::PendingSurfaceMutations { .. }
+            | Self::LatestActive { .. } => true,
+            #[cfg(test)]
+            Self::DelayForTest { .. } => true,
+            _ => false,
+        }
+    }
+}
+
 type Reply = SyncSender<Result<GoalActorReply, GoalActorError>>;
 
 enum GoalActorReply {
@@ -1586,10 +1602,38 @@ impl GoalRuntimeHandle {
         command: impl FnOnce(Reply) -> GoalActorCommand,
     ) -> Result<GoalActorReply, GoalActorError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.sender
-            .send(command(reply_tx))
-            .map_err(|_| GoalActorError::Closed)?;
-        match reply_rx.recv_timeout(self.request_timeout) {
+        let deadline = std::time::Instant::now() + self.request_timeout;
+        let command = command(reply_tx);
+        let read_only = command.is_read_only();
+        let mut pending = Some(command);
+        loop {
+            match self
+                .sender
+                .try_send(pending.take().expect("pending Goal command"))
+            {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(command)) => {
+                    pending = Some(command);
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(GoalActorError::Timeout {
+                            timeout: self.request_timeout,
+                        });
+                    }
+                    thread::sleep(remaining.min(Duration::from_millis(1)));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(GoalActorError::Closed);
+                }
+            }
+        }
+
+        if !read_only {
+            return reply_rx.recv().map_err(|_| GoalActorError::Closed)?;
+        }
+
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match reply_rx.recv_timeout(remaining) {
             Ok(reply) => reply,
             Err(mpsc::RecvTimeoutError::Timeout) => Err(GoalActorError::Timeout {
                 timeout: self.request_timeout,
@@ -3072,6 +3116,26 @@ mod tests {
             .unwrap();
         assert_eq!(handle.latest_active().unwrap(), None);
 
+        handle.shutdown().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn admitted_goal_mutation_waits_for_an_unambiguous_result() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let timeout = std::time::Duration::from_millis(20);
+        let (handle, join) = GoalRuntimeHandle::spawn_with_request_timeout_for_test(store, timeout);
+        let blocker = handle
+            .delay_for_test(std::time::Duration::from_millis(80))
+            .unwrap();
+
+        let started_at = std::time::Instant::now();
+        let record = create(&handle, "mutation-waits");
+
+        assert_eq!(record.session_id, "mutation-waits");
+        assert!(started_at.elapsed() >= std::time::Duration::from_millis(40));
+        blocker.join().unwrap();
         handle.shutdown().unwrap();
         join.join().unwrap();
     }

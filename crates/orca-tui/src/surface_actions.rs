@@ -17,12 +17,13 @@ use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::types::{TuiEvent, TuiMemoryScope};
 
 #[cfg(test)]
-static RENAME_SAVED_SESSION_FAILURES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static RENAME_SAVED_SESSION_FAILURE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
-pub(crate) fn inject_rename_saved_session_failure_once() {
-    RENAME_SAVED_SESSION_FAILURES.store(1, std::sync::atomic::Ordering::SeqCst);
+pub(crate) fn inject_rename_saved_session_failure_once(session_id: &str) {
+    *RENAME_SAVED_SESSION_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(session_id.to_string());
 }
 
 /// The only TUI-facing entry point for thread-scoped runtime commands and
@@ -50,15 +51,14 @@ impl TuiHostActions {
 
     pub(crate) fn rename_saved_session(session_id: &str, title: &str) -> Result<(), String> {
         #[cfg(test)]
-        if RENAME_SAVED_SESSION_FAILURES
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |remaining| remaining.checked_sub(1),
-            )
-            .is_ok()
         {
-            return Err("injected saved-session rename failure".to_string());
+            let mut injected = RENAME_SAVED_SESSION_FAILURE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if injected.as_deref() == Some(session_id) {
+                *injected = None;
+                return Err("injected saved-session rename failure".to_string());
+            }
         }
         orca_runtime::surface::RuntimeSurfaceHostHandle::rename_saved_session(session_id, title)
             .map(|_| ())
@@ -142,34 +142,33 @@ impl TuiSurfaceActions {
 
     pub(crate) fn rename_current_session(&self, session_id: &str, title: &str) -> io::Result<()> {
         let before = self.read_snapshot()?;
-        crate::surface_client::update_session_metadata(
+        let committed_revision = crate::surface_client::update_session_metadata(
             &self.thread,
-            orca_runtime::surface::SessionMetadataPrecondition::Exact {
-                revision: before.thread.metadata_revision,
-            },
+            before.thread.metadata_revision,
             orca_runtime::surface::SessionMetadataPatch::SetTitle {
                 title: orca_runtime::surface::DisplayText::new(title),
             },
-        )?;
+        )
+        .map_err(io::Error::other)?;
 
         if let Err(error) = TuiHostActions::rename_saved_session(session_id, title) {
-            let compensation = self
-                .read_snapshot()
-                .and_then(|after| {
-                    crate::surface_client::update_session_metadata(
-                        &self.thread,
-                        orca_runtime::surface::SessionMetadataPrecondition::Exact {
-                            revision: after.thread.metadata_revision,
-                        },
-                        orca_runtime::surface::SessionMetadataPatch::SetTitle {
-                            title: before.thread.title.clone(),
-                        },
-                    )
-                })
-                .err();
-            let detail = compensation
-                .map(|compensation| format!("; runtime compensation failed: {compensation}"))
-                .unwrap_or_default();
+            let compensation = crate::surface_client::update_session_metadata(
+                &self.thread,
+                committed_revision,
+                orca_runtime::surface::SessionMetadataPatch::SetTitle {
+                    title: before.thread.title.clone(),
+                },
+            );
+            let detail = match compensation {
+                Ok(_) => String::new(),
+                Err(compensation) if compensation.is_stale() => {
+                    "; runtime compensation rejected because session metadata changed concurrently"
+                        .to_string()
+                }
+                Err(compensation) => {
+                    format!("; runtime compensation failed: {compensation}")
+                }
+            };
             return Err(io::Error::other(format!(
                 "failed to persist conversation rename: {error}{detail}"
             )));

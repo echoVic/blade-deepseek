@@ -66,10 +66,12 @@ fn require_all_properties(schema: &mut Value) {
         return;
     };
     let is_typed_object = object.get("type").and_then(Value::as_str) == Some("object");
-    if is_typed_object && let Some(properties) = object.get("properties").and_then(Value::as_object)
-    {
-        let required = properties.keys().cloned().map(Value::String).collect();
-        object.insert("required".to_string(), Value::Array(required));
+    if is_typed_object {
+        object.insert("additionalProperties".to_string(), Value::Bool(false));
+        if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+            let required = properties.keys().cloned().map(Value::String).collect();
+            object.insert("required".to_string(), Value::Array(required));
+        }
     }
 
     if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
@@ -101,7 +103,13 @@ mod tests {
                 "type": "object",
                 "properties": {
                     "required_value": { "type": "string" },
-                    "optional_value": { "type": ["string", "null"] }
+                    "optional_value": { "type": ["string", "null"] },
+                    "nested": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" }
+                        }
+                    }
                 },
                 "required": ["required_value"],
                 "additionalProperties": false
@@ -132,7 +140,11 @@ mod tests {
         assert_eq!(tools[0]["function"]["strict"], true);
         assert_eq!(
             tools[0]["function"]["parameters"]["required"],
-            json!(["optional_value", "required_value"])
+            json!(["nested", "optional_value", "required_value"])
+        );
+        assert_eq!(
+            tools[0]["function"]["parameters"]["properties"]["nested"]["additionalProperties"],
+            false
         );
     }
 }

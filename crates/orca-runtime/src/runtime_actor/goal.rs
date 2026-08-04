@@ -140,9 +140,15 @@ impl<Command, PendingRecovery, Completion, ActiveControl, PauseEvent>
         self.deferred_commands.pop_front()
     }
 
-    pub(crate) fn set_pending_recovery(&mut self, pending: PendingRecovery) {
-        debug_assert!(self.pending_recovery.is_none());
+    pub(crate) fn set_pending_recovery(
+        &mut self,
+        pending: PendingRecovery,
+    ) -> Result<(), PendingRecovery> {
+        if self.pending_recovery.is_some() {
+            return Err(pending);
+        }
         self.pending_recovery = Some(pending);
+        Ok(())
     }
 
     pub(crate) fn pending_recovery(&self) -> Option<&PendingRecovery> {
@@ -158,10 +164,22 @@ impl<Command, PendingRecovery, Completion, ActiveControl, PauseEvent>
         operation_id: OperationId,
         control: Option<ActiveControl>,
         turn: Option<GoalTurnContext>,
-    ) {
+    ) -> bool {
         debug_assert!(control.is_some() || turn.is_none());
+        if self
+            .active_control
+            .as_ref()
+            .is_some_and(|(active_id, _, _)| *active_id != operation_id)
+            || self
+                .pending_pause_settlement
+                .as_ref()
+                .is_some_and(|(active_id, _)| *active_id != operation_id)
+        {
+            return false;
+        }
         self.active_control = control.map(|control| (operation_id, control, turn));
         self.pending_pause_settlement = None;
+        true
     }
 
     pub(crate) fn active_control(&self, operation_id: OperationId) -> Option<&ActiveControl> {
@@ -201,10 +219,12 @@ impl<Command, PendingRecovery, Completion, ActiveControl, PauseEvent>
         &mut self,
         operation_id: OperationId,
         settlement: PauseEvent,
-    ) {
+    ) -> bool {
         if self.pending_pause_settlement.is_none() && self.has_active_control(operation_id) {
             self.pending_pause_settlement = Some((operation_id, settlement));
+            return true;
         }
+        false
     }
 
     pub(crate) fn pending_pause_settlement(
@@ -299,7 +319,7 @@ mod tests {
         controller.defer(20);
         trace.push(controller.trace());
 
-        controller.set_pending_recovery(30);
+        controller.set_pending_recovery(30).unwrap();
         trace.push(controller.trace());
         controller.finish_blocking();
         assert_eq!(controller.take_deferred(), Some(10));
@@ -322,15 +342,22 @@ mod tests {
         controller.completion_tx.try_send(40).unwrap();
         assert_eq!(controller.completion_rx.try_recv(), Ok(40));
 
+        controller.set_pending_recovery(31).unwrap();
+        assert_eq!(controller.set_pending_recovery(32), Err(32));
+        assert_eq!(controller.take_pending_recovery(), Some(31));
+
         let allocator = OperationIdAllocator::new();
         let first = allocator.allocate();
         let second = allocator.allocate();
-        controller.bind_active(first, Some(50), None);
+        assert!(controller.bind_active(first, Some(50), None));
         assert_eq!(controller.active_control(first), Some(&50));
         assert_eq!(controller.active_control(second), None);
-        controller.schedule_pause_settlement(second, 60);
+        assert!(!controller.schedule_pause_settlement(second, 60));
         assert_eq!(controller.pending_pause_settlement(first), None);
-        controller.schedule_pause_settlement(first, 70);
+        assert!(controller.schedule_pause_settlement(first, 70));
+        assert!(!controller.bind_active(second, Some(80), None));
+        assert_eq!(controller.active_control(first), Some(&50));
+        assert_eq!(controller.pending_pause_settlement(first), Some(&70));
         assert_eq!(controller.take_pause_settlement(second), None);
         assert_eq!(controller.take_pause_settlement(first), Some(70));
         controller.clear_active(first);

@@ -7123,6 +7123,7 @@ fn goal_with_predecessor(predecessor: &SurfaceGoalGenerationIdentity) -> Surface
         goal_revision: GoalRevision::try_new(1).unwrap(),
         goal_owner_epoch: GoalOwnerEpoch::try_new(1).unwrap(),
         catalog_revision: GoalCatalogRevision::try_new(1).unwrap(),
+        receipt_digest: digest(1),
         objective: NonEmptyText::try_new("finish reducer").unwrap(),
         objective_revision: GoalObjectiveRevision::new(1),
         state: SurfaceGoalState::Active,
@@ -8190,6 +8191,15 @@ fn goal_continuation_replay_is_batch_exact_and_receipt_must_match() {
             .goal_revision
             .get(),
         3
+    );
+    assert_eq!(
+        applied_state
+            .snapshot()
+            .goal
+            .as_ref()
+            .unwrap()
+            .receipt_digest,
+        digest(80)
     );
 
     let first_commit_id = match &first.commit_class {

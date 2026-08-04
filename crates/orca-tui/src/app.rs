@@ -1963,19 +1963,19 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn mcp_process_is_alive(pid: &str) -> bool {
-        std::process::Command::new("/bin/kill")
+    fn mcp_process_is_alive(pid: &str) -> std::io::Result<bool> {
+        std::process::Command::new("kill")
             .args(["-0", pid])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok_and(|status| status.success())
+            .map(|status| status.success())
     }
 
     #[cfg(unix)]
     fn wait_for_mcp_process_exit(pid: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while mcp_process_is_alive(pid) {
+        while mcp_process_is_alive(pid).expect("probe MCP fixture process") {
             assert!(
                 Instant::now() < deadline,
                 "MCP fixture process {pid} was not reaped before the deadline"
@@ -3648,6 +3648,15 @@ done
         f(home.path())
     }
 
+    #[test]
+    fn saved_history_fallback_reports_load_failure() {
+        with_orca_home(|_| {
+            let error = load_saved_history_fallback("missing-session")
+                .expect_err("missing session must not produce an empty resumed transcript");
+            assert!(error.contains("failed to load saved conversation missing-session"));
+        });
+    }
+
     struct HostedTuiHarness {
         action_tx: mpsc::Sender<UserAction>,
         event_rx: mpsc::Receiver<TuiEvent>,
@@ -4195,14 +4204,12 @@ done
             assert!(
                 crate::surface_client::update_session_metadata(
                     &surface,
-                    orca_runtime::surface::SessionMetadataPrecondition::Exact {
-                        revision: stale_revision,
-                    },
+                    stale_revision,
                     orca_runtime::surface::SessionMetadataPatch::SetTitle {
                         title: orca_runtime::surface::DisplayText::new("stale title"),
                     },
                 )
-                .is_err()
+                .is_err_and(|error| error.is_stale())
             );
             assert_eq!(
                 TuiSurfaceActions::new(surface)
@@ -4243,7 +4250,7 @@ done
                 .as_str()
                 .to_string();
 
-            crate::surface_actions::inject_rename_saved_session_failure_once();
+            crate::surface_actions::inject_rename_saved_session_failure_once(&session_id);
             harness.send(UserAction::RenameCurrentSession {
                 title: "must not stick".to_string(),
             });
@@ -8939,14 +8946,25 @@ fn reap_hosted_thread(thread: RuntimeThreadHandle) {
     let result = std::thread::Builder::new()
         .name("orca-tui-session-reaper".to_string())
         .spawn(move || {
-            for _ in 0..32 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut delay = Duration::from_millis(10);
+            loop {
                 if thread.shutdown().is_ok() {
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    eprintln!(
+                        "orca: runtime session reaper exhausted its 5-second shutdown budget"
+                    );
+                    return;
+                }
+                std::thread::sleep(delay.min(remaining));
+                delay = delay.saturating_mul(2).min(Duration::from_millis(250));
             }
         });
     if result.is_err() {
+        eprintln!("orca: failed to start runtime session reaper; shutting down inline");
         let _ = fallback.shutdown();
     }
 }
@@ -9127,8 +9145,8 @@ fn emit_typed_history_snapshot(
     };
     if messages.is_empty()
         && let HistoryMode::Resume(selector) | HistoryMode::Fork(selector) = mode
-        && let Ok(transcript) = RuntimeSurfaceHostHandle::load_saved_session(selector)
     {
+        let transcript = load_saved_history_fallback(selector)?;
         messages = transcript
             .messages
             .into_iter()
@@ -9157,6 +9175,11 @@ fn emit_typed_history_snapshot(
             .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn load_saved_history_fallback(selector: &str) -> Result<history::SessionTranscript, String> {
+    RuntimeSurfaceHostHandle::load_saved_session(selector)
+        .map_err(|error| format!("failed to load saved conversation {selector}: {error}"))
 }
 
 fn typed_history_startup_eligible(
@@ -9647,7 +9670,7 @@ fn resume_latest_active_goal_hosted(
         }
     };
     if let Some(previous) = thread.take() {
-        let _ = previous.shutdown();
+        reap_hosted_thread(previous);
     }
     notify_recovered_background_approvals_for_tui(
         &TuiSurfaceActions::new(resumed.typed_surface()),

@@ -15,14 +15,15 @@ use orca_runtime::surface::{
     OperationRequestIntent, OperationSettingsPreparation, OperationTerminal, PinnedContextAction,
     PinnedContextSourceRevision, PinnedUserRevision, ReplayabilityRequest, RuntimeSettingsPatch,
     RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle,
-    SessionMetadataPatch, SessionMetadataPrecondition, Sha256Digest, SurfaceAllowDeny,
-    SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId,
-    SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceGoal, SurfaceGoalFence,
-    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
-    SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
-    SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceUnavailableReason,
-    SurfaceWorkflowRunId, TaskControlAction, TransferBackgroundOutput, WaitOperationTerminalResult,
-    WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
+    SessionMetadataPatch, SessionMetadataPrecondition, SessionMetadataRevision, Sha256Digest,
+    StaleMutationError, SurfaceAllowDeny, SurfaceAttachmentRole, SurfaceCapability,
+    SurfaceCatalogEntryId, SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceGoal,
+    SurfaceGoalFence, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
+    SurfaceOperationId, SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId,
+    SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence,
+    SurfaceUnavailableReason, SurfaceWorkflowRunId, TaskControlAction, TransferBackgroundOutput,
+    UncommittedMutation, WaitOperationTerminalResult, WorkflowCatalogRevision,
+    WorkflowControlAction, WorkflowPatch,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -45,6 +46,42 @@ impl fmt::Display for TerminalRecoveryRequired {
 }
 
 impl Error for TerminalRecoveryRequired {}
+
+#[derive(Debug)]
+pub(crate) enum SessionMetadataUpdateError {
+    Stale { error: StaleMutationError },
+    Other(io::Error),
+}
+
+impl SessionMetadataUpdateError {
+    pub(crate) fn is_stale(&self) -> bool {
+        matches!(self, Self::Stale { .. })
+    }
+}
+
+impl fmt::Display for SessionMetadataUpdateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stale { error } => formatter.write_str(error.error().message.as_str()),
+            Self::Other(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for SessionMetadataUpdateError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Stale { .. } => None,
+            Self::Other(error) => Some(error),
+        }
+    }
+}
+
+impl From<io::Error> for SessionMetadataUpdateError {
+    fn from(error: io::Error) -> Self {
+        Self::Other(error)
+    }
+}
 
 pub(crate) fn is_terminal_recovery_error(error: &io::Error) -> bool {
     error
@@ -365,9 +402,16 @@ pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<S
 
 pub(crate) fn update_session_metadata(
     thread: &RuntimeSurfaceThreadHandle,
-    precondition: SessionMetadataPrecondition,
+    expected_revision: SessionMetadataRevision,
     patch: SessionMetadataPatch,
-) -> io::Result<()> {
+) -> Result<SessionMetadataRevision, SessionMetadataUpdateError> {
+    let committed_revision = SessionMetadataRevision::try_new(
+        expected_revision
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("session metadata revision overflow"))?,
+    )
+    .map_err(|error| io::Error::other(format!("invalid session metadata revision: {error}")))?;
     let surface = thread.surface();
     let attachment = match surface.attach_fresh(FreshAttachRequest {
         request_id: SurfaceRequestId::new(),
@@ -382,39 +426,49 @@ pub(crate) fn update_session_metadata(
         AttachResult::Denied { reason } => {
             return Err(io::Error::other(format!(
                 "typed TUI metadata attachment denied: {reason:?}"
-            )));
+            ))
+            .into());
         }
         AttachResult::Unavailable { reason } => {
             return Err(io::Error::other(format!(
                 "typed TUI metadata attachment unavailable: {reason:?}"
-            )));
+            ))
+            .into());
         }
         AttachResult::ThreadClosed { .. } => {
-            return Err(io::Error::other("typed TUI metadata thread is closed"));
+            return Err(io::Error::other("typed TUI metadata thread is closed").into());
         }
         AttachResult::CursorAttached { .. }
         | AttachResult::SnapshotRequired { .. }
         | AttachResult::InvalidCursor { .. } => {
             return Err(io::Error::other(
                 "typed TUI metadata attachment returned an invalid fresh-attach result",
-            ));
+            )
+            .into());
         }
     };
-    let result =
-        attachment
-            .client
-            .update_session_metadata(SurfaceRequestId::new(), precondition, patch);
+    let result = attachment.client.update_session_metadata(
+        SurfaceRequestId::new(),
+        SessionMetadataPrecondition::Exact {
+            revision: expected_revision,
+        },
+        patch,
+    );
     detach(&surface, &attachment.client);
     let result = result.map_err(|error| {
         io::Error::other(format!("typed TUI metadata update failed: {error:?}"))
     })?;
     match result {
-        MutationReply::Committed { .. } => Ok(()),
+        MutationReply::Committed { .. } => Ok(committed_revision),
+        MutationReply::Uncommitted {
+            mutation: UncommittedMutation::Stale { error, .. },
+        } => Err(SessionMetadataUpdateError::Stale { error }),
         MutationReply::Uncommitted { mutation } => Err(io::Error::other(format!(
             "typed TUI metadata update did not commit: {mutation:?}"
-        ))),
+        ))
+        .into()),
         MutationReply::Deferred { .. } => {
-            Err(io::Error::other("typed TUI metadata update deferred"))
+            Err(io::Error::other("typed TUI metadata update deferred").into())
         }
     }
 }

@@ -21,8 +21,9 @@ fn root_binary_exposes_the_supported_command_surface() {
             "root help is missing {command}"
         );
     }
+    let tokens = stdout.split_whitespace().collect::<Vec<_>>();
     for option in ["--resume", "--fork", "--continue", "--model", "--mode"] {
-        assert!(stdout.contains(option), "root help is missing {option}");
+        assert!(tokens.contains(&option), "root help is missing {option}");
     }
 }
 

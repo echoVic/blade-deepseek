@@ -45,6 +45,17 @@ pub(crate) fn available_session_actions(
     actions
 }
 
+fn session_action_index(
+    active_session_id: Option<&str>,
+    selected_session_id: &str,
+    action: SessionPickerAction,
+) -> usize {
+    available_session_actions(active_session_id, selected_session_id)
+        .iter()
+        .position(|candidate| *candidate == action)
+        .expect("picker phase action must remain available")
+}
+
 pub(crate) fn handle_session_picker_key<F>(
     key: &KeyEvent,
     state: &mut AppState,
@@ -122,9 +133,14 @@ where
                 });
             }
             KeyCode::Esc => {
+                let selected = session_action_index(
+                    state.current_session_id.as_deref(),
+                    &session_id,
+                    SessionPickerAction::Rename,
+                );
                 state.session_picker_phase = SessionPickerPhase::Actions {
                     session_id,
-                    selected: 2,
+                    selected,
                 };
             }
             _ => {}
@@ -155,9 +171,14 @@ where
                 let _ = action_tx.send(UserAction::ArchiveSavedSession { session_id });
             }
             KeyCode::Enter | KeyCode::Esc => {
+                let selected = session_action_index(
+                    state.current_session_id.as_deref(),
+                    &session_id,
+                    SessionPickerAction::Archive,
+                );
                 state.session_picker_phase = SessionPickerPhase::Actions {
                     session_id,
-                    selected: 3,
+                    selected,
                 };
             }
             _ => {}
@@ -188,9 +209,14 @@ where
                 let _ = action_tx.send(UserAction::DeleteSavedSession { session_id });
             }
             KeyCode::Enter | KeyCode::Esc => {
+                let selected = session_action_index(
+                    state.current_session_id.as_deref(),
+                    &session_id,
+                    SessionPickerAction::Delete,
+                );
                 state.session_picker_phase = SessionPickerPhase::Actions {
                     session_id,
-                    selected: 4,
+                    selected,
                 };
             }
             _ => {}
@@ -401,5 +427,25 @@ mod tests {
 
         assert_eq!(state.session_picker_phase, SessionPickerPhase::Browsing);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn session_action_indices_follow_available_actions() {
+        assert_eq!(
+            session_action_index(None, "two", SessionPickerAction::Rename),
+            2
+        );
+        assert_eq!(
+            session_action_index(None, "two", SessionPickerAction::Archive),
+            3
+        );
+        assert_eq!(
+            session_action_index(None, "two", SessionPickerAction::Delete),
+            4
+        );
+        assert_eq!(
+            session_action_index(Some("two"), "two", SessionPickerAction::CopySessionId),
+            3
+        );
     }
 }

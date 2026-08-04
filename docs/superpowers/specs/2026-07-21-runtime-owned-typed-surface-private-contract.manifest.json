@@ -247,12 +247,11 @@
       "Backtrack",
       "BackgroundCurrentTurn",
       "Interrupt",
-      "Cancel"
-    ],
-    "required_tui_user_action_additions": [
+      "Cancel",
       "ResumeOperation",
       "CancelOperation"
     ],
+    "required_tui_user_action_additions": [],
     "task_source_target_variants": [
       "Upserted",
       "StatusChanged"
@@ -4503,12 +4502,12 @@
     ],
     [
       "ResumeOperation",
-      "required_addition",
+      "current",
       [
         "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md:1599"
       ],
       "recovery_mutation",
-      "Phase3 recovery action (not in baseline enum)",
+      "UserAction::ResumeOperation",
       "ResumeOperation(exact visible operation)",
       "ResumeOperation(exact visible operation)",
       [
@@ -4525,12 +4524,12 @@
     ],
     [
       "CancelOperation",
-      "required_addition",
+      "current",
       [
         "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md:1601"
       ],
       "recovery_mutation",
-      "Phase3 recovery action (not in baseline enum)",
+      "UserAction::CancelOperation",
       "CancelOperation(exact visible operation)",
       "CancelOperation(exact visible operation)",
       [
@@ -5715,7 +5714,7 @@
       "id": "tui_user_action_inventory",
       "source": "tui_actions",
       "compare_current_to": "crates/orca-tui/src/types.rs::UserAction",
-      "required_additions_activate_in": "Phase3",
+      "required_additions_completed_in": "Phase3",
       "assert": [
         "every_current_variant_once",
         "no_unclassified_addition",
@@ -6438,8 +6437,8 @@
       "given": "current UserAction source",
       "when": "Phase0B inventory parser compares manifest",
       "expect": [
-        "all 21 current variants exactly once",
-        "two additions remain declared until Phase3",
+        "all 32 current variants exactly once",
+        "no required additions remain after Phase3",
         "new or renamed variant fails build"
       ]
     },
@@ -7082,7 +7081,7 @@
   ],
   "phase_0a_manifest_invariants": [
     "source_facts has exactly 53 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 30 unique variants matching UserAction at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 32 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",

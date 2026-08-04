@@ -292,7 +292,9 @@ impl TaskRegistry {
     ) -> io::Result<Self> {
         let persistence = Arc::new(TaskPersistence::new(root, session_id.clone()));
         let typed_provider_outcomes = persistence.load_typed_provider_outcomes(&session_id)?;
-        let mut records = persistence.load_session_records(&session_id)?;
+        let _session_lock = ExclusiveFileLock::acquire(&persistence.session_lock_path(&session_id))
+            .map_err(io::Error::other)?;
+        let mut records = persistence.load_session_records_unlocked(&session_id)?;
         let mut changed = false;
         if recover_interrupted {
             for (task_id, record) in &mut records {
@@ -302,8 +304,9 @@ impl TaskRegistry {
             }
         }
         if changed {
-            persistence.write_session_records(&session_id, &records)?;
+            persistence.write_session_records_unlocked(&session_id, &records)?;
         }
+        drop(_session_lock);
         Ok(Self {
             session_id,
             inner: Arc::new(Mutex::new(records)),
@@ -540,6 +543,17 @@ impl TaskRegistry {
         agent_type: Option<String>,
         parent_task_id: Option<String>,
     ) -> TaskHandle {
+        let mut ancestor_id = parent_task_id.clone();
+        let mut refreshed = HashSet::new();
+        while let Some(id) = ancestor_id {
+            if !refreshed.insert(id.clone()) {
+                break;
+            }
+            ancestor_id = self
+                .refresh_task_from_persistence(&id)
+                .expect("task registry parent refresh failed")
+                .and_then(|record| record.parent_task_id);
+        }
         let id = new_task_id();
         let created_at_ms = now_ms();
         let control = TaskControl {
@@ -588,12 +602,27 @@ impl TaskRegistry {
             .lock()
             .expect("cancelled task roots lock poisoned");
         let mut tasks = self.inner.lock().expect("task registry lock poisoned");
-        let parent_cancelled = record.parent_task_id.as_ref().is_some_and(|parent_id| {
-            cancelled_roots.contains(parent_id)
-                || tasks.get(parent_id).is_some_and(|parent| {
-                    is_terminal(parent.status) || parent.control.cancel.is_cancelled()
+        let mut ancestor_id = record.parent_task_id.as_deref();
+        let mut inspected = HashSet::new();
+        let mut parent_cancelled = false;
+        while let Some(id) = ancestor_id {
+            if !inspected.insert(id.to_string()) {
+                break;
+            }
+            if cancelled_roots.contains(id)
+                || tasks.get(id).is_some_and(|ancestor| {
+                    is_terminal(ancestor.status)
+                        || ancestor.status == TaskStatus::Stopping
+                        || ancestor.control.cancel.is_cancelled()
                 })
-        });
+            {
+                parent_cancelled = true;
+                break;
+            }
+            ancestor_id = tasks
+                .get(id)
+                .and_then(|ancestor| ancestor.parent_task_id.as_deref());
+        }
         let mut record = record;
         if parent_cancelled {
             record.status = TaskStatus::Stopping;
@@ -1761,10 +1790,12 @@ impl TaskPersistence {
         requesting_session_id: &str,
     ) -> io::Result<Option<TaskRecord>> {
         let index = self.load_index()?;
-        let Some(session_id) = index.get(id) else {
+        let Some(session_id) = index.get(id).cloned() else {
             return Ok(None);
         };
-        let mut records = self.load_session_records(session_id)?;
+        let _session_lock = ExclusiveFileLock::acquire(&self.session_lock_path(&session_id))
+            .map_err(io::Error::other)?;
+        let mut records = self.load_session_records_unlocked(&session_id)?;
         let Some(record) = records.get_mut(id) else {
             return Ok(None);
         };
@@ -1772,15 +1803,24 @@ impl TaskPersistence {
             && session_id != requesting_session_id
             && mark_interrupted_if_active(record)
         {
-            self.write_session_records(session_id, &records)?;
+            self.write_session_records_unlocked(&session_id, &records)?;
         }
         Ok(records.remove(id))
     }
 
     fn load_session_records(&self, session_id: &str) -> io::Result<HashMap<String, TaskRecord>> {
+        let _session_lock = ExclusiveFileLock::acquire(&self.session_lock_path(session_id))
+            .map_err(io::Error::other)?;
+        self.load_session_records_unlocked(session_id)
+    }
+
+    fn load_session_records_unlocked(
+        &self,
+        session_id: &str,
+    ) -> io::Result<HashMap<String, TaskRecord>> {
         let (records, changed) = self.read_session_records(session_id)?;
         if changed {
-            self.write_session_records(session_id, &records)?;
+            self.write_session_records_unlocked(session_id, &records)?;
         }
         Ok(records)
     }
@@ -1804,16 +1844,6 @@ impl TaskPersistence {
             })
             .collect::<HashMap<_, _>>();
         Ok((records, changed))
-    }
-
-    fn write_session_records(
-        &self,
-        session_id: &str,
-        records: &HashMap<String, TaskRecord>,
-    ) -> io::Result<()> {
-        let _session_lock = ExclusiveFileLock::acquire(&self.session_lock_path(session_id))
-            .map_err(io::Error::other)?;
-        self.write_session_records_unlocked(session_id, records)
     }
 
     fn write_session_records_unlocked(
@@ -2610,7 +2640,9 @@ fn migrate_legacy_task_sessions(legacy_root: &Path, target_root: &Path) -> io::R
             continue;
         }
 
-        let mut target_records = target.load_session_records(&session_id)?;
+        let _session_lock = ExclusiveFileLock::acquire(&target.session_lock_path(&session_id))
+            .map_err(io::Error::other)?;
+        let mut target_records = target.load_session_records_unlocked(&session_id)?;
         let mut changed_session = false;
         for (id, record) in legacy_records {
             if legacy_index.get(&id) != Some(&session_id) || target_index.contains_key(&id) {
@@ -2623,7 +2655,7 @@ fn migrate_legacy_task_sessions(legacy_root: &Path, target_root: &Path) -> io::R
         }
 
         if changed_session {
-            target.write_session_records(&session_id, &target_records)?;
+            target.write_session_records_unlocked(&session_id, &target_records)?;
         }
     }
 
@@ -3620,6 +3652,30 @@ mod tests {
             persisted.get(&detached.id).unwrap().status,
             TaskStatus::Running
         );
+    }
+
+    #[test]
+    fn persistent_child_creation_refreshes_cancelled_parent_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("tasks");
+        let owner =
+            TaskRegistry::new_persistent("shared-session".to_string(), root_path.clone()).unwrap();
+        let root = owner.create_main_session("foreground turn".to_string());
+        owner.mark_running(&root.id).unwrap();
+        let worker =
+            TaskRegistry::new_persistent_attached("shared-session".to_string(), root_path).unwrap();
+        assert_eq!(worker.get(&root.id).unwrap().status, TaskStatus::Running);
+
+        owner.request_stop(&root.id).unwrap();
+        let child = worker.create_subagent_with_parent(
+            "late worker child".to_string(),
+            None,
+            Some(root.id),
+        );
+
+        let child = worker.get(&child.id).unwrap();
+        assert_eq!(child.status, TaskStatus::Stopping);
+        assert!(child.control.cancel.is_cancelled());
     }
 
     #[cfg(unix)]

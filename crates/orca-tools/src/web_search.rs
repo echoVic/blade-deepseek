@@ -231,8 +231,10 @@ async fn search_exa_at_or_cancel_async(
 }
 
 fn search_client() -> Result<reqwest::Client, SearchError> {
-    reqwest::Client::builder()
-        .timeout(SEARCH_TIMEOUT)
+    let builder = reqwest::Client::builder().timeout(SEARCH_TIMEOUT);
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+    builder
         .build()
         .map_err(|error| SearchError::Failed(format!("failed to build web search client: {error}")))
 }

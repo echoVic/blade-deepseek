@@ -84,11 +84,10 @@ pub fn canonical_tool_definitions(
                 .as_ref()
                 .is_some_and(|allowed| allowed.contains(tool.name())),
             ToolSelection::Subagent(_) => {
-                matches!(tool.spec().name, ToolName::Mcp(_) | ToolName::External(_))
-                    || (tool.name() != "subagent"
-                        && allowed
-                            .as_ref()
-                            .is_some_and(|allowed| allowed.contains(tool.name())))
+                tool.name() != "subagent"
+                    && allowed
+                        .as_ref()
+                        .is_some_and(|allowed| allowed.contains(tool.name()))
             }
         })
         .map(|tool| CanonicalToolDefinition {
@@ -194,6 +193,37 @@ fn tool_target(name: &ToolName, arguments: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn external_tool(name: &str) -> orca_core::external_config::ExternalToolConfig {
+        orca_core::external_config::ExternalToolConfig {
+            name: name.to_string(),
+            description: name.to_string(),
+            action_kind: orca_core::approval_types::ActionKind::Read,
+            command: "true".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    #[test]
+    fn subagent_policy_does_not_grant_unlisted_external_tools() {
+        let external_tools = vec![external_tool("private_lookup")];
+        let registry = crate::registry::tool_registry_with_mcp_and_external(None, &external_tools);
+        let policy = ToolPolicy {
+            selection: ToolSelection::Subagent(vec!["read_file".to_string()]),
+        };
+
+        let names = canonical_tool_definitions(&policy, &registry)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "read_file"));
+        assert!(!names.iter().any(|name| name == "private_lookup"));
+    }
 
     #[test]
     fn normalizes_plan_boolean_status_flags() {

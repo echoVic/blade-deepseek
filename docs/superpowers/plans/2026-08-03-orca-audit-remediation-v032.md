@@ -782,7 +782,7 @@ Expected: FAIL on wildcard exports.
 
 - [x] **Step 3: Replace globs**
 
-List exports explicitly in mod.rs. Replace production use super::* imports with exact sibling imports. Test modules may use super::* only when the module itself is the intended test namespace.
+List exports explicitly in mod.rs. Replace production `use super::*` imports with exact sibling imports. Test modules may use `super::*` only when the module itself is the intended test namespace.
 
 - [x] **Step 4: Run GREEN and commit**
 
@@ -1134,7 +1134,8 @@ npm --prefix site run check:seo
 git diff --check
 ~~~
 
-Expected: all exit 0 before versioning. On 2026-08-04, the TUI profile passed
+Expected: all exit 0 before versioning. On 2026-08-04 Asia/Shanghai
+(2026-08-03 UTC), the TUI profile passed
 1,023/1,023 and the workspace profile passed 2,490/2,490 with zero failures and
 zero skipped tests; nextest reported one leaky process but no flaky retry. The
 SEO check passed after the v0.3.3 site version/date assets were updated.
@@ -1158,7 +1159,8 @@ git commit -m "release: prepare Orca v0.3.3"
 - [x] **Step 6: Rerun complete release matrix**
 
 Repeat Step 3 after the version commit. Record date, exit, and test counts;
-commit the final evidence update. On 2026-08-04, every command exited 0: the
+commit the final evidence update. On 2026-08-04 Asia/Shanghai (2026-08-03 UTC),
+every command exited 0: the
 TUI profile passed 1,023/1,023 and the workspace profile passed 2,490/2,490
 with zero skipped tests, failures, flaky retries, or leaky-process reports.
 

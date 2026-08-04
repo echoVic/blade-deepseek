@@ -47,7 +47,10 @@ pub fn prepare_child_agent_loop(
         tools_override: crate::tool_invocation::provider_tool_schema_override(
             request.depth,
             &request.subagent_type,
-            crate::tool_invocation::AgentToolPolicyContext::unrestricted(),
+            crate::tool_invocation::AgentToolPolicyContext::new(
+                request.allowed_tools.as_deref(),
+                request.tool_policy_label.as_deref(),
+            ),
             &mcp_registry,
             &config.external_tools,
         ),

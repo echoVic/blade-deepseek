@@ -64,19 +64,19 @@ mod runtime_surface;
 ///
 /// The implementation namespace is intentionally private:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0603
 /// use orca_runtime::runtime_surface::SurfaceCursor;
 /// ```
 ///
 /// Authority-bearing values intentionally keep construction, fields, and debug output
 /// private:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// fn requires_debug<T: std::fmt::Debug>() {}
 /// requires_debug::<orca_runtime::surface::AuthorityFingerprint>();
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0616
 /// fn leak(value: &orca_runtime::surface::AuthorityFingerprint) {
 ///     let _ = &value.operation_id;
 /// }
@@ -84,7 +84,7 @@ mod runtime_surface;
 ///
 /// Reservation leases can be decoded and inspected but not minted by consumers:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// let _ = orca_runtime::surface::ReservationLease::new;
 /// ```
 pub mod surface {

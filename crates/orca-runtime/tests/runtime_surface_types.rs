@@ -2028,8 +2028,7 @@ fn every_identity_revision_fence_scope_and_capability_is_constructible() {
         commit_id: commit_id.clone(),
     };
     let ephemeral = CommitClass::Ephemeral {
-        incarnation: orca_runtime::surface::SurfaceIncarnation::try_from_bytes(uuid_v7_bytes(4))
-            .unwrap(),
+        incarnation: SurfaceIncarnation::try_from_bytes(uuid_v7_bytes(4)).unwrap(),
         live_revision: LiveRevision::try_new(1).unwrap(),
         commit_id,
     };
@@ -2127,8 +2126,7 @@ fn independent_revision_domains_and_scalar_wrappers_do_not_collapse() {
     };
     let _cursor = SurfaceCursor {
         thread_id: SurfaceThreadId::try_from_bytes([6; 16]).unwrap(),
-        incarnation: orca_runtime::surface::SurfaceIncarnation::try_from_bytes(uuid_v7_bytes(6))
-            .unwrap(),
+        incarnation: SurfaceIncarnation::try_from_bytes(uuid_v7_bytes(6)).unwrap(),
         next_seq: SequenceNumber::new(0),
         source_revision: CursorSourceRevision::Recorded {
             durable_revision: DurableRevision::try_new(1).unwrap(),

@@ -4505,6 +4505,7 @@ mod closed_command_domain_tests {
             goal_revision: GoalRevision::try_new(1).unwrap(),
             goal_owner_epoch: GoalOwnerEpoch::try_new(1).unwrap(),
             catalog_revision: GoalCatalogRevision::try_new(1).unwrap(),
+            receipt_digest: digest(seed),
             objective: NonEmptyText::try_new("finish typed surface").unwrap(),
             objective_revision: GoalObjectiveRevision::new(1),
             state: SurfaceGoalState::Active,

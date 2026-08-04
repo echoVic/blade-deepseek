@@ -294,12 +294,16 @@ where
     pub(crate) fn prepare_terminalization(
         &mut self,
         pending: Terminalization,
-    ) -> SurfaceCommitEffect<Terminalization, AdmissionCommit, AdmissionRepair, AdmissionTerminal>
-    {
-        debug_assert!(self.terminalization.is_none());
+    ) -> Result<
+        SurfaceCommitEffect<Terminalization, AdmissionCommit, AdmissionRepair, AdmissionTerminal>,
+        Terminalization,
+    > {
+        if self.terminalization.is_some() {
+            return Err(pending);
+        }
         let effect = SurfaceCommitEffect::Terminalization(pending.clone());
         self.terminalization = Some(pending);
-        effect
+        Ok(effect)
     }
 
     pub(crate) fn prepare_admission_commit(&mut self, pending: AdmissionCommit) {
@@ -367,8 +371,14 @@ where
     > {
         match key {
             SurfaceCommitRetryKey::Terminalization(operation_id) => {
+                if self
+                    .terminalization
+                    .as_ref()
+                    .is_none_or(|pending| pending.operation_id() != operation_id)
+                {
+                    return None;
+                }
                 let pending = self.terminalization.take()?;
-                debug_assert_eq!(pending.operation_id(), operation_id);
                 Some(SurfaceCommitEffect::Terminalization(pending))
             }
             SurfaceCommitRetryKey::AdmissionCommit(operation_id) => self
@@ -436,7 +446,10 @@ where
     ) {
         match effect {
             SurfaceCommitEffect::Terminalization(pending) => {
-                debug_assert!(self.terminalization.is_none());
+                assert!(
+                    self.terminalization.is_none(),
+                    "terminalization retry slot must be empty after begin_attempt"
+                );
                 self.terminalization = Some(pending);
             }
             SurfaceCommitEffect::AdmissionCommit(pending) => self.prepare_admission_commit(pending),
@@ -532,7 +545,9 @@ mod tests {
 
         controller.retain_pending_terminal(pending_terminal_id.clone(), pending_terminal);
         controller.register_terminal_waiter(pending_terminal_id.clone(), waiter_tx);
-        let _initial_effect = controller.prepare_terminalization(terminalization.clone());
+        let _initial_effect = controller
+            .prepare_terminalization(terminalization.clone())
+            .unwrap_or_else(|_| panic!("terminalization slot should be empty"));
         controller.prepare_admission_commit(admission.clone());
         controller.prepare_admission_repair(repair.clone());
         controller.prepare_admission_terminal(terminal.clone());
@@ -659,6 +674,34 @@ mod tests {
                     admission_terminals: 0
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn terminalization_slot_rejects_replacement_and_stale_keys() {
+        let mut controller =
+            SurfaceCommitController::<Pending, Pending, Pending, Pending, Pending>::new(
+                HashMap::new(),
+            );
+        let first = pending(1, false);
+        let second = pending(2, false);
+
+        assert!(controller.prepare_terminalization(first.clone()).is_ok());
+        let rejected = match controller.prepare_terminalization(second.clone()) {
+            Ok(_) => panic!("occupied slot must reject replacement"),
+            Err(rejected) => rejected,
+        };
+        assert_eq!(rejected.identity, second.identity);
+        assert!(
+            controller
+                .begin_attempt(&SurfaceCommitRetryKey::Terminalization(
+                    second.operation_id.clone(),
+                ))
+                .is_none()
+        );
+        assert_eq!(
+            controller.inspect_terminalization(|pending| pending.identity),
+            Some(first.identity)
         );
     }
 }

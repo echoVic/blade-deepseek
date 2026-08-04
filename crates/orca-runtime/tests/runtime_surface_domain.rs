@@ -279,6 +279,11 @@ fn goal_set_and_run_commits_the_goal_store_binding_and_requested_operation_atomi
         .current_surface_receipt_digest(thread.thread_id())
         .unwrap()
         .expect("settled Goal receipt digest");
+    assert_eq!(
+        settled_goal.receipt_digest.as_bytes(),
+        &set_again_digest,
+        "the surface projection and durable Goal fence must expose the same receipt"
+    );
     let set_again = match attachment
         .client
         .goal_mutation(

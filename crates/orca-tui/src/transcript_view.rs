@@ -822,14 +822,13 @@ impl TranscriptRenderCache {
             }
         }
 
+        const DEFAULT_REFLOW_ENTRY_BUDGET: usize = 64;
         let reflow_started = Instant::now();
+        let reflow_entry_budget = reflow_entry_budget.unwrap_or(DEFAULT_REFLOW_ENTRY_BUDGET);
         let mut budgeted_entries = 0usize;
         loop {
-            if reflow_entry_budget.is_some_and(|budget| budgeted_entries >= budget)
-                || (reflow_window.is_some()
-                    && reflow_entry_budget.is_none()
-                    && budgeted_entries > 0
-                    && reflow_started.elapsed() >= Duration::from_millis(5))
+            if budgeted_entries >= reflow_entry_budget
+                || (budgeted_entries > 0 && reflow_started.elapsed() >= Duration::from_millis(5))
             {
                 break;
             }
@@ -3164,5 +3163,55 @@ mod tests {
             cache.viewport(0, 0, usize::MAX).total_height,
             unlimited.viewport(0, 0, usize::MAX).total_height
         );
+    }
+
+    #[test]
+    fn transcript_reflow_has_a_default_entry_budget() {
+        let messages = (0..5_000)
+            .map(|index| {
+                ChatMessage::System(format!(
+                    "message {index}: {}",
+                    "content that changes wrapped height ".repeat(3)
+                ))
+            })
+            .collect::<Vec<_>>();
+        let revisions = (1..=5_000).collect::<Vec<u64>>();
+        let theme = theme();
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(
+            &messages,
+            &revisions,
+            TranscriptRenderContext::new(&theme, 80, 0, false),
+            |_, message, _, _, _, _| match message {
+                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                _ => unreachable!(),
+            },
+        );
+
+        let visible_height = 12;
+        let requested_scroll = cache.cumulative_heights[2_500];
+        let visible_before = cache
+            .viewport(0, requested_scroll, visible_height)
+            .rendered_message_count;
+        cache.prepare(
+            &messages,
+            &revisions,
+            TranscriptRenderContext::new(&theme, 20, 0, false).with_reflow_window(
+                0,
+                requested_scroll,
+                visible_height,
+            ),
+            |_, message, _, _, _, _| match message {
+                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                _ => unreachable!(),
+            },
+        );
+
+        assert!(
+            cache.last_prepare_visited() <= visible_before + 64,
+            "default reflow visited {} entries with {visible_before} visible",
+            cache.last_prepare_visited()
+        );
+        assert!(cache.reflow_pending_for_test());
     }
 }

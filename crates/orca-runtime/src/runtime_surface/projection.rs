@@ -1185,6 +1185,7 @@ pub struct SurfaceGoal {
     pub goal_revision: GoalRevision,
     pub goal_owner_epoch: GoalOwnerEpoch,
     pub catalog_revision: GoalCatalogRevision,
+    pub receipt_digest: Sha256Digest,
     pub objective: NonEmptyText,
     pub objective_revision: GoalObjectiveRevision,
     pub state: SurfaceGoalState,

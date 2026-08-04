@@ -47,6 +47,7 @@ node --test scripts/test-validate-windows-platform-boundaries.mjs
 node scripts/validate-windows-platform-boundaries.mjs
 cargo nextest run -p orca-tui --lib --locked --profile ci-serial
 cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
+node scripts/release/test-verify-version-sync.mjs
 node scripts/release/test-stage-npm.mjs
 node scripts/release/test-verify-published.mjs
 npm --prefix site run build

@@ -153,6 +153,32 @@ fn prepare_child_agent_loop_builds_provider_conversation_and_policy() {
 }
 
 #[test]
+fn prepare_child_agent_loop_applies_request_tool_allowlist_to_provider_schema() {
+    let mut request = ChildAgentRequest::new(
+        "inspect repo".to_string(),
+        SubagentType::General,
+        None,
+        2,
+        false,
+    );
+    request.allowed_tools = Some(vec!["read_file".to_string()]);
+    request.tool_policy_label = Some("review-only".to_string());
+    let setup = prepare_child_agent_loop(
+        &config(None),
+        &request,
+        std::env::temp_dir().as_path(),
+        &ProjectInstructions::default(),
+        &MemoryBlock::default(),
+    );
+
+    let tools = setup.provider_config.tools_override.expect("tool override");
+    assert_eq!(
+        tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>(),
+        vec!["read_file"]
+    );
+}
+
+#[test]
 fn advance_child_agent_turn_stops_after_runtime_owned_limit() {
     let runtime_config = config(None);
     let mut setup = child_loop_setup(&runtime_config);

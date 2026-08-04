@@ -258,7 +258,7 @@ fn main() {
 
     println!("== Verdicts ==");
     verdict(
-        "default endpoint: update_plan call validates + executes",
+        "default endpoint: update_plan call validates in provider path",
         default_ok,
         &default_detail,
     );

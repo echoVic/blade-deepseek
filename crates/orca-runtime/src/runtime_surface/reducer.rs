@@ -6310,7 +6310,9 @@ fn apply_goal_patch(
                     "created goal does not match the receipt post-state",
                 ));
             }
-            state.snapshot.goal = Some(goal.clone());
+            let mut goal = goal.clone();
+            goal.receipt_digest = receipt.receipt_digest.clone();
+            state.snapshot.goal = Some(goal);
             return Ok(());
         }
         GoalPatch::Edited {
@@ -6380,7 +6382,9 @@ fn apply_goal_patch(
                     "edited goal does not match the receipt post-state",
                 ));
             }
-            state.snapshot.goal = Some(goal.clone());
+            let mut goal = goal.clone();
+            goal.receipt_digest = receipt.receipt_digest.clone();
+            state.snapshot.goal = Some(goal);
             return Ok(());
         }
         GoalPatch::Removed {
@@ -7087,6 +7091,7 @@ fn apply_goal_patch(
     goal.objective_revision = goal_envelope.receipt.objective_revision;
     goal.catalog_revision = goal_envelope.receipt.catalog_revision;
     goal.goal_owner_epoch = goal_envelope.receipt.goal_owner_epoch;
+    goal.receipt_digest = goal_envelope.receipt.receipt_digest;
     goal.state = next_state.clone();
     goal.current_run = current_run.clone();
     if successor_authorization.is_some() {
@@ -7132,6 +7137,7 @@ fn goal_with_present_receipt(
     goal.objective_revision = receipt.objective_revision;
     goal.catalog_revision = receipt.catalog_revision;
     goal.goal_owner_epoch = receipt.goal_owner_epoch;
+    goal.receipt_digest = receipt.receipt_digest.clone();
     goal.state = state.clone();
     goal.current_run = current_run.clone();
     goal

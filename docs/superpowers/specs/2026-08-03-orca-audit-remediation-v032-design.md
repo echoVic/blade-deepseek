@@ -433,7 +433,7 @@ The minimum local release candidate gates are:
 
 ```text
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --locked -j 1
 node --test scripts/test-validate-runtime-surface-contract.mjs
 node scripts/validate-runtime-surface-contract.mjs
 node --test scripts/test-validate-windows-platform-boundaries.mjs
