@@ -6343,7 +6343,7 @@ mod tests {
         assert!(!medium.contains("shortcuts"));
 
         let narrow = status_line(&state, &theme, 46).to_string();
-        assert!(narrow.contains("suggest"));
+        assert!(narrow.contains("auto-edit"));
         assert!(narrow.contains("context 25%"));
         assert!(!narrow.contains("git:"));
         assert!(!narrow.contains("blade-deepseek"));
@@ -6361,7 +6361,7 @@ mod tests {
 
         let text = status_line(&state, &theme, 46).to_string();
 
-        assert!(text.contains("suggest"));
+        assert!(text.contains("auto-edit"));
         assert!(text.contains("context 25%"));
         assert!(!text.contains("~/workspace"));
         assert!(!text.contains("git:main"));
@@ -6391,7 +6391,7 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
         let narrow = status_line(&state, &theme, 46).to_string();
-        assert!(narrow.contains("suggest"));
+        assert!(narrow.contains("auto-edit"));
         assert!(narrow.contains("context 25%"));
         assert!(!narrow.contains("tokens"));
         assert!(!narrow.contains("shortcuts"));
@@ -9408,7 +9408,7 @@ mod tests {
             "input box must stay visible when the transcript overflows"
         );
         assert!(
-            has("suggest"),
+            has("auto-edit"),
             "status line must stay visible when the transcript overflows"
         );
         // The composer (input) needs its full height; the messages area is everything above
