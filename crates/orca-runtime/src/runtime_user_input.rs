@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io;
 
-use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
+use orca_core::tool_types::{ToolRequest, ToolResult};
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16,14 +16,6 @@ pub trait RuntimeUserInputHandler {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RuntimeUserInputRequestArgs {
-    question: String,
-    #[serde(default)]
-    choices: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AskUserQuestionArgs {
     questions: Vec<AskUserQuestion>,
@@ -35,7 +27,7 @@ struct AskUserQuestion {
     header: String,
     question: String,
     options: Vec<AskUserQuestionOption>,
-    #[serde(default, alias = "multi_select")]
+    #[serde(default)]
     multi_select: bool,
 }
 
@@ -52,19 +44,7 @@ pub(crate) fn execute_user_input_tool(
     request: &ToolRequest,
     handler: &dyn RuntimeUserInputHandler,
 ) -> io::Result<ToolResult> {
-    if request.name == ToolName::AskUserQuestion {
-        return execute_ask_user_question_tool(request, handler);
-    }
-    let args = parse_runtime_user_input_request(request)?;
-    let input = RuntimeUserInputRequest {
-        id: request.id.clone(),
-        question: args.question,
-        choices: args.choices,
-    };
-    Ok(match handler.request_user_input(&input)? {
-        Some(answer) => ToolResult::completed(request, answer, false),
-        None => ToolResult::cancelled(request, "user input request cancelled", None),
-    })
+    execute_ask_user_question_tool(request, handler)
 }
 
 pub(crate) fn execute_ask_user_question_tool(
@@ -191,30 +171,6 @@ fn invalid_questionnaire(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-pub(crate) fn parse_runtime_user_input_request(
-    request: &ToolRequest,
-) -> io::Result<RuntimeUserInputRequestArgs> {
-    let raw = request.raw_arguments.as_deref().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "missing request_user_input arguments JSON",
-        )
-    })?;
-    let args: RuntimeUserInputRequestArgs = serde_json::from_str(raw).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid request_user_input arguments JSON: {error}"),
-        )
-    })?;
-    if args.question.trim().is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "missing required request_user_input argument: question",
-        ));
-    }
-    Ok(args)
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -285,7 +241,7 @@ mod tests {
                             {"label": "Logs", "description": "Capture structured logs"},
                             {"label": "Metrics", "description": "Capture numeric metrics", "preview": "p95"}
                         ],
-                        "multi_select": true
+                        "multiSelect": true
                     }
                 ]
             }"#,
@@ -351,6 +307,7 @@ mod tests {
             r#"{"questions":[{"header":"This header is too long","question":"Which?","options":[{"label":"A","description":"A"},{"label":"B","description":"B"}]}]}"#,
             r#"{"questions":[{"header":"Choice","question":"Which?","options":[{"label":"Only","description":"One"}]}]}"#,
             r#"{"questions":[{"header":"Choice","question":"Which?","options":[{"label":"Same","description":"One"},{"label":"Same","description":"Two"}]}]}"#,
+            r#"{"questions":[{"header":"Choice","question":"Which?","options":[{"label":"A","description":"One"},{"label":"B","description":"Two"}],"multi_select":true}]}"#,
         ];
 
         for arguments in invalid_arguments {

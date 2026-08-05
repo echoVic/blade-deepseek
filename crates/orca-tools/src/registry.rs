@@ -1442,35 +1442,6 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         ),
         BuiltinExecutor::RequestPermissions,
     ));
-    registry.register(BuiltinTool::new(
-        conservative_builtin_spec(
-            "request_user_input",
-            "Ask the user a structured clarification question. Use only when progress requires user input; headless runs return a deterministic failure instead of blocking.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "question": {
-                        "type": "string",
-                        "description": "A concise question to show the user"
-                    },
-                    "choices": {
-                        "type": "array",
-                        "description": "Optional mutually exclusive answer choices",
-                        "items": {
-                            "type": "string"
-                        }
-                    }
-                },
-                "required": ["question"],
-                "additionalProperties": false
-            }),
-            CapabilitySet::new(vec![ToolCapability::UserInputRequest]),
-            ToolExposure::Direct,
-            RendererHint::State,
-            false,
-        ),
-        BuiltinExecutor::RequestUserInput,
-    ));
     let ask_user_question = conservative_builtin_spec(
         "ask_user_question",
         "Ask the user one to four structured questions when progress requires clarification. Each question offers two to four choices, while the user may also type a custom answer. Headless runs fail deterministically instead of blocking.",
@@ -1786,11 +1757,6 @@ impl Tool for BuiltinTool {
                 "request_permissions must be executed by the runtime",
                 None,
             ),
-            BuiltinExecutor::RequestUserInput => ToolResult::failed(
-                request,
-                "request_user_input requires an interactive TUI session",
-                None,
-            ),
             BuiltinExecutor::AskUserQuestion => ToolResult::failed(
                 request,
                 "ask_user_question requires an interactive TUI session",
@@ -1834,7 +1800,6 @@ enum BuiltinExecutor {
     ListMcpResourceTemplates,
     ReadMcpResource,
     RequestPermissions,
-    RequestUserInput,
     AskUserQuestion,
 }
 
@@ -2271,7 +2236,7 @@ mod tests {
             "write_file",
             "subagent",
             "request_permissions",
-            "request_user_input",
+            "ask_user_question",
             "list_mcp_resources",
             "read_mcp_resource",
         ] {

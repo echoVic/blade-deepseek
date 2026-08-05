@@ -4,7 +4,7 @@
 
 **Goal:** Add a DeepSeek-visible `ask_user_question` tool that collects one to four structured answers through Orca's existing runtime-owned interaction path.
 
-**Architecture:** Keep `request_user_input` intact and add a distinct `ToolName::AskUserQuestion` contract whose model-visible name is `ask_user_question`. Parse and validate the Claude-compatible questionnaire in `orca-runtime`, then issue one typed `RuntimeUserInputRequest` per question through the existing broker so TUI, surface routing, cancellation, and recovery keep a single owner. Aggregate accepted answers into deterministic JSON for the model.
+**Architecture:** Standardize the model-visible contract on `ask_user_question`. Parse and validate the Claude-compatible questionnaire in `orca-runtime`, then issue one typed `RuntimeUserInputRequest` per question through the existing broker so TUI, surface routing, cancellation, and recovery keep a single owner. Aggregate accepted answers into deterministic JSON for the model.
 
 **Tech Stack:** Rust, serde/serde_json, Orca tool registry, runtime interaction broker, ratatui TUI, Cargo contract tests.
 
@@ -49,7 +49,7 @@ Expected: PASS.
 
 - [x] **Step 1: Write failing parser and execution tests**
 
-Cover one-to-four questions, camelCase and snake_case `multiSelect`, ordered per-question broker calls, label/description projection, JSON answer aggregation, cancellation, empty questions, too many questions, invalid options, duplicate labels, and unchanged legacy `request_user_input` behavior.
+Cover one-to-four questions, the canonical camelCase `multiSelect` field, ordered per-question broker calls, label/description projection, JSON answer aggregation, cancellation, empty questions, too many questions, invalid options, duplicate labels, and rejection of the retired `request_user_input` name.
 
 - [x] **Step 2: Run the focused tests and verify RED**
 
@@ -63,7 +63,7 @@ Deserialize `questions` into typed question/option structs, validate the public 
 
 - [x] **Step 4: Route the new tool through the existing special interaction dispatch**
 
-Classify both `RequestUserInput` and `AskUserQuestion` as user-input interactions, but select the correct parser from the typed `ToolName`.
+Classify only `AskUserQuestion` as a model-visible user-input interaction and route it through the questionnaire parser. Keep the existing runtime handler interface as an internal broker boundary.
 
 - [x] **Step 5: Run focused runtime tests and verify GREEN**
 
@@ -106,7 +106,7 @@ Expected: PASS.
 
 - [x] **Step 1: Document when and how the model uses `ask_user_question`**
 
-Document the structured schema, 1-4 and 2-4 bounds, multi-select answer convention, custom text, cancellation semantics, and headless failure behavior. Do not change the legacy `request_user_input` contract.
+Document the structured schema, 1-4 and 2-4 bounds, multi-select answer convention, custom text, cancellation semantics, headless failure behavior, and the migration from the retired `request_user_input` name.
 
 - [x] **Step 2: Run formatting and static validation**
 

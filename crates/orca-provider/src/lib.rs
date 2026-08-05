@@ -1514,13 +1514,19 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         let question = rest.trim();
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
-            name: ToolName::RequestUserInput,
+            name: ToolName::AskUserQuestion,
             action: ActionKind::Read,
             target: Some(question.to_string()),
             raw_arguments: Some(
                 serde_json::json!({
-                    "question": question,
-                    "choices": ["yes", "no"]
+                    "questions": [{
+                        "header": "Confirm",
+                        "question": question,
+                        "options": [
+                            {"label": "yes", "description": "Continue"},
+                            {"label": "no", "description": "Stop"}
+                        ]
+                    }]
                 })
                 .to_string(),
             ),

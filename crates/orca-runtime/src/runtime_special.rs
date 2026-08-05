@@ -96,9 +96,7 @@ impl RuntimeToolActorContext {
             ToolName::TaskList => RuntimeSpecialToolDispatch::TaskList,
             ToolName::TaskStop => RuntimeSpecialToolDispatch::TaskStop,
             ToolName::RequestPermissions => RuntimeSpecialToolDispatch::RequestPermissions,
-            ToolName::AskUserQuestion | ToolName::RequestUserInput => {
-                RuntimeSpecialToolDispatch::RequestUserInput
-            }
+            ToolName::AskUserQuestion => RuntimeSpecialToolDispatch::RequestUserInput,
             ToolName::WorkflowSendMessage
             | ToolName::WorkflowReadMessages
             | ToolName::WorkflowClearMessages

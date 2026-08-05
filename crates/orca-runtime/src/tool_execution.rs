@@ -1883,7 +1883,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_execution_routes_request_user_input_through_turn_interaction_handler() {
+    fn tool_execution_routes_ask_user_question_through_turn_interaction_handler() {
         struct AnswerHandler;
 
         impl RuntimeUserInputHandler for AnswerHandler {
@@ -1891,9 +1891,12 @@ mod tests {
                 &self,
                 request: &RuntimeUserInputRequest,
             ) -> io::Result<Option<String>> {
-                assert_eq!(request.id, "ask");
-                assert_eq!(request.question, "Continue?");
-                assert_eq!(request.choices, vec!["yes".to_string(), "no".to_string()]);
+                assert_eq!(request.id, "ask:question:1");
+                assert_eq!(request.question, "Confirm: Continue?");
+                assert_eq!(
+                    request.choices,
+                    vec!["yes - Continue".to_string(), "no - Stop".to_string()]
+                );
                 Ok(Some("yes".to_string()))
             }
         }
@@ -1916,13 +1919,19 @@ mod tests {
         let handler = AnswerHandler;
         let request = ToolRequest {
             id: "ask".to_string(),
-            name: ToolName::RequestUserInput,
+            name: ToolName::AskUserQuestion,
             action: ActionKind::Read,
             target: Some("Continue?".to_string()),
             raw_arguments: Some(
                 serde_json::json!({
-                    "question": "Continue?",
-                    "choices": ["yes", "no"]
+                    "questions": [{
+                        "header": "Confirm",
+                        "question": "Continue?",
+                        "options": [
+                            {"label": "yes", "description": "Continue"},
+                            {"label": "no", "description": "Stop"}
+                        ]
+                    }]
                 })
                 .to_string(),
             ),
@@ -1951,7 +1960,10 @@ mod tests {
             .expect("tool execution");
 
         assert_eq!(result.status, ToolStatus::Completed);
-        assert_eq!(result.output.as_deref(), Some("yes"));
+        assert_eq!(
+            result.output.as_deref(),
+            Some(r#"{"answers":{"Continue?":"yes"}}"#)
+        );
     }
 
     #[test]
@@ -1983,10 +1995,13 @@ mod tests {
         let mut permission_overlay = TurnPermissionOverlay::default();
         let request = ToolRequest {
             id: "ask-error".to_string(),
-            name: ToolName::RequestUserInput,
+            name: ToolName::AskUserQuestion,
             action: ActionKind::Read,
             target: Some("Continue?".to_string()),
-            raw_arguments: Some(r#"{"question":"Continue?"}"#.to_string()),
+            raw_arguments: Some(
+                r#"{"questions":[{"header":"Confirm","question":"Continue?","options":[{"label":"yes","description":"Continue"},{"label":"no","description":"Stop"}]}]}"#
+                    .to_string(),
+            ),
         };
 
         let (status, result) = actor

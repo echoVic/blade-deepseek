@@ -646,7 +646,7 @@ fn task_actor_routes_interactive_approval_through_handler() {
 }
 
 #[test]
-fn tool_actor_context_routes_request_user_input_through_handler() {
+fn tool_actor_context_routes_canonical_user_question_through_handler() {
     struct AnswerHandler;
 
     impl RuntimeUserInputHandler for AnswerHandler {
@@ -654,9 +654,12 @@ fn tool_actor_context_routes_request_user_input_through_handler() {
             &self,
             request: &RuntimeUserInputRequest,
         ) -> std::io::Result<Option<String>> {
-            assert_eq!(request.id, "ask");
-            assert_eq!(request.question, "Continue?");
-            assert_eq!(request.choices, vec!["yes".to_string(), "no".to_string()]);
+            assert_eq!(request.id, "ask:question:1");
+            assert_eq!(request.question, "Confirm: Continue?");
+            assert_eq!(
+                request.choices,
+                vec!["yes - Continue".to_string(), "no - Stop".to_string()]
+            );
             Ok(Some("yes".to_string()))
         }
     }
@@ -664,10 +667,13 @@ fn tool_actor_context_routes_request_user_input_through_handler() {
     let mut context = RuntimeToolActorContext::new("run-tools", 2);
     let request = ToolRequest {
         id: "ask".to_string(),
-        name: ToolName::RequestUserInput,
+        name: ToolName::AskUserQuestion,
         action: ActionKind::Read,
         target: None,
-        raw_arguments: Some(r#"{"question":"Continue?","choices":["yes","no"]}"#.to_string()),
+        raw_arguments: Some(
+            r#"{"questions":[{"header":"Confirm","question":"Continue?","options":[{"label":"yes","description":"Continue"},{"label":"no","description":"Stop"}]}]}"#
+                .to_string(),
+        ),
     };
 
     let result = context
@@ -675,7 +681,10 @@ fn tool_actor_context_routes_request_user_input_through_handler() {
         .expect("user input result");
 
     assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
-    assert_eq!(result.output.as_deref(), Some("yes"));
+    assert_eq!(
+        result.output.as_deref(),
+        Some(r#"{"answers":{"Continue?":"yes"}}"#)
+    );
 }
 
 #[test]
@@ -687,7 +696,7 @@ fn tool_actor_context_cancelled_user_input_returns_cancelled_result() {
             &self,
             request: &RuntimeUserInputRequest,
         ) -> std::io::Result<Option<String>> {
-            assert_eq!(request.id, "ask");
+            assert_eq!(request.id, "ask:question:1");
             Ok(None)
         }
     }
@@ -695,10 +704,13 @@ fn tool_actor_context_cancelled_user_input_returns_cancelled_result() {
     let mut context = RuntimeToolActorContext::new("run-tools", 2);
     let request = ToolRequest {
         id: "ask".to_string(),
-        name: ToolName::RequestUserInput,
+        name: ToolName::AskUserQuestion,
         action: ActionKind::Read,
         target: None,
-        raw_arguments: Some(r#"{"question":"Continue?"}"#.to_string()),
+        raw_arguments: Some(
+            r#"{"questions":[{"header":"Confirm","question":"Continue?","options":[{"label":"yes","description":"Continue"},{"label":"no","description":"Stop"}]}]}"#
+                .to_string(),
+        ),
     };
 
     let result = context
@@ -712,7 +724,7 @@ fn tool_actor_context_cancelled_user_input_returns_cancelled_result() {
     );
     assert_eq!(
         result.error.as_deref(),
-        Some("user input request cancelled")
+        Some("user question request cancelled")
     );
 }
 
@@ -1822,7 +1834,7 @@ fn tool_actor_context_classifies_runtime_special_tool_dispatch() {
     );
     assert_eq!(
         context.classify_dispatch(&tool_request(ToolName::RequestUserInput), false),
-        RuntimeSpecialToolDispatch::RequestUserInput
+        RuntimeSpecialToolDispatch::Normal
     );
     assert_eq!(
         context.classify_dispatch(&tool_request(ToolName::AskUserQuestion), false),

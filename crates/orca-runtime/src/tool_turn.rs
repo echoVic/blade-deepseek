@@ -1335,10 +1335,12 @@ mod tests {
         let mut conversation = Conversation::new();
         let sampling_state = RuntimeSamplingRequestState::new();
         let request = request(
-            ToolName::RequestUserInput,
+            ToolName::AskUserQuestion,
             ActionKind::Read,
             Some("Continue?"),
-            Some(r#"{"question":"Continue?"}"#),
+            Some(
+                r#"{"questions":[{"header":"Confirm","question":"Continue?","options":[{"label":"yes","description":"Continue"},{"label":"no","description":"Stop"}]}]}"#,
+            ),
         );
         let result = ToolResult::cancelled(&request, "user input cancelled", None);
 
@@ -1379,10 +1381,12 @@ mod tests {
         let mut conversation = Conversation::new();
         let sampling_state = RuntimeSamplingRequestState::new();
         let request = request(
-            ToolName::RequestUserInput,
+            ToolName::AskUserQuestion,
             ActionKind::Read,
             Some("Continue?"),
-            Some(r#"{"question":"Continue?"}"#),
+            Some(
+                r#"{"questions":[{"header":"Confirm","question":"Continue?","options":[{"label":"yes","description":"Continue"},{"label":"no","description":"Stop"}]}]}"#,
+            ),
         );
         let result = ToolResult::indeterminate(&request, "interaction channel closed");
 
@@ -2633,10 +2637,13 @@ mod tests {
             .into_iter()
             .map(|id| ToolRequest {
                 id: id.to_string(),
-                name: ToolName::RequestUserInput,
+                name: ToolName::AskUserQuestion,
                 action: ActionKind::Read,
                 target: Some("Continue?".to_string()),
-                raw_arguments: Some(r#"{"question":"Continue?"}"#.to_string()),
+                raw_arguments: Some(
+                    r#"{"questions":[{"header":"Confirm","question":"Continue?","options":[{"label":"yes","description":"Continue"},{"label":"no","description":"Stop"}]}]}"#
+                        .to_string(),
+                ),
             })
             .collect::<Vec<_>>();
         let instructions = ProjectInstructions::default();

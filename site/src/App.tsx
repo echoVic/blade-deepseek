@@ -106,7 +106,7 @@ const copy = {
       },
       {
         title: "Skills and user input",
-        body: "Markdown skills can be explicitly injected with $skill ids, and the TUI can answer structured request_user_input questions without ending the turn.",
+        body: "Markdown skills can be explicitly injected with $skill ids, and the TUI can answer structured ask_user_question prompts without ending the turn.",
       },
       {
         title: "Resumable history",
@@ -379,7 +379,7 @@ const copy = {
       },
       {
         title: "Skills 与用户输入",
-        body: "Markdown skills 可通过 $skill id 显式注入；TUI 能回答结构化 request_user_input 问题，并继续同一轮任务。",
+        body: "Markdown skills 可通过 $skill id 显式注入；TUI 能回答结构化 ask_user_question 问题，并继续同一轮任务。",
       },
       {
         title: "可恢复历史",
