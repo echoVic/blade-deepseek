@@ -12,6 +12,8 @@ fn suggest_denies_write_in_jsonl_mode() {
             "jsonl",
             "--provider",
             "mock",
+            "--approval-mode",
+            "suggest",
             "write a file",
         ])
         .output()

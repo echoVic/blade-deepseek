@@ -138,6 +138,8 @@ fn suggest_denies_bash_in_jsonl_mode() {
             "jsonl",
             "--provider",
             "mock",
+            "--approval-mode",
+            "suggest",
             "bash printf hi",
         ])
         .output()
@@ -570,6 +572,8 @@ fn suggest_denies_edit_in_jsonl_mode() {
             "jsonl",
             "--provider",
             "mock",
+            "--approval-mode",
+            "suggest",
             "--cwd",
             temp_dir.to_str().unwrap(),
             "edit note.txt :: hello => hi",
