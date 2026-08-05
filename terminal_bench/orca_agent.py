@@ -10,17 +10,12 @@ Usage:
 import json
 import os
 import shlex
+import subprocess
 from pathlib import Path
 
 from harbor.agents.installed.base import BaseInstalledAgent, with_prompt_template
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
-
-ORCA_VERSION = "0.3.3"
-ORCA_RELEASE_URL = (
-    f"https://github.com/echoVic/orca-agent/releases/download/v{ORCA_VERSION}"
-    f"/orca-x86_64-unknown-linux-gnu.tar.gz"
-)
 
 ORCA_LOCAL_MUSL_BIN = str(
     Path(__file__).resolve().parent.parent
@@ -46,7 +41,17 @@ class OrcaInstalledAgent(BaseInstalledAgent):
         return "orca"
 
     def version(self) -> str | None:
-        return ORCA_VERSION
+        try:
+            result = subprocess.run(
+                [ORCA_LOCAL_MUSL_BIN, "--version"],
+                capture_output=True,
+                check=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return None
+        parts = result.stdout.strip().split()
+        return parts[1] if len(parts) >= 2 else None
 
     async def install(self, environment: BaseEnvironment) -> None:
         await self.exec_as_root(
@@ -78,7 +83,12 @@ class OrcaInstalledAgent(BaseInstalledAgent):
             f" {shlex.quote(instruction)}"
         )
 
-        await self.exec_as_agent(environment, command=cmd, env=env)
+        result = await self.exec_as_agent(environment, command=cmd, env=env)
+        output = result.stdout if result else ""
+        logs_dir = Path(self.logs_dir)
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "trajectory.jsonl").write_text(output, encoding="utf-8")
+        context.output = output
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         pass

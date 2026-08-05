@@ -57,10 +57,10 @@ task containers lack. The static musl binary works universally.
 ## Filtering Tasks
 
 ```bash
-# By difficulty
+# Limit the number of tasks
 harbor run -d "terminal-bench/terminal-bench-2" \
   --agent "terminal_bench.orca_agent:OrcaInstalledAgent" \
-  --filter-difficulty easy \
+  --n-tasks 10 \
   --mounts '[{"type":"bind","source":"'"$(pwd)"'/target/x86_64-unknown-linux-musl/release","target":"/mnt/orca-bin","read_only":true}]'
 
 # Single task
