@@ -4559,6 +4559,8 @@ mod closed_command_domain_tests {
             usage: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }
     }
 

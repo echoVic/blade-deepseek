@@ -2420,6 +2420,8 @@ fn task(status: SurfaceTaskStatus, revision: u64) -> SurfaceTask {
         usage: None,
         result: None,
         error: None,
+        retry_count: 0,
+        output_truncated: false,
     }
 }
 

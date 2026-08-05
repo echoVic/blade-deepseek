@@ -3,8 +3,11 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-07-29
-Current baseline: v0.3.0 adds native Windows x64 and ARM64 support across the
+Last updated: 2026-08-06
+Current baseline: v0.3.6 adds explicit delegation-policy inheritance,
+cross-process transcript write serialization, durable retry and truncation
+diagnostics, and full task-registry publication before session completion on
+top of the native Windows x64 and ARM64 support across the
 CLI, TUI, shell sessions, sandboxing, update flow, persistence, npm packages,
 release archives, and CI. Shell resolution preserves PowerShell 7, Windows
 PowerShell, cmd.exe, and explicit Git Bash dialects. PowerShell 7 is discovered

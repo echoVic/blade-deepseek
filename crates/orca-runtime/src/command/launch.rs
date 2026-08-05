@@ -195,13 +195,16 @@ fn run_subagent_worker_with_reader(request: SubagentWorkerLaunchRequest, reader:
         base_url: request.base_url,
         reasoning_effort: None,
     };
-    let config = match build_run_config(config_request) {
+    let mut config = match build_run_config(config_request) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("orca: {error}");
             return 1;
         }
     };
+    if let Some(snapshot) = subagent_request.delegation.as_ref() {
+        snapshot.apply_to(&mut config, subagent_request.model.clone());
+    }
 
     subagent_async_worker::run_async_subagent_worker(AsyncSubagentWorkerInput {
         config,

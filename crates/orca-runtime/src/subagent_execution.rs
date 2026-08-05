@@ -376,7 +376,10 @@ fn execute_subagent_batch(
         };
 
         let effective = invocation.effective;
-        let request = subagent::create_subagent_request(&effective);
+        let request = subagent::with_delegation_snapshot(
+            subagent::create_subagent_request(&effective),
+            orca_core::config::DelegationSnapshot::from_config(config),
+        );
         let description = request.description.clone();
         let tool_id = effective.id.clone();
         let invocation = RuntimeSubagentInvocation::snapshot(
@@ -475,7 +478,10 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
     child_executor: ChildAgentExecutor<io::Sink>,
     event_error: &mut Option<io::Error>,
 ) -> io::Result<tool_types::ToolResult> {
-    let request = subagent::create_subagent_request(tool_request);
+    let request = subagent::with_delegation_snapshot(
+        subagent::create_subagent_request(tool_request),
+        orca_core::config::DelegationSnapshot::from_config(config),
+    );
     let description = request.description.clone();
 
     if subagent_depth >= config.subagents.max_depth {

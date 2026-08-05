@@ -18,6 +18,19 @@ pub enum TaskStatus {
     Cancelled,
 }
 
+impl TaskStatus {
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Queued | Self::Running | Self::Paused | Self::Stopping
+        )
+    }
+
+    pub fn requires_attention(self) -> bool {
+        self == Self::ApprovalRequired
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskType {
@@ -144,4 +157,8 @@ pub struct BackgroundTaskSummary {
     pub result: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub output_truncated: bool,
 }

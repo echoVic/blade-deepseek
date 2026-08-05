@@ -116,6 +116,8 @@ fn background_task_summary_matches_sdk_names() {
         last_activity_at_ms: None,
         result: None,
         error: None,
+        retry_count: 0,
+        output_truncated: false,
     };
 
     let value = serde_json::to_value(summary).unwrap();

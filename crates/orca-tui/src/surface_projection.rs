@@ -1011,6 +1011,8 @@ pub(crate) fn workflow_task_summaries(
                 last_activity_at_ms: task.completed_at.or(task.started_at).map(UnixMillis::get),
                 result: task.result.as_ref().map(|value| value.as_str().to_string()),
                 error: task.error.as_ref().map(|value| value.as_str().to_string()),
+                retry_count: task.retry_count,
+                output_truncated: task.output_truncated,
             }
         })
         .collect()

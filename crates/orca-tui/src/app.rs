@@ -3041,6 +3041,8 @@ done
             last_activity_at_ms: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }
     }
 

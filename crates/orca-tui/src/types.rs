@@ -4352,6 +4352,8 @@ mod tests {
             last_activity_at_ms: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }
     }
 
@@ -6066,6 +6068,8 @@ mod tests {
             last_activity_at_ms: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }];
         state.workflow_panel.selected = 9;
 
@@ -6196,6 +6200,8 @@ mod tests {
                 last_activity_at_ms: None,
                 result: None,
                 error: None,
+                retry_count: 0,
+                output_truncated: false,
             }],
         });
         state.update(TuiEvent::WorkflowNotification {
@@ -6513,6 +6519,8 @@ mod tests {
                 last_activity_at_ms: None,
                 result: None,
                 error: None,
+                retry_count: 0,
+                output_truncated: false,
             }],
         });
 
@@ -6631,6 +6639,8 @@ mod tests {
                 last_activity_at_ms: None,
                 result: None,
                 error: None,
+                retry_count: 0,
+                output_truncated: false,
             }],
         });
 

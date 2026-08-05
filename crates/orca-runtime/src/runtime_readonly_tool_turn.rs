@@ -13,12 +13,13 @@ use crate::hooks::{HookContext, HookRunError, HookRunner};
 use crate::runtime_surface::RuntimeProviderResponseIngress;
 use crate::runtime_tool_call::{RuntimeReadonlyToolInvocation, RuntimeToolCallRuntime};
 use crate::session::record_tool_result_for_agent;
+use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_execution::semantic_commit_failure;
 use crate::tool_invocation::{
     apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,
 };
-use crate::tool_turn::ToolTurnOutcome;
+use crate::tool_turn::{ToolTurnOutcome, record_root_task_output_truncation};
 
 pub(crate) struct RuntimeReadonlyBatchContext<'a, W: io::Write> {
     pub(crate) cwd: &'a Path,
@@ -60,6 +61,8 @@ pub(crate) struct RuntimeReadonlyToolTurnServices<'a> {
     pub(crate) mcp_registry: &'a McpRegistry,
     pub(crate) hooks: &'a HookRunner,
     pub(crate) provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
+    pub(crate) task_registry: Option<&'a TaskRegistry>,
+    pub(crate) root_task_id: Option<&'a str>,
 }
 
 pub(crate) struct RuntimeReadonlyBatchExecution {
@@ -297,6 +300,8 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
         mcp_registry,
         hooks,
         provider_response_ingress,
+        task_registry,
+        root_task_id,
     } = services;
     let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
         cwd,
@@ -317,8 +322,18 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
         .find(|result| result.status == ToolStatus::Cancelled);
     let cancelled_error = cancelled_result.and_then(|result| result.error.clone());
     let turn_cancelled = cancel.is_cancelled() || cancelled_result.is_some();
+    let output_truncated = execution.results.iter().any(|result| result.truncated);
 
     record_readonly_batch_results(conversation, history_writer, execution.results, emit_deltas)?;
+    if let Some(task_registry) = task_registry {
+        record_root_task_output_truncation(
+            task_registry,
+            root_task_id,
+            output_truncated,
+            events,
+            sink,
+        )?;
+    }
     if let Some(error) = execution.event_error {
         return Err(error);
     }

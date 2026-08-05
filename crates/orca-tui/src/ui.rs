@@ -1317,7 +1317,7 @@ fn task_type_label(task: &BackgroundTaskSummary) -> &'static str {
 }
 
 fn task_detail_label(task: &BackgroundTaskSummary) -> String {
-    match task.task_type {
+    let detail = match task.task_type {
         TaskType::Workflow => workflow_progress_label(task),
         TaskType::Subagent => subagent_progress_label(task),
         TaskType::MainSession
@@ -1332,6 +1332,19 @@ fn task_detail_label(task: &BackgroundTaskSummary) -> String {
             format!("backgrounded • {}", elapsed_label(task))
         }
         TaskType::MainSession | TaskType::Shell | TaskType::Monitor => elapsed_label(task),
+    };
+
+    let mut visibility = Vec::new();
+    if task.retry_count > 0 {
+        visibility.push(format!("retried {}", task.retry_count));
+    }
+    if task.output_truncated {
+        visibility.push("output truncated".to_string());
+    }
+    if visibility.is_empty() {
+        detail
+    } else {
+        format!("{detail} • {}", visibility.join(" • "))
     }
 }
 
@@ -6838,6 +6851,8 @@ mod tests {
             last_activity_at_ms: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         assert_eq!(
@@ -6891,6 +6906,8 @@ mod tests {
             completed_at_ms: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -6973,6 +6990,8 @@ mod tests {
             completed_at_ms: Some(2_000),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7076,6 +7095,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         assert_eq!(task_type_label(&task), "session");
@@ -7114,6 +7135,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         assert!(task_detail_label(&task).starts_with("backgrounded • elapsed "));
@@ -7151,6 +7174,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         assert_eq!(
@@ -7193,6 +7218,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: None,
             error: Some("model timed out".to_string()),
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7242,6 +7269,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: None,
             error: Some("first failure\nsecond failure\nthird failure\nfourth failure".to_string()),
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7292,6 +7321,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: Some("line one\nline two\nline three\nline four".to_string()),
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         assert_eq!(workflow_metadata_row_count(&task), 3);
@@ -7331,6 +7362,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: Some("summary ready".to_string()),
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7380,6 +7413,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7440,6 +7475,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7494,6 +7531,8 @@ mod tests {
             last_activity_at_ms: Some(1_000),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7562,7 +7601,24 @@ mod tests {
             completed_at_ms: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }
+    }
+
+    #[test]
+    fn workflow_panel_labels_retry_and_truncated_output() {
+        let mut task = workflow_task_for_agent_dashboard(
+            "audit",
+            "agent-1",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        task.retry_count = 2;
+        task.output_truncated = true;
+
+        let detail = task_detail_label(&task);
+        assert!(detail.contains("retried 2"));
+        assert!(detail.contains("output truncated"));
     }
 
     #[test]
