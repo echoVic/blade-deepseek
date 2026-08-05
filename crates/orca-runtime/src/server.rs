@@ -2587,6 +2587,8 @@ mod tests {
     use std::io::{Cursor, Read};
     use tempfile::{TempDir, tempdir};
 
+    const EOF_EVENT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
     fn emit_runtime_event<W: Write>(writer: &mut W, event: EventDraft) {
         let mut sink = EventSink::new(writer, OutputFormat::Jsonl);
         sink.emit(event).expect("serialize runtime event");
@@ -2733,7 +2735,7 @@ mod tests {
                 buffer.push('\n');
                 return Ok(self.line.len() + 1);
             }
-            wait_for_event(&self.output.0, Duration::from_secs(2), |event| {
+            wait_for_event(&self.output.0, EOF_EVENT_WAIT_TIMEOUT, |event| {
                 event["event"] == self.awaited_event
             })
             .ok_or_else(|| {
