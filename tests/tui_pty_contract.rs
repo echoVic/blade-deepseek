@@ -51,6 +51,8 @@ fn tui_submit_renders_and_restores_the_terminal() {
 fn tui_permission_round_trips_through_the_runtime_surface() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");
+    std::fs::write(home.path().join("config.toml"), "mode = \"suggest\"\n")
+        .expect("configure explicit suggest mode");
     const PERMISSION_SENTINEL: &str = "PTY_PERMISSION_RESUMED";
     let prompt = format!(
         "request_permissions_then_bash {} :: printf '\\120\\124\\131\\137\\120\\105\\122\\115\\111\\123\\123\\111\\117\\116\\137\\122\\105\\123\\125\\115\\105\\104'",
