@@ -109,6 +109,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_file_mode_defaults_to_auto_edit() {
+        let request = RunConfigRequest::new("0.3.4", PathBuf::from("/workspace"));
+
+        let config = assemble_run_config(request, FileConfig::default()).unwrap();
+
+        assert_eq!(config.approval_mode, ApprovalMode::AutoEdit);
+    }
+
+    #[test]
     fn assembles_shared_run_config_without_losing_launch_fields() {
         let file = FileConfig {
             mode: Some(ApprovalMode::Plan),

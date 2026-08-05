@@ -14,7 +14,7 @@ Options:
 
 - `--output-format text|jsonl` — Output format (default: text)
 - `--cwd <path>` — Workspace directory
-- `--approval-mode suggest|auto-edit|full-auto` — Approval policy (default: suggest)
+- `--approval-mode suggest|auto-edit|full-auto` — Approval policy (default: auto-edit)
 - `--verifier <command>` — Post-completion verification command
 - `--model <name>` — Model override
 - `--base-url <url>` — API base URL override
@@ -245,8 +245,8 @@ the default sandbox boundary.
 
 | Mode | read | write | network | agent | shell |
 |------|------|-------|---------|-------|-------|
-| `suggest` (default) | allow | ask | ask | ask | ask |
-| `auto-edit` | allow | allow | allow | allow | allow |
+| `suggest` | allow | ask | ask | ask | ask |
+| `auto-edit` (default) | allow | allow | allow | allow | allow |
 | `full-auto` | allow | allow | allow | allow | allow |
 | `plan` | allow | deny | deny | deny | deny |
 

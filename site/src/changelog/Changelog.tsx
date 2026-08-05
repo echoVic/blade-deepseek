@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react";
 import {
-    type Locale,
-    type SeoEntry,
-    applySeoHead,
-    canonicalOrigin,
-    detectInitialLocale,
-    links,
-    localeStorageKey,
-    releaseVersion,
-    releases,
+  type Locale,
+  type SeoEntry,
+  applySeoHead,
+  canonicalOrigin,
+  detectInitialLocale,
+  links,
+  localeStorageKey,
+  releaseVersion,
+  releases,
 } from "../shared";
 
 const canonicalUrl = `${canonicalOrigin}/changelog/`;
@@ -77,7 +77,7 @@ const copy = {
     },
     summaries: {
       "v0.3.4":
-        "Fixes the context meter and compaction policy for large model windows. The TUI now shows provider-reported prompt usage as a used percentage of the full context window instead of displaying an estimate against the old 96k compaction budget. Automatic compaction now triggers at 80% of the model window, keeps a 90% hard safety ceiling, and retains a fixed recent-context budget of about 48k tokens before summarizing older history. Existing absolute compaction overrides remain compatible.",
+        "Fixes the context meter and compaction policy for large model windows. The TUI now shows provider-reported prompt usage as a used percentage of the full context window instead of displaying an estimate against the old 96k compaction budget. Automatic compaction now triggers at 80% of the model window, keeps a 90% hard safety ceiling, and retains a fixed recent-context budget of about 48k tokens before summarizing older history. New sessions now default to sandboxed auto-edit; suggest, full-auto, and plan remain available explicitly. Existing absolute compaction overrides remain compatible.",
       "v0.3.3":
         "Closes the Orca runtime and architecture audit. Goal persistence and terminal replies now settle in order without blocking Tokio actors, operation cancellation owns spawned task trees, and session switch, fork, rename, and stale-event handling are transactionally fenced. Runtime surfaces use an explicit facade, tool schemas are provider-neutral, root MCP ownership lives in RuntimeHost, and transcript streaming, reflow, search, deduplication, usage, and projection state now have bounded or revision-checked behavior.",
       "v0.3.2":
@@ -567,7 +567,7 @@ const copy = {
     },
     summaries: {
       "v0.3.4":
-        "修复大模型窗口下的 context 指示器与自动压缩策略。TUI 现在展示 provider 回报的真实 prompt token 占完整模型窗口的已用百分比，不再拿本地估算值对照旧的 96k 压缩预算。自动压缩默认在模型窗口 80% 时触发，以 90% 作为硬安全线，并固定保留约 48k token 的近期上下文后总结更早历史；现有绝对压缩阈值覆盖仍保持兼容。",
+        "修复大模型窗口下的 context 指示器与自动压缩策略。TUI 现在展示 provider 回报的真实 prompt token 占完整模型窗口的已用百分比，不再拿本地估算值对照旧的 96k 压缩预算。自动压缩默认在模型窗口 80% 时触发，以 90% 作为硬安全线，并固定保留约 48k token 的近期上下文后总结更早历史。新会话现在默认使用沙箱内自主执行的 auto-edit；suggest、full-auto 和 plan 仍可显式选择。现有绝对压缩阈值覆盖仍保持兼容。",
       "v0.3.3":
         "完成 Orca runtime 与架构审计整改。Goal 持久化和 terminal reply 现在按顺序结算且不会阻塞 Tokio actor，operation 取消会收拢其创建的任务树；session 切换、fork、rename 与陈旧事件都受事务和 attachment fence 约束。Runtime surface 改为显式 facade，tool schema 与 provider 解耦，根 MCP 生命周期归 RuntimeHost 所有；transcript streaming、reflow、search、去重、usage 与 projection state 也具备有界或 revision 校验语义。",
       "v0.3.2":

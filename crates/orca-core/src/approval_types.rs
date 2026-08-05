@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApprovalMode {
-    #[default]
     Suggest,
     #[value(name = "auto-edit")]
+    #[default]
     AutoEdit,
     FullAuto,
     Plan,
@@ -30,6 +30,18 @@ impl ApprovalMode {
             Self::FullAuto => Self::Plan,
             Self::Plan => Self::Suggest,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApprovalMode;
+
+    #[test]
+    fn defaults_to_auto_edit_without_changing_the_mode_cycle() {
+        assert_eq!(ApprovalMode::default(), ApprovalMode::AutoEdit);
+        assert_eq!(ApprovalMode::Suggest.next(), ApprovalMode::AutoEdit);
+        assert_eq!(ApprovalMode::Plan.next(), ApprovalMode::Suggest);
     }
 }
 
