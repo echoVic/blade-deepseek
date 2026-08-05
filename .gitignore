@@ -10,6 +10,12 @@ dist/
 node_modules/
 *.tsbuildinfo
 
+# Python and Terminal-Bench generated artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+/jobs/
+
 # git worktrees
 .worktrees/
 
