@@ -70,10 +70,12 @@ impl RuntimeTurnOpeningStep {
                 input.context_config,
                 input.provider_config,
             );
+            // First-turn estimate seed on the full-window scale; the real
+            // provider-reported occupancy replaces it after the first response.
             input.sink.emit(
                 input
                     .events
-                    .context_updated(pressure.wire_tokens, pressure.soft_limit),
+                    .context_updated(pressure.wire_tokens, input.context_config.max_tokens),
             )?;
         }
 

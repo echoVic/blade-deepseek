@@ -3121,20 +3121,19 @@ fn format_elapsed_compact(elapsed_secs: u64) -> String {
     format!("{hours}h {minutes:02}m {seconds:02}s")
 }
 
-/// Remaining context window as a percentage of the local compaction budget.
-/// Pure local observability — this value is never sent upstream, so it cannot
-/// affect DeepSeek's prefix cache. Hidden until a real budget is known.
+/// Used context as a percentage of the full model window (100% = window full).
+/// Fed by the provider-reported prompt tokens once a turn completes; a fresh
+/// session reads low. Pure local observability — never sent upstream, so it
+/// cannot affect DeepSeek's prefix cache. Hidden until a real budget is known.
 fn context_cell(state: &AppState, theme: &Theme) -> Span<'static> {
     if state.context_limit_tokens == 0 {
         return Span::raw("");
     }
-    let remaining = state
-        .context_limit_tokens
-        .saturating_sub(state.context_used_tokens);
-    let percent = (remaining * 100) / state.context_limit_tokens;
-    let color = if percent > 50 {
+    let used = state.context_used_tokens.min(state.context_limit_tokens);
+    let percent = (used * 100) / state.context_limit_tokens;
+    let color = if percent < 50 {
         theme.success
-    } else if percent >= 20 {
+    } else if percent < 80 {
         theme.warning
     } else {
         theme.error
@@ -6158,28 +6157,40 @@ mod tests {
     }
 
     #[test]
-    fn context_cell_shows_remaining_percentage() {
+    fn context_cell_shows_used_percentage() {
         let mut state = test_state();
         state.context_limit_tokens = 1000;
         state.context_used_tokens = 250;
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let cell = context_cell(&state, &theme);
-        assert_eq!(cell.content.as_ref(), "  ·  context 75%");
+        // 25% of the window used -> healthy/green.
+        assert_eq!(cell.content.as_ref(), "  ·  context 25%");
         assert_eq!(cell.style.fg, Some(theme.success));
     }
 
     #[test]
-    fn context_cell_warns_then_errors_as_budget_shrinks() {
+    fn context_cell_clamps_used_at_full_window() {
+        let mut state = test_state();
+        state.context_limit_tokens = 1000;
+        state.context_used_tokens = 1200; // over-full estimate clamps to 100%
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let cell = context_cell(&state, &theme);
+        assert_eq!(cell.content.as_ref(), "  ·  context 100%");
+        assert_eq!(cell.style.fg, Some(theme.error));
+    }
+
+    #[test]
+    fn context_cell_warns_then_errors_as_window_fills() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
         let mut warn = test_state();
         warn.context_limit_tokens = 1000;
-        warn.context_used_tokens = 700; // 30% remaining
+        warn.context_used_tokens = 700; // 70% used
         assert_eq!(context_cell(&warn, &theme).style.fg, Some(theme.warning));
 
         let mut danger = test_state();
         danger.context_limit_tokens = 1000;
-        danger.context_used_tokens = 900; // 10% remaining
+        danger.context_used_tokens = 900; // 90% used
         assert_eq!(context_cell(&danger, &theme).style.fg, Some(theme.error));
     }
 
@@ -6318,14 +6329,14 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
         let wide = status_line(&state, &theme, 180).to_string();
-        assert!(wide.contains("context 75%"));
+        assert!(wide.contains("context 25%"));
         assert!(wide.contains("~/Documents/GitHub/blade-deepseek"));
         assert!(wide.contains("git:feature/footer"));
         assert!(wide.contains("8.7k tokens"));
         assert!(wide.contains("F1 shortcuts"));
 
         let medium = status_line(&state, &theme, 92).to_string();
-        assert!(medium.contains("context 75%"));
+        assert!(medium.contains("context 25%"));
         assert!(medium.contains("blade-deepseek"));
         assert!(medium.contains("git:feature/footer"));
         assert!(!medium.contains("tokens"));
@@ -6333,7 +6344,7 @@ mod tests {
 
         let narrow = status_line(&state, &theme, 46).to_string();
         assert!(narrow.contains("suggest"));
-        assert!(narrow.contains("context 75%"));
+        assert!(narrow.contains("context 25%"));
         assert!(!narrow.contains("git:"));
         assert!(!narrow.contains("blade-deepseek"));
     }
@@ -6351,7 +6362,7 @@ mod tests {
         let text = status_line(&state, &theme, 46).to_string();
 
         assert!(text.contains("suggest"));
-        assert!(text.contains("context 75%"));
+        assert!(text.contains("context 25%"));
         assert!(!text.contains("~/workspace"));
         assert!(!text.contains("git:main"));
         assert!(UnicodeWidthStr::width(text.as_str()) <= 46);
@@ -6381,7 +6392,7 @@ mod tests {
 
         let narrow = status_line(&state, &theme, 46).to_string();
         assert!(narrow.contains("suggest"));
-        assert!(narrow.contains("context 75%"));
+        assert!(narrow.contains("context 25%"));
         assert!(!narrow.contains("tokens"));
         assert!(!narrow.contains("shortcuts"));
 

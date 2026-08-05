@@ -9,17 +9,35 @@ use tiktoken_rs::cl100k_base_singleton;
 use crate::ProviderConfig;
 
 const DEFAULT_MAX_TOKENS: usize = 1_000_000;
-const COMPACTION_THRESHOLD: f64 = 0.80;
+// Hard compaction ceiling as a fraction of the context window (safety net).
+// Aligns with codex (90%) and grok/claude (~85-95%). Compaction is normally
+// driven by the soft line below; this is the last line before prompt-too-long.
+const COMPACTION_THRESHOLD: f64 = 0.90;
+// Small response/overhead headroom subtracted when deriving the hard ceiling.
+// Output length is NOT reserved here (that would gut the usable window); the
+// real per-request output cap is sent as the API `max_tokens` parameter.
 const RESERVED_FOR_RESPONSE: usize = 4096;
+// Soft compaction line as a fraction of the context window. This is the line
+// that actually triggers compaction in normal use. Keying it off the window
+// (rather than a fixed absolute) is how codex/grok/claude scale with the
+// model: a 1M window compacts near 800k, a 200k window near 160k.
+const DEFAULT_SOFT_COMPACT_FRACTION: f64 = 0.80;
 const STALE_TOOL_OUTPUT_BYTES: usize = 2048;
-const DEFAULT_SOFT_COMPACT_TOKEN_LIMIT: usize = 96_000;
 const RECENT_TOOL_RESULTS_TO_KEEP: usize = 6;
 
-// Hysteresis: compaction triggers at effective_limit but compresses the kept
-// window down to this fraction so the next turn still has headroom before the
-// next trigger. Keeps the storm-quenching budget tight but not so tight that
-// useful context gets dropped on every cycle.
-const COMPACTION_TARGET_FRACTION: f64 = 0.60;
+// Deep-compaction target: a FIXED amount of recent context to keep, NOT a
+// window fraction. "Enough recent context to resume work" is an absolute
+// quantity (codex keeps ~20k of recent user messages); it must not balloon
+// with the window (30% of 1M would keep 300k, larger than many models'
+// entire window). We keep a bit more than codex because our `kept` tail
+// includes user + assistant + tool messages and feeds incremental summary
+// deltas, so too small a tail would thrash baseline rebuilds. On any window,
+// compaction targets this budget: 800k soft trigger -> compact to ~48k.
+const COMPACTION_TARGET_TOKENS: usize = 48_000;
+// Small-window fallback: the fixed target must still land well below the soft
+// trigger. This cap never grows the 48k target; it only reduces it when a user
+// configures a context window too small to leave meaningful headroom.
+const COMPACTION_TARGET_SOFT_CAP_FRACTION: f64 = 0.60;
 
 pub trait TokenCounter {
     fn count_text(&self, text: &str) -> usize;
@@ -52,7 +70,9 @@ impl ContextConfig {
             compaction_threshold: COMPACTION_THRESHOLD,
             reserved_for_response: RESERVED_FOR_RESPONSE,
             auto_compact_token_limit: None,
-            soft_compact_token_limit: Some(DEFAULT_SOFT_COMPACT_TOKEN_LIMIT),
+            // None => soft line derived from the window fraction. An absolute
+            // override is opt-in via `soft_compact_token_limit`.
+            soft_compact_token_limit: None,
         }
     }
 
@@ -81,8 +101,12 @@ impl ContextConfig {
         if effective == 0 {
             return 0;
         }
+        // Default: fraction of the window (scales with the model). An explicit
+        // `soft_compact_token_limit` overrides with an absolute value. Either
+        // way the soft line never exceeds the hard ceiling.
+        let derived = (self.max_tokens as f64 * DEFAULT_SOFT_COMPACT_FRACTION) as usize;
         self.soft_compact_token_limit
-            .unwrap_or(effective)
+            .unwrap_or(derived)
             .min(effective)
             .max(1)
     }
@@ -93,9 +117,15 @@ impl ContextConfig {
     /// just under the limit and next turn's wire prompt almost always re-fires
     /// compaction (the "compaction storm" pathology).
     pub fn target_compaction_limit(&self) -> usize {
-        let limit = self.soft_limit();
-        let scaled = ((limit as f64) * COMPACTION_TARGET_FRACTION) as usize;
-        scaled.max(1).min(limit)
+        // Fixed retention target for normal/large windows. Tiny configured
+        // windows use a proportional cap only to preserve anti-thrashing
+        // headroom; the target never grows above the fixed 48k budget.
+        let soft = self.soft_limit();
+        if soft == 0 {
+            return 0;
+        }
+        let small_window_cap = ((soft as f64) * COMPACTION_TARGET_SOFT_CAP_FRACTION) as usize;
+        COMPACTION_TARGET_TOKENS.min(small_window_cap).max(1)
     }
 }
 
@@ -106,7 +136,7 @@ impl Default for ContextConfig {
             compaction_threshold: COMPACTION_THRESHOLD,
             reserved_for_response: RESERVED_FOR_RESPONSE,
             auto_compact_token_limit: None,
-            soft_compact_token_limit: Some(DEFAULT_SOFT_COMPACT_TOKEN_LIMIT),
+            soft_compact_token_limit: None,
         }
     }
 }
@@ -1447,6 +1477,82 @@ mod tests {
     }
 
     #[test]
+    fn for_model_derives_soft_line_from_window_fraction() {
+        // Compaction scales with the window: no fixed absolute soft line.
+        let config = ContextConfig::for_model(Some(orca_core::model::PRO_MODEL));
+        assert_eq!(config.max_tokens, 1_000_000);
+        // Small headroom only; the output cap is NOT reserved from input budget.
+        assert_eq!(config.reserved_for_response, 4096);
+        // Hard ceiling = 1_000_000 * 0.90 - 4096 = 895_904 (safety net).
+        assert_eq!(config.effective_limit(), 895_904);
+        // Soft line (the real trigger) = 1_000_000 * 0.80 = 800_000.
+        assert_eq!(config.soft_limit(), 800_000);
+    }
+
+    #[test]
+    fn soft_line_scales_down_with_a_smaller_window() {
+        // A 200k window compacts near 160k, not a fixed 96k.
+        let runtime = ModelRuntimeConfig {
+            context_window: Some(200_000),
+            auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
+        };
+        let config =
+            ContextConfig::for_model_with_runtime(Some(orca_core::model::PRO_MODEL), &runtime);
+        assert_eq!(config.soft_limit(), 160_000); // 200_000 * 0.80
+    }
+
+    #[test]
+    fn deep_compaction_target_is_a_fixed_budget_not_a_window_fraction() {
+        // A fixed retention floor: compaction lands near ~48k regardless of how
+        // big the window is (never balloons to a fraction of a 1M window).
+        let big = ContextConfig::for_model(Some(orca_core::model::PRO_MODEL));
+        assert_eq!(big.target_compaction_limit(), 48_000);
+        assert!(big.target_compaction_limit() < big.soft_limit());
+
+        // Same fixed floor on a smaller window (still well under its soft line).
+        let runtime = ModelRuntimeConfig {
+            context_window: Some(200_000),
+            auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
+        };
+        let small =
+            ContextConfig::for_model_with_runtime(Some(orca_core::model::PRO_MODEL), &runtime);
+        assert_eq!(small.target_compaction_limit(), 48_000);
+        assert!(small.target_compaction_limit() < small.soft_limit());
+    }
+
+    #[test]
+    fn deep_compaction_target_preserves_headroom_for_tiny_windows() {
+        let runtime = ModelRuntimeConfig {
+            context_window: Some(40_000),
+            auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
+        };
+        let config =
+            ContextConfig::for_model_with_runtime(Some(orca_core::model::PRO_MODEL), &runtime);
+
+        // The 90% hard ceiling minus 4,096 headroom (31,904) is slightly below
+        // the derived 80% soft line (32,000), so it becomes the effective line.
+        assert_eq!(config.soft_limit(), 31_904);
+        assert_eq!(config.target_compaction_limit(), 19_142);
+        assert!(config.target_compaction_limit() < config.soft_limit());
+    }
+
+    #[test]
+    fn soft_compact_token_limit_overrides_the_derived_line() {
+        // Users who want the old tight window opt in with an absolute value.
+        let runtime = ModelRuntimeConfig {
+            context_window: None,
+            auto_compact_token_limit: None,
+            soft_compact_token_limit: Some(96_000),
+        };
+        let config =
+            ContextConfig::for_model_with_runtime(Some(orca_core::model::PRO_MODEL), &runtime);
+        assert_eq!(config.soft_limit(), 96_000);
+    }
+
+    #[test]
     fn pressure_triggers_soft_limit_before_model_limit() {
         let config = ContextConfig {
             max_tokens: 1_000_000,
@@ -2244,12 +2350,14 @@ mod tests {
         let summary_tokens = summary_state_tokens(&conv, &DefaultTokenCounter) + 256;
         let newest_tokens = message_tokens(conv.messages.last().unwrap());
         let target_tokens = system_tokens + summary_tokens + newest_tokens + 4;
-        let effective_limit = target_tokens.saturating_mul(5).div_ceil(3);
+        // target_compaction_limit() = min(COMPACTION_TARGET_TOKENS, soft_limit). Pin the
+        // soft line (via auto_compact) to target_tokens so the target lands
+        // exactly there and the fixed 48k floor does not clamp it lower.
         let config = ContextConfig {
             max_tokens: 10_000,
             compaction_threshold: 1.0,
             reserved_for_response: 0,
-            auto_compact_token_limit: Some(effective_limit),
+            auto_compact_token_limit: Some(target_tokens),
             soft_compact_token_limit: None,
         };
         let provider_config = ProviderConfig {
@@ -2339,14 +2447,15 @@ mod tests {
         //
         // FixedCounter scores each message as 5 tokens (content 1 + overhead 4).
         // The partition budget starts at system(5) + summary reserve(257) + 4 =
-        // 266. With hysteresis, partition uses target_compaction_limit() = 60%
-        // of effective_limit. We pick 452 so target = 271 and exactly the
-        // newest message fits (266 + 5 = 271), collapsing the two before it.
+        // 266. target_compaction_limit() = min(COMPACTION_TARGET_TOKENS, soft_limit).
+        // With auto_compact_token_limit=271 the soft line is 271, so target=271
+        // and exactly the newest message fits (266 + 5 = 271), collapsing the
+        // two before it.
         let config = ContextConfig {
             max_tokens: 1000,
             compaction_threshold: 1.0,
             reserved_for_response: 0,
-            auto_compact_token_limit: Some(452),
+            auto_compact_token_limit: Some(271),
             soft_compact_token_limit: None,
         };
 

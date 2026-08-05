@@ -245,12 +245,18 @@ impl<'a> RuntimeCompactionPolicy<'a> {
     pub(crate) fn decide_for_pressure(
         pressure: context::ContextPressure,
     ) -> Option<RuntimeCompactionTrigger> {
+        // Single trigger line: the soft line is the one that fires compaction.
+        // Since the soft line is always <= the hard ceiling, it fires first in
+        // normal use. The hard ceiling only refines the event label for the
+        // pathological case where a single compaction could not get us back
+        // under the soft line and tokens kept climbing past the ceiling.
+        if !pressure.should_soft_compact {
+            return None;
+        }
         if pressure.should_hard_compact {
             Some(RuntimeCompactionTrigger::HardLimit)
-        } else if pressure.should_soft_compact {
-            Some(RuntimeCompactionTrigger::SoftLimit)
         } else {
-            None
+            Some(RuntimeCompactionTrigger::SoftLimit)
         }
     }
 
