@@ -87,3 +87,8 @@ uv tool install --force harbor \
 |------|-------|-------------|
 | `orca_agent.py` | `OrcaInstalledAgent` | Copies musl binary from mount into container. |
 | `orca_external.py` | `OrcaExternalAgent` | Uses a pre-built Orca binary on the host. |
+
+The installed adapter writes Orca's raw JSONL output to the trial's
+`agent/trajectory.jsonl` artifact for `harbor analyze` and `harbor view`.
+Command output is not assigned to `AgentContext`: Harbor 0.20.0 does not define
+an `output` field, and adding one aborts the trial before verifier execution.

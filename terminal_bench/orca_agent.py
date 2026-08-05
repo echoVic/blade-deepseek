@@ -88,7 +88,6 @@ class OrcaInstalledAgent(BaseInstalledAgent):
         logs_dir = Path(self.logs_dir)
         logs_dir.mkdir(parents=True, exist_ok=True)
         (logs_dir / "trajectory.jsonl").write_text(output, encoding="utf-8")
-        context.output = output
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         pass

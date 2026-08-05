@@ -1,6 +1,6 @@
 # Terminal-Bench Open Issues Implementation Plan
 
-**Goal:** Fix GitHub issues #22 and #23 while retaining the already committed repository-hygiene fix for #24.
+**Goal:** Fix GitHub issues #22 and #23, correct the Harbor context regression reported in #25, and retain the already committed repository-hygiene fix for #24.
 
 **Architecture:** Keep the Harbor adapter self-contained. Derive the reported Orca version from the mounted binary, preserve the command transcript as Harbor's trajectory artifact, and document only filters supported by Harbor 0.20.0.
 
@@ -14,7 +14,7 @@
 
 1. Stub Harbor modules so the adapter can be tested without installing Harbor.
 2. Assert `version()` reads the mounted binary's `--version` output.
-3. Assert `run()` writes stdout to `trajectory.jsonl` and assigns `context.output`.
+3. Assert `run()` writes stdout to `trajectory.jsonl` without adding fields to Harbor's closed `AgentContext` model.
 4. Run `python3 -m unittest terminal_bench.test_orca_agent` and confirm the tests fail before implementation.
 5. Implement the smallest adapter changes and rerun the tests.
 
@@ -32,4 +32,4 @@
 
 1. Run the focused Python tests and repository hygiene test.
 2. Run formatting/static checks applicable to the changed files.
-3. Commit with `Fixes #22` and `Fixes #23` trailers.
+3. Commit with `Fixes #22`, `Fixes #23`, and `Fixes #25` trailers.

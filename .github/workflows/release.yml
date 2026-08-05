@@ -38,6 +38,10 @@ jobs:
           node scripts/validate-runtime-surface-contract.mjs
           cargo metadata --locked --format-version 1 > /dev/null
           cargo test -p orca-tui runtime_surface_contract --lib --locked
+      - name: Validate repository adapters and hygiene
+        run: |
+          python3 -m unittest discover -s terminal_bench -p 'test_*.py' -v
+          node scripts/test-repository-hygiene.mjs
       - name: Run tests
         env:
           RUST_BACKTRACE: "1"

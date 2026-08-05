@@ -66,4 +66,3 @@ class OrcaExternalAgent(BaseAgent):
         )
 
         result = await environment.exec(cmd)
-        context.output = result.stdout if result else ""
