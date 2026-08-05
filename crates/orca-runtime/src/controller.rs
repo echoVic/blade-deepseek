@@ -2024,7 +2024,8 @@ mod tests {
                 &self,
                 request: &RuntimeUserInputRequest,
             ) -> io::Result<Option<String>> {
-                assert_eq!(request.question, "Continue?");
+                assert_eq!(request.question, "Confirm: Continue?");
+                assert_eq!(request.choices, ["yes - Continue", "no - Stop"]);
                 Ok(Some("yes".to_string()))
             }
         }
@@ -2048,7 +2049,11 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| {
-                    matches!(message, Message::Tool { content, .. } if content == "yes")
+                    matches!(
+                        message,
+                        Message::Tool { content, .. }
+                            if content == r#"{"answers":{"Continue?":"yes"}}"#
+                    )
                 })
         );
     }

@@ -7561,9 +7561,9 @@ enabled = true
             assert!(
                 request["question"]
                     .as_str()
-                    .is_some_and(|question| question == "Continue?")
+                    .is_some_and(|question| question == "Confirm: Continue?")
             );
-            assert_eq!(request["choices"], json!(["yes", "no"]));
+            assert_eq!(request["choices"], json!(["yes - Continue", "no - Stop"]));
 
             handle_line(
                 &server_config,
