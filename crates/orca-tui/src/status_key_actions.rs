@@ -122,7 +122,15 @@ where
 
     if state.status == AppStatus::Running {
         handle_running_key(
-            ev, key, state, config, action_tx, textarea, vim_state, theme,
+            ev,
+            key,
+            state,
+            config,
+            shared_config,
+            action_tx,
+            textarea,
+            vim_state,
+            theme,
         );
     }
 

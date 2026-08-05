@@ -84,6 +84,15 @@ pub fn parse_with_cwd(input: &str, cwd: &Path) -> Option<SlashCommand> {
     None
 }
 
+pub fn invalid_slash_command_message(input: &str) -> String {
+    let command = input.trim().split_whitespace().next().unwrap_or("/");
+    if command == "/workflow" {
+        "invalid workflow command. Use /workflow:<name> [args].".to_string()
+    } else {
+        format!("unknown slash command `{command}`. Type / to view available commands.")
+    }
+}
+
 fn parse_static(input: &str) -> Option<SlashCommand> {
     let trimmed = input.trim();
     let rest = trimmed.strip_prefix('/')?;

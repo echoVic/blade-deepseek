@@ -1,14 +1,17 @@
 use crossbeam_channel as mpsc;
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use orca_core::config::RunConfig;
+use std::sync::{Arc, Mutex};
 use tui_textarea::TextArea;
 
+use crate::commands;
 use crate::composer_input_actions::{apply_composer_key_input, insert_composer_newline};
 use crate::composer_textarea::{make_textarea, make_textarea_with_text, textarea_text};
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::queued_input::QueuedUserMessage;
 use crate::running_actions::handle_running_shortcut;
 use crate::shortcuts::{RunningShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
+use crate::slash_command_actions::{SlashOutcome, handle_slash_command};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, PanelMode, UserAction};
 use crate::vim::VimState;
@@ -114,7 +117,8 @@ pub(crate) fn handle_running_key(
     ev: &Event,
     key: &KeyEvent,
     state: &mut AppState,
-    config: &RunConfig,
+    config: &mut RunConfig,
+    shared_config: &Arc<Mutex<RunConfig>>,
     action_tx: &mpsc::Sender<UserAction>,
     textarea: &mut TextArea,
     vim_state: &mut VimState,
@@ -141,6 +145,26 @@ pub(crate) fn handle_running_key(
                 if state.panel_mode != PanelMode::Conversation {
                     return false;
                 }
+                let text = textarea_text(textarea).trim().to_string();
+                if text.starts_with('/') {
+                    if let Some(outcome) =
+                        handle_slash_command(&text, config, shared_config, state, action_tx)
+                    {
+                        reset_after_running_slash(state, textarea, vim_state, theme, outcome);
+                    } else {
+                        state.push_message(crate::types::ChatMessage::Error(
+                            commands::invalid_slash_command_message(&text),
+                        ));
+                        reset_after_running_slash(
+                            state,
+                            textarea,
+                            vim_state,
+                            theme,
+                            SlashOutcome::Continue,
+                        );
+                    }
+                    return true;
+                }
                 enqueue_composer_follow_up(state, textarea, vim_state, theme);
             }
             RunningShortcut::Newline => {
@@ -164,6 +188,25 @@ pub(crate) fn handle_running_key(
         return apply_composer_key_input(ev, key, state, config, textarea, vim_state, theme);
     }
     false
+}
+
+fn reset_after_running_slash(
+    state: &mut AppState,
+    textarea: &mut TextArea,
+    vim_state: &mut VimState,
+    theme: &Theme,
+    outcome: SlashOutcome,
+) {
+    state.slash_menu = None;
+    state.mention.clear_projection();
+    state.pending_pastes.clear();
+    state.mention_bindings.clear();
+    state.reset_history_navigation();
+    vim_state.reset_insert(textarea, theme);
+    *textarea = match outcome {
+        SlashOutcome::Continue => make_textarea(vim_state, theme),
+        SlashOutcome::Prefill(value) => make_textarea_with_text(&value, vim_state, theme),
+    };
 }
 
 #[cfg(test)]
@@ -344,7 +387,8 @@ mod tests {
         let (action_tx, action_rx) = mpsc::unbounded();
         let mut state = state();
         state.panel_mode = PanelMode::Workflows;
-        let config = crate::test_support::test_run_config();
+        let mut config = crate::test_support::test_run_config();
+        let shared_config = Arc::new(Mutex::new(config.clone()));
         let theme = theme();
         let mut vim = VimState::new(false);
         let mut textarea = make_textarea_with_text("hidden draft", &vim, &theme);
@@ -354,7 +398,8 @@ mod tests {
             &Event::Key(key),
             &key,
             &mut state,
-            &config,
+            &mut config,
+            &shared_config,
             &action_tx,
             &mut textarea,
             &mut vim,
@@ -366,11 +411,70 @@ mod tests {
     }
 
     #[test]
+    fn workflows_command_opens_panel_while_running() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state();
+        let mut config = crate::test_support::test_run_config();
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let theme = theme();
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("/workflows", &vim, &theme);
+        let key = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+
+        assert!(handle_running_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+        assert_eq!(state.panel_mode, PanelMode::Workflows);
+        assert!(state.queued_user_messages.is_empty());
+        assert_eq!(textarea_text(&textarea), "");
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn unknown_slash_command_is_not_queued_while_running() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state();
+        let mut config = crate::test_support::test_run_config();
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let theme = theme();
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("/does-not-exist", &vim, &theme);
+        let key = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+
+        assert!(handle_running_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+        assert!(state.queued_user_messages.is_empty());
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::Error(message)) if message.contains("unknown slash command")
+        ));
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn shortcuts_overlay_blocks_running_composer_edit_and_submit() {
         let (action_tx, action_rx) = mpsc::unbounded();
         let mut state = state();
         state.show_shortcuts = true;
-        let config = crate::test_support::test_run_config();
+        let mut config = crate::test_support::test_run_config();
+        let shared_config = Arc::new(Mutex::new(config.clone()));
         let theme = theme();
         let mut vim = VimState::new(false);
         let mut textarea = make_textarea_with_text("draft", &vim, &theme);
@@ -383,7 +487,8 @@ mod tests {
                 &Event::Key(key),
                 &key,
                 &mut state,
-                &config,
+                &mut config,
+                &shared_config,
                 &action_tx,
                 &mut textarea,
                 &mut vim,

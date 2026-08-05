@@ -5,6 +5,7 @@ use tui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
 
+use crate::commands;
 use crate::composer_textarea::{
     expand_pending_pastes, make_textarea, make_textarea_with_text, textarea_text,
 };
@@ -51,6 +52,16 @@ pub(crate) fn handle_idle_submit(
                 return true;
             }
         }
+    }
+
+    if state.status != AppStatus::WaitingUserInput && text.starts_with('/') {
+        state.push_message(ChatMessage::Error(commands::invalid_slash_command_message(
+            &text,
+        )));
+        state.pending_pastes.clear();
+        state.mention_bindings.clear();
+        reset_composer_after_submit(textarea, vim_state, theme);
+        return true;
     }
 
     if state.status == AppStatus::WaitingUserInput {
@@ -129,6 +140,69 @@ mod tests {
             action_rx.try_recv(),
             Ok(UserAction::SubmitWithMentions { prompt, .. })
                 if prompt == "new foreground"
+        ));
+    }
+
+    #[test]
+    fn malformed_workflow_command_is_not_sent_to_the_model() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("/workflow audit", &vim, &theme);
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+        ));
+        assert!(action_rx.try_recv().is_err());
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::Error(message))
+                if message.contains("/workflow:<name>")
+        ));
+    }
+
+    #[test]
+    fn unknown_slash_command_is_not_sent_to_the_model() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("/does-not-exist", &vim, &theme);
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+        ));
+        assert!(action_rx.try_recv().is_err());
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::Error(message)) if message.contains("unknown slash command")
         ));
     }
 }

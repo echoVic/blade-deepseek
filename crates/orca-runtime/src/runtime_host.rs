@@ -30981,7 +30981,8 @@ impl ThreadActor {
     ) {
         let completion_tx = self.goal_controller.completion_sender();
         let session_id = self.handle.session_id.clone();
-        debug_assert!(self.goal_controller.begin_blocking());
+        let began_blocking = self.goal_controller.begin_blocking();
+        debug_assert!(began_blocking);
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let (handle, join) = GoalRuntimeHandle::open_default().map_err(|error| {
