@@ -717,6 +717,104 @@ fn tool_actor_context_cancelled_user_input_returns_cancelled_result() {
 }
 
 #[test]
+fn tool_actor_context_maps_invalid_ask_user_question_to_invalid_input_result() {
+    struct UnexpectedHandler;
+
+    impl RuntimeUserInputHandler for UnexpectedHandler {
+        fn request_user_input(
+            &self,
+            _request: &RuntimeUserInputRequest,
+        ) -> std::io::Result<Option<String>> {
+            panic!("invalid questionnaire must not reach the interaction handler")
+        }
+    }
+
+    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let request = ToolRequest {
+        id: "ask-invalid".to_string(),
+        name: ToolName::AskUserQuestion,
+        action: ActionKind::Read,
+        target: None,
+        raw_arguments: Some(r#"{"questions":[]}"#.to_string()),
+    };
+
+    let result = context
+        .execute_user_input_tool(&request, &UnexpectedHandler)
+        .expect("invalid questionnaire is a tool result");
+
+    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+    assert_eq!(
+        result.kind,
+        orca_core::tool_types::ToolResultKind::InvalidInput
+    );
+    assert_eq!(
+        result.terminal().started,
+        orca_core::tool_types::ToolInvocationStarted::No
+    );
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("between 1 and 4 questions")
+    );
+}
+
+#[test]
+fn tool_actor_context_routes_ask_user_question_through_typed_handler() {
+    struct AnswerHandler;
+
+    impl RuntimeUserInputHandler for AnswerHandler {
+        fn request_user_input(
+            &self,
+            request: &RuntimeUserInputRequest,
+        ) -> std::io::Result<Option<String>> {
+            assert_eq!(request.id, "ask-structured:question:1");
+            assert_eq!(request.question, "Runtime: Which path?");
+            assert_eq!(
+                request.choices,
+                vec![
+                    "Reuse - Use the runtime broker".to_string(),
+                    "New - Create another path".to_string()
+                ]
+            );
+            Ok(Some("Reuse".to_string()))
+        }
+    }
+
+    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let request = ToolRequest {
+        id: "ask-structured".to_string(),
+        name: ToolName::AskUserQuestion,
+        action: ActionKind::Read,
+        target: None,
+        raw_arguments: Some(
+            serde_json::json!({
+                "questions": [{
+                    "header": "Runtime",
+                    "question": "Which path?",
+                    "options": [
+                        {"label": "Reuse", "description": "Use the runtime broker"},
+                        {"label": "New", "description": "Create another path"}
+                    ]
+                }]
+            })
+            .to_string(),
+        ),
+    };
+
+    let result = context
+        .execute_user_input_tool(&request, &AnswerHandler)
+        .expect("structured user input result");
+
+    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(result.output.as_deref().unwrap()).unwrap(),
+        serde_json::json!({"answers": {"Which path?": "Reuse"}})
+    );
+}
+
+#[test]
 fn tool_actor_context_grants_request_permissions_write_roots_for_current_turn() {
     let mut context = RuntimeToolActorContext::new("run-tools", 2);
     let extra = tempfile::tempdir().expect("extra");
@@ -1724,6 +1822,10 @@ fn tool_actor_context_classifies_runtime_special_tool_dispatch() {
     );
     assert_eq!(
         context.classify_dispatch(&tool_request(ToolName::RequestUserInput), false),
+        RuntimeSpecialToolDispatch::RequestUserInput
+    );
+    assert_eq!(
+        context.classify_dispatch(&tool_request(ToolName::AskUserQuestion), false),
         RuntimeSpecialToolDispatch::RequestUserInput
     );
     assert_eq!(

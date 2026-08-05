@@ -1471,6 +1471,75 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         ),
         BuiltinExecutor::RequestUserInput,
     ));
+    let ask_user_question = conservative_builtin_spec(
+        "ask_user_question",
+        "Ask the user one to four structured questions when progress requires clarification. Each question offers two to four choices, while the user may also type a custom answer. Headless runs fail deterministically instead of blocking.",
+        json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "description": "Questions to ask the user (1-4 questions)",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "header": {
+                                "type": "string",
+                                "description": "Very short label for the question (maximum 12 characters)"
+                            },
+                            "question": {
+                                "type": "string",
+                                "description": "The complete, clear question to ask the user"
+                            },
+                            "options": {
+                                "type": "array",
+                                "description": "Available choices (2-4 options). Do not add an Other option; the user can type a custom answer.",
+                                "minItems": 2,
+                                "maxItems": 4,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {
+                                            "type": "string",
+                                            "description": "Concise option label (1-5 words)"
+                                        },
+                                        "description": {
+                                            "type": "string",
+                                            "description": "What selecting this option means or implies"
+                                        },
+                                        "preview": {
+                                            "type": "string",
+                                            "description": "Optional preview content shown for comparison"
+                                        }
+                                    },
+                                    "required": ["label", "description"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "multiSelect": {
+                                "type": "boolean",
+                                "description": "Whether the user may choose more than one option"
+                            }
+                        },
+                        "required": ["header", "question", "options"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["questions"],
+            "additionalProperties": false
+        }),
+        CapabilitySet::new(vec![ToolCapability::UserInputRequest]),
+        ToolExposure::Direct,
+        RendererHint::State,
+        false,
+    );
+    registry.register(BuiltinTool::new(
+        ask_user_question,
+        BuiltinExecutor::AskUserQuestion,
+    ));
 }
 
 const SAFE_LOCAL_READ: ToolControlSemantics = ToolControlSemantics {
@@ -1722,6 +1791,11 @@ impl Tool for BuiltinTool {
                 "request_user_input requires an interactive TUI session",
                 None,
             ),
+            BuiltinExecutor::AskUserQuestion => ToolResult::failed(
+                request,
+                "ask_user_question requires an interactive TUI session",
+                None,
+            ),
         }
     }
 }
@@ -1761,6 +1835,7 @@ enum BuiltinExecutor {
     ReadMcpResource,
     RequestPermissions,
     RequestUserInput,
+    AskUserQuestion,
 }
 
 fn execute_list_mcp_resources(request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {

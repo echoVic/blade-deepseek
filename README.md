@@ -79,6 +79,9 @@ sandbox permissions.
   prefix-cache-friendly prompts, automatic context management, and retry logic.
 - Reads, searches, edits, and writes code; runs shell commands; and can verify
   the result with a command you choose.
+- Asks one to four structured clarification questions in interactive TUI
+  sessions, including described choices, optional previews, and multi-select
+  answers.
 - Gates risky actions with `suggest`, sandboxed `auto-edit`, full-access
   `full-auto`, and read-only `plan` modes, plus per-folder trust.
 - Saves local conversations with `--resume` for continuation and `--fork` for

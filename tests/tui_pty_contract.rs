@@ -77,7 +77,7 @@ fn tui_permission_round_trips_through_the_runtime_surface() {
     receive_until(
         &process,
         &mut output,
-        "Approval Required",
+        "requested shell",
         Duration::from_secs(10),
         "TUI did not advance to the runtime-owned tool approval",
     );

@@ -192,8 +192,21 @@ Built-in tools:
 | `get_goal` | read | Reads active persistent goal state while goal mode is running |
 | `create_goal` | read | Creates a persistent goal while goal mode is running and no unfinished goal exists |
 | `update_goal` | read | Submits an evidence-bearing complete/blocked intent for turn-end verification while Goal mode is running |
+| `ask_user_question` | read | Asks 1-4 structured questions through the interactive runtime; each question has a header and 2-4 described options, with optional preview and multi-select support |
+| `request_user_input` | read | Compatibility single-question input tool |
 
 Tools are registered through a canonical registry. Each tool spec declares its capability set, renderer hint, exposure, aliases, and concurrent-safety flag. Runtime approval derives from the resolved tool spec instead of a separate hard-coded name list. Tool arguments are validated before execution with common JSON Schema object keywords, enums, arrays, and `oneOf` / `anyOf` composition.
+
+`ask_user_question` accepts `questions` with 1-4 entries. Each entry requires a
+`header` of at most 12 characters, a non-empty `question`, and 2-4 distinct
+`options` containing `label` and `description`; `preview` and `multiSelect` are
+optional. Orca asks the questions in order through the runtime-owned interaction
+broker. In the TUI, the user submits one answer per question from the composer,
+may type a custom answer, and can separate multi-select labels with commas. A
+completed call returns compact JSON as `{"answers":{"question":"answer"}}`.
+Dismissal cancels the whole tool call. Headless execution fails deterministically
+instead of waiting for input. `request_user_input` keeps its existing
+single-question contract.
 
 Tool events:
 - `tool.call.requested` — emitted before execution, contains `name`, `action`, `target`

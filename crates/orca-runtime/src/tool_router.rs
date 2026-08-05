@@ -273,7 +273,10 @@ impl<'a> RuntimeToolRouter<'a> {
                     return Ok(RuntimeToolDispatchOutput::continue_model(
                         tool_types::ToolResult::failed(
                             execution_request,
-                            "request_user_input requires a runtime user input handler",
+                            format!(
+                                "{} requires a runtime user input handler",
+                                execution_request.name.as_str()
+                            ),
                             None,
                         ),
                     ));

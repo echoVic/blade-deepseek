@@ -428,6 +428,63 @@ mod tests {
     }
 
     #[test]
+    fn ask_user_question_tool_exposes_structured_questionnaire_contract() {
+        let reg = registry::default_tool_registry();
+        let tool = reg
+            .get("ask_user_question")
+            .expect("ask_user_question is registered");
+        let schema = &tool.spec().input_schema;
+        let question_items = &schema["properties"]["questions"];
+        let option_items = &question_items["items"]["properties"]["options"];
+
+        assert!(tool.spec().exposure.is_model_visible());
+        assert_eq!(tool.spec().name.as_str(), "ask_user_question");
+        assert!(
+            reg.resolve("AskUserQuestion").is_none(),
+            "PascalCase spelling must not remain as an alias"
+        );
+        assert_eq!(question_items["minItems"], 1);
+        assert_eq!(question_items["maxItems"], 4);
+        assert_eq!(option_items["minItems"], 2);
+        assert_eq!(option_items["maxItems"], 4);
+        assert_eq!(
+            question_items["items"]["required"],
+            serde_json::json!(["header", "question", "options"])
+        );
+        assert_eq!(
+            option_items["items"]["required"],
+            serde_json::json!(["label", "description"])
+        );
+        assert_eq!(
+            question_items["items"]["properties"]["multiSelect"]["type"],
+            "boolean"
+        );
+
+        let request = ToolRequest {
+            id: "questionnaire".to_string(),
+            name: ToolName::plain("ask_user_question"),
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(
+                r#"{"questions":[{"header":"Runtime","question":"Which path?","options":[{"label":"Reuse","description":"Use the runtime broker"},{"label":"New","description":"Create another path"}],"multiSelect":false}]}"#
+                    .to_string(),
+            ),
+        };
+
+        assert!(tool.is_read_only(&request));
+        assert!(!tool.is_concurrent_safe(&request));
+        let result = reg.execute(&request, &registry::ToolContext::new(Path::new(".")));
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("interactive TUI session")
+        );
+    }
+
+    #[test]
     fn skill_tools_are_model_visible_readonly_tools() {
         let reg = registry::default_tool_registry();
         for name in ["list_skills", "read_skill"] {

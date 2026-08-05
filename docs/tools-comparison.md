@@ -46,7 +46,8 @@ special dispatch 执行，不再通过普通工具 worker 或 thread-local callb
 | `get_goal` | read/state | 已实现 | 仅 goal 上下文中可用，用于读取持久目标状态 |
 | `create_goal` | read/state | 已实现 | 仅 goal 上下文中可用，在没有未完成 goal 时创建新目标 |
 | `update_goal` | read/state | 已实现 | 仅 goal 上下文中可用，只允许模型标记 `complete` 或 `blocked` |
-| `request_user_input` | read/state | 已实现 | headless 模式确定性失败，TUI 模式可等待用户回答并继续同一轮 |
+| `ask_user_question` | read/state | 已实现 | 1-4 个结构化问题，每题 2-4 个带说明选项，支持 preview、multiSelect、自定义答案和取消 |
+| `request_user_input` | read/state | 兼容保留 | 单问题兼容契约；headless 模式确定性失败，TUI 模式等待用户回答并继续同一轮 |
 | `list_skills` | read | 已实现 | 列出用户和项目 Markdown skills |
 | `read_skill` | read | 已实现 | 读取指定 skill 的 Markdown 指令内容 |
 | MCP tools | dynamic | 已实现基础路由 | 配置的 MCP server 工具以 namespaced tool 暴露 |
@@ -68,7 +69,7 @@ special dispatch 执行，不再通过普通工具 worker 或 thread-local callb
 | MCP | 支持 | 支持 | MCP 客户端工具路由与 resources list/templates/read 已接入 |
 | 自定义工具 | 插件/扩展 | MCP/插件 | TOML external tools + MCP |
 | Skills | skills / slash 工作流 | Codex skills / plugins | Markdown `SKILL.md` discovery + `$skill` 显式注入 |
-| 用户输入 | 交互式问题/审批 | `request_user_input` | TUI `request_user_input` answer loop |
+| 用户输入 | `AskUserQuestion` 多问题问卷 | `request_user_input` 多问题结构 | TUI `ask_user_question` 逐题 answer loop + `request_user_input` 兼容路径 |
 | 审批 | 工具能力/策略 | 工具能力/策略 | 从 `ToolSpec.capabilities` 推导 |
 | 上下文工具 | 按模式暴露 | 按模式暴露 | `get_goal` / `create_goal` / `update_goal` 等按 runtime context 过滤 |
 
@@ -137,11 +138,13 @@ session、live extension context 或 GoalStore I/O 失败属于控制面错误�
 
 ### 4. Skills and Structured User Input
 
-v0.1.17-v0.1.19 补齐了两个常用交互面：
+Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 
 - `list_skills` / `read_skill` 可发现和读取 `$ORCA_HOME/skills`、`~/.orca/skills` 和项目 `.orca/skills` 下的 Markdown skills。
 - 当 prompt 明确提到 `$skill_id` 时，Orca 会把对应 `SKILL.md` 注入当轮模型上下文。
-- `request_user_input` 是模型可见的结构化澄清工具；headless/jsonl 路径保持确定性，TUI 路径会展示问题和 choices，并把用户下一次 composer 提交作为工具结果继续同一轮。
+- `ask_user_question` 是首选的模型可见澄清工具：单次接受 1-4 个问题，每题需要短 header、问题正文和 2-4 个 `label`/`description` 选项，可附 `preview` 并用 `multiSelect` 标记多选。runtime 逐题生成唯一 interaction id，经现有 broker 等待 composer 答案，最后返回 `answers` JSON；任一题取消会取消整次工具调用。
+- 旧 `request_user_input` 单问题契约继续兼容。
+- headless 路径确定性失败而不阻塞。TUI 允许输入选项标签或自定义文本；多选答案以逗号分隔，preview 会随选项正文展示。
 
 ### 5. Empty-result Semantics
 
@@ -174,7 +177,7 @@ v0.1.17-v0.1.19 补齐了两个常用交互面：
 
 1. 引入 Codex CLI 风格的 shell session 工具：`exec_command`、`write_stdin`、可选 PTY、超时和后台 session id。
 2. 保留 `bash` 作为兼容 alias，逐步让 prompt 推荐新 shell 工具。
-3. 为 `request_user_input` 增加更接近 Codex 的多问题结构和自动超时选项。
+3. 为 `ask_user_question` 增加可配置自动超时和专用多选控件；当前答案通过 composer 逐题提交。
 
 ### 中期
 

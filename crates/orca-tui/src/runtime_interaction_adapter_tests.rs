@@ -150,6 +150,48 @@ fn user_input_waiter_accepts_only_its_typed_response() {
 }
 
 #[test]
+fn ask_user_question_projection_preserves_described_choices_and_answer() {
+    let (controller, _operation, control) = operation();
+    let (event_tx, event_rx) = crossbeam_channel::unbounded();
+    let handler = TuiUserInputHandler::new(event_tx, control);
+    let request = RuntimeUserInputRequest {
+        id: "ask-structured:question:1".to_string(),
+        question: "Runtime: Which path?".to_string(),
+        choices: vec![
+            "Reuse - Use the runtime broker".to_string(),
+            "New - Create another path".to_string(),
+        ],
+    };
+    let join = std::thread::spawn(move || handler.request_user_input(&request));
+
+    let (key, question, choices) = match event_rx.recv().expect("question event") {
+        TuiEvent::UserInputRequested {
+            key,
+            question,
+            choices,
+        } => (key, question, choices),
+        event => panic!("expected user input event, got {event:?}"),
+    };
+    assert_eq!(question, "Runtime: Which path?");
+    assert_eq!(
+        choices,
+        [
+            "Reuse - Use the runtime broker",
+            "New - Create another path"
+        ]
+    );
+    controller
+        .broker()
+        .respond(&key, TuiInteractionResponse::UserInput("Reuse".to_string()))
+        .expect("answer question");
+
+    assert_eq!(
+        join.join().expect("join question").expect("response"),
+        Some("Reuse".to_string())
+    );
+}
+
+#[test]
 fn mcp_elicitation_waiter_routes_fenced_json_response() {
     let (controller, _operation, control) = operation();
     let (event_tx, event_rx) = crossbeam_channel::unbounded();

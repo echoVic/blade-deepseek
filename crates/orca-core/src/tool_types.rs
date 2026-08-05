@@ -36,6 +36,7 @@ pub enum ToolName {
     CreateGoal,
     UpdateGoal,
     UpdatePlan,
+    AskUserQuestion,
     RequestUserInput,
     RequestPermissions,
     ListMcpResources,
@@ -83,6 +84,7 @@ impl ToolName {
             "create_goal" => Self::CreateGoal,
             "update_goal" => Self::UpdateGoal,
             "update_plan" => Self::UpdatePlan,
+            "ask_user_question" => Self::AskUserQuestion,
             "request_user_input" => Self::RequestUserInput,
             "request_permissions" => Self::RequestPermissions,
             "list_mcp_resources" => Self::ListMcpResources,
@@ -142,6 +144,7 @@ impl ToolName {
             Self::CreateGoal => "create_goal",
             Self::UpdateGoal => "update_goal",
             Self::UpdatePlan => "update_plan",
+            Self::AskUserQuestion => "ask_user_question",
             Self::RequestUserInput => "request_user_input",
             Self::RequestPermissions => "request_permissions",
             Self::ListMcpResources => "list_mcp_resources",
@@ -187,6 +190,7 @@ impl ToolName {
             Self::CreateGoal => "create_goal",
             Self::UpdateGoal => "update_goal",
             Self::UpdatePlan => "update_plan",
+            Self::AskUserQuestion => "ask_user_question",
             Self::RequestUserInput => "request_user_input",
             Self::RequestPermissions => "request_permissions",
             Self::ListMcpResources => "list_mcp_resources",
@@ -234,6 +238,7 @@ impl ToolName {
             "create_goal" => Self::CreateGoal,
             "update_goal" => Self::UpdateGoal,
             "update_plan" => Self::UpdatePlan,
+            "ask_user_question" => Self::AskUserQuestion,
             "request_user_input" => Self::RequestUserInput,
             "request_permissions" => Self::RequestPermissions,
             "list_mcp_resources" => Self::ListMcpResources,
@@ -262,6 +267,7 @@ impl ToolName {
                 | Self::WorkflowReadMessages
                 | Self::WorkflowListTasks
                 | Self::GetGoal
+                | Self::AskUserQuestion
                 | Self::RequestUserInput
                 | Self::ListMcpResources
                 | Self::ListMcpResourceTemplates

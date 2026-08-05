@@ -769,7 +769,12 @@ impl<'a> RuntimeTaskActor<'a> {
         request: &ToolRequest,
         handler: &dyn RuntimeUserInputHandler,
     ) -> io::Result<ToolResult> {
-        crate::runtime_user_input::execute_user_input_tool(request, handler)
+        match crate::runtime_user_input::execute_user_input_tool(request, handler) {
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                Ok(ToolResult::invalid_input(request, error.to_string()))
+            }
+            result => result,
+        }
     }
 
     pub fn record_usage(
