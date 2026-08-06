@@ -169,7 +169,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/workflow:<name>", "Run a saved workflow"),
         ("/workflows", "Show workflow tasks"),
         ("/agents", "Show workflow agent dashboard"),
-        ("/skills", "List available skills"),
+        ("/skills", "Browse and insert a skill"),
         ("/remember", "Save a note to memory"),
         ("/trust", "Manage folder trust for the OS sandbox"),
     ]

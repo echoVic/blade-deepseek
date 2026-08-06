@@ -4,10 +4,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use orca_file_search::{
-    SearchMode, SearchPhase, SearchSession, SearchSessionOptions, SearchSnapshot, SessionGeneration,
+    SearchMode, SearchPhase, SearchProgress, SearchSession, SearchSessionOptions, SearchSnapshot,
+    SessionGeneration,
 };
 use orca_runtime::mentions::{self, MentionToken};
-use orca_runtime::mentions::{MentionCandidate, MentionCatalog};
+use orca_runtime::mentions::{MentionCandidate, MentionCatalog, MentionKind, MentionSigil};
 
 use crate::surface_actions::TuiSurfaceActions;
 use crate::types::{AppState, AppStatus, PanelMode, TuiEvent};
@@ -19,6 +20,7 @@ const CATALOG_RESULT_CAPACITY: usize = 8;
 struct TokenIdentity {
     start: usize,
     quoted: bool,
+    sigil: MentionSigil,
 }
 
 struct CatalogDiscoveryResult {
@@ -31,6 +33,7 @@ impl From<&MentionToken> for TokenIdentity {
         Self {
             start: token.start,
             quoted: token.quoted,
+            sigil: token.sigil,
         }
     }
 }
@@ -66,11 +69,13 @@ impl MentionSearchManager {
 
     #[cfg(test)]
     pub(crate) fn new(root: PathBuf, event_tx: mpsc::Sender<TuiEvent>) -> Self {
-        Self::new_roots(vec![root], event_tx)
+        Self::new_roots_with_catalog(vec![root], event_tx, MentionCatalog::default())
     }
 
     pub(crate) fn new_roots(roots: Vec<PathBuf>, event_tx: mpsc::Sender<TuiEvent>) -> Self {
-        Self::new_roots_with_catalog(roots, event_tx, MentionCatalog::default())
+        let roots = normalize_roots(roots);
+        let catalog = MentionCatalog::discover_skills(&roots);
+        Self::new_roots_with_catalog(roots, event_tx, catalog)
     }
 
     fn new_roots_with_catalog(
@@ -109,6 +114,7 @@ impl MentionSearchManager {
         if self.roots == roots {
             return;
         }
+        self.catalog = MentionCatalog::discover_skills(&roots);
         self.roots = roots;
         self.refresh_catalog_async();
         self.warm_deadline = None;
@@ -142,7 +148,14 @@ impl MentionSearchManager {
         };
         self.catalog = catalog;
 
-        if self.active_token.is_some() {
+        if self
+            .active_token
+            .is_some_and(|token| token.sigil == MentionSigil::Dollar)
+        {
+            if let Some(query) = self.active_query.as_deref() {
+                self.project_skill_candidates(query, state);
+            }
+        } else if self.active_token.is_some() {
             let generation = self.advance_generation();
             self.active_generation = Some(generation);
             if let Some(session) = &self.session {
@@ -180,9 +193,13 @@ impl MentionSearchManager {
         let identity = TokenIdentity::from(&token);
         if state
             .mention
-            .dismissed_query
-            .as_deref()
-            .is_some_and(|dismissed| dismissed != token.query)
+            .sigil
+            .is_some_and(|sigil| sigil != token.sigil)
+            || state
+                .mention
+                .dismissed_query
+                .as_deref()
+                .is_some_and(|dismissed| dismissed != token.query)
         {
             state.mention.dismissed_query = None;
         }
@@ -196,6 +213,21 @@ impl MentionSearchManager {
         self.active_token = Some(identity);
         self.active_query = Some(token.query.clone());
         state.mention.pending_query = Some(token.query.clone());
+        state.mention.sigil = Some(token.sigil);
+
+        if token.sigil == MentionSigil::Dollar {
+            self.warm_deadline = None;
+            self.active_generation = None;
+            self.refreshing = false;
+            self.begin_stop();
+            if state.mention.dismissed_query.as_deref() == Some(token.query.as_str()) {
+                state.mention.phase = None;
+                state.mention.candidates.clear();
+            } else {
+                self.project_skill_candidates(&token.query, state);
+            }
+            return;
+        }
 
         if self.warm_deadline.take().is_some()
             && self
@@ -409,6 +441,9 @@ impl MentionSearchManager {
         let Some(token) = mentions::mention_token_at_cursor(text, cursor) else {
             return;
         };
+        if token.sigil != MentionSigil::At {
+            return;
+        }
         if self.active_token != Some(TokenIdentity::from(&token))
             || self.active_query.as_deref() != Some(token.query.as_str())
             || state.mention.pending_query.as_deref() != Some(token.query.as_str())
@@ -418,22 +453,35 @@ impl MentionSearchManager {
             return;
         }
 
-        let previous_index = state.mention.selected;
-        let anchored_candidate = state
-            .mention
-            .manual_selection
-            .then(|| state.mention.selected_identity.clone())
-            .flatten();
         let files = snapshot
             .matches
             .iter()
             .map(MentionCandidate::from_file_match)
             .collect::<Vec<_>>();
         let static_candidates = self.catalog.search(&token.query, 12);
-        state.mention.candidates =
-            mentions::merge_candidates(&token.query, static_candidates, files, 12);
+        let candidates = mentions::merge_candidates(&token.query, static_candidates, files, 12);
+        Self::replace_candidates(state, candidates);
+        state.mention.sigil = Some(MentionSigil::At);
         state.mention.phase = Some(snapshot.phase);
         state.mention.progress = snapshot.progress;
+    }
+
+    fn project_skill_candidates(&self, query: &str, state: &mut AppState) {
+        let candidates = self.catalog.search_all_kind(query, MentionKind::Skill);
+        Self::replace_candidates(state, candidates);
+        state.mention.sigil = Some(MentionSigil::Dollar);
+        state.mention.phase = Some(SearchPhase::Complete);
+        state.mention.progress = SearchProgress::default();
+    }
+
+    fn replace_candidates(state: &mut AppState, candidates: Vec<MentionCandidate>) {
+        let previous_index = state.mention.selected;
+        let anchored_candidate = state
+            .mention
+            .manual_selection
+            .then(|| state.mention.selected_identity.clone())
+            .flatten();
+        state.mention.candidates = candidates;
         if let Some(id) = anchored_candidate {
             state.mention.selected = state
                 .mention
@@ -500,7 +548,7 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use super::{MentionCandidate, MentionSearchManager, TokenIdentity};
+    use super::{MentionCandidate, MentionSearchManager, MentionSigil, TokenIdentity};
     use crate::types::{AppState, AppStatus, PanelMode};
 
     fn state() -> AppState {
@@ -672,6 +720,7 @@ mod tests {
         manager.active_token = Some(TokenIdentity {
             start: 0,
             quoted: false,
+            sigil: MentionSigil::At,
         });
         manager.active_query = Some("m".to_string());
         state.mention.pending_query = Some("m".to_string());
@@ -714,6 +763,22 @@ mod tests {
 
         assert_ne!(first, second);
         assert!(manager.stopping.is_none());
+    }
+
+    #[test]
+    fn dollar_skill_search_uses_catalog_without_starting_file_scan() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("code-review.rs"), "not a skill").unwrap();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let mut manager = MentionSearchManager::new(root.path().to_path_buf(), event_tx);
+        let mut state = state();
+
+        manager.sync("$code-review", true, &mut state, Instant::now());
+
+        assert!(manager.session.is_none());
+        assert_eq!(state.mention.sigil, Some(MentionSigil::Dollar));
+        assert_eq!(state.mention.phase, Some(SearchPhase::Complete));
+        assert!(state.mention.candidates.is_empty());
     }
 
     #[test]

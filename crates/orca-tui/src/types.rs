@@ -838,6 +838,7 @@ pub struct MentionPopupState {
     pub selected: usize,
     pub selected_identity: Option<String>,
     pub manual_selection: bool,
+    pub sigil: Option<orca_runtime::mentions::MentionSigil>,
     pub phase: Option<SearchPhase>,
     pub progress: SearchProgress,
     pub pending_query: Option<String>,
@@ -939,6 +940,7 @@ pub struct AppState {
     pub slash_menu: Option<SlashMenu>,
     pub mention: MentionPopupState,
     pub mention_bindings: MentionBindings,
+    pub atomic_skill_tokens: MentionBindings,
     pub current_plan: Option<(Option<String>, Vec<PlanItem>)>,
     proposed_plan_parser: ProposedPlanStreamParser,
     assistant_stream: StreamingMarkdownAssembler,
@@ -1103,6 +1105,7 @@ impl AppState {
             slash_menu: None,
             mention: MentionPopupState::default(),
             mention_bindings: MentionBindings::default(),
+            atomic_skill_tokens: MentionBindings::default(),
             current_plan: None,
             proposed_plan_parser: ProposedPlanStreamParser::default(),
             assistant_stream: StreamingMarkdownAssembler::default(),
@@ -1875,6 +1878,7 @@ impl AppState {
         self.slash_menu = None;
         self.mention = MentionPopupState::default();
         self.mention_bindings.clear();
+        self.atomic_skill_tokens.clear();
         self.pending_pastes.clear();
         self.reset_history_navigation();
         self.last_ctrl_c = None;
@@ -3116,6 +3120,7 @@ impl AppState {
                 }
                 self.remove_after_last_user();
                 self.mention_bindings.clear();
+                self.atomic_skill_tokens.clear();
                 self.clear_receiving_tool_progress();
                 self.push_message(ChatMessage::Error(message));
                 self.set_status(AppStatus::Idle);

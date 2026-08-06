@@ -130,40 +130,7 @@ pub(crate) fn handle_slash_command(
         SlashCommand::WorkflowList => {
             state.show_workflows();
         }
-        SlashCommand::SkillList => {
-            let cwd = config
-                .cwd
-                .as_deref()
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            match orca_tools::skills::discover_from_env(&cwd) {
-                Ok(skills) if skills.is_empty() => {
-                    state.push_message(ChatMessage::System("No skills found. Add SKILL.md files under .orca/skills/ or .agents/skills/.".to_string()));
-                }
-                Ok(skills) => {
-                    let list = skills
-                        .iter()
-                        .map(|s| {
-                            format!(
-                                "${} [{}] — {}",
-                                s.id,
-                                s.source.as_str(),
-                                if s.description.is_empty() {
-                                    &s.name
-                                } else {
-                                    &s.description
-                                }
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    state.push_message(ChatMessage::System(format!("Available skills:\n{list}")));
-                }
-                Err(e) => {
-                    state.push_message(ChatMessage::Error(format!("failed to list skills: {e}")))
-                }
-            }
-        }
+        SlashCommand::SkillList => return Some(SlashOutcome::Prefill("$".to_string())),
         SlashCommand::WorkflowRun { name, args } => {
             state.enter_running();
             let _ = action_tx.send(UserAction::RunWorkflow { name, args });
@@ -547,6 +514,23 @@ mod tests {
                 assert!(matches!(state.messages.last(), Some(ChatMessage::Error(_))));
             }
         }
+    }
+
+    #[test]
+    fn skills_slash_command_opens_picker_without_writing_transcript() {
+        let mut state = state();
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::unbounded();
+
+        let outcome = handle_slash_command("/skills", &mut config, &shared, &mut state, &action_tx);
+
+        assert!(matches!(
+            outcome,
+            Some(SlashOutcome::Prefill(value)) if value == "$"
+        ));
+        assert!(state.messages.is_empty());
+        assert!(action_rx.try_recv().is_err());
     }
 
     #[test]

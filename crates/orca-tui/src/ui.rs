@@ -3310,15 +3310,11 @@ pub(crate) fn mention_menu_hit_index(state: &AppState, column: u16, row: u16) ->
     if state.slash_menu.is_some() {
         return None;
     }
-    let phase = state.mention.phase.as_ref()?;
+    state.mention.phase.as_ref()?;
     let frame_area = state.frame_area?;
     let input_area = state.input_area?;
     let candidates = &state.mention.candidates;
-    let status = mention_status_text(
-        phase,
-        state.mention.progress.scanned_paths,
-        candidates.is_empty(),
-    );
+    let status = mention_popup_status(state);
     let geometry = popup_geometry(
         frame_area,
         input_area,
@@ -3407,15 +3403,12 @@ fn render_slash_menu(frame: &mut Frame, input_area: Rect, state: &AppState, them
 
 fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppState, theme: &Theme) {
     let candidates = &state.mention.candidates;
-    let Some(phase) = &state.mention.phase else {
+    if state.mention.phase.is_none() {
         return;
-    };
+    }
 
-    let status = mention_status_text(
-        phase,
-        state.mention.progress.scanned_paths,
-        candidates.is_empty(),
-    );
+    let skills_only = state.mention.sigil == Some(orca_runtime::mentions::MentionSigil::Dollar);
+    let status = mention_popup_status(state);
     let Some(geometry) = popup_geometry(
         frame.area(),
         input_area,
@@ -3446,7 +3439,8 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
             } else {
                 Style::default().fg(theme.text)
             };
-            let mut spans = vec![Span::styled(format!("{prefix}@"), style)];
+            let sigil = state.mention.sigil.map_or('@', |sigil| sigil.as_char());
+            let mut spans = vec![Span::styled(format!("{prefix}{sigil}"), style)];
             for (index, ch) in candidate.display.chars().enumerate() {
                 let matched = candidate.indices.binary_search(&(index as u32)).is_ok();
                 let char_style = if matched {
@@ -3459,7 +3453,11 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
                 spans.push(Span::styled(ch.to_string(), char_style));
             }
             spans.push(Span::styled(
-                format!("  [{}] {}", candidate.kind.label(), candidate.description),
+                if skills_only {
+                    format!("  {}", candidate.description)
+                } else {
+                    format!("  [{}] {}", candidate.kind.label(), candidate.description)
+                },
                 Style::default().fg(theme.muted),
             ));
             Line::from(spans)
@@ -3477,11 +3475,40 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(" Mentions ")
+        .title(if skills_only {
+            " Skills "
+        } else {
+            " Mentions "
+        })
         .border_style(Style::default().fg(theme.border));
 
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, geometry.area);
+}
+
+fn mention_popup_status(state: &AppState) -> Option<(String, Color)> {
+    let candidates = &state.mention.candidates;
+    if state.mention.sigil == Some(orca_runtime::mentions::MentionSigil::Dollar) {
+        Some((
+            if candidates.is_empty() {
+                "No matching skills".to_string()
+            } else {
+                format!(
+                    "{}/{} · ↑↓ select · PgUp/PgDn page · Home/End · Enter insert · Esc close",
+                    state.mention.selected.saturating_add(1),
+                    candidates.len()
+                )
+            },
+            Color::DarkGray,
+        ))
+    } else {
+        let phase = state.mention.phase.as_ref()?;
+        mention_status_text(
+            phase,
+            state.mention.progress.scanned_paths,
+            candidates.is_empty(),
+        )
+    }
 }
 
 fn mention_status_text(
@@ -5885,6 +5912,52 @@ mod tests {
         assert!(rendered.contains("@file-08.rs"));
         assert!(rendered.contains("▸ @file-19.rs"));
         assert!(!rendered.contains("@file-00.rs"));
+    }
+
+    #[test]
+    fn skill_picker_uses_compact_dollar_rows_and_interaction_hint() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.mention.sigil = Some(orca_runtime::mentions::MentionSigil::Dollar);
+        state.mention.phase = Some(orca_file_search::SearchPhase::Complete);
+        state.mention.candidates = (0..25)
+            .map(|index| orca_runtime::mentions::MentionCandidate {
+                id: format!("skill:skill-{index:02}"),
+                kind: orca_runtime::mentions::MentionKind::Skill,
+                display: format!("skill-{index:02}"),
+                description: format!("Skill description {index}"),
+                score: 1,
+                indices: Vec::new(),
+                target: orca_runtime::mentions::MentionTarget::Skill {
+                    id: format!("skill-{index:02}"),
+                    path: std::path::PathBuf::from(format!("/skills/skill-{index:02}/SKILL.md")),
+                },
+            })
+            .collect();
+        state.mention.selected = 12;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 12))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| {
+                render_mention_candidates(frame, Rect::new(0, 10, 70, 1), &state, &theme);
+            })
+            .expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Skills"));
+        assert!(rendered.contains("▸ $skill-12"));
+        assert!(rendered.contains("Skill description 12"));
+        assert!(rendered.contains("13/25"));
+        assert!(rendered.contains("PgUp/PgDn page"));
+        assert!(!rendered.contains("$skill-00"));
+        assert!(!rendered.contains("[skill]"));
     }
 
     #[test]

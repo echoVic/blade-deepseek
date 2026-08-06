@@ -42,12 +42,14 @@ pub(crate) fn handle_idle_submit(
             SlashOutcome::Continue => {
                 state.pending_pastes.clear();
                 state.mention_bindings.clear();
+                state.atomic_skill_tokens.clear();
                 reset_composer_after_submit(textarea, vim_state, theme);
                 return true;
             }
             SlashOutcome::Prefill(value) => {
                 state.pending_pastes.clear();
                 state.mention_bindings.clear();
+                state.atomic_skill_tokens.clear();
                 *textarea = make_textarea_with_text(&value, vim_state, theme);
                 return true;
             }
@@ -60,6 +62,7 @@ pub(crate) fn handle_idle_submit(
         )));
         state.pending_pastes.clear();
         state.mention_bindings.clear();
+        state.atomic_skill_tokens.clear();
         reset_composer_after_submit(textarea, vim_state, theme);
         return true;
     }
@@ -94,6 +97,7 @@ pub(crate) fn handle_idle_submit(
     }
     state.pending_pastes.clear();
     state.mention_bindings.clear();
+    state.atomic_skill_tokens.clear();
     reset_composer_after_submit(textarea, vim_state, theme);
     true
 }

@@ -732,6 +732,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
                 let text = textarea_text(&textarea);
                 let cursor = textarea_cursor_byte_index(&textarea);
                 state.mention_bindings.reconcile(&text);
+                state.atomic_skill_tokens.reconcile(&text);
                 mention_search.sync_at_cursor(
                     &text,
                     cursor,

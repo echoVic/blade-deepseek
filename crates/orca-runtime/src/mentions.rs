@@ -28,6 +28,21 @@ pub enum MentionKind {
     Resource,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MentionSigil {
+    At,
+    Dollar,
+}
+
+impl MentionSigil {
+    pub fn as_char(self) -> char {
+        match self {
+            Self::At => '@',
+            Self::Dollar => '$',
+        }
+    }
+}
+
 impl MentionKind {
     pub fn label(self) -> &'static str {
         match self {
@@ -90,6 +105,11 @@ pub struct MentionCatalog {
 }
 
 impl MentionCatalog {
+    pub fn discover_skills(roots: &[PathBuf]) -> Self {
+        let (orca_home, agents_home) = skill_discovery_dirs_from_env();
+        Self::discover_skills_with_dirs(roots, orca_home.as_deref(), agents_home.as_deref())
+    }
+
     pub fn discover(roots: &[PathBuf], mcp_registry: &orca_mcp::McpRegistry) -> Self {
         let (orca_home, agents_home) = skill_discovery_dirs_from_env();
         Self::discover_with_skill_dirs(
@@ -111,33 +131,7 @@ impl MentionCatalog {
         } else {
             roots.to_vec()
         };
-        let mut catalog = Self::default();
-        for root in &roots {
-            match orca_tools::skills::discover(root, orca_home, agents_home) {
-                Ok(skills) => {
-                    for skill in skills {
-                        let target = MentionTarget::Skill {
-                            id: skill.id.clone(),
-                            path: skill.path.clone(),
-                        };
-                        catalog.candidates.push(MentionCandidate {
-                            id: target.stable_id(),
-                            kind: MentionKind::Skill,
-                            display: skill.id,
-                            description: if skill.description.is_empty() {
-                                skill.name
-                            } else {
-                                format!("{} — {}", skill.name, skill.description)
-                            },
-                            score: 0,
-                            indices: Vec::new(),
-                            target,
-                        });
-                    }
-                }
-                Err(error) => catalog.errors.push(error),
-            }
-        }
+        let mut catalog = Self::discover_skills_with_dirs(&roots, orca_home, agents_home);
         let (plugins, plugin_errors) = discover_plugins(&roots);
         catalog.errors.extend(plugin_errors);
         catalog.candidates.extend(plugins.into_iter().map(|plugin| {
@@ -155,7 +149,6 @@ impl MentionCatalog {
                 target,
             }
         }));
-
         let resources = mcp_registry.list_resources_with_errors(None);
         catalog.errors.extend(resources.errors);
         catalog
@@ -205,6 +198,50 @@ impl MentionCatalog {
         catalog
     }
 
+    fn discover_skills_with_dirs(
+        roots: &[PathBuf],
+        orca_home: Option<&Path>,
+        agents_home: Option<&Path>,
+    ) -> Self {
+        let roots = if roots.is_empty() {
+            vec![std::env::current_dir().unwrap_or_default()]
+        } else {
+            roots.to_vec()
+        };
+        let mut catalog = Self::default();
+        for root in &roots {
+            match orca_tools::skills::discover_metadata(root, orca_home, agents_home) {
+                Ok(skills) => {
+                    for skill in skills {
+                        let target = MentionTarget::Skill {
+                            id: skill.id.clone(),
+                            path: skill.path.clone(),
+                        };
+                        catalog.candidates.push(MentionCandidate {
+                            id: target.stable_id(),
+                            kind: MentionKind::Skill,
+                            display: skill.id,
+                            description: if skill.description.is_empty() {
+                                skill.name
+                            } else {
+                                format!("{} — {}", skill.name, skill.description)
+                            },
+                            score: 0,
+                            indices: Vec::new(),
+                            target,
+                        });
+                    }
+                }
+                Err(error) => catalog.errors.push(error),
+            }
+        }
+        catalog.candidates.sort_by(candidate_identity_order);
+        catalog
+            .candidates
+            .dedup_by(|left, right| left.id == right.id);
+        catalog
+    }
+
     pub fn candidates(&self) -> &[MentionCandidate] {
         &self.candidates
     }
@@ -214,9 +251,39 @@ impl MentionCatalog {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<MentionCandidate> {
+        self.search_filtered(query, limit, |_| true)
+    }
+
+    pub fn search_kind(
+        &self,
+        query: &str,
+        kind: MentionKind,
+        limit: usize,
+    ) -> Vec<MentionCandidate> {
+        self.search_filtered(query, limit, |candidate| candidate.kind == kind)
+    }
+
+    pub fn search_all_kind(&self, query: &str, kind: MentionKind) -> Vec<MentionCandidate> {
+        self.search_filtered(query, self.candidates.len().max(1), |candidate| {
+            candidate.kind == kind
+        })
+    }
+
+    fn search_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        include: impl Fn(&MentionCandidate) -> bool,
+    ) -> Vec<MentionCandidate> {
         let limit = limit.max(1);
         if query.trim().is_empty() {
-            return self.candidates.iter().take(limit).cloned().collect();
+            return self
+                .candidates
+                .iter()
+                .filter(|candidate| include(candidate))
+                .take(limit)
+                .cloned()
+                .collect();
         }
         let atom = Atom::new(
             query.trim(),
@@ -229,6 +296,9 @@ impl MentionCatalog {
         let mut haystack_buf = Vec::new();
         let mut scored = Vec::new();
         for candidate in &self.candidates {
+            if !include(candidate) {
+                continue;
+            }
             let mut candidate = candidate.clone();
             let haystack = Utf32Str::new(&candidate.display, &mut haystack_buf);
             let mut indices = Vec::new();
@@ -939,6 +1009,7 @@ pub struct MentionToken {
     pub end: usize,
     pub query: String,
     pub quoted: bool,
+    pub sigil: MentionSigil,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -960,12 +1031,16 @@ pub fn mention_token_at_cursor(input: &str, cursor: usize) -> Option<MentionToke
 
     let mut active = None;
     for (start, ch) in input.char_indices() {
-        if ch != '@'
-            || (start > 0
-                && !input[..start]
-                    .chars()
-                    .next_back()
-                    .is_some_and(char::is_whitespace))
+        let sigil = match ch {
+            '@' => MentionSigil::At,
+            '$' => MentionSigil::Dollar,
+            _ => continue,
+        };
+        if start > 0
+            && !input[..start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
         {
             continue;
         }
@@ -983,6 +1058,7 @@ pub fn mention_token_at_cursor(input: &str, cursor: usize) -> Option<MentionToke
                     end: closing_quote.map_or(query_end, |end| end + 1),
                     query: input[query_start..query_end].to_string(),
                     quoted: true,
+                    sigil,
                 });
             }
             continue;
@@ -1004,6 +1080,7 @@ pub fn mention_token_at_cursor(input: &str, cursor: usize) -> Option<MentionToke
             end,
             query: query.to_string(),
             quoted: false,
+            sigil,
         });
     }
     active
@@ -1035,9 +1112,10 @@ pub fn complete_file_mention_from_candidates_at_cursor(
     let mut completed = String::new();
     completed.push_str(&input[..token.start]);
     if token.quoted {
-        completed.push_str("@\"");
+        completed.push(token.sigil.as_char());
+        completed.push('"');
     } else {
-        completed.push('@');
+        completed.push(token.sigil.as_char());
     }
     completed.push_str(&replacement);
     let completed_cursor = completed.len();
@@ -1068,13 +1146,14 @@ pub fn apply_mention_selection_at_cursor(
     let mut result = String::new();
     result.push_str(&input[..token.start]);
     if token.quoted || has_space {
-        result.push_str("@\"");
+        result.push(token.sigil.as_char());
+        result.push('"');
         result.push_str(candidate);
         if !candidate.ends_with('/') {
             result.push('"');
         }
     } else {
-        result.push('@');
+        result.push(token.sigil.as_char());
         result.push_str(candidate);
     }
     let inserted_end = result.len();
@@ -1232,8 +1311,22 @@ mod tests {
                 end: 15,
                 query: "src/ma".to_string(),
                 quoted: true,
+                sigil: MentionSigil::At,
             }
         );
+    }
+
+    #[test]
+    fn dollar_token_selection_preserves_skill_sigil() {
+        let token = current_mention_token("$code-rev").unwrap();
+
+        assert_eq!(token.query, "code-rev");
+        assert_eq!(token.sigil, MentionSigil::Dollar);
+
+        let edit = apply_mention_selection_at_cursor("$code-rev", "$code-rev".len(), "code-review")
+            .unwrap();
+        assert_eq!(edit.text, "$code-review ");
+        assert_eq!(edit.cursor, edit.text.len());
     }
 
     #[test]
@@ -1379,6 +1472,34 @@ mod tests {
     }
 
     #[test]
+    fn all_kind_search_does_not_truncate_skill_results() {
+        let candidates = (0..30)
+            .map(|index| {
+                let id = format!("skill-{index:02}");
+                let target = MentionTarget::Skill {
+                    id: id.clone(),
+                    path: PathBuf::from(format!("/skills/{id}/SKILL.md")),
+                };
+                MentionCandidate {
+                    id: target.stable_id(),
+                    kind: MentionKind::Skill,
+                    display: id,
+                    description: "Skill".to_string(),
+                    score: 0,
+                    indices: Vec::new(),
+                    target,
+                }
+            })
+            .collect();
+        let catalog = MentionCatalog {
+            candidates,
+            errors: Vec::new(),
+        };
+
+        assert_eq!(catalog.search_all_kind("", MentionKind::Skill).len(), 30);
+    }
+
+    #[test]
     fn unified_catalog_discovers_skills_and_codex_compatible_plugins() {
         let project = tempfile::tempdir().unwrap();
         let orca_home = tempfile::tempdir().unwrap();
@@ -1418,6 +1539,21 @@ mod tests {
             orca_core::config::folder_trust::TrustLevel::Trusted,
         )
         .unwrap();
+        let skills_catalog = MentionCatalog::discover_skills_with_dirs(
+            &[project.path().to_path_buf()],
+            Some(orca_home.path()),
+            None,
+        );
+        assert!(skills_catalog.candidates().iter().any(|candidate| {
+            candidate.kind == MentionKind::Skill && candidate.display == "review"
+        }));
+        assert!(
+            !skills_catalog
+                .candidates()
+                .iter()
+                .any(|candidate| candidate.kind == MentionKind::Plugin)
+        );
+
         let catalog = MentionCatalog::discover_with_skill_dirs(
             &[project.path().to_path_buf()],
             &orca_mcp::McpRegistry::default(),
@@ -1432,6 +1568,12 @@ mod tests {
             candidate.kind == MentionKind::Plugin && candidate.display == "GitHub"
         }));
         assert_eq!(catalog.search("review", 8)[0].kind, MentionKind::Skill);
+        assert!(
+            catalog
+                .search_kind("", MentionKind::Skill, 8)
+                .iter()
+                .all(|candidate| candidate.kind == MentionKind::Skill)
+        );
     }
 
     #[test]

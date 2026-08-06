@@ -47,6 +47,7 @@ pub(crate) fn enqueue_composer_follow_up(
     state.mention.clear_projection();
     state.pending_pastes.clear();
     state.mention_bindings.clear();
+    state.atomic_skill_tokens.clear();
     state.reset_history_navigation();
     vim_state.reset_insert(textarea, theme);
     *textarea = make_textarea(vim_state, theme);
@@ -78,6 +79,7 @@ pub(crate) fn restore_latest_queued_message(
     vim_state.reset_insert(textarea, theme);
     *textarea = make_textarea_with_text(&composer.visible_text, vim_state, theme);
     state.mention_bindings = composer.mention_bindings;
+    state.atomic_skill_tokens.clear();
     state.pending_pastes = composer.pending_pastes;
     state.reset_history_navigation();
     true
@@ -201,6 +203,7 @@ fn reset_after_running_slash(
     state.mention.clear_projection();
     state.pending_pastes.clear();
     state.mention_bindings.clear();
+    state.atomic_skill_tokens.clear();
     state.reset_history_navigation();
     vim_state.reset_insert(textarea, theme);
     *textarea = match outcome {

@@ -50,7 +50,9 @@ pub(crate) fn handle_idle_key(
     }
 
     if (!state.mention.candidates.is_empty()
-        || (state.mention.phase.is_some() && key.code == KeyCode::Esc))
+        || (state.mention.phase.is_some()
+            && (key.code == KeyCode::Esc
+                || state.mention.sigil == Some(orca_runtime::mentions::MentionSigil::Dollar))))
         && handle_mention_menu_key(ev, key, state, textarea, vim_state, theme)
     {
         vim_state.cancel_pending_command();
@@ -123,6 +125,41 @@ mod tests {
     use crate::types::TuiEvent;
     use crossterm::event::KeyModifiers;
     use orca_core::config::{ThemeName, VimInsertEscapeSequence};
+
+    #[test]
+    fn empty_skill_picker_consumes_enter_without_submitting_dollar_prompt() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.mention.sigil = Some(orca_runtime::mentions::MentionSigil::Dollar);
+        state.mention.phase = Some(orca_file_search::SearchPhase::Complete);
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::from(["$"]);
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        handle_idle_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert_eq!(textarea.lines(), &["$".to_string()]);
+        assert!(action_rx.try_recv().is_err());
+        assert!(state.messages.is_empty());
+    }
 
     #[test]
     fn nonempty_composer_keeps_vim_count_when_e_matches_expand_shortcut() {

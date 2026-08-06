@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobSetBuilder};
@@ -75,14 +76,42 @@ pub fn discover(
     orca_home: Option<&Path>,
     agents_home: Option<&Path>,
 ) -> Result<Vec<Skill>, String> {
+    discover_with_body(cwd, orca_home, agents_home, true)
+}
+
+pub fn discover_metadata(
+    cwd: &Path,
+    orca_home: Option<&Path>,
+    agents_home: Option<&Path>,
+) -> Result<Vec<Skill>, String> {
+    discover_with_body(cwd, orca_home, agents_home, false)
+}
+
+fn discover_with_body(
+    cwd: &Path,
+    orca_home: Option<&Path>,
+    agents_home: Option<&Path>,
+    include_body: bool,
+) -> Result<Vec<Skill>, String> {
     let project_root = project_root(cwd);
     let mut skills = Vec::new();
     if let Some(home) = orca_home {
-        collect_skills(&home.join("skills"), SkillSource::User, None, &mut skills)?;
+        collect_skills(
+            &home.join("skills"),
+            SkillSource::User,
+            None,
+            include_body,
+            &mut skills,
+        )?;
     }
     if let Some(home) = agents_home {
-        // ~/.agents/<skill-name>/SKILL.md  (no "skills" subdirectory at global level)
-        collect_skills(home, SkillSource::User, None, &mut skills)?;
+        collect_skills(
+            &home.join("skills"),
+            SkillSource::User,
+            None,
+            include_body,
+            &mut skills,
+        )?;
     }
     if let Some(project_root) = project_root
         && orca_home.is_some_and(|home| {
@@ -93,12 +122,14 @@ pub fn discover(
             &project_root.join(".orca/skills"),
             SkillSource::Project,
             Some(&project_root),
+            include_body,
             &mut skills,
         )?;
         collect_skills(
             &project_root.join(".agents/skills"),
             SkillSource::Project,
             Some(&project_root),
+            include_body,
             &mut skills,
         )?;
     }
@@ -221,6 +252,7 @@ fn collect_skills(
     skills_dir: &Path,
     source: SkillSource,
     allowed_root: Option<&Path>,
+    include_body: bool,
     skills: &mut Vec<Skill>,
 ) -> Result<(), String> {
     if !skills_dir.is_dir() {
@@ -252,7 +284,12 @@ fn collect_skills(
         {
             continue;
         }
-        if let Ok(skill) = parse_skill(id, source, &skill_path) {
+        let parsed = if include_body {
+            parse_skill(id, source, &skill_path)
+        } else {
+            parse_skill_metadata(id, source, &skill_path)
+        };
+        if let Ok(skill) = parsed {
             if let Some(root) = allowed_root {
                 if !skill.paths.is_empty() && !paths_match(&skill.paths, root) {
                     continue;
@@ -306,6 +343,51 @@ fn parse_skill(id: &str, source: SkillSource, path: &Path) -> Result<Skill, Stri
         source,
         path: path.to_path_buf(),
         body: body.trim().to_string(),
+    })
+}
+
+fn parse_skill_metadata(id: &str, source: SkillSource, path: &Path) -> Result<Skill, String> {
+    const MAX_FRONTMATTER_BYTES: usize = 64 * 1024;
+
+    let file = fs::File::open(path)
+        .map_err(|error| format!("failed to read skill {}: {error}", path.display()))?;
+    let mut lines = std::io::BufReader::new(file).lines();
+    let frontmatter = if lines
+        .next()
+        .transpose()
+        .map_err(|error| format!("failed to read skill metadata {}: {error}", path.display()))?
+        == Some("---".to_string())
+    {
+        let mut frontmatter = String::new();
+        let mut closed = false;
+        for line in lines {
+            let line = line.map_err(|error| {
+                format!("failed to read skill metadata {}: {error}", path.display())
+            })?;
+            if line == "---" {
+                closed = true;
+                break;
+            }
+            if frontmatter.len().saturating_add(line.len()) > MAX_FRONTMATTER_BYTES {
+                break;
+            }
+            frontmatter.push_str(&line);
+            frontmatter.push('\n');
+        }
+        closed.then_some(frontmatter)
+    } else {
+        None
+    };
+    let (name, description, when_to_use, paths) = parse_frontmatter(frontmatter.as_deref());
+    Ok(Skill {
+        id: id.to_string(),
+        name: name.unwrap_or_else(|| id.to_string()),
+        description: description.unwrap_or_default(),
+        when_to_use,
+        paths,
+        source,
+        path: path.to_path_buf(),
+        body: String::new(),
     })
 }
 
@@ -495,7 +577,45 @@ mod tests {
     }
 
     #[test]
-    fn discovers_skills_from_agents_skills_dir() {
+    fn discovers_user_skills_from_agents_skills_dir() {
+        let agents_home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_skill(
+            &agents_home.path().join("skills/lint"),
+            "Lint",
+            "Run linter",
+            "Run cargo clippy.",
+        );
+
+        let skills = discover(project.path(), None, Some(agents_home.path())).unwrap();
+
+        assert!(skills.iter().any(|s| s.id == "lint"));
+    }
+
+    #[test]
+    fn metadata_discovery_reads_frontmatter_without_loading_body() {
+        let agents_home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_skill(
+            &agents_home.path().join("skills/lint"),
+            "Lint",
+            "Run linter",
+            &"large body ".repeat(10_000),
+        );
+
+        let skill = discover_metadata(project.path(), None, Some(agents_home.path()))
+            .unwrap()
+            .into_iter()
+            .find(|skill| skill.id == "lint")
+            .unwrap();
+
+        assert_eq!(skill.name, "Lint");
+        assert_eq!(skill.description, "Run linter");
+        assert!(skill.body.is_empty());
+    }
+
+    #[test]
+    fn discovers_project_skills_from_agents_skills_dir() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         fs::write(

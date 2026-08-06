@@ -1,4 +1,4 @@
-use crossterm::event::{Event, KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use tui_textarea::{Input, TextArea};
 
 use orca_core::config::RunConfig;
@@ -39,6 +39,7 @@ pub(crate) fn recall_previous_history(
     } else {
         let draft = textarea_text(textarea);
         if let Some(history) = state.history_previous(draft) {
+            state.atomic_skill_tokens.clear();
             *textarea = make_textarea_with_text(&history, vim_state, theme);
         }
     }
@@ -55,6 +56,7 @@ pub(crate) fn recall_next_history(
     if key.code == KeyCode::Down && textarea.lines().len() > 1 {
         textarea.input(Input::from(ev.clone()));
     } else if let Some(history) = state.history_next() {
+        state.atomic_skill_tokens.clear();
         *textarea = make_textarea_with_text(&history, vim_state, theme);
     }
 }
@@ -68,6 +70,10 @@ pub(crate) fn apply_composer_key_input(
     vim_state: &mut VimState,
     theme: &Theme,
 ) -> bool {
+    if delete_atomic_skill_token(key, state, textarea, vim_state, theme) {
+        refresh_input_menus(textarea, state, config);
+        return true;
+    }
     let normalized_event = normalize_windows_altgr_event(ev);
     let changed = if key.code == KeyCode::Tab {
         vim_state.cancel_pending_command();
@@ -105,10 +111,55 @@ pub(crate) fn apply_composer_key_input(
         textarea.input(Input::from(normalized_event))
     };
     if changed {
+        state
+            .atomic_skill_tokens
+            .reconcile(&textarea_text(textarea));
         state.reset_history_navigation();
         refresh_input_menus(textarea, state, config);
     }
     changed
+}
+
+pub(crate) fn delete_atomic_skill_token(
+    key: &KeyEvent,
+    state: &mut AppState,
+    textarea: &mut TextArea,
+    vim_state: &VimState,
+    theme: &Theme,
+) -> bool {
+    if !matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        || (vim_state.enabled && vim_state.mode != crate::vim::VimMode::Insert)
+    {
+        return false;
+    }
+    let text = textarea_text(textarea);
+    state.atomic_skill_tokens.reconcile(&text);
+    let cursor = textarea_cursor_byte_index(textarea);
+    let range = state
+        .atomic_skill_tokens
+        .bindings()
+        .iter()
+        .find(|binding| match key.code {
+            KeyCode::Backspace => binding.start < cursor && cursor <= binding.end,
+            KeyCode::Delete => binding.start <= cursor && cursor < binding.end,
+            _ => false,
+        })
+        .map(|binding| binding.start..binding.end);
+    let Some(range) = range else {
+        return false;
+    };
+
+    let mut next = text;
+    next.replace_range(range.clone(), "");
+    state.atomic_skill_tokens.reconcile(&next);
+    state.mention_bindings.reconcile(&next);
+    state.mention.clear_projection();
+    state.reset_history_navigation();
+    *textarea = make_textarea_with_text_at_cursor(&next, range.start, vim_state, theme);
+    true
 }
 
 fn normalize_windows_altgr_event(ev: &Event) -> Event {
@@ -157,10 +208,129 @@ mod windows_input_tests {
 mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use orca_core::config::ThemeName;
+    use orca_runtime::mentions::{MentionBinding, MentionBindings, MentionTarget};
+    use std::path::PathBuf;
 
     use super::*;
     use crate::composer_textarea::{make_textarea_with_text, textarea_text};
     use crate::types::{AppState, AppStatus};
+
+    fn bind_atomic_skill(state: &mut AppState, text: &str, visible: &str) {
+        let start = text.find(visible).unwrap();
+        state.atomic_skill_tokens = MentionBindings::from_bindings(
+            text,
+            vec![MentionBinding {
+                start,
+                end: start + visible.len(),
+                visible: visible.to_string(),
+                target: MentionTarget::Skill {
+                    id: visible.trim_start_matches('$').to_string(),
+                    path: PathBuf::from("/skills/test/SKILL.md"),
+                },
+            }],
+        );
+    }
+
+    #[test]
+    fn selected_skill_backspace_deletes_the_atomic_name_not_one_character() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let text = "$algorithmic-art ";
+        bind_atomic_skill(&mut state, text, "$algorithmic-art");
+        let config = crate::test_support::test_run_config();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text(text, &vim, &theme);
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+
+        apply_composer_key_input(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &config,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert_eq!(textarea_text(&textarea), "$algorithmic-art");
+
+        apply_composer_key_input(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &config,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert_eq!(textarea_text(&textarea), "");
+        assert!(state.atomic_skill_tokens.is_empty());
+    }
+
+    #[test]
+    fn manually_typed_skill_like_text_keeps_character_deletion() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let config = crate::test_support::test_run_config();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("$algorithmic-art", &vim, &theme);
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+
+        apply_composer_key_input(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &config,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert_eq!(textarea_text(&textarea), "$algorithmic-ar");
+    }
+
+    #[test]
+    fn delete_inside_selected_skill_removes_the_whole_atomic_name() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let text = "use $algorithmic-art next";
+        bind_atomic_skill(&mut state, text, "$algorithmic-art");
+        let config = crate::test_support::test_run_config();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let cursor = text.find("$algorithmic-art").unwrap() + 5;
+        let mut textarea = make_textarea_with_text_at_cursor(text, cursor, &vim, &theme);
+        let key = KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE);
+
+        apply_composer_key_input(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &config,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert_eq!(textarea_text(&textarea), "use  next");
+        assert!(state.atomic_skill_tokens.is_empty());
+    }
 
     #[test]
     fn running_slash_text_never_opens_local_command_menu() {

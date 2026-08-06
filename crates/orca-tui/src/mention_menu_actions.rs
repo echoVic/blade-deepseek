@@ -3,12 +3,15 @@ use tui_textarea::{Input, TextArea};
 
 use orca_runtime::mentions;
 
+use crate::composer_input_actions::delete_atomic_skill_token;
 use crate::composer_textarea::{
     make_textarea_with_text_at_cursor, textarea_cursor_byte_index, textarea_text,
 };
 use crate::theme::Theme;
 use crate::types::AppState;
 use crate::vim::VimState;
+
+const MENTION_PAGE_SIZE: usize = 12;
 
 pub(crate) fn handle_mention_menu_key(
     ev: &Event,
@@ -18,6 +21,9 @@ pub(crate) fn handle_mention_menu_key(
     vim_state: &VimState,
     theme: &Theme,
 ) -> bool {
+    if delete_atomic_skill_token(key, state, textarea, vim_state, theme) {
+        return true;
+    }
     match key.code {
         KeyCode::Up => {
             state.mention.selected = state.mention.selected.saturating_sub(1);
@@ -32,6 +38,31 @@ pub(crate) fn handle_mention_menu_key(
             mark_manual_selection(state);
             true
         }
+        KeyCode::PageUp => {
+            state.mention.selected = state.mention.selected.saturating_sub(MENTION_PAGE_SIZE);
+            mark_manual_selection(state);
+            true
+        }
+        KeyCode::PageDown => {
+            let max = state.mention.candidates.len().saturating_sub(1);
+            state.mention.selected = state
+                .mention
+                .selected
+                .saturating_add(MENTION_PAGE_SIZE)
+                .min(max);
+            mark_manual_selection(state);
+            true
+        }
+        KeyCode::Home => {
+            state.mention.selected = 0;
+            mark_manual_selection(state);
+            true
+        }
+        KeyCode::End => {
+            state.mention.selected = state.mention.candidates.len().saturating_sub(1);
+            mark_manual_selection(state);
+            true
+        }
         KeyCode::Tab | KeyCode::Enter => {
             if let Some(candidate) = state
                 .mention
@@ -41,16 +72,24 @@ pub(crate) fn handle_mention_menu_key(
             {
                 let text = textarea_text(textarea);
                 let cursor = textarea_cursor_byte_index(textarea);
-                if let Some(edit) =
-                    mentions::apply_mention_selection_at_cursor(&text, cursor, &candidate.display)
-                {
+                let token = mentions::mention_token_at_cursor(&text, cursor);
+                if let (Some(token), Some(edit)) = (
+                    token,
+                    mentions::apply_mention_selection_at_cursor(&text, cursor, &candidate.display),
+                ) {
                     *textarea = make_textarea_with_text_at_cursor(
                         &edit.text,
                         edit.cursor,
                         vim_state,
                         theme,
                     );
-                    if !candidate.is_directory() {
+                    if token.sigil == mentions::MentionSigil::Dollar {
+                        state.atomic_skill_tokens.apply_selection(
+                            &text,
+                            &edit,
+                            candidate.target.clone(),
+                        );
+                    } else if !candidate.is_directory() {
                         state.mention_bindings.apply_selection(
                             &text,
                             &edit,
@@ -94,7 +133,9 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use orca_core::config::ThemeName;
     use orca_file_search::{MatchKind, SearchMatch};
-    use orca_runtime::mentions::{MentionCandidate, MentionFileKind, MentionTarget};
+    use orca_runtime::mentions::{
+        MentionCandidate, MentionFileKind, MentionKind, MentionSigil, MentionTarget,
+    };
 
     use super::*;
     use crate::composer_textarea::{make_textarea_with_text, textarea_text};
@@ -177,5 +218,84 @@ mod tests {
 
         assert_eq!(textarea_text(&textarea), "review @src/");
         assert!(state.mention_bindings.is_empty());
+    }
+
+    #[test]
+    fn selecting_skill_records_atomic_composer_token_without_model_binding() {
+        let mut state = state();
+        state.mention.sigil = Some(MentionSigil::Dollar);
+        state.mention.candidates = vec![MentionCandidate {
+            id: "skill:code-review".to_string(),
+            kind: MentionKind::Skill,
+            display: "code-review".to_string(),
+            description: "Review code".to_string(),
+            score: 42,
+            indices: vec![0],
+            target: MentionTarget::Skill {
+                id: "code-review".to_string(),
+                path: PathBuf::from("/skills/code-review/SKILL.md"),
+            },
+        }];
+        let theme = Theme::named(ThemeName::Dark);
+        let vim_state = VimState::new(false);
+        let mut textarea = make_textarea_with_text("$code", &vim_state, &theme);
+        let (event, key) = enter();
+
+        assert!(handle_mention_menu_key(
+            &event,
+            &key,
+            &mut state,
+            &mut textarea,
+            &vim_state,
+            &theme,
+        ));
+
+        assert_eq!(textarea_text(&textarea), "$code-review ");
+        assert!(state.mention_bindings.is_empty());
+        assert_eq!(state.atomic_skill_tokens.bindings().len(), 1);
+        assert!(state.mention.candidates.is_empty());
+    }
+
+    #[test]
+    fn skill_picker_supports_page_and_boundary_navigation() {
+        let mut state = state();
+        state.mention.sigil = Some(MentionSigil::Dollar);
+        state.mention.candidates = (0..30)
+            .map(|index| MentionCandidate {
+                id: format!("skill:skill-{index:02}"),
+                kind: MentionKind::Skill,
+                display: format!("skill-{index:02}"),
+                description: format!("Skill {index}"),
+                score: 0,
+                indices: Vec::new(),
+                target: MentionTarget::Skill {
+                    id: format!("skill-{index:02}"),
+                    path: PathBuf::from(format!("/skills/skill-{index:02}/SKILL.md")),
+                },
+            })
+            .collect();
+        let theme = Theme::named(ThemeName::Dark);
+        let vim_state = VimState::new(false);
+        let mut textarea = make_textarea_with_text("$", &vim_state, &theme);
+
+        for (code, expected) in [
+            (KeyCode::PageDown, 12),
+            (KeyCode::PageDown, 24),
+            (KeyCode::PageDown, 29),
+            (KeyCode::PageUp, 17),
+            (KeyCode::Home, 0),
+            (KeyCode::End, 29),
+        ] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            assert!(handle_mention_menu_key(
+                &Event::Key(key),
+                &key,
+                &mut state,
+                &mut textarea,
+                &vim_state,
+                &theme,
+            ));
+            assert_eq!(state.mention.selected, expected);
+        }
     }
 }
