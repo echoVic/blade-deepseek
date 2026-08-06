@@ -99,23 +99,27 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
     let mut parts = rest.split_whitespace();
     let command = parts.next()?;
     match command {
-        "new" | "clear" => Some(SlashCommand::New),
-        "model" => Some(SlashCommand::Model(
-            parts.next().map(|name| name.to_string()),
-        )),
-        "compact" => Some(SlashCommand::Compact),
-        "resume" => Some(SlashCommand::Resume),
+        "new" | "clear" => no_arguments(parts).then_some(SlashCommand::New),
+        "model" => optional_single_argument(parts)
+            .map(|model| SlashCommand::Model(model.map(str::to_string))),
+        "compact" => no_arguments(parts).then_some(SlashCommand::Compact),
+        "resume" => no_arguments(parts).then_some(SlashCommand::Resume),
         "fork" => Some(SlashCommand::Fork(optional_argument(parts))),
         "rename" => Some(SlashCommand::Rename(optional_argument(parts))),
-        "status" if parts.next().is_none() => Some(SlashCommand::Status),
+        "status" => no_arguments(parts).then_some(SlashCommand::Status),
         "copy" => Some(SlashCommand::Copy(optional_argument(parts))),
-        "cancel-operation" => Some(SlashCommand::CancelOperation),
-        "cost" => Some(SlashCommand::Cost),
-        "config" if parts.next() == Some("show") => Some(SlashCommand::ConfigShow),
-        "mode" => Some(SlashCommand::Mode(
-            parts.next().map(|mode| mode.to_string()),
-        )),
-        "plan" => Some(SlashCommand::Plan(parts.next().map(str::to_string))),
+        "cancel-operation" => no_arguments(parts).then_some(SlashCommand::CancelOperation),
+        "cost" => no_arguments(parts).then_some(SlashCommand::Cost),
+        "config" => match optional_single_argument(parts)? {
+            Some("show") => Some(SlashCommand::ConfigShow),
+            _ => None,
+        },
+        "mode" => {
+            optional_single_argument(parts).map(|mode| SlashCommand::Mode(mode.map(str::to_string)))
+        }
+        "plan" => {
+            optional_single_argument(parts).map(|arg| SlashCommand::Plan(arg.map(str::to_string)))
+        }
         "goal" => parse_goal(parts.collect::<Vec<_>>().join(" ")).map(SlashCommand::Goal),
         command if command.starts_with("workflow:") => {
             let name = command.trim_start_matches("workflow:").trim();
@@ -129,9 +133,9 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
                 })
             }
         }
-        "workflows" => Some(SlashCommand::WorkflowList),
-        "agents" => Some(SlashCommand::AgentDashboard),
-        "skills" => Some(SlashCommand::SkillList),
+        "workflows" => no_arguments(parts).then_some(SlashCommand::WorkflowList),
+        "agents" => no_arguments(parts).then_some(SlashCommand::AgentDashboard),
+        "skills" => no_arguments(parts).then_some(SlashCommand::SkillList),
         "remember" => {
             let note = parts.collect::<Vec<_>>().join(" ");
             if note.is_empty() {
@@ -140,12 +144,14 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
                 Some(SlashCommand::Remember(note))
             }
         }
-        "trust" => Some(SlashCommand::Trust(match parts.next() {
-            None | Some("show") => TrustSlashCommand::Show,
-            Some("add") => TrustSlashCommand::Add,
-            Some("remove") => TrustSlashCommand::Remove,
-            Some(_) => return None,
-        })),
+        "trust" => Some(SlashCommand::Trust(
+            match optional_single_argument(parts)? {
+                None | Some("show") => TrustSlashCommand::Show,
+                Some("add") => TrustSlashCommand::Add,
+                Some("remove") => TrustSlashCommand::Remove,
+                Some(_) => return None,
+            },
+        )),
         _ => None,
     }
 }
@@ -178,6 +184,17 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
 fn optional_argument<'a>(parts: impl Iterator<Item = &'a str>) -> Option<String> {
     let argument = parts.collect::<Vec<_>>().join(" ");
     (!argument.is_empty()).then_some(argument)
+}
+
+fn optional_single_argument<'a>(
+    mut parts: impl Iterator<Item = &'a str>,
+) -> Option<Option<&'a str>> {
+    let argument = parts.next();
+    parts.next().is_none().then_some(argument)
+}
+
+fn no_arguments<'a>(mut parts: impl Iterator<Item = &'a str>) -> bool {
+    parts.next().is_none()
 }
 
 pub fn available_commands(cwd: &Path) -> Vec<(String, String)> {
@@ -320,12 +337,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_mode_commands() {
+        assert_eq!(parse("/mode"), Some(SlashCommand::Mode(None)));
+        assert_eq!(
+            parse("/mode auto-edit"),
+            Some(SlashCommand::Mode(Some("auto-edit".to_string())))
+        );
+    }
+
+    #[test]
     fn parses_plan_commands() {
         assert_eq!(parse("/plan"), Some(SlashCommand::Plan(None)));
         assert_eq!(
             parse("/plan off"),
             Some(SlashCommand::Plan(Some("off".to_string())))
         );
+    }
+
+    #[test]
+    fn fixed_arity_commands_reject_trailing_arguments() {
+        for command in [
+            "/new now",
+            "/clear now",
+            "/model auto extra",
+            "/compact now",
+            "/resume latest",
+            "/status now",
+            "/cancel-operation now",
+            "/cost now",
+            "/config show extra",
+            "/mode auto-edit extra",
+            "/plan off extra",
+            "/workflows now",
+            "/agents now",
+            "/skills now",
+            "/trust add extra",
+        ] {
+            assert_eq!(parse(command), None, "accepted malformed {command}");
+        }
     }
 
     #[test]

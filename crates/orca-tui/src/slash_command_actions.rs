@@ -83,7 +83,7 @@ pub(crate) fn handle_slash_command(
         SlashCommand::Mode(None) => {
             state.push_message(ChatMessage::System(format!(
                 "Current mode: {}",
-                config.approval_mode.as_str()
+                state.approval_mode.as_str()
             )));
         }
         SlashCommand::Plan(arg) => match arg.as_deref() {
@@ -91,7 +91,7 @@ pub(crate) fn handle_slash_command(
                 pending_settings_action = Some(UserAction::SetModel(encode_settings_intent(
                     None,
                     None,
-                    Some(ApprovalMode::Suggest),
+                    Some(ApprovalMode::default()),
                 )));
             }
             None => {
@@ -181,7 +181,7 @@ pub(crate) fn handle_slash_command(
             let _ = action_tx.send(UserAction::RenameCurrentSession { title });
         }
         SlashCommand::Status => {
-            state.push_message(ChatMessage::System(format_status(state, config)));
+            state.push_message(ChatMessage::System(format_status(state)));
         }
         SlashCommand::Copy(argument) => {
             let position = match argument.as_deref() {
@@ -251,7 +251,7 @@ pub(crate) fn handle_slash_command(
     Some(SlashOutcome::Continue)
 }
 
-fn format_status(state: &AppState, config: &RunConfig) -> String {
+fn format_status(state: &AppState) -> String {
     let session_id = state.current_session_id.as_deref().unwrap_or("-");
     let title = state.current_session_title.as_deref().unwrap_or("-");
     let context = if state.context_limit_tokens == 0 {
@@ -295,7 +295,7 @@ fn format_status(state: &AppState, config: &RunConfig) -> String {
          recoverable: {}",
         state.model_name,
         state.reasoning_effort.as_str(),
-        config.approval_mode.as_str(),
+        state.approval_mode.as_str(),
         state.cwd,
         state.usage.input_tokens,
         state.usage.output_tokens,
@@ -461,7 +461,8 @@ mod tests {
             .unwrap(),
         );
         let mut config = test_run_config();
-        config.approval_mode = ApprovalMode::Plan;
+        config.approval_mode = ApprovalMode::Suggest;
+        state.approval_mode = ApprovalMode::Plan;
         let shared = Arc::new(Mutex::new(config.clone()));
         let (action_tx, _) = mpsc::unbounded();
 
@@ -483,6 +484,35 @@ mod tests {
         ] {
             assert!(status.contains(expected), "missing {expected}: {status}");
         }
+    }
+
+    #[test]
+    fn mode_and_plan_commands_use_committed_state_and_current_default() {
+        let mut state = state();
+        state.approval_mode = ApprovalMode::FullAuto;
+        let mut config = test_run_config();
+        config.approval_mode = ApprovalMode::Suggest;
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::unbounded();
+
+        handle_slash_command("/mode", &mut config, &shared, &mut state, &action_tx);
+
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::System(message)) if message == "Current mode: full-auto"
+        ));
+
+        handle_slash_command("/plan off", &mut config, &shared, &mut state, &action_tx);
+        let UserAction::SetModel(intent) = action_rx.try_recv().expect("plan settings action")
+        else {
+            panic!("expected settings action");
+        };
+        assert_eq!(
+            decode_settings_intent(&intent)
+                .expect("settings intent")
+                .approval_mode,
+            Some(ApprovalMode::default())
+        );
     }
 
     #[test]

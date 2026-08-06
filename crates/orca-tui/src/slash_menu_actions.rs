@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use tui_textarea::{Input, TextArea};
 
+use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{ReasoningEffort, RunConfig};
 
 use crate::commands;
@@ -93,7 +94,7 @@ pub(crate) fn handle_slash_menu_key(
                     if let Ok(()) = commands::validate_model(&chosen_model) {
                         menu.sub_menu = Some(reasoning_effort_submenu(
                             chosen_model,
-                            config.reasoning_effort,
+                            state.reasoning_effort,
                         ));
                         return true;
                     }
@@ -216,40 +217,17 @@ fn select_slash_menu_command(
 ) {
     match selected_cmd.as_str() {
         "/model" => {
-            let models: Vec<String> = commands::available_models()
-                .iter()
-                .map(|s| match *s {
-                    "auto" => "auto (pro + flash for aux)".to_string(),
-                    other => other.to_string(),
-                })
-                .collect();
             state.slash_menu = Some(SlashMenu {
                 items: menu_items,
                 selected,
-                sub_menu: Some(SubMenu {
-                    title: "/model".to_string(),
-                    items: models,
-                    selected: 0,
-                    context: None,
-                }),
+                sub_menu: Some(model_submenu(&state.model_name)),
             });
         }
         "/mode" => {
-            let modes = vec![
-                "suggest".to_string(),
-                "auto-edit".to_string(),
-                "full-auto".to_string(),
-                "plan".to_string(),
-            ];
             state.slash_menu = Some(SlashMenu {
                 items: menu_items,
                 selected,
-                sub_menu: Some(SubMenu {
-                    title: "/mode".to_string(),
-                    items: modes,
-                    selected: 0,
-                    context: None,
-                }),
+                sub_menu: Some(approval_mode_submenu(state.approval_mode)),
             });
         }
         "/remember" => {
@@ -276,6 +254,45 @@ fn select_slash_menu_command(
 }
 
 pub(crate) const REASONING_SUBMENU_TITLE: &str = "/model · reasoning effort";
+
+fn model_submenu(current: &str) -> SubMenu {
+    let selected = commands::available_models()
+        .iter()
+        .position(|model| *model == current)
+        .unwrap_or(0);
+    let items = commands::available_models()
+        .iter()
+        .map(|model| match *model {
+            "auto" => "auto (pro + flash for aux)".to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    SubMenu {
+        title: "/model".to_string(),
+        items,
+        selected,
+        context: None,
+    }
+}
+
+fn approval_mode_submenu(current: ApprovalMode) -> SubMenu {
+    let modes = [
+        ApprovalMode::Suggest,
+        ApprovalMode::AutoEdit,
+        ApprovalMode::FullAuto,
+        ApprovalMode::Plan,
+    ];
+    let selected = modes.iter().position(|mode| *mode == current).unwrap_or(0);
+    SubMenu {
+        title: "/mode".to_string(),
+        items: modes
+            .into_iter()
+            .map(|mode| mode.as_str().to_string())
+            .collect(),
+        selected,
+        context: None,
+    }
+}
 
 fn reasoning_effort_submenu(pending_model: String, current: ReasoningEffort) -> SubMenu {
     let items: Vec<String> = reasoning_effort_options()
@@ -308,4 +325,19 @@ fn parse_reasoning_effort(choice: &str) -> Option<ReasoningEffort> {
         .iter()
         .find(|(effort, _)| effort.as_str() == token)
         .map(|(effort, _)| *effort)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{approval_mode_submenu, model_submenu};
+    use orca_core::approval_types::ApprovalMode;
+
+    #[test]
+    fn settings_submenus_preselect_the_committed_values() {
+        let model = model_submenu("deepseek-v4-pro");
+        assert_eq!(model.items[model.selected], "deepseek-v4-pro");
+
+        let mode = approval_mode_submenu(ApprovalMode::AutoEdit);
+        assert_eq!(mode.items[mode.selected], "auto-edit");
+    }
 }
