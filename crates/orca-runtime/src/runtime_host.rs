@@ -7575,6 +7575,12 @@ fn bootstrap_recorded_surface(
     incarnation_bytes[8] = 0x80 | (incarnation_bytes[8] & 0x3f);
     let incarnation = surface::SurfaceIncarnation::try_from_bytes(incarnation_bytes)
         .expect("normalized thread UUID is v7");
+    let restored_context_tokens =
+        crate::thread_store::read_latest_context_tokens(&path).map_err(|error| {
+            RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to restore latest provider context: {error}"),
+            }
+        })?;
 
     let owner_lease = surface_owner.owner_lease;
     let current_owner_epoch = surface::ThreadOwnerEpoch::new(owner_lease.owner_epoch());
@@ -7586,6 +7592,7 @@ fn bootstrap_recorded_surface(
         surface::ThreadPersistence::RecordedCatalogued,
         config,
         title,
+        restored_context_tokens,
     )?;
     let ledger = surface::JsonlSurfaceCommitLedger::new(path, snapshot.cursor.clone());
     let mut coordinator = surface::RuntimeCommitCoordinator::recover_with_owned_lease(
@@ -7755,6 +7762,7 @@ fn bootstrap_ephemeral_surface(
         surface::ThreadPersistence::EphemeralNonCataloguedOneShot { close_after },
         config,
         title,
+        None,
     )?;
     let ledger = surface::RuntimeSurfaceCommitLedger::Ephemeral(
         surface::InMemorySurfaceCommitLedger::new(snapshot.cursor.clone()),
@@ -7888,6 +7896,7 @@ fn initial_surface_snapshot(
     persistence: surface::ThreadPersistence,
     config: &RunConfig,
     title: &str,
+    restored_context_tokens: Option<u64>,
 ) -> Result<surface::SurfaceSnapshot, RuntimeHostError> {
     let cwd = config.cwd.clone().unwrap_or_else(|| {
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
@@ -7999,6 +8008,11 @@ fn initial_surface_snapshot(
     let permission_rules_digest = surface_sha256(
         &serde_json::to_vec(&permission_rules).expect("surface permission rules are serializable"),
     );
+    let context_limit_tokens = config
+        .model_runtime
+        .context_window
+        .unwrap_or_else(|| orca_core::model::max_context_tokens(config.model.as_deref()))
+        .max(1) as u64;
     let settings = surface::SurfaceRuntimeSettings {
         model: surface::NonEmptyText::try_new(
             config
@@ -8083,8 +8097,8 @@ fn initial_surface_snapshot(
         },
         context: surface::SurfaceContextSnapshot {
             revision: surface::ContextRevision::try_new(1).expect("one is a valid revision"),
-            used_tokens: 0,
-            limit_tokens: 128_000,
+            used_tokens: restored_context_tokens.unwrap_or(0),
+            limit_tokens: context_limit_tokens,
             compaction: surface::CompactionState::Idle,
             fragments: Vec::new(),
             provider_replay: surface::ProviderReplayHealth::None,
@@ -50279,6 +50293,75 @@ mod tests {
             Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
             None => unsafe { std::env::remove_var("ORCA_HOME") },
         }
+    }
+
+    #[test]
+    fn resumed_legacy_usage_restores_latest_provider_context() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = OrcaHomeRestore::set(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+
+        let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+            .expect("start legacy context fixture host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "legacy context fixture",
+            )
+            .expect("start legacy context fixture thread");
+        let thread_id = thread.thread_id().to_string();
+        let transcript_path = SessionStore::new()
+            .load_session(&thread_id)
+            .expect("load legacy context fixture")
+            .path;
+        thread
+            .shutdown()
+            .expect("shutdown legacy context fixture thread");
+        host.shutdown()
+            .expect("shutdown legacy context fixture host");
+
+        let mut writer = crate::thread_store::SessionWriter::append_to_existing(transcript_path)
+            .expect("open legacy context fixture transcript");
+        writer
+            .append_usage(UsageTotals {
+                input_tokens: 929_128,
+                output_tokens: 10_260,
+                cache_tokens: 893_696,
+                estimated_cost_usd: 0.063661744,
+            })
+            .expect("append penultimate usage snapshot");
+        writer
+            .append_usage(UsageTotals {
+                input_tokens: 970_611,
+                output_tokens: 10_627,
+                cache_tokens: 935_040,
+                estimated_cost_usd: 0.065860634,
+            })
+            .expect("append latest usage snapshot");
+        drop(writer);
+
+        let resumed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+            .expect("start resumed legacy context host");
+        let resumed = resumed_host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id)),
+                "resume legacy context fixture",
+            )
+            .expect("resume legacy context fixture");
+        let snapshot = fresh_surface_attachment(&resumed.surface())
+            .baseline
+            .snapshot;
+
+        assert_eq!(snapshot.context.used_tokens, 41_483);
+        assert_eq!(snapshot.context.limit_tokens, 1_000_000);
+
+        resumed
+            .shutdown()
+            .expect("shutdown resumed legacy context thread");
+        resumed_host
+            .shutdown()
+            .expect("shutdown resumed legacy context host");
     }
 
     #[test]

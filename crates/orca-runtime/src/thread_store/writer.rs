@@ -431,6 +431,27 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
     })
 }
 
+pub(crate) fn read_latest_context_tokens(path: &Path) -> io::Result<Option<u64>> {
+    let mut previous_input_tokens = 0;
+    let mut latest_context_tokens = None;
+    for record in read_records(path)? {
+        match record {
+            SessionRecord::Usage(usage) => {
+                latest_context_tokens = Some(
+                    usage
+                        .input_tokens
+                        .checked_sub(previous_input_tokens)
+                        .unwrap_or(usage.input_tokens),
+                );
+                previous_input_tokens = usage.input_tokens;
+            }
+            SessionRecord::UsageBaseline(_) => previous_input_tokens = 0,
+            _ => {}
+        }
+    }
+    Ok(latest_context_tokens)
+}
+
 fn redact_session_record(record: &SessionRecord) -> SessionRecord {
     let mut redacted = record.clone();
     match &mut redacted {
@@ -1302,6 +1323,19 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(values, vec![8_000]);
+    }
+
+    #[test]
+    fn latest_context_tokens_are_the_delta_between_usage_snapshots() {
+        let (_directory, path, mut writer) = new_transcript();
+        writer
+            .append_usage(usage(929_128, 10_260, 893_696, 0.06))
+            .expect("write penultimate usage snapshot");
+        writer
+            .append_usage(usage(970_611, 10_627, 935_040, 0.06))
+            .expect("write latest usage snapshot");
+
+        assert_eq!(read_latest_context_tokens(&path).unwrap(), Some(41_483));
     }
 
     #[test]

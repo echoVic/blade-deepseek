@@ -165,12 +165,13 @@ pub(crate) enum SurfaceProjectionError {
 pub(crate) type TuiStreamDeliveryWatermark = BTreeMap<SurfaceStreamId, ByteOffset>;
 
 impl SurfaceProjectionState {
-    fn from_surface_snapshot(snapshot: &orca_runtime::surface::SurfaceSnapshot) -> Self {
+    pub(crate) fn from_surface_snapshot(snapshot: &orca_runtime::surface::SurfaceSnapshot) -> Self {
         Self {
             session_id: surface_thread_id_text(&snapshot.thread.thread_id),
             title: snapshot.thread.title.as_str().to_string(),
             usage_revision: snapshot.usage.revision.get(),
             usage: core_usage_totals(&snapshot.usage.thread_total),
+            context_revision: snapshot.context.revision.get(),
             context_used_tokens: usize::try_from(snapshot.context.used_tokens)
                 .unwrap_or(usize::MAX),
             context_limit_tokens: usize::try_from(snapshot.context.limit_tokens)
