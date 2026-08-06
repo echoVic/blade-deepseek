@@ -306,7 +306,11 @@ The runtime executes a multi-turn agent loop (max 128 turns):
 3. If response is a final message → return success
 4. If budget exhausted → return `budget_exhausted` (exit code 4)
 
-Subagents run the same loop as a child conversation in the same workspace. They inherit provider/model config and approval mode. Nested subagents are rejected in this MVP.
+Subagents run the same loop as a child conversation. Synchronous, asynchronous,
+and workflow child agents apply one immutable delegation snapshot for the parent
+approval/plan mode, active and configured permission profiles, workspace roots,
+permission rules, additional working directories, and model selection. A
+request-level child model override can replace only the captured model.
 
 Context window management:
 - Window size: DeepSeek V4 1M-token context window, compacted at the configured threshold with response reserve

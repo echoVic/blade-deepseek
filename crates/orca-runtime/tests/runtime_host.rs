@@ -2500,6 +2500,24 @@ fn canonical_hosted_task_metadata_owns_one_main_session_lifecycle() {
         "Workflow notification task-42"
     );
 
+    let events = output.json_events();
+    let registry_index = events
+        .iter()
+        .rposition(|event| event["type"] == "workflow.tasks.updated")
+        .expect("complete task registry event");
+    let completed_index = events
+        .iter()
+        .rposition(|event| event["type"] == "session.completed")
+        .expect("session completion event");
+    assert!(
+        registry_index < completed_index,
+        "the complete task registry must publish before session completion"
+    );
+    assert_eq!(
+        events[registry_index]["payload"]["tasks"][0]["status"],
+        "completed"
+    );
+
     let tasks = thread.task_registry().list();
     let task = tasks
         .iter()

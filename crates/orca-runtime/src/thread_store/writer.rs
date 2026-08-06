@@ -732,7 +732,12 @@ fn looks_like_standalone_secret(token: &str) -> bool {
 }
 
 pub(crate) fn acquire_file_lock(path: &Path) -> io::Result<ExclusiveFileLock> {
-    let mut lock_path = path.as_os_str().to_os_string();
+    let logical_path = if path.extension().and_then(|extension| extension.to_str()) == Some("zst") {
+        path.with_extension("")
+    } else {
+        path.to_path_buf()
+    };
+    let mut lock_path = logical_path.as_os_str().to_os_string();
     lock_path.push(".lock");
     ExclusiveFileLock::acquire(Path::new(&lock_path)).map_err(io::Error::other)
 }
@@ -1270,6 +1275,33 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(values, vec![7, 9_000]);
+    }
+
+    #[test]
+    fn compressed_and_plaintext_transcript_paths_share_one_process_lock() {
+        let (_directory, path, _writer) = new_transcript();
+        let compressed_path = path.with_extension("jsonl.zst");
+        let lock = acquire_file_lock(&compressed_path).expect("hold compressed transcript lock");
+        let mut child = spawn_append_probe(&path, 8, 1);
+
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            child.try_wait().expect("inspect blocked writer").is_none(),
+            "plaintext append bypassed the compressed transcript lock"
+        );
+
+        drop(lock);
+        wait_for_append_probe(&mut child, Duration::from_secs(10));
+
+        let values = read_records(&path)
+            .expect("read transcript after compressed lock release")
+            .into_iter()
+            .filter_map(|record| match record {
+                SessionRecord::Usage(usage) => Some(usage.input_tokens),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![8_000]);
     }
 
     #[test]

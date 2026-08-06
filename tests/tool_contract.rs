@@ -265,10 +265,17 @@ fn full_auto_bash_persists_runtime_shell_task_record() {
         &fs::read_to_string(&task_files[0]).expect("read persisted shell tasks"),
     )
     .expect("persisted tasks json");
+    let tasks = tasks.as_object().expect("persisted task map");
     let shell_task = tasks
-        .as_object()
-        .and_then(|tasks| tasks.values().next())
-        .expect("one shell task");
+        .values()
+        .find(|task| task["task_type"] == "shell")
+        .expect("persisted shell task");
+    assert!(
+        tasks
+            .values()
+            .any(|task| task["task_type"] == "main_session"),
+        "headless execution should persist its canonical main-session task"
+    );
     assert_eq!(shell_task["task_type"], "shell");
     assert_eq!(shell_task["status"], "completed");
     assert_eq!(shell_task["command"], "printf persisted-shell-task");
@@ -303,7 +310,13 @@ output_truncation = { mode = "tokens", limit = 12 }
         .output()
         .expect("run orca");
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output.stderr.is_empty());
 
     let events = parse_jsonl(&output.stdout);
@@ -314,6 +327,17 @@ output_truncation = { mode = "tokens", limit = 12 }
     let text = completed["payload"]["output"].as_str().unwrap();
     assert!(text.contains("Warning: truncated tool output"));
     assert!(text.contains("Original token count:"));
+
+    let tasks = events
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "workflow.tasks.updated")
+        .expect("complete task registry event");
+    let main_task = tasks["payload"]["tasks"]
+        .as_array()
+        .and_then(|tasks| tasks.iter().find(|task| task["type"] == "main_session"))
+        .expect("canonical main-session task");
+    assert_eq!(main_task["outputTruncated"], true);
 }
 
 #[test]

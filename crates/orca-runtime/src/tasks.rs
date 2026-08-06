@@ -18,8 +18,8 @@ use orca_core::conversation::RawToolCall;
 use orca_core::cost_types::UsageTotals;
 use orca_core::provider_types::{ProviderResponse, ProviderStep, ToolCallProgress, Usage};
 use orca_core::task_types::{
-    BackgroundTaskSummary, PendingToolCallSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
-    WorkflowPhaseTaskSummary, WorkflowTaskProgress,
+    BackgroundTaskSummary, PendingToolCallSummary, TaskActivitySummary, TaskStatus, TaskType,
+    WorkflowAgentTaskSummary, WorkflowPhaseTaskSummary, WorkflowTaskProgress,
 };
 use orca_core::thread_identity::TurnId;
 use orca_core::thread_item_projection::ModelResponseIdentity;
@@ -771,13 +771,15 @@ impl TaskRegistry {
     }
 
     pub fn has_active_tasks(&self) -> bool {
-        self.list().into_iter().any(|task| task.status.is_active())
+        self.activity_summary().has_active_tasks()
     }
 
     pub fn requires_attention(&self) -> bool {
-        self.list()
-            .into_iter()
-            .any(|task| task.status.requires_attention())
+        self.activity_summary().requires_attention()
+    }
+
+    pub fn activity_summary(&self) -> TaskActivitySummary {
+        TaskActivitySummary::from_tasks(&self.list())
     }
 
     pub fn summary(&self, id: &str) -> Option<BackgroundTaskSummary> {
@@ -3039,6 +3041,8 @@ mod tests {
             0,
         );
         registry.mark_running(&workflow.id).unwrap();
+        assert_eq!(registry.activity_summary().active_count, 1);
+        assert_eq!(registry.activity_summary().attention_count, 0);
         assert!(registry.has_active_tasks());
         assert!(!registry.requires_attention());
 
@@ -3055,9 +3059,13 @@ mod tests {
                 None,
             )
             .unwrap();
+        assert_eq!(registry.activity_summary().active_count, 1);
+        assert_eq!(registry.activity_summary().attention_count, 1);
         assert!(registry.requires_attention());
 
         registry.stop(&workflow.id, "done".to_string()).unwrap();
+        assert_eq!(registry.activity_summary().active_count, 0);
+        assert_eq!(registry.activity_summary().attention_count, 1);
         assert!(!registry.has_active_tasks());
         assert!(registry.requires_attention());
     }

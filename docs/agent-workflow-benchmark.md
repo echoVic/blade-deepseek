@@ -128,7 +128,7 @@ All 8 agents were launched concurrently via `Promise.all()` in the `research` ph
 | Rule scoping | Per-tool, per-target (glob on command/path) | `approval_rules.rs:14` — `tool: String, pattern: String` |
 | Hook events | 9: session_start/end, pre/post_tool_use, pre/post_model_call, on_budget_warning, pre/post_compact | `hook_types.rs` (referenced in README) |
 | Non-interactive approval | Policy-based; `plan` denies all writes; `full-auto` allows all | `approval/src/policy.rs:84-93` |
-| Workflow child approval | Auto-Edit mode forced for workflow children | `workflow/runner.rs` tests — `workflow_child_config_defaults_to_autoedit_approval_mode` |
+| Workflow child execution policy | Inherits the parent's immutable delegation snapshot: approval/plan mode, active and configured permission profiles, workspace roots, permission rules, additional working directories, and model | `workflow/runner.rs` tests — `workflow_child_config_applies_immutable_delegation_policy_snapshot`, `workflow_child_config_preserves_parent_approval_mode`, `workflow_child_config_preserves_parent_plan_mode` |
 
 ### Agent G: Tests and Eval Harnesses
 

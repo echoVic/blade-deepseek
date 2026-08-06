@@ -1115,7 +1115,9 @@ fn run_inner<W: io::Write>(
     let (relay_tx, relay_rx) = mpsc::sync_channel(HOSTED_EVENT_RELAY_CAPACITY);
     let operation = thread
         .start_turn(
-            HostedTurnRequest::headless_session(prompt.clone()).with_options(options),
+            HostedTurnRequest::headless_session(prompt.clone())
+                .with_task_description(prompt.clone())
+                .with_options(options),
             HostedEventRelayWriter {
                 tx: relay_tx,
                 buffer: Vec::new(),
