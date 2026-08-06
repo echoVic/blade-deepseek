@@ -148,7 +148,12 @@ fn async_subagent_launches_without_blocking_parent_tool() {
     let agent_id = payload["agent_id"].as_str().unwrap();
     assert!(agent_id.starts_with("task-"));
     assert_eq!(payload["description"], "inspect repo");
-    let task_update = find_event(&events, "task.status.updated");
+    let task_update = events
+        .iter()
+        .find(|event| {
+            event["type"] == "task.status.updated" && event["payload"]["task"]["id"] == agent_id
+        })
+        .expect("async subagent task update");
     assert_eq!(task_update["payload"]["task"]["id"], agent_id);
     assert_eq!(task_update["payload"]["task"]["type"], "subagent");
     assert_eq!(task_update["payload"]["task"]["status"], "running");

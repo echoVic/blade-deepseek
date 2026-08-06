@@ -385,6 +385,8 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     mcp_registry,
                     hooks,
                     provider_response_ingress,
+                    task_registry: Some(task_registry),
+                    root_task_id,
                 },
             });
             let outcome = match outcome {
@@ -836,10 +838,42 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
             ToolTurnOutcome::from_record_outcome(record_outcome)
         }
     };
+    record_root_task_output_truncation(
+        task_registry,
+        root_task_id,
+        execution.result.truncated,
+        events,
+        sink,
+    )?;
     Ok(RuntimeNormalToolTurnExecution {
         outcome,
         event_error,
     })
+}
+
+pub(crate) fn record_root_task_output_truncation<W: io::Write>(
+    task_registry: &TaskRegistry,
+    root_task_id: Option<&str>,
+    truncated: bool,
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+) -> io::Result<()> {
+    if !truncated {
+        return Ok(());
+    }
+    let Some(task_id) = root_task_id else {
+        return Ok(());
+    };
+    task_registry
+        .mark_output_truncated(task_id)
+        .map_err(io::Error::other)?;
+    let task = task_registry.summary(task_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("root task '{task_id}' disappeared after recording output truncation"),
+        )
+    })?;
+    sink.emit(events.task_status_updated(&task))
 }
 
 #[cfg(test)]
@@ -959,6 +993,27 @@ mod tests {
 
         assert_eq!(sampling_state.tool_cursor_position(), 1);
         assert!(conversation.messages.is_empty());
+    }
+
+    #[test]
+    fn truncated_tool_output_marks_root_task_and_emits_visible_summary() {
+        let registry = TaskRegistry::new("truncation-root".to_string());
+        let task = registry.create_main_session("read a large file".to_string());
+        registry.mark_running(&task.id).expect("root task running");
+        let mut events = EventFactory::new("truncation-root".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+
+        record_root_task_output_truncation(&registry, Some(&task.id), true, &mut events, &mut sink)
+            .expect("record truncation");
+
+        let summary = registry.summary(&task.id).expect("root task summary");
+        assert!(summary.output_truncated);
+        assert!(
+            String::from_utf8(output)
+                .expect("event output")
+                .contains("outputTruncated")
+        );
     }
 
     fn config_with_external(external_tools: Vec<ExternalToolConfig>) -> RunConfig {
@@ -1721,6 +1776,8 @@ mod tests {
                 mcp_registry: &registry,
                 hooks: &hooks,
                 provider_response_ingress: None,
+                task_registry: None,
+                root_task_id: None,
             },
         })
         .expect("run readonly tool turn");
@@ -1790,6 +1847,8 @@ mod tests {
                 mcp_registry: &registry,
                 hooks: &hooks,
                 provider_response_ingress: None,
+                task_registry: None,
+                root_task_id: None,
             },
         })
         .expect("run cancelled readonly tool turn");
@@ -1858,6 +1917,8 @@ mod tests {
                 mcp_registry: &registry,
                 hooks: &hooks,
                 provider_response_ingress: None,
+                task_registry: None,
+                root_task_id: None,
             },
         })
         .expect("run readonly hook failures");
@@ -1921,6 +1982,8 @@ mod tests {
                 mcp_registry: &registry,
                 hooks: &hooks,
                 provider_response_ingress: None,
+                task_registry: None,
+                root_task_id: None,
             },
         })
         .expect("cancel blocked readonly pre-hook");

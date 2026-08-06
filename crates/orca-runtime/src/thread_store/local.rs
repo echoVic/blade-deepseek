@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,7 +26,7 @@ use super::types::{
 };
 use super::writer::{
     acquire_file_lock, conversation_record_from_semantic_event, read_history_lines, read_records,
-    read_session_meta, read_transcript, rewrite_records, write_durable_record,
+    read_session_meta, read_transcript, rewrite_records_unlocked, write_durable_record,
 };
 use super::{LiveThread, ORCA_HOME_ENV};
 
@@ -408,8 +408,7 @@ pub fn compress_session(selector: &str) -> io::Result<PathBuf> {
         return Ok(path);
     }
     let compressed_path = path.with_extension("jsonl.zst");
-    let lock = OpenOptions::new().read(true).write(true).open(&path)?;
-    let _lock = acquire_file_lock(&path, &lock)?;
+    let _lock = acquire_file_lock(&path)?;
     let result = (|| {
         let input = File::open(&path)?;
         let output = File::create(&compressed_path)?;
@@ -933,6 +932,7 @@ impl ThreadStore for JsonlThreadStore {
                 format!("no saved session matches '{thread_id}'"),
             )
         })?;
+        let _lock = acquire_file_lock(&path)?;
         let mut records = read_records(&path)?;
         let mut patched = false;
         for record in &mut records {
@@ -978,7 +978,7 @@ impl ThreadStore for JsonlThreadStore {
                 "thread metadata patch did not include any supported fields",
             ));
         }
-        rewrite_records(&path, &records)?;
+        rewrite_records_unlocked(&path, &records)?;
         summarize_session_with_archive_flag(&path, path.starts_with(archive_dir()))
     }
 

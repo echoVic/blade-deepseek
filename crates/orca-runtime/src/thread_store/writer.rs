@@ -59,8 +59,8 @@ pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()
         fs::create_dir_all(parent)?;
     }
 
+    let _lock = acquire_file_lock(path)?;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    let _lock = acquire_file_lock(path, &file)?;
     write_record_line(&mut file, record)?;
     file.flush()
 }
@@ -69,12 +69,12 @@ pub(crate) fn write_durable_record(path: &Path, record: &SessionRecord) -> io::R
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let _lock = acquire_file_lock(path)?;
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .open(path)?;
-    let _lock = acquire_file_lock(path, &file)?;
     repair_incomplete_final_record(&mut file)?;
     write_record_line(&mut file, record)?;
     file.flush()?;
@@ -248,10 +248,7 @@ fn line_has_invalid_tool_terminal(line: &str) -> bool {
         .is_some_and(|result| result.is_err())
 }
 
-pub(crate) fn rewrite_records(path: &Path, records: &[SessionRecord]) -> io::Result<()> {
-    let lock = OpenOptions::new().read(true).write(true).open(path)?;
-    let _lock = acquire_file_lock(path, &lock)?;
-
+pub(crate) fn rewrite_records_unlocked(path: &Path, records: &[SessionRecord]) -> io::Result<()> {
     atomic_write_with(path, AtomicWritePolicy::NoFollow, |temporary| {
         write_records_to(temporary, path, records)
     })
@@ -734,16 +731,15 @@ fn looks_like_standalone_secret(token: &str) -> bool {
                 || lower.contains("test")))
 }
 
-pub(crate) fn acquire_file_lock(path: &Path, _file: &File) -> io::Result<ExclusiveFileLock> {
-    #[cfg(windows)]
-    let lock = {
-        let mut lock_path = path.as_os_str().to_os_string();
-        lock_path.push(".lock");
-        ExclusiveFileLock::acquire(Path::new(&lock_path))
+pub(crate) fn acquire_file_lock(path: &Path) -> io::Result<ExclusiveFileLock> {
+    let logical_path = if path.extension().and_then(|extension| extension.to_str()) == Some("zst") {
+        path.with_extension("")
+    } else {
+        path.to_path_buf()
     };
-    #[cfg(not(windows))]
-    let lock = ExclusiveFileLock::acquire_file(path, _file.try_clone()?);
-    lock.map_err(io::Error::other)
+    let mut lock_path = logical_path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    ExclusiveFileLock::acquire(Path::new(&lock_path)).map_err(io::Error::other)
 }
 
 #[derive(Clone, Debug)]
@@ -758,8 +754,7 @@ fn restore_plaintext_transcript(path: PathBuf) -> io::Result<PathBuf> {
         return Ok(path);
     }
     let plain_path = path.with_extension("");
-    let lock = OpenOptions::new().read(true).write(true).open(&path)?;
-    let _lock = acquire_file_lock(&path, &lock)?;
+    let _lock = acquire_file_lock(&path)?;
     let result = (|| {
         let input = File::open(&path)?;
         let output = File::create(&plain_path)?;
@@ -1144,8 +1139,8 @@ impl EventPublicationStore for SessionWriter {
 }
 
 fn append_usage_baseline(path: &Path) -> io::Result<()> {
+    let _lock = acquire_file_lock(path)?;
     let mut file = OpenOptions::new().read(true).append(true).open(path)?;
-    let _lock = acquire_file_lock(path, &file)?;
     let result = (|| {
         let Some(usage) = read_transcript(path)?.usage else {
             return Ok(());
@@ -1162,6 +1157,13 @@ mod tests {
     use orca_core::approval_rules::PermissionRules;
     use orca_core::event_schema::{EVENT_SCHEMA_VERSION, EventType};
     use orca_core::thread_item_projection::{CompletedModelResponse, ModelResponseIdentity};
+    use std::process::{Child, Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const APPEND_PROBE_PATH: &str = "ORCA_THREAD_STORE_APPEND_PROBE_PATH";
+    const APPEND_PROBE_WORKER: &str = "ORCA_THREAD_STORE_APPEND_PROBE_WORKER";
+    const APPEND_PROBE_COUNT: &str = "ORCA_THREAD_STORE_APPEND_PROBE_COUNT";
 
     fn usage(input_tokens: u64, output_tokens: u64, cache_tokens: u64, cost: f64) -> UsageTotals {
         UsageTotals {
@@ -1212,6 +1214,160 @@ mod tests {
             turn_id: None,
         };
         (directory, path, writer)
+    }
+
+    #[test]
+    fn concurrent_process_appends_keep_every_jsonl_record_intact() {
+        let (_directory, path, _writer) = new_transcript();
+        let workers = 4_u64;
+        let records_per_worker = 40_u64;
+        let mut children = (0..workers)
+            .map(|worker| spawn_append_probe(&path, worker, records_per_worker))
+            .collect::<Vec<_>>();
+
+        for child in &mut children {
+            wait_for_append_probe(child, Duration::from_secs(10));
+        }
+
+        let values = read_records(&path)
+            .expect("read concurrent transcript")
+            .into_iter()
+            .filter_map(|record| match record {
+                SessionRecord::Usage(usage) => Some(usage.input_tokens),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(values.len() as u64, workers * records_per_worker);
+        for worker in 0..workers {
+            for record in 0..records_per_worker {
+                assert!(values.contains(&(worker * 1_000 + record)));
+            }
+        }
+        assert_eq!(
+            fs::read(&path).expect("read transcript bytes").last(),
+            Some(&b'\n')
+        );
+    }
+
+    #[test]
+    fn blocked_append_reopens_the_rewritten_transcript_after_lock_release() {
+        let (_directory, path, _writer) = new_transcript();
+        let lock = acquire_file_lock(&path).expect("hold transcript lock");
+        let mut child = spawn_append_probe(&path, 9, 1);
+
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            child.try_wait().expect("inspect blocked writer").is_none(),
+            "append probe bypassed the transcript sidecar lock"
+        );
+
+        rewrite_records_unlocked(&path, &[SessionRecord::Usage(usage(7, 0, 0, 0.0))])
+            .expect("rewrite transcript while owning lock");
+        drop(lock);
+        wait_for_append_probe(&mut child, Duration::from_secs(10));
+
+        let values = read_records(&path)
+            .expect("read rewritten transcript")
+            .into_iter()
+            .filter_map(|record| match record {
+                SessionRecord::Usage(usage) => Some(usage.input_tokens),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![7, 9_000]);
+    }
+
+    #[test]
+    fn compressed_and_plaintext_transcript_paths_share_one_process_lock() {
+        let (_directory, path, _writer) = new_transcript();
+        let compressed_path = path.with_extension("jsonl.zst");
+        let lock = acquire_file_lock(&compressed_path).expect("hold compressed transcript lock");
+        let mut child = spawn_append_probe(&path, 8, 1);
+
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            child.try_wait().expect("inspect blocked writer").is_none(),
+            "plaintext append bypassed the compressed transcript lock"
+        );
+
+        drop(lock);
+        wait_for_append_probe(&mut child, Duration::from_secs(10));
+
+        let values = read_records(&path)
+            .expect("read transcript after compressed lock release")
+            .into_iter()
+            .filter_map(|record| match record {
+                SessionRecord::Usage(usage) => Some(usage.input_tokens),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![8_000]);
+    }
+
+    #[test]
+    fn thread_store_append_probe_child() {
+        let Some(path) = std::env::var_os(APPEND_PROBE_PATH).map(PathBuf::from) else {
+            return;
+        };
+        let worker = std::env::var(APPEND_PROBE_WORKER)
+            .expect("append probe worker")
+            .parse::<u64>()
+            .expect("numeric append probe worker");
+        let count = std::env::var(APPEND_PROBE_COUNT)
+            .expect("append probe count")
+            .parse::<u64>()
+            .expect("numeric append probe count");
+        for record in 0..count {
+            write_record(
+                &path,
+                &SessionRecord::Usage(usage(worker * 1_000 + record, 0, 0, 0.0)),
+            )
+            .expect("append probe record");
+        }
+    }
+
+    fn spawn_append_probe(path: &Path, worker: u64, count: u64) -> Child {
+        Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "thread_store::writer::tests::thread_store_append_probe_child",
+                "--nocapture",
+            ])
+            .env(APPEND_PROBE_PATH, path)
+            .env(APPEND_PROBE_WORKER, worker.to_string())
+            .env(APPEND_PROBE_COUNT, count.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn append probe")
+    }
+
+    fn wait_for_append_probe(child: &mut Child, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(status) = child.try_wait().expect("poll append probe") {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut stream) = child.stdout.take() {
+                    stream.read_to_end(&mut stdout).expect("read probe stdout");
+                }
+                if let Some(mut stream) = child.stderr.take() {
+                    stream.read_to_end(&mut stderr).expect("read probe stderr");
+                }
+                assert!(
+                    status.success(),
+                    "append probe failed: status={status}, stdout={}, stderr={}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("append probe timed out");
     }
 
     #[test]

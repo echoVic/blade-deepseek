@@ -512,6 +512,14 @@ impl ThreadTurnMainSessionTask {
         sink.emit(events.task_status_updated(&task))
     }
 
+    fn emit_all<W: io::Write>(
+        &self,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+    ) -> io::Result<()> {
+        sink.emit(events.workflow_tasks_updated(&self.registry.list()))
+    }
+
     fn finish(&self, status: RunStatus, error: Option<&str>, usage: UsageTotals) -> io::Result<()> {
         let usage = add_task_usage(
             self.task_usage_before,
@@ -747,6 +755,7 @@ impl ThreadTurnCompletion {
         session.complete_with_error(self.status.as_str(), self.error.as_deref());
         if let Some(task) = self.main_session_task.as_ref() {
             task.finish_and_emit(self.status, self.error.as_deref(), self.usage, events, sink)?;
+            task.emit_all(events, sink)?;
         }
         if request.emit_session_completed() {
             sink.emit(events.session_completed(self.status))?;
@@ -1106,7 +1115,9 @@ fn run_inner<W: io::Write>(
     let (relay_tx, relay_rx) = mpsc::sync_channel(HOSTED_EVENT_RELAY_CAPACITY);
     let operation = thread
         .start_turn(
-            HostedTurnRequest::headless_session(prompt.clone()).with_options(options),
+            HostedTurnRequest::headless_session(prompt.clone())
+                .with_task_description(prompt.clone())
+                .with_options(options),
             HostedEventRelayWriter {
                 tx: relay_tx,
                 buffer: Vec::new(),

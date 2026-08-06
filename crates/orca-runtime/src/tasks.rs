@@ -18,8 +18,8 @@ use orca_core::conversation::RawToolCall;
 use orca_core::cost_types::UsageTotals;
 use orca_core::provider_types::{ProviderResponse, ProviderStep, ToolCallProgress, Usage};
 use orca_core::task_types::{
-    BackgroundTaskSummary, PendingToolCallSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
-    WorkflowPhaseTaskSummary, WorkflowTaskProgress,
+    BackgroundTaskSummary, PendingToolCallSummary, TaskActivitySummary, TaskStatus, TaskType,
+    WorkflowAgentTaskSummary, WorkflowPhaseTaskSummary, WorkflowTaskProgress,
 };
 use orca_core::thread_identity::TurnId;
 use orca_core::thread_item_projection::ModelResponseIdentity;
@@ -116,6 +116,8 @@ pub struct TaskRecord {
     pub last_activity_at_ms: Option<i64>,
     pub result: Option<String>,
     pub error: Option<String>,
+    pub retry_count: u32,
+    pub output_truncated: bool,
     pub worker_pid: Option<u32>,
     pub command: Option<String>,
     pub control: TaskControl,
@@ -207,6 +209,10 @@ struct PersistedTaskRecord {
     last_activity_at_ms: Option<i64>,
     result: Option<String>,
     error: Option<String>,
+    #[serde(default)]
+    retry_count: u32,
+    #[serde(default)]
+    output_truncated: bool,
     #[serde(default)]
     worker_pid: Option<u32>,
     #[serde(default)]
@@ -512,6 +518,8 @@ impl TaskRegistry {
             last_activity_at_ms: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
             worker_pid: None,
             command: None,
             control,
@@ -592,6 +600,8 @@ impl TaskRegistry {
             last_activity_at_ms: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
             worker_pid: None,
             command: None,
             control,
@@ -679,6 +689,8 @@ impl TaskRegistry {
             last_activity_at_ms: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
             worker_pid: None,
             command: None,
             control,
@@ -733,6 +745,8 @@ impl TaskRegistry {
             last_activity_at_ms: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
             worker_pid: None,
             command: Some(command),
             control,
@@ -754,6 +768,18 @@ impl TaskRegistry {
             .expect("task registry lock poisoned");
         summaries.sort_by(|left, right| left.id.cmp(&right.id));
         summaries
+    }
+
+    pub fn has_active_tasks(&self) -> bool {
+        self.activity_summary().has_active_tasks()
+    }
+
+    pub fn requires_attention(&self) -> bool {
+        self.activity_summary().requires_attention()
+    }
+
+    pub fn activity_summary(&self) -> TaskActivitySummary {
+        TaskActivitySummary::from_tasks(&self.list())
     }
 
     pub fn summary(&self, id: &str) -> Option<BackgroundTaskSummary> {
@@ -873,6 +899,35 @@ impl TaskRegistry {
             }
             record.completed_at_ms = None;
             record.control.pause.store(false, Ordering::Release);
+            Ok(())
+        })
+    }
+
+    pub fn record_retry(&self, id: &str, error: impl Into<String>) -> Result<(), String> {
+        let error = error.into();
+        self.update_task(id, |record| {
+            if is_terminal(record.status)
+                && !matches!(
+                    record.status,
+                    TaskStatus::Failed | TaskStatus::ApprovalRequired
+                )
+            {
+                return Err(task_state_error("record_retry", record.status));
+            }
+            record.retry_count = record.retry_count.saturating_add(1);
+            record.status = TaskStatus::Running;
+            record.error = Some(error.clone());
+            record.result = None;
+            record.completed_at_ms = None;
+            record.last_activity_at_ms = Some(now_ms());
+            Ok(())
+        })
+    }
+
+    pub fn mark_output_truncated(&self, id: &str) -> Result<(), String> {
+        self.update_task(id, |record| {
+            record.output_truncated = true;
+            record.last_activity_at_ms = Some(now_ms());
             Ok(())
         })
     }
@@ -2015,6 +2070,8 @@ impl PersistedTaskRecord {
             last_activity_at_ms: self.last_activity_at_ms,
             result: self.result,
             error: self.error,
+            retry_count: self.retry_count,
+            output_truncated: self.output_truncated,
             worker_pid: self.worker_pid,
             command: self.command,
             control: new_task_control(),
@@ -2074,6 +2131,8 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             last_activity_at_ms: record.last_activity_at_ms,
             result: record.result.clone(),
             error: record.error.as_deref().map(redact_sensitive_text),
+            retry_count: record.retry_count,
+            output_truncated: record.output_truncated,
             worker_pid: record.worker_pid,
             command: record.command.clone(),
         }
@@ -2287,6 +2346,8 @@ fn task_summary(record: &TaskRecord) -> BackgroundTaskSummary {
         last_activity_at_ms: record.last_activity_at_ms,
         result: record.result.clone(),
         error: record.error.clone(),
+        retry_count: record.retry_count,
+        output_truncated: record.output_truncated,
     }
 }
 
@@ -2968,6 +3029,45 @@ mod tests {
         assert_eq!(list[0].task_type, TaskType::MainSession);
         assert_eq!(list[0].status, TaskStatus::Running);
         assert!(list[0].is_backgrounded);
+    }
+
+    #[test]
+    fn registry_activity_converges_active_and_attention_states() {
+        let registry = TaskRegistry::new("activity-summary".to_string());
+        let workflow = registry.create_workflow(
+            "workflow-run".to_string(),
+            "audit".to_string(),
+            "Audit".to_string(),
+            0,
+        );
+        registry.mark_running(&workflow.id).unwrap();
+        assert_eq!(registry.activity_summary().active_count, 1);
+        assert_eq!(registry.activity_summary().attention_count, 0);
+        assert!(registry.has_active_tasks());
+        assert!(!registry.requires_attention());
+
+        let main = registry.create_main_session("Needs approval".to_string());
+        registry.mark_running(&main.id).unwrap();
+        registry
+            .apply_main_session_terminal_update(
+                &main.id,
+                MainSessionTerminalUpdate::ApprovalRequired {
+                    summary: "approve".to_string(),
+                    pending_tool_call: None,
+                    pending_provider_response: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(registry.activity_summary().active_count, 1);
+        assert_eq!(registry.activity_summary().attention_count, 1);
+        assert!(registry.requires_attention());
+
+        registry.stop(&workflow.id, "done".to_string()).unwrap();
+        assert_eq!(registry.activity_summary().active_count, 0);
+        assert_eq!(registry.activity_summary().attention_count, 1);
+        assert!(!registry.has_active_tasks());
+        assert!(registry.requires_attention());
     }
 
     #[test]
@@ -4029,6 +4129,32 @@ while :; do :; done
             Some("bash: cargo test")
         );
         assert_eq!(summary.subagent_turn, Some(2));
+        assert!(summary.last_activity_at_ms.is_some());
+    }
+
+    #[test]
+    fn task_summary_preserves_retry_and_truncation_visibility_after_reload() {
+        let root = tempfile::tempdir().unwrap();
+        let registry =
+            TaskRegistry::new_persistent("retry-visibility".to_string(), root.path().to_path_buf())
+                .unwrap();
+        let task =
+            registry.create_subagent("inspect auth".to_string(), Some("general".to_string()));
+        registry.mark_running(&task.id).unwrap();
+        registry
+            .record_retry(&task.id, "provider timed out")
+            .unwrap();
+        registry.mark_output_truncated(&task.id).unwrap();
+
+        let reloaded = TaskRegistry::new_persistent_attached(
+            "retry-visibility".to_string(),
+            root.path().to_path_buf(),
+        )
+        .unwrap();
+        let summary = reloaded.summary(&task.id).expect("reloaded task");
+        assert_eq!(summary.retry_count, 1);
+        assert!(summary.output_truncated);
+        assert_eq!(summary.error.as_deref(), Some("provider timed out"));
         assert!(summary.last_activity_at_ms.is_some());
     }
 

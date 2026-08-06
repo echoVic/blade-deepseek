@@ -1516,6 +1516,8 @@ mod tests {
             last_activity_at_ms: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         let event = f.workflow_tasks_updated(&[task]);
@@ -1564,6 +1566,8 @@ mod tests {
             last_activity_at_ms: Some(30),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         let event = f.task_status_updated(&task);

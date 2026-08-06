@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::task_types::{
-    BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
+    BackgroundTaskSummary, TaskActivitySummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
 };
 use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
 use orca_file_search::SearchPhase;
@@ -1317,7 +1317,7 @@ fn task_type_label(task: &BackgroundTaskSummary) -> &'static str {
 }
 
 fn task_detail_label(task: &BackgroundTaskSummary) -> String {
-    match task.task_type {
+    let detail = match task.task_type {
         TaskType::Workflow => workflow_progress_label(task),
         TaskType::Subagent => subagent_progress_label(task),
         TaskType::MainSession
@@ -1332,6 +1332,19 @@ fn task_detail_label(task: &BackgroundTaskSummary) -> String {
             format!("backgrounded • {}", elapsed_label(task))
         }
         TaskType::MainSession | TaskType::Shell | TaskType::Monitor => elapsed_label(task),
+    };
+
+    let mut visibility = Vec::new();
+    if task.retry_count > 0 {
+        visibility.push(format!("retried {}", task.retry_count));
+    }
+    if task.output_truncated {
+        visibility.push("output truncated".to_string());
+    }
+    if visibility.is_empty() {
+        detail
+    } else {
+        format!("{detail} • {}", visibility.join(" • "))
     }
 }
 
@@ -3072,7 +3085,8 @@ fn approval_mode_color(mode: ApprovalMode, theme: &Theme) -> Color {
 /// elapsed wall-clock time.
 fn activity_line(state: &AppState, theme: &Theme) -> Option<(String, ratatui::style::Color)> {
     match &state.status {
-        AppStatus::Idle | AppStatus::Setup | AppStatus::SessionPicker => None,
+        AppStatus::Idle => background_task_activity_line(&state.workflow_panel.tasks, theme),
+        AppStatus::Setup | AppStatus::SessionPicker => None,
         AppStatus::Running => {
             let live_elapsed = state
                 .running_started_at
@@ -3092,6 +3106,44 @@ fn activity_line(state: &AppState, theme: &Theme) -> Option<(String, ratatui::st
         AppStatus::WaitingApproval => Some(("● approval".to_string(), theme.approval)),
         AppStatus::WaitingUserInput => Some(("● input".to_string(), theme.approval)),
     }
+}
+
+fn background_task_activity_line(
+    tasks: &[BackgroundTaskSummary],
+    theme: &Theme,
+) -> Option<(String, ratatui::style::Color)> {
+    let activity = TaskActivitySummary::from_tasks(tasks);
+    if !activity.has_active_tasks() && !activity.requires_attention() {
+        return None;
+    }
+
+    let mut labels = Vec::with_capacity(2);
+    if activity.active_count > 0 {
+        let noun = if activity.active_count == 1 {
+            "task"
+        } else {
+            "tasks"
+        };
+        labels.push(format!(
+            "{} background {noun} running",
+            activity.active_count
+        ));
+    }
+    if activity.attention_count > 0 {
+        let verb = if activity.attention_count == 1 {
+            "needs"
+        } else {
+            "need"
+        };
+        labels.push(format!("{} {verb} approval", activity.attention_count));
+    }
+
+    let color = if activity.requires_attention() {
+        theme.approval
+    } else {
+        theme.warning
+    };
+    Some((format!("● {}", labels.join(" · ")), color))
 }
 
 fn render_activity(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -6799,6 +6851,55 @@ mod tests {
     }
 
     #[test]
+    fn idle_foreground_keeps_active_background_tasks_visible() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut task = workflow_task_for_agent_dashboard(
+            "audit",
+            "agent-1",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        task.status = TaskStatus::Running;
+        state.enter_running();
+        state.update(crate::types::TuiEvent::WorkflowTasksUpdated { tasks: vec![task] });
+        state.update(crate::types::TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+
+        let (text, color) =
+            activity_line(&state, &theme).expect("active background task remains visible");
+
+        assert_eq!(state.status, AppStatus::Idle);
+        assert_eq!(text, "● 1 background task running");
+        assert_eq!(color, theme.warning);
+    }
+
+    #[test]
+    fn idle_foreground_prioritizes_background_tasks_needing_attention() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut running = workflow_task_for_agent_dashboard(
+            "audit",
+            "agent-1",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        running.status = TaskStatus::Running;
+        let mut approval = workflow_task_for_agent_dashboard(
+            "deploy",
+            "agent-2",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        approval.status = TaskStatus::ApprovalRequired;
+        state.status = AppStatus::Idle;
+        state.workflow_panel.tasks = vec![running, approval];
+
+        let (text, color) = activity_line(&state, &theme).expect("task attention remains visible");
+
+        assert_eq!(text, "● 1 background task running · 1 needs approval");
+        assert_eq!(color, theme.approval);
+    }
+
+    #[test]
     fn workflow_progress_label_summarizes_agents_and_phases() {
         let task = BackgroundTaskSummary {
             id: "task-1".to_string(),
@@ -6838,6 +6939,8 @@ mod tests {
             last_activity_at_ms: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         assert_eq!(
@@ -6891,6 +6994,8 @@ mod tests {
             completed_at_ms: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -6973,6 +7078,8 @@ mod tests {
             completed_at_ms: Some(2_000),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7076,6 +7183,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         assert_eq!(task_type_label(&task), "session");
@@ -7114,6 +7223,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         assert!(task_detail_label(&task).starts_with("backgrounded • elapsed "));
@@ -7151,6 +7262,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         assert_eq!(
@@ -7193,6 +7306,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: None,
             error: Some("model timed out".to_string()),
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7242,6 +7357,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: None,
             error: Some("first failure\nsecond failure\nthird failure\nfourth failure".to_string()),
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7292,6 +7409,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: Some("line one\nline two\nline three\nline four".to_string()),
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         assert_eq!(workflow_metadata_row_count(&task), 3);
@@ -7331,6 +7450,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: Some("summary ready".to_string()),
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7380,6 +7501,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7440,6 +7563,8 @@ mod tests {
             last_activity_at_ms: Some(4_000),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7494,6 +7619,8 @@ mod tests {
             last_activity_at_ms: Some(1_000),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7562,7 +7689,24 @@ mod tests {
             completed_at_ms: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         }
+    }
+
+    #[test]
+    fn workflow_panel_labels_retry_and_truncated_output() {
+        let mut task = workflow_task_for_agent_dashboard(
+            "audit",
+            "agent-1",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        task.retry_count = 2;
+        task.output_truncated = true;
+
+        let detail = task_detail_label(&task);
+        assert!(detail.contains("retried 2"));
+        assert!(detail.contains("output truncated"));
     }
 
     #[test]

@@ -3094,6 +3094,8 @@ fn recover_retries_prepared_main_session_transfer_as_one_owner_batch() {
             usage: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         },
     );
     let transfer_commit_id = match &transfer.commit_class {

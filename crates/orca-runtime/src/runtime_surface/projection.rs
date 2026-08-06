@@ -773,6 +773,8 @@ pub struct SurfaceTask {
     pub usage: Option<UsageTotals>,
     pub result: Option<DisplayText>,
     pub error: Option<DisplayText>,
+    pub retry_count: u32,
+    pub output_truncated: bool,
 }
 
 #[derive(Clone, PartialEq)]

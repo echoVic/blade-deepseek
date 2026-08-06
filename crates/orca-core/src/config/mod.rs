@@ -350,6 +350,51 @@ pub struct RunConfig {
     pub auto_memory: bool,
 }
 
+/// Immutable execution policy captured when work is delegated to another
+/// runtime owner. The snapshot keeps child execution stable even if the
+/// parent process later changes its interactive settings.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationSnapshot {
+    pub approval_mode: ApprovalMode,
+    pub active_permission_profile: Option<ActivePermissionProfile>,
+    #[serde(default)]
+    pub permission_profiles: HashMap<String, PermissionProfileConfig>,
+    pub runtime_workspace_roots: Option<Vec<PathBuf>>,
+    pub permission_rules: PermissionRules,
+    #[serde(default)]
+    pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    pub model: Option<String>,
+}
+
+impl DelegationSnapshot {
+    pub fn from_config(config: &RunConfig) -> Self {
+        Self {
+            approval_mode: config.approval_mode,
+            active_permission_profile: config.active_permission_profile.clone(),
+            permission_profiles: config.permission_profiles.clone(),
+            runtime_workspace_roots: config.runtime_workspace_roots.clone(),
+            permission_rules: config.permission_rules.clone(),
+            additional_working_directories: config.additional_working_directories.clone(),
+            model: config.model.as_option(),
+        }
+    }
+
+    pub fn apply_to(&self, config: &mut RunConfig, child_model_override: Option<String>) {
+        config.approval_mode = self.approval_mode;
+        config.active_permission_profile = self.active_permission_profile.clone();
+        config.permission_profiles = self.permission_profiles.clone();
+        config.runtime_workspace_roots = self.runtime_workspace_roots.clone();
+        config.permission_rules = self.permission_rules.clone();
+        config.additional_working_directories = self.additional_working_directories.clone();
+
+        let model = child_model_override.or_else(|| self.model.clone());
+        if let Ok(model) = ModelSelection::parse(model) {
+            config.model = model;
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AdditionalWorkingDirectory {
     pub path: PathBuf,
@@ -775,8 +820,10 @@ fn history_posture(history_mode: &HistoryMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval_rules::PermissionRule;
     use crate::approval_types::ApprovalMode;
-    use crate::model::ModelSelection;
+    use crate::approval_types::Decision;
+    use crate::model::{AUTO_MODEL, FLASH_MODEL, ModelSelection};
 
     #[test]
     fn theme_name_defaults_to_auto_and_round_trips_all_values() {
@@ -881,5 +928,75 @@ mod tests {
         assert!(shown.contains("terminal_notifications = false"));
         assert!(shown.contains("api_key = \"<redacted>\""));
         assert!(!shown.contains("sk-secret"));
+    }
+
+    #[test]
+    fn delegation_snapshot_round_trips_execution_policy_and_applies_child_model() {
+        let mut parent = RunConfig {
+            app_version: "test".to_string(),
+            prompt: String::new(),
+            cwd: Some(PathBuf::from("/workspace")),
+            output_format: OutputFormat::Jsonl,
+            approval_mode: ApprovalMode::Plan,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::parse(Some(AUTO_MODEL.to_string())).unwrap(),
+            model_runtime: ModelRuntimeConfig::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            api_key: None,
+            base_url: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            external_tools: Vec::new(),
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            active_permission_profile: Some(ActivePermissionProfile::new("strict", Some("base"))),
+            permission_profiles: HashMap::new(),
+            runtime_workspace_roots: Some(vec![
+                PathBuf::from("/workspace"),
+                PathBuf::from("job"),
+            ]),
+            permission_rules: PermissionRules {
+                rules: vec![PermissionRule::new("bash", "cargo *", Decision::Allow)],
+            },
+            additional_working_directories: vec![AdditionalWorkingDirectory::new(
+                "job",
+                "delegation",
+            )],
+            max_budget_usd: None,
+            subagents: SubagentConfig::default(),
+            tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
+            theme: ThemeName::default(),
+            vim_mode: false,
+            vim_insert_escape: None,
+            update_check: false,
+            desktop_notifications: false,
+            terminal_notifications: false,
+            auto_memory: false,
+        };
+
+        let snapshot = DelegationSnapshot::from_config(&parent);
+        let encoded = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        let decoded: DelegationSnapshot =
+            serde_json::from_str(&encoded).expect("deserialize snapshot");
+        decoded.apply_to(&mut parent, Some(FLASH_MODEL.to_string()));
+
+        assert_eq!(decoded.approval_mode, ApprovalMode::Plan);
+        assert_eq!(
+            decoded.active_permission_profile,
+            parent.active_permission_profile
+        );
+        assert_eq!(
+            decoded.runtime_workspace_roots,
+            parent.runtime_workspace_roots
+        );
+        assert_eq!(decoded.permission_rules, parent.permission_rules);
+        assert_eq!(
+            decoded.additional_working_directories,
+            parent.additional_working_directories
+        );
+        assert_eq!(parent.approval_mode, ApprovalMode::Plan);
+        assert_eq!(parent.model.as_deref(), Some(FLASH_MODEL));
     }
 }

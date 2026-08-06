@@ -281,7 +281,12 @@ fn run_subagent_worker(
         mode: _,
         isolation,
         schema,
+        delegation,
     } = request;
+    let mut child_config = config.clone();
+    if let Some(snapshot) = delegation.as_ref() {
+        snapshot.apply_to(&mut child_config, model.clone());
+    }
     let worktree_guard = if isolation == SubagentIsolation::Worktree {
         match WorktreeGuard::create(&cwd) {
             Ok(guard) => Some(guard),
@@ -334,7 +339,7 @@ fn run_subagent_worker(
             root_task_id: root_task_id.as_deref(),
             executor: child_executor,
         });
-        run_child_agent(&config, &child_request, &mut runtime)
+        run_child_agent(&child_config, &child_request, &mut runtime)
     }));
     let worktree = worktree_guard.map(WorktreeGuard::finish).transpose();
 

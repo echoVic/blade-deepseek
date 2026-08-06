@@ -858,6 +858,10 @@ struct StoredTaskV1 {
     usage: Option<UsageTotals>,
     result: Option<DisplayText>,
     error: Option<DisplayText>,
+    #[serde(default)]
+    retry_count: u32,
+    #[serde(default)]
+    output_truncated: bool,
 }
 
 impl StoredTaskV1 {
@@ -884,6 +888,8 @@ impl StoredTaskV1 {
             usage: task.usage.clone(),
             result: task.result.clone(),
             error: task.error.clone(),
+            retry_count: task.retry_count,
+            output_truncated: task.output_truncated,
         })
     }
 
@@ -908,6 +914,8 @@ impl StoredTaskV1 {
             usage: self.usage,
             result: self.result,
             error: self.error,
+            retry_count: self.retry_count,
+            output_truncated: self.output_truncated,
         }
     }
 }

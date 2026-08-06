@@ -7,9 +7,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::CancelToken;
-use orca_core::config::{OutputFormat, RunConfig};
+use orca_core::config::{DelegationSnapshot, OutputFormat, RunConfig};
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::EventFactory;
 use orca_core::event_schema::RunStatus;
@@ -148,6 +147,7 @@ impl WorkflowBackgroundLaunch {
 #[derive(Clone, Debug)]
 pub struct WorkflowRunner {
     config: RunConfig,
+    delegation: DelegationSnapshot,
     tasks: TaskRegistry,
     session_dir: PathBuf,
     state: WorkflowStateStore,
@@ -331,8 +331,10 @@ impl Drop for WorkflowAgentPermit {
 impl WorkflowRunner {
     pub fn new(config: RunConfig, tasks: TaskRegistry, session_dir: PathBuf) -> Self {
         let state = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+        let delegation = DelegationSnapshot::from_config(&config);
         Self {
             config,
+            delegation,
             tasks,
             session_dir,
             state,
@@ -1389,7 +1391,7 @@ impl WorkflowRunner {
         let instructions = instructions::load_for_cwd_or_default(cwd);
         let memory = memory::load_for_cwd(cwd);
         let (workflow_child_config, mcp_registry) =
-            Self::workflow_child_runtime_parts(&self.config);
+            Self::workflow_child_runtime_parts(&self.config, &self.delegation);
         let hooks = HookRunner::new(self.config.hooks.clone());
         let child_request = ChildAgentRequest {
             prompt: call.prompt.clone(),
@@ -1480,17 +1482,18 @@ impl WorkflowRunner {
         }
     }
 
-    fn workflow_child_config(config: &RunConfig) -> RunConfig {
+    fn workflow_child_config(config: &RunConfig, delegation: &DelegationSnapshot) -> RunConfig {
         let mut workflow_child_config = config.clone();
-        if workflow_child_config.approval_mode != ApprovalMode::FullAuto {
-            workflow_child_config.approval_mode = ApprovalMode::AutoEdit;
-        }
+        delegation.apply_to(&mut workflow_child_config, None);
         workflow_child_config.output_format = OutputFormat::Jsonl;
         workflow_child_config
     }
 
-    fn workflow_child_runtime_parts(config: &RunConfig) -> (RunConfig, orca_mcp::McpRegistry) {
-        let workflow_child_config = Self::workflow_child_config(config);
+    fn workflow_child_runtime_parts(
+        config: &RunConfig,
+        delegation: &DelegationSnapshot,
+    ) -> (RunConfig, orca_mcp::McpRegistry) {
+        let workflow_child_config = Self::workflow_child_config(config, delegation);
         let mcp_registry = orca_mcp::initialize_registry(&workflow_child_config.mcp_servers);
         (workflow_child_config, mcp_registry)
     }
@@ -2136,35 +2139,87 @@ mod tests {
     use super::*;
     use crate::agent_child::ChildAgentResult;
     use crate::cost::CostTracker;
-    use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, ToolConfig, WorkflowConfig};
+    use orca_core::approval_rules::PermissionRule;
+    use orca_core::approval_types::{ApprovalMode, Decision};
+    use orca_core::config::{
+        ActivePermissionProfile, AdditionalWorkingDirectory, HistoryMode, OutputFormat,
+        ProviderKind, ToolConfig, WorkflowConfig,
+    };
     use orca_core::mcp_types::McpServerConfig;
     use orca_core::model::ModelSelection;
     use tempfile::tempdir;
 
     #[test]
-    fn workflow_child_config_defaults_to_autoedit_approval_mode() {
+    fn workflow_child_config_preserves_parent_approval_mode() {
         let mut config = test_run_config();
         config.approval_mode = ApprovalMode::Suggest;
+        let delegation = DelegationSnapshot::from_config(&config);
 
-        let child_config = WorkflowRunner::workflow_child_config(&config);
-        assert_eq!(child_config.approval_mode, ApprovalMode::AutoEdit);
+        let child_config = WorkflowRunner::workflow_child_config(&config, &delegation);
+        assert_eq!(child_config.approval_mode, ApprovalMode::Suggest);
     }
 
     #[test]
-    fn workflow_child_config_preserves_fullauto_approval_mode() {
+    fn workflow_child_config_preserves_parent_plan_mode() {
         let mut config = test_run_config();
-        config.approval_mode = ApprovalMode::FullAuto;
+        config.approval_mode = ApprovalMode::Plan;
+        let delegation = DelegationSnapshot::from_config(&config);
 
-        let child_config = WorkflowRunner::workflow_child_config(&config);
-        assert_eq!(child_config.approval_mode, ApprovalMode::FullAuto);
+        let child_config = WorkflowRunner::workflow_child_config(&config, &delegation);
+        assert_eq!(child_config.approval_mode, ApprovalMode::Plan);
+    }
+
+    #[test]
+    fn workflow_child_config_applies_immutable_delegation_policy_snapshot() {
+        let mut config = test_run_config();
+        config.approval_mode = ApprovalMode::Plan;
+        config.active_permission_profile =
+            Some(ActivePermissionProfile::new("strict", None::<String>));
+        config.runtime_workspace_roots = Some(vec![PathBuf::from("/captured")]);
+        config
+            .permission_rules
+            .rules
+            .push(PermissionRule::new("bash", "cargo *", Decision::Allow));
+        config
+            .additional_working_directories
+            .push(AdditionalWorkingDirectory::new(
+                "/captured-extra",
+                "workflow",
+            ));
+        config.model = ModelSelection::parse(Some("deepseek-v4-flash".to_string())).unwrap();
+        let delegation = DelegationSnapshot::from_config(&config);
+
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.active_permission_profile = None;
+        config.runtime_workspace_roots = Some(vec![PathBuf::from("/mutated")]);
+        config.permission_rules = Default::default();
+        config.additional_working_directories.clear();
+        config.model = ModelSelection::parse(Some("deepseek-v4-pro".to_string())).unwrap();
+
+        let child_config = WorkflowRunner::workflow_child_config(&config, &delegation);
+
+        assert_eq!(child_config.approval_mode, ApprovalMode::Plan);
+        assert_eq!(
+            child_config.active_permission_profile,
+            Some(ActivePermissionProfile::new("strict", None::<String>))
+        );
+        assert_eq!(
+            child_config.runtime_workspace_roots,
+            Some(vec![PathBuf::from("/captured")])
+        );
+        assert_eq!(child_config.permission_rules.rules.len(), 1);
+        assert_eq!(child_config.additional_working_directories.len(), 1);
+        assert_eq!(child_config.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(child_config.output_format, OutputFormat::Jsonl);
     }
 
     #[test]
     fn workflow_child_config_disables_interactive_text_prompts() {
         let mut config = test_run_config();
         config.output_format = OutputFormat::Text;
+        let delegation = DelegationSnapshot::from_config(&config);
 
-        let child_config = WorkflowRunner::workflow_child_config(&config);
+        let child_config = WorkflowRunner::workflow_child_config(&config, &delegation);
         assert_eq!(child_config.output_format, OutputFormat::Jsonl);
     }
 
@@ -2175,8 +2230,9 @@ mod tests {
             name: String::new(),
             ..Default::default()
         }];
+        let delegation = DelegationSnapshot::from_config(&config);
 
-        let (_, registry) = WorkflowRunner::workflow_child_runtime_parts(&config);
+        let (_, registry) = WorkflowRunner::workflow_child_runtime_parts(&config, &delegation);
         let registry_error_count = registry.errors().len();
         assert!(
             registry_error_count > 0,
@@ -2193,9 +2249,11 @@ mod tests {
             name: String::new(),
             ..Default::default()
         }];
+        let delegation = DelegationSnapshot::from_config(&config);
 
-        let (child_config, registry) = WorkflowRunner::workflow_child_runtime_parts(&config);
-        assert_eq!(child_config.approval_mode, ApprovalMode::AutoEdit);
+        let (child_config, registry) =
+            WorkflowRunner::workflow_child_runtime_parts(&config, &delegation);
+        assert_eq!(child_config.approval_mode, ApprovalMode::Suggest);
         assert_eq!(child_config.output_format, OutputFormat::Jsonl);
         assert!(
             !registry.errors().is_empty(),

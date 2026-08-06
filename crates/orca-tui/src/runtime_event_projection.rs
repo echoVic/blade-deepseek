@@ -937,6 +937,8 @@ mod tests {
             last_activity_at_ms: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         let tui_event =
@@ -992,6 +994,8 @@ mod tests {
             last_activity_at_ms: Some(30),
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         let tui_event =

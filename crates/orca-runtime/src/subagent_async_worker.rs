@@ -228,6 +228,10 @@ pub(crate) fn launch_async_subagent(
         task_registry,
         root_task_id,
     } = context;
+    let request = subagent::with_delegation_snapshot(
+        request,
+        orca_core::config::DelegationSnapshot::from_config(config),
+    );
     if task_registry.is_process_local() {
         return AsyncSubagentLaunchOutput {
             result: tool_types::ToolResult::failed(

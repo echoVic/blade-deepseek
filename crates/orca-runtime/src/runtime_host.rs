@@ -16494,6 +16494,8 @@ impl ThreadActor {
             usage: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
         let workflow = surface::SurfaceWorkflow {
             workflow_run_id: started.workflow_run_id.clone(),
@@ -24904,6 +24906,8 @@ impl ThreadActor {
             usage: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
         let initial_workflow = surface::SurfaceWorkflow {
             workflow_run_id: workflow_run_id.clone(),
@@ -34196,6 +34200,8 @@ impl ThreadActor {
             usage: None,
             result: None,
             error: None,
+            retry_count: task_record.retry_count,
+            output_truncated: task_record.output_truncated,
         };
         let transfer_batch = self.surface_event_batch_with_commit_id(
             vec![
@@ -43211,6 +43217,8 @@ mod tests {
             usage: None,
             result: None,
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         reconcile_main_session_task_mirror(&registry, &foreground_surface);
@@ -43252,6 +43260,8 @@ mod tests {
             }),
             result: Some(surface::DisplayText::new("done")),
             error: None,
+            retry_count: 0,
+            output_truncated: false,
         };
 
         reconcile_main_session_task_mirror(&registry, &completed_surface);

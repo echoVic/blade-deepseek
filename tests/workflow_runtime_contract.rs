@@ -672,7 +672,7 @@ fn workflow_child_agents_can_exchange_messages_with_mailbox_tools() {
     .unwrap();
 
     let mut config = mock_run_config(temp.path());
-    config.approval_mode = ApprovalMode::Suggest;
+    config.approval_mode = ApprovalMode::AutoEdit;
     let tasks = TaskRegistry::new("session-1".to_string());
     let session_dir = temp.path().join("session");
     let runner = WorkflowRunner::new(config, tasks.clone(), session_dir);
@@ -711,7 +711,7 @@ fn workflow_child_agents_can_claim_and_complete_shared_tasks() {
     .unwrap();
 
     let mut config = mock_run_config(temp.path());
-    config.approval_mode = ApprovalMode::Suggest;
+    config.approval_mode = ApprovalMode::AutoEdit;
     let tasks = TaskRegistry::new("session-1".to_string());
     let session_dir = temp.path().join("session");
     let runner = WorkflowRunner::new(config, tasks.clone(), session_dir);

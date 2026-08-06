@@ -1,3 +1,4 @@
+use orca_core::config::DelegationSnapshot;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::ToolRequest;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,8 @@ pub struct SubagentRequest {
     pub mode: SubagentMode,
     pub isolation: SubagentIsolation,
     pub schema: Option<Value>,
+    #[serde(default)]
+    pub delegation: Option<DelegationSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -71,7 +74,16 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         mode,
         isolation,
         schema,
+        delegation: None,
     }
+}
+
+pub fn with_delegation_snapshot(
+    mut request: SubagentRequest,
+    snapshot: DelegationSnapshot,
+) -> SubagentRequest {
+    request.delegation = Some(snapshot);
+    request
 }
 
 #[cfg(test)]

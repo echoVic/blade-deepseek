@@ -46,7 +46,6 @@ use crate::step_context::{
     RuntimeSamplingRequestState, RuntimeStepCapabilitySnapshot, RuntimeStepContext,
     RuntimeStepSnapshot,
 };
-#[cfg(test)]
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_invocation::{AgentToolPolicyContext, tool_requests_from_provider_steps};
@@ -684,6 +683,17 @@ impl RuntimeTurnProviderCycleStep {
         {
             ingress.commit_provider_failure(&response.identity, &error.message)?;
         }
+        if matches!(
+            &provider_error_outcome,
+            RuntimeProviderErrorStepOutcome::ContinueAfterCompaction
+        ) {
+            record_provider_retry(
+                capabilities.task_registry,
+                turn_context.root_task_id,
+                input.events,
+                input.sink,
+            )?;
+        }
         match RuntimeProviderErrorResultStep::new().fold(provider_error_outcome) {
             RuntimeProviderErrorResult::ContinueLoop => {
                 return Ok(RuntimeTurnProviderCycleResult::ContinueLoop);
@@ -745,6 +755,30 @@ impl RuntimeTurnProviderCycleStep {
             },
         )
     }
+}
+
+fn record_provider_retry<W: io::Write>(
+    task_registry: &TaskRegistry,
+    root_task_id: Option<&str>,
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+) -> io::Result<()> {
+    let Some(task_id) = root_task_id else {
+        return Ok(());
+    };
+    task_registry
+        .record_retry(
+            task_id,
+            "provider context limit reached; compacted context and retrying",
+        )
+        .map_err(io::Error::other)?;
+    let task = task_registry.summary(task_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("root task '{task_id}' disappeared after recording retry"),
+        )
+    })?;
+    sink.emit(events.task_status_updated(&task))
 }
 
 fn cancelled_provider_turn<W: io::Write>(
@@ -960,6 +994,28 @@ mod tests {
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"error\""));
         assert!(output.contains("DeepSeek provider error: quota"));
+    }
+
+    #[test]
+    fn provider_retry_marks_root_task_and_emits_visible_summary() {
+        let registry = TaskRegistry::new("provider-retry-root".to_string());
+        let task = registry.create_main_session("retry prompt".to_string());
+        registry.mark_running(&task.id).expect("root task running");
+        let mut events = EventFactory::new("provider-retry-root".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+
+        record_provider_retry(&registry, Some(&task.id), &mut events, &mut sink)
+            .expect("record provider retry");
+
+        let summary = registry.summary(&task.id).expect("root task summary");
+        assert_eq!(summary.retry_count, 1);
+        assert!(summary.error.is_some());
+        assert!(
+            String::from_utf8(output)
+                .expect("event output")
+                .contains("retryCount")
+        );
     }
 
     #[test]

@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.6":
+        "Strengthens runtime reliability across delegated work and durable task state. Synchronous, asynchronous, and workflow child agents now inherit one serialized execution-policy snapshot; plaintext and compressed transcript paths share a stable cross-process lock during append and rewrite; provider compaction retries and truncated tool output remain visible in task summaries; and session completion publishes the complete task registry before the terminal event. The composer remains available while an activity line shows running or approval-blocked background work.",
       "v0.3.5":
         "Adds one canonical ask_user_question tool for one to four structured questions, with described choices, previews, multi-select answers, custom responses, and cancellation through the runtime-owned TUI interaction broker. Goal mode now starts provider work correctly in optimized builds, /workflows remains available during foreground turns, and unknown slash commands are rejected instead of reaching the model. Terminal-Bench now reports the mounted binary version, preserves JSONL trajectories for Harbor without extending its closed AgentContext model, documents supported filters, and keeps generated benchmark artifacts out of Git.",
       "v0.3.4":
@@ -568,6 +570,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.6":
+        "增强 runtime reliability，统一 delegated work 与 durable task 状态。同步、异步和 workflow 子 agent 现在继承同一份序列化执行策略快照；同一 thread transcript 的明文与压缩路径在 append 和 rewrite 时共用稳定的跨进程锁；provider 压缩重试与被截断的 tool 输出会保留在任务摘要中；session 完成事件前会先发布完整 task registry。前台 composer 仍可继续使用，activity line 会持续展示运行中或等待审批的后台任务。",
       "v0.3.5":
         "新增唯一规范名称 ask_user_question，一次可提出 1-4 个结构化问题，支持带说明的选项、preview、多选、自定义答案和取消，并复用 runtime-owned TUI 交互 broker。修复优化构建中 Goal mode 未发起 provider 调用、前台任务期间 /workflows 不可用，以及未知斜杠命令被错误发送给模型的问题。Terminal-Bench 现在从挂载二进制读取版本，在不扩展 Harbor 封闭 AgentContext 模型的前提下保留 JSONL trajectory，使用受支持的过滤参数，并阻止生成的 benchmark 产物进入 Git。",
       "v0.3.4":
