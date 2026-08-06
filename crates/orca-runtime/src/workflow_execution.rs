@@ -401,6 +401,7 @@ pub(crate) fn execute_workflow_draft_action_tool(
             let launch = runner.launch_background(WorkflowLaunchRequest::from(WorkflowInput {
                 draft_id: Some(input.draft_id.clone()),
                 args: input.args.clone(),
+                token_budget: input.token_budget,
                 ..Default::default()
             }))?;
             let task_id = launch.task_id.clone();
@@ -725,6 +726,8 @@ struct WorkflowDraftActionInput {
     scope: Option<String>,
     #[serde(default)]
     args: Option<serde_json::Value>,
+    #[serde(default)]
+    token_budget: Option<u64>,
 }
 
 fn parse_workflow_draft_action_input(
@@ -1140,6 +1143,7 @@ export const meta = {
                     transcript_dir: None,
                     script_path: None,
                     session_url: None,
+                    budget: None,
                 },
                 summary: "cancelled".to_string(),
                 status_line: "cancelled".to_string(),
@@ -1220,6 +1224,7 @@ export const meta = {
                     transcript_dir: None,
                     script_path: None,
                     session_url: None,
+                    budget: None,
                 },
                 summary: "completed".to_string(),
                 status_line: "completed".to_string(),

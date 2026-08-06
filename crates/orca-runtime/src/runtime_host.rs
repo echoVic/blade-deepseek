@@ -34741,7 +34741,7 @@ impl ThreadActor {
                                     successor_fence,
                                     task_id,
                                 }) => {
-                                    let _ = active.steer_handle.drain();
+                                    self.persist_pending_steer_inputs(&mut result.state, &active);
                                     result
                                         .state
                                         .thread
@@ -34859,7 +34859,7 @@ impl ThreadActor {
                                 message: error.to_string(),
                             }
                         } else {
-                            let _ = active.steer_handle.drain();
+                            self.persist_pending_steer_inputs(&mut result.state, &active);
                             if let Some(task_id) = active.runtime_task_id.as_deref() {
                                 result
                                     .state
@@ -35377,6 +35377,10 @@ impl ThreadActor {
         if code != GoalContinuationRejectCode::QueuedUserInput {
             return;
         }
+        self.persist_pending_steer_inputs(state, active);
+    }
+
+    fn persist_pending_steer_inputs(&self, state: &mut ThreadActorState, active: &ActiveOperation) {
         for input in active.steer_handle.drain() {
             let message = Message::user(input);
             state
@@ -37989,6 +37993,9 @@ mod tests {
 
     #[test]
     fn goal_store_wait_does_not_block_thread_actor() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = OrcaHomeRestore::set(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start runtime host");
         let thread = host

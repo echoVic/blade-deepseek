@@ -767,6 +767,7 @@ pub(crate) fn acquire_file_lock(path: &Path) -> io::Result<ExclusiveFileLock> {
 pub struct SessionWriter {
     path: PathBuf,
     conversation_records: Arc<Mutex<Vec<StoredConversationRecord>>>,
+    event_sequence_cursor: Arc<Mutex<u64>>,
     turn_id: Option<TurnId>,
 }
 
@@ -828,6 +829,7 @@ impl SessionWriter {
         Ok(Self {
             path,
             conversation_records: Arc::new(Mutex::new(Vec::new())),
+            event_sequence_cursor: Arc::new(Mutex::new(0)),
             turn_id: None,
         })
     }
@@ -844,6 +846,7 @@ impl SessionWriter {
         // be restored to plaintext before it can be continued.
         let path = restore_plaintext_transcript(path)?;
         append_usage_baseline(&path)?;
+        let event_sequence_cursor = read_transcript(&path)?.next_event_seq;
         let mut conversation_records = Vec::new();
         for record in read_records(&path)? {
             match record {
@@ -868,6 +871,7 @@ impl SessionWriter {
         Ok(Self {
             path,
             conversation_records: Arc::new(Mutex::new(conversation_records)),
+            event_sequence_cursor: Arc::new(Mutex::new(event_sequence_cursor)),
             turn_id: None,
         })
     }
@@ -1110,10 +1114,29 @@ impl SessionWriter {
     }
 
     fn reserve_event_sequence(&self, next_seq: u64) -> io::Result<()> {
-        write_record(
-            &self.path,
+        let mut expected = self
+            .event_sequence_cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = acquire_file_lock(&self.path)?;
+        let current = read_transcript(&self.path)?.next_event_seq;
+        if current != *expected {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "stale event sequence reservation: expected {}, current reservation is {current}; another process may be writing this session",
+                    *expected
+                ),
+            ));
+        }
+        let mut file = OpenOptions::new().append(true).open(&self.path)?;
+        write_record_line(
+            &mut file,
             &SessionRecord::EventSequenceReserved { next_seq },
-        )
+        )?;
+        file.flush()?;
+        *expected = (*expected).max(next_seq);
+        Ok(())
     }
 
     fn append_semantic_event_record(&self, event: &EventEnvelope) -> io::Result<()> {
@@ -1232,6 +1255,7 @@ mod tests {
         let writer = SessionWriter {
             path: path.clone(),
             conversation_records: Arc::new(Mutex::new(Vec::new())),
+            event_sequence_cursor: Arc::new(Mutex::new(0)),
             turn_id: None,
         };
         (directory, path, writer)
@@ -1828,6 +1852,33 @@ mod tests {
 
         assert_eq!(transcript.next_event_seq, 0);
         assert!(transcript.semantic_events.is_empty());
+    }
+
+    #[test]
+    fn stale_event_sequence_reservation_is_rejected() {
+        let (_directory, path, writer) = new_transcript();
+        let stale_writer =
+            SessionWriter::append_to_existing(path.clone()).expect("open concurrent writer");
+        writer
+            .reserve_event_sequence(orca_core::event_schema::EVENT_SEQUENCE_RESERVATION_SIZE)
+            .expect("first sequence reservation");
+
+        let error = stale_writer
+            .reserve_event_sequence(orca_core::event_schema::EVENT_SEQUENCE_RESERVATION_SIZE)
+            .expect_err("a second writer with the same cursor must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            error
+                .to_string()
+                .contains("stale event sequence reservation")
+        );
+        assert_eq!(
+            read_transcript(&path)
+                .expect("read transcript")
+                .next_event_seq,
+            orca_core::event_schema::EVENT_SEQUENCE_RESERVATION_SIZE
+        );
     }
 
     fn seed_foreground_and_background(writer: &mut SessionWriter) {

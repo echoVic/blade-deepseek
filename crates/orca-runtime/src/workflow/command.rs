@@ -843,6 +843,7 @@ fn workflow_input_for_launch(
         title: None,
         script: None,
         args,
+        token_budget: None,
         resume_from_run_id,
         restart_phase: None,
     }

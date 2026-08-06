@@ -18,7 +18,7 @@ use orca_core::task_types::{TaskStatus, TaskType, WorkflowPhaseTaskSummary, Work
 use orca_core::workflow_types::{
     WorkflowAgentStatus, WorkflowEvidenceIdentity, WorkflowEvidenceToolEvent, WorkflowInput,
     WorkflowOutput, WorkflowPhaseRecord, WorkflowRunState, WorkflowRunStatus,
-    WorkflowTaskLifecycleEvidence,
+    WorkflowTaskLifecycleEvidence, WorkflowTokenBudget,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -132,6 +132,7 @@ impl WorkflowBackgroundLaunch {
             transcript_dir: None,
             script_path: None,
             session_url: None,
+            budget: None,
         };
         Self {
             task_id,
@@ -159,6 +160,8 @@ struct WorkflowExecutionCounters {
     total_agents: u32,
     active_agents: usize,
     max_observed_concurrent_agents: usize,
+    settled_tokens: u64,
+    token_budget: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -254,6 +257,7 @@ impl Write for SharedEventBuffer {
 
 #[derive(Debug)]
 struct WorkflowExecutionGate {
+    token_budget: Option<u64>,
     counters: Mutex<WorkflowExecutionCounters>,
     condvar: Condvar,
 }
@@ -261,7 +265,20 @@ struct WorkflowExecutionGate {
 impl WorkflowExecutionGate {
     fn new() -> Self {
         Self {
+            token_budget: None,
             counters: Mutex::new(WorkflowExecutionCounters::default()),
+            condvar: Condvar::new(),
+        }
+    }
+
+    fn with_token_budget_and_spent(token_budget: u64, spent: u64) -> Self {
+        let token_budget = token_budget.max(1);
+        let mut counters = WorkflowExecutionCounters::default();
+        counters.token_budget = Some(token_budget);
+        counters.settled_tokens = spent;
+        Self {
+            token_budget: Some(token_budget),
+            counters: Mutex::new(counters),
             condvar: Condvar::new(),
         }
     }
@@ -277,6 +294,14 @@ impl WorkflowExecutionGate {
             .lock()
             .map_err(|_| io::Error::other("workflow execution counters poisoned"))?;
         loop {
+            if let Some(token_budget) = self.token_budget
+                && counters.settled_tokens >= token_budget
+            {
+                return Err(io::Error::other(format!(
+                    "workflow run {token_budget} token budget exhausted after {} tokens",
+                    counters.settled_tokens
+                )));
+            }
             if counters.total_agents >= max_agents_per_run {
                 return Err(io::Error::other(format!(
                     "maximum workflow agent count {max_agents_per_run} exceeded"
@@ -314,6 +339,36 @@ impl WorkflowExecutionGate {
             .lock()
             .map(|guard| guard.clone())
             .map_err(|_| io::Error::other("workflow execution counters poisoned"))
+    }
+
+    fn record_usage(&self, tokens: u64) -> io::Result<()> {
+        let mut counters = self
+            .counters
+            .lock()
+            .map_err(|_| io::Error::other("workflow execution counters poisoned"))?;
+        counters.settled_tokens = counters.settled_tokens.saturating_add(tokens);
+        self.condvar.notify_all();
+        Ok(())
+    }
+
+    fn is_exhausted(&self) -> io::Result<bool> {
+        let counters = self
+            .counters
+            .lock()
+            .map_err(|_| io::Error::other("workflow execution counters poisoned"))?;
+        Ok(self
+            .token_budget
+            .is_some_and(|total| counters.settled_tokens >= total))
+    }
+
+    fn budget(&self) -> io::Result<Option<WorkflowTokenBudget>> {
+        let counters = self
+            .counters
+            .lock()
+            .map_err(|_| io::Error::other("workflow execution counters poisoned"))?;
+        Ok(self
+            .token_budget
+            .map(|total| WorkflowTokenBudget::from_total_and_spent(total, counters.settled_tokens)))
     }
 }
 
@@ -416,6 +471,11 @@ impl WorkflowRunner {
             transcript_dir: Some(prepared.transcript_dir.display().to_string()),
             script_path: Some(prepared.resolved.persisted_path.display().to_string()),
             session_url: None,
+            budget: prepared
+                .request
+                .input
+                .token_budget
+                .map(|total| WorkflowTokenBudget::from_total_and_spent(total, 0)),
         };
         self.state.write_worker_record(
             &run_id,
@@ -605,6 +665,22 @@ impl WorkflowRunner {
         let cwd = self.config.cwd.clone().unwrap_or(std::env::current_dir()?);
         fs::create_dir_all(&self.session_dir)?;
 
+        if request.input.token_budget.is_none()
+            && let Some(resume_from_run_id) = request.input.resume_from_run_id.as_deref()
+        {
+            request.input.token_budget = self
+                .state
+                .load_launch_input(resume_from_run_id)
+                .ok()
+                .and_then(|input| input.token_budget);
+        }
+        if request.input.token_budget == Some(0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tokenBudget must be at least 1",
+            ));
+        }
+
         let run_id = format!("workflow-run-{}", uuid::Uuid::new_v4());
         let persisted_script_path = self.state.run_dir(&run_id).join("script.js");
         let resolved_input = self.resolve_launch_input(&request.input)?;
@@ -704,6 +780,7 @@ impl WorkflowRunner {
             draft_id: None,
             script_path: Some(script_path.display().to_string()),
             args: input.args.clone(),
+            token_budget: input.token_budget,
             resume_from_run_id: input.resume_from_run_id.clone(),
             restart_phase: input.restart_phase.clone(),
             ..Default::default()
@@ -727,7 +804,25 @@ impl WorkflowRunner {
         let cached_agents = Arc::new(AtomicU32::new(0));
         let mut failed_error = None;
         let mut completed_result = None;
-        let gate = Arc::new(WorkflowExecutionGate::new());
+        let resumed_spent = resume_from
+            .as_deref()
+            .map(|run_id| {
+                self.state.agent_summaries(run_id).map(|agents| {
+                    agents
+                        .into_iter()
+                        .filter_map(|agent| agent.usage)
+                        .map(UsageTotals::total_tokens)
+                        .sum()
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let gate = Arc::new(match request.input.token_budget {
+            Some(token_budget) => {
+                WorkflowExecutionGate::with_token_budget_and_spent(token_budget, resumed_spent)
+            }
+            None => WorkflowExecutionGate::new(),
+        });
         let ipc_paths = WorkflowHostIpcPaths {
             mailbox_path: self.state.mailbox_path(&run_id),
             task_lists_path: self.state.task_lists_path(&run_id),
@@ -890,6 +985,7 @@ impl WorkflowRunner {
             &counts,
             &counters,
             self.config.workflows.max_concurrent_agents,
+            gate.budget()?,
         );
         self.refresh_task_progress(&task_id, &state)?;
         self.tasks
@@ -909,6 +1005,7 @@ impl WorkflowRunner {
                 transcript_dir: Some(transcript_dir.display().to_string()),
                 script_path: Some(resolved.persisted_path.display().to_string()),
                 session_url: None,
+                budget: gate.budget()?,
             },
             summary,
             status_line,
@@ -1116,6 +1213,10 @@ impl WorkflowRunner {
             match self.run_child_agent_call(&call, workflow_ipc, &execution_policy, workflow_cancel)
             {
                 Ok(child_output) => {
+                    gate.record_usage(child_output.usage.total_tokens())?;
+                    if gate.is_exhausted()? {
+                        workflow_cancel.cancel();
+                    }
                     let completed_at_ms = now_ms();
                     let child_task = child_output.task.clone();
                     let mut output = child_agent_output(&call.prompt, &child_output.message);
@@ -1199,6 +1300,12 @@ impl WorkflowRunner {
                         tool_events,
                         task,
                     } = error;
+                    if let Some(usage) = usage {
+                        gate.record_usage(usage.total_tokens())?;
+                        if gate.is_exhausted()? {
+                            workflow_cancel.cancel();
+                        }
+                    }
                     let transcript_path =
                         write_agent_transcript(transcript_dir, &call, &error_message, false)?;
                     self.state.record_agent_completed(
@@ -1532,6 +1639,9 @@ impl WorkflowRunner {
                 transcript_dir: Some(transcript_dir.display().to_string()),
                 script_path: Some(script_path.display().to_string()),
                 session_url: None,
+                budget: counters.token_budget.map(|total| {
+                    WorkflowTokenBudget::from_total_and_spent(total, counters.settled_tokens)
+                }),
             },
             summary: STOPPED_SUMMARY.to_string(),
             status_line: workflow_status_line(
@@ -1539,6 +1649,9 @@ impl WorkflowRunner {
                 &counts,
                 &counters,
                 self.config.workflows.max_concurrent_agents,
+                counters.token_budget.map(|total| {
+                    WorkflowTokenBudget::from_total_and_spent(total, counters.settled_tokens)
+                }),
             ),
         })
     }
@@ -1642,6 +1755,7 @@ fn workflow_status_line(
     counts: &WorkflowAgentStatusCounts,
     counters: &WorkflowExecutionCounters,
     max_configured_concurrent_agents: usize,
+    budget: Option<WorkflowTokenBudget>,
 ) -> String {
     let completed_agents = counts.completed.saturating_add(counts.cached);
     let failed_agents = counts.failed.saturating_add(counts.cancelled);
@@ -1670,8 +1784,21 @@ fn workflow_status_line(
         .iter()
         .filter(|phase| phase.fallback.is_some())
         .count();
+    let budget_line = budget
+        .map(|budget| {
+            let warning = budget.spent.saturating_mul(100) >= budget.total.saturating_mul(80)
+                && budget.remaining > 0;
+            format!(
+                "\nBudget: {} spent / {} tokens ({} remaining){}",
+                budget.spent,
+                budget.total,
+                budget.remaining,
+                if warning { " · warning" } else { "" }
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "Workflow {}\nAgents: {} completed, {} failed, {} running\nPhases: {} completed, {} failed, {} with fallback\nMax observed concurrency: {} / {}\nInspect: /workflows -> {}",
+        "Workflow {}\nAgents: {} completed, {} failed, {} running\nPhases: {} completed, {} failed, {} with fallback\nMax observed concurrency: {} / {}\nInspect: /workflows -> {}{}",
         workflow_run_status_label(state.status),
         completed_agents,
         failed_agents,
@@ -1681,7 +1808,8 @@ fn workflow_status_line(
         fallback_phases,
         counters.max_observed_concurrent_agents,
         max_configured_concurrent_agents,
-        state.run_id
+        state.run_id,
+        budget_line
     )
 }
 
@@ -2292,6 +2420,61 @@ mod tests {
     }
 
     #[test]
+    fn workflow_draft_resolution_preserves_token_budget() {
+        let temp = tempdir().unwrap();
+        let session_dir = temp.path().join("workflow-session");
+        let draft_dir = session_dir.join("workflow-drafts").join("draft-budget");
+        fs::create_dir_all(&draft_dir).unwrap();
+        fs::write(
+            draft_dir.join("script.js"),
+            "export const meta = { name: 'draft-budget', description: 'budget', phases: ['main'] };\nexport default 'done';",
+        )
+        .unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(temp.path().to_path_buf());
+        let runner = WorkflowRunner::new(
+            config,
+            TaskRegistry::new("workflow-draft-budget".to_string()),
+            session_dir,
+        );
+
+        let resolved = runner
+            .resolve_launch_input(&WorkflowInput {
+                draft_id: Some("draft-budget".to_string()),
+                token_budget: Some(321),
+                ..Default::default()
+            })
+            .expect("draft input should resolve");
+
+        assert_eq!(resolved.token_budget, Some(321));
+    }
+
+    #[test]
+    fn workflow_launch_rejects_zero_token_budget() {
+        let temp = tempdir().unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(temp.path().to_path_buf());
+        let runner = WorkflowRunner::new(
+            config,
+            TaskRegistry::new("workflow-zero-budget".to_string()),
+            temp.path().join("workflow-session"),
+        );
+
+        let error = runner
+            .prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
+                script: Some(
+                    "export const meta = { name: 'zero-budget', description: 'budget', phases: ['main'] };\nexport default 'done';".to_string(),
+                ),
+                token_budget: Some(0),
+                ..Default::default()
+            }))
+            .expect_err("zero token budgets should be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("tokenBudget must be at least 1"));
+    }
+
+    #[test]
     fn durable_workflow_state_repairs_interrupted_task_for_every_terminal_outcome() {
         for (run_status, task_status) in [
             (WorkflowRunStatus::Completed, TaskStatus::Completed),
@@ -2512,6 +2695,72 @@ mod tests {
         assert_eq!(results.iter().filter(|acquired| **acquired).count(), 1);
         assert_eq!(results.iter().filter(|acquired| !**acquired).count(), 1);
         assert_eq!(gate.snapshot().expect("gate counters").total_agents, 2);
+    }
+
+    #[test]
+    fn workflow_execution_gate_stops_new_agents_at_run_token_budget() {
+        let gate = Arc::new(WorkflowExecutionGate::with_token_budget_and_spent(100, 0));
+        let first = gate.begin_agent(10, 2).expect("first agent");
+        gate.record_usage(80).expect("record first usage");
+        drop(first);
+
+        let second = gate
+            .begin_agent(10, 2)
+            .expect("80 percent warning threshold must not stop work");
+        gate.record_usage(20).expect("record second usage");
+        drop(second);
+
+        let error = gate
+            .begin_agent(10, 2)
+            .expect_err("exhausted token budget must stop new agents");
+        assert!(error.to_string().contains("100 token budget exhausted"));
+        let budget = gate
+            .budget()
+            .expect("read budget snapshot")
+            .expect("budget snapshot");
+        assert_eq!(budget.total, 100);
+        assert_eq!(budget.spent, 100);
+        assert_eq!(budget.remaining, 0);
+    }
+
+    #[test]
+    fn workflow_status_line_reports_budget_warning_and_remaining_tokens() {
+        let state = WorkflowRunState {
+            run_id: "workflow-budget-status".to_string(),
+            task_id: "task-budget-status".to_string(),
+            session_id: "session-budget-status".to_string(),
+            cwd: "/tmp".to_string(),
+            workflow_name: "budget-status".to_string(),
+            meta: orca_core::workflow_types::WorkflowMeta {
+                name: "budget-status".to_string(),
+                description: "budget status".to_string(),
+                phases: vec!["main".to_string()],
+                tags: Vec::new(),
+                version: None,
+            },
+            script_digest: "digest".to_string(),
+            args_digest: "args".to_string(),
+            status: WorkflowRunStatus::Completed,
+            phases: Vec::new(),
+            total_agent_count: 1,
+            final_summary: Some("done".to_string()),
+            error: None,
+        };
+        let counts = WorkflowAgentStatusCounts::default();
+        let counters = WorkflowExecutionCounters {
+            max_observed_concurrent_agents: 1,
+            ..Default::default()
+        };
+        let status = workflow_status_line(
+            &state,
+            &counts,
+            &counters,
+            2,
+            Some(WorkflowTokenBudget::from_total_and_spent(100, 80)),
+        );
+
+        assert!(status.contains("Budget: 80 spent / 100 tokens (20 remaining)"));
+        assert!(status.contains("warning"));
     }
 
     #[test]

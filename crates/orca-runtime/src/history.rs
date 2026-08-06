@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -182,14 +182,23 @@ fn replay_compactions_for_resume(
     compactions: &[CompactionRecord],
     summaries: &[ContextSummaryRecord],
 ) -> Vec<Message> {
-    let summarized_compactions: HashSet<(usize, usize)> = summaries
-        .iter()
-        .map(|record| (record.before_messages, record.after_messages))
-        .collect();
+    let mut summarized_compactions = HashMap::<(usize, usize), usize>::new();
+    for summary in summaries {
+        *summarized_compactions
+            .entry((summary.before_messages, summary.after_messages))
+            .or_default() += 1;
+    }
     let mut restored = messages.to_vec();
     for compaction in compactions {
         let has_remote_summary = summarized_compactions
-            .contains(&(compaction.before_messages, compaction.after_messages));
+            .get_mut(&(compaction.before_messages, compaction.after_messages))
+            .is_some_and(|remaining| {
+                if *remaining == 0 {
+                    return false;
+                }
+                *remaining -= 1;
+                true
+            });
         restored = replay_compaction_for_resume(restored, compaction, has_remote_summary);
     }
     restored
@@ -1256,5 +1265,54 @@ mod tests {
             }
         }
         result.expect("compacted messages filtered on resume");
+    }
+
+    #[test]
+    fn repeated_compactions_consume_matching_summaries_once() {
+        let messages = vec![
+            Message::system("system".to_string()),
+            Message::user("old-a".to_string()),
+            Message::Assistant {
+                content: Some("old-b".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                pinned: false,
+            },
+            Message::user("old-c".to_string()),
+            Message::Assistant {
+                content: Some("old-d".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                pinned: false,
+            },
+            Message::user("old-e".to_string()),
+        ];
+        let compactions = vec![
+            CompactionRecord {
+                collapsed_at: Utc::now(),
+                before_messages: 4,
+                after_messages: 2,
+            },
+            CompactionRecord {
+                collapsed_at: Utc::now(),
+                before_messages: 4,
+                after_messages: 2,
+            },
+        ];
+        let summaries = vec![ContextSummaryRecord {
+            summarized_at: Utc::now(),
+            before_messages: 4,
+            after_messages: 2,
+            summary: "only the first compaction was summarized".to_string(),
+            summary_state: None,
+        }];
+
+        let restored = replay_compactions_for_resume(&messages, &compactions, &summaries);
+        let rendered = restored
+            .iter()
+            .filter_map(Message::content_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, vec!["system"]);
     }
 }

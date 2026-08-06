@@ -756,16 +756,28 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         safe_local_read_builtin_spec(
             "subagent_status",
-            "Query the status and result of an async subagent by agent_id, including durable headless worker results from prior processes.",
+            "Query the status and result of an async subagent by agent_id. Text results are paged so large durable worker results can be recovered with offset and limit.",
             json!({
                 "type": "object",
                 "properties": {
                     "agent_id": {
                         "type": "string",
                         "description": "The agent_id returned by subagent with mode async"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Optional character offset into text output. Use output_next_offset from the previous response to continue reading."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 32000,
+                        "description": "Optional maximum number of output characters to return. Defaults to 12000."
                     }
                 },
-                "required": ["agent_id"]
+                "required": ["agent_id"],
+                "additionalProperties": false
             }),
             CapabilitySet::new(vec![ToolCapability::TaskRead]),
             ToolExposure::Direct,
@@ -870,6 +882,11 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "args": {
                         "type": "object",
                         "description": "Structured args passed when action=run."
+                    },
+                    "tokenBudget": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional run-level token budget passed to the workflow."
                     }
                 },
                 "required": ["draftId", "action"]
@@ -907,6 +924,11 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "args": {
                         "type": "object",
                         "description": "Structured input exposed to the workflow script as the global args value."
+                    },
+                    "tokenBudget": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional hard run-level token budget. New agents stop after settled child usage reaches this limit; the result reports total, spent, and remaining."
                     },
                     "draftId": {
                         "type": "string",
@@ -2608,6 +2630,7 @@ mod tests {
                 .expect("workflow script description");
         assert!(workflow_script_description.contains("Do not export `run`"));
         assert!(workflow_script_description.contains("tasks: [{ prompt:"));
+        assert!(workflow.spec().input_schema["properties"]["tokenBudget"].is_object());
 
         let subagent = registry.get("subagent").expect("subagent tool");
         let subagent_mode_description =
