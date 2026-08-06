@@ -4408,7 +4408,10 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{SlashMenu, SlashMenuItem, TuiEvent, TuiInteractionKey, TuiInteractionKind};
+    use crate::types::{
+        SlashMenu, SlashMenuItem, SurfaceProjectionState, TuiEvent, TuiInteractionKey,
+        TuiInteractionKind,
+    };
     use chrono::Utc;
     use crossbeam_channel as mpsc;
     use orca_core::config::{AdditionalWorkingDirectory, ThemeName};
@@ -6399,6 +6402,40 @@ mod tests {
         assert!(narrow.contains("context 25%"));
         assert!(!narrow.contains("git:"));
         assert!(!narrow.contains("blade-deepseek"));
+    }
+
+    #[test]
+    fn provider_context_survives_same_revision_surface_sync_in_footer() {
+        let mut state = test_state();
+        let snapshot = SurfaceProjectionState {
+            session_id: "goal-session".to_string(),
+            title: "Goal session".to_string(),
+            usage_revision: 1,
+            usage: orca_core::cost_types::UsageTotals::default(),
+            context_revision: 1,
+            context_used_tokens: 0,
+            context_limit_tokens: 128_000,
+            workflow_tasks: Vec::new(),
+            current_goal: None,
+            foreground_operation_id: None,
+        };
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            snapshot.clone(),
+        )));
+        state.update(TuiEvent::ContextUpdated {
+            used_tokens: 393_527,
+            limit_tokens: 1_000_000,
+        });
+
+        // A later operation batch carries the unchanged context snapshot.
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(snapshot)));
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        assert!(
+            status_line(&state, &theme, 100)
+                .to_string()
+                .contains("context 39%")
+        );
     }
 
     #[test]

@@ -31,7 +31,9 @@ pub use types::{
     TurnItemsView,
 };
 pub use writer::SessionWriter;
-pub(crate) use writer::{read_manual_compaction_snapshot, redact_sensitive_text};
+pub(crate) use writer::{
+    read_latest_context_tokens, read_manual_compaction_snapshot, redact_sensitive_text,
+};
 
 pub(crate) fn resume_conversation(
     transcript: &SessionTranscript,

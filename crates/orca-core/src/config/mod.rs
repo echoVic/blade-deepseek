@@ -952,10 +952,7 @@ mod tests {
             show_session_picker: false,
             active_permission_profile: Some(ActivePermissionProfile::new("strict", Some("base"))),
             permission_profiles: HashMap::new(),
-            runtime_workspace_roots: Some(vec![
-                PathBuf::from("/workspace"),
-                PathBuf::from("job"),
-            ]),
+            runtime_workspace_roots: Some(vec![PathBuf::from("/workspace"), PathBuf::from("job")]),
             permission_rules: PermissionRules {
                 rules: vec![PermissionRule::new("bash", "cargo *", Decision::Allow)],
             },
