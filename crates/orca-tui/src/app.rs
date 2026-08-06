@@ -58,7 +58,8 @@ use crate::surface_actions::{TuiHostActions, TuiSurfaceActions};
 use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
 use crate::theme::Theme;
 use crate::types::{
-    AppState, AppStatus, AttachedTuiEvent, ChatMessage, SessionAttachmentId, TuiEvent, UserAction,
+    AppState, AppStatus, AttachedTuiEvent, ChatMessage, SessionAttachmentId,
+    SurfaceProjectionState, TuiEvent, UserAction,
 };
 use crate::ui;
 use crate::vim::{PendingInsertEscapeFlow, VimState};
@@ -5244,6 +5245,48 @@ done
     }
 
     #[test]
+    fn resumed_legacy_usage_projects_context_before_next_turn() {
+        with_orca_home(|home| {
+            let mut writer =
+                history::SessionWriter::start(home, "mock", Some("auto".to_string()), "context")
+                    .expect("create legacy context transcript");
+            writer
+                .append_usage(orca_core::cost_types::UsageTotals {
+                    input_tokens: 929_128,
+                    output_tokens: 10_260,
+                    cache_tokens: 893_696,
+                    estimated_cost_usd: 0.063661744,
+                })
+                .expect("append penultimate usage snapshot");
+            writer
+                .append_usage(orca_core::cost_types::UsageTotals {
+                    input_tokens: 970_611,
+                    output_tokens: 10_627,
+                    cache_tokens: 935_040,
+                    estimated_cost_usd: 0.065860634,
+                })
+                .expect("append latest usage snapshot");
+            drop(writer);
+            let session_id = history::load_session("latest")
+                .expect("load legacy context transcript")
+                .meta
+                .session_id;
+
+            let mut harness =
+                HostedTuiHarness::start(test_config(HistoryMode::Resume(session_id)), None);
+            let event =
+                harness.recv_until(|event| matches!(event, TuiEvent::SurfaceProjectionSynced(_)));
+            let TuiEvent::SurfaceProjectionSynced(projection) = event else {
+                unreachable!("predicate accepted only a surface projection")
+            };
+            assert_eq!(projection.context_used_tokens, 41_483);
+            assert_eq!(projection.context_limit_tokens, 1_000_000);
+
+            harness.shutdown();
+        });
+    }
+
+    #[test]
     fn empty_recorded_hosted_tui_goal_resume_restores_latest_active_goal() {
         with_orca_home(|home| {
             let mut writer =
@@ -9169,6 +9212,11 @@ fn emit_typed_history_snapshot(
             plan,
             label: label.to_string(),
         })
+        .map_err(|error| error.to_string())?;
+    event_tx
+        .send(TuiEvent::SurfaceProjectionSynced(Box::new(
+            SurfaceProjectionState::from_surface_snapshot(&snapshot),
+        )))
         .map_err(|error| error.to_string())?;
     let tasks = crate::surface_projection::workflow_task_summaries(&snapshot);
     if !tasks.is_empty() {

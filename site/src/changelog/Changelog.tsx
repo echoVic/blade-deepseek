@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.7":
+        "Completes session-context and TUI projection reliability. Recorded sessions restore provider prompt occupancy before the first resumed turn; revision-aware projection prevents an older surface snapshot from replacing a newer context footer; reasoning, message, and plan streams preserve their opened order during hydration; and already-streamed completed responses are no longer rendered twice. The delegated execution, transcript locking, retry diagnostics, and task-registry guarantees from v0.3.6 remain included.",
       "v0.3.6":
         "Strengthens runtime reliability across delegated work and durable task state. Synchronous, asynchronous, and workflow child agents now inherit one serialized execution-policy snapshot; plaintext and compressed transcript paths share a stable cross-process lock during append and rewrite; provider compaction retries and truncated tool output remain visible in task summaries; and session completion publishes the complete task registry before the terminal event. The composer remains available while an activity line shows running or approval-blocked background work.",
       "v0.3.5":
@@ -570,6 +572,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.7":
+        "完成 session context 与 TUI projection reliability 收口。恢复历史会话时会在首个 resumed turn 前还原 provider prompt 占用；revision-aware projection 不会让旧 surface snapshot 覆盖更新的 context footer；reasoning、message、plan stream 在 hydration 时保留打开顺序；已经流式展示的 completed response 不会再渲染一遍。v0.3.6 的 delegated execution、transcript lock、retry diagnostics 与 task registry 保证继续包含在本版本中。",
       "v0.3.6":
         "增强 runtime reliability，统一 delegated work 与 durable task 状态。同步、异步和 workflow 子 agent 现在继承同一份序列化执行策略快照；同一 thread transcript 的明文与压缩路径在 append 和 rewrite 时共用稳定的跨进程锁；provider 压缩重试与被截断的 tool 输出会保留在任务摘要中；session 完成事件前会先发布完整 task registry。前台 composer 仍可继续使用，activity line 会持续展示运行中或等待审批的后台任务。",
       "v0.3.5":

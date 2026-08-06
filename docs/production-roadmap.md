@@ -4,10 +4,11 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-08-06
-Current baseline: v0.3.6 adds explicit delegation-policy inheritance,
+Current baseline: v0.3.7 adds explicit delegation-policy inheritance,
 cross-process transcript write serialization, durable retry and truncation
-diagnostics, and full task-registry publication before session completion on
-headless and interactive surfaces on top of the native Windows x64 and ARM64 support across the
+diagnostics, context restoration with revision-safe TUI projection, ordered
+assistant stream replay, and full task-registry publication before session
+completion on headless and interactive surfaces on top of the native Windows x64 and ARM64 support across the
 CLI, TUI, shell sessions, sandboxing, update flow, persistence, npm packages,
 release archives, and CI. Shell resolution preserves PowerShell 7, Windows
 PowerShell, cmd.exe, and explicit Git Bash dialects. PowerShell 7 is discovered

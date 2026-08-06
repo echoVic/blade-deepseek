@@ -319,7 +319,7 @@ Context window management:
 
 ### Replay State
 
-`provider.replay.updated` preserves provider-specific context for multi-turn DeepSeek thinking/tool-use flows (`reasoning_content` + tool call IDs). When DeepSeek returns reasoning with a tool call, the next request fully replays that reasoning alongside its assistant tool calls. If DeepSeek omits reasoning for a tool call, Orca executes the call without fabricating replay state.
+`provider.replay.updated` preserves provider-specific context for multi-turn DeepSeek thinking/tool-use flows (`reasoning_content` + tool call IDs). When DeepSeek returns reasoning with a tool call, the next request fully replays that reasoning alongside its assistant tool calls. If DeepSeek omits reasoning for a tool call, Orca executes the call without fabricating replay state. Recorded sessions also restore the latest provider prompt occupancy before a resumed turn; the TUI's typed context revision prevents an older snapshot from replacing a newer legacy context observation, and assistant stream hydration preserves stream-open order without duplicating an identical completed response.
 
 ## Configuration
 

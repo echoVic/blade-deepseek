@@ -326,6 +326,7 @@ pub struct SurfaceProjectionState {
     pub(crate) title: String,
     pub(crate) usage_revision: u64,
     pub(crate) usage: UsageTotals,
+    pub(crate) context_revision: u64,
     pub(crate) context_used_tokens: usize,
     pub(crate) context_limit_tokens: usize,
     pub(crate) workflow_tasks: Vec<BackgroundTaskSummary>,
@@ -928,6 +929,11 @@ pub struct AppState {
     pub session_picker_error: Option<String>,
     pub usage: UsageTotals,
     usage_revision: Option<u64>,
+    /// Revision of the typed surface context snapshot last applied. Legacy
+    /// provider context events are transient and intentionally do not advance
+    /// this value, so an older snapshot cannot overwrite their observation.
+    context_revision: Option<u64>,
+    context_observed: bool,
     pub context_used_tokens: usize,
     pub context_limit_tokens: usize,
     pub slash_menu: Option<SlashMenu>,
@@ -1090,6 +1096,8 @@ impl AppState {
             session_picker_error: None,
             usage: UsageTotals::default(),
             usage_revision: None,
+            context_revision: None,
+            context_observed: false,
             context_used_tokens: 0,
             context_limit_tokens: 0,
             slash_menu: None,
@@ -1735,8 +1743,19 @@ impl AppState {
         self.current_session_title = Some(projection.title.clone());
         self.usage = projection.usage.clone();
         self.usage_revision = Some(projection.usage_revision);
-        self.context_used_tokens = projection.context_used_tokens;
-        self.context_limit_tokens = projection.context_limit_tokens;
+        let revision_advanced = self
+            .context_revision
+            .is_none_or(|revision| projection.context_revision > revision);
+        let should_apply_context =
+            revision_advanced && (!self.context_observed || self.context_revision.is_some());
+        if revision_advanced {
+            self.context_revision = Some(projection.context_revision);
+        }
+        if should_apply_context {
+            self.context_used_tokens = projection.context_used_tokens;
+            self.context_limit_tokens = projection.context_limit_tokens;
+            self.context_observed = false;
+        }
         self.current_goal = projection.current_goal.clone();
         self.active_surface_operation_id = projection.foreground_operation_id.clone();
         self.apply_workflow_tasks_update(projection.workflow_tasks.clone());
@@ -1754,8 +1773,11 @@ impl AppState {
         );
         debug_assert_eq!(self.usage, projection.usage);
         debug_assert_eq!(self.usage_revision, Some(projection.usage_revision));
-        debug_assert_eq!(self.context_used_tokens, projection.context_used_tokens);
-        debug_assert_eq!(self.context_limit_tokens, projection.context_limit_tokens);
+        if !self.context_observed {
+            debug_assert_eq!(self.context_revision, Some(projection.context_revision));
+            debug_assert_eq!(self.context_used_tokens, projection.context_used_tokens);
+            debug_assert_eq!(self.context_limit_tokens, projection.context_limit_tokens);
+        }
         debug_assert_eq!(
             self.workflow_panel.tasks,
             sort_workflow_tasks_for_panel(projection.workflow_tasks.clone())
@@ -1840,6 +1862,8 @@ impl AppState {
         self.usage_revision = None;
         self.context_used_tokens = 0;
         self.context_limit_tokens = 0;
+        self.context_revision = None;
+        self.context_observed = false;
         self.approval_dialog = None;
         self.pending_input = None;
         self.approval_allowlist.clear();
@@ -3134,6 +3158,7 @@ impl AppState {
             } => {
                 self.context_used_tokens = used_tokens;
                 self.context_limit_tokens = limit_tokens;
+                self.context_observed = true;
             }
             TuiEvent::CompactionStarted => {
                 self.set_status(AppStatus::Compacting);
@@ -5670,6 +5695,7 @@ mod tests {
                 cache_tokens: 7,
                 estimated_cost_usd: 0.007,
             },
+            context_revision: 1,
             context_used_tokens: 700,
             context_limit_tokens: 1_000,
             workflow_tasks: vec![workflow_task_summary("task-1", "Canonical task")],
@@ -5699,6 +5725,49 @@ mod tests {
             expected.foreground_operation_id
         );
         state.assert_surface_projection_consistent(&expected);
+
+        // A legacy provider usage event is more recent than the typed snapshot
+        // when the snapshot revision has not advanced. The stale snapshot must
+        // not put the footer back at 0%.
+        state.update(TuiEvent::ContextUpdated {
+            used_tokens: 25_000,
+            limit_tokens: 1_000_000,
+        });
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            expected.clone(),
+        )));
+        assert_eq!(state.context_used_tokens, 25_000);
+        assert_eq!(state.context_limit_tokens, 1_000_000);
+        state.assert_surface_projection_consistent(&expected);
+
+        let mut compacted = expected.clone();
+        compacted.context_revision = 2;
+        compacted.context_used_tokens = 10_000;
+        compacted.context_limit_tokens = 1_000_000;
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(compacted)));
+        assert_eq!(state.context_used_tokens, 10_000);
+        assert_eq!(state.context_limit_tokens, 1_000_000);
+
+        let (pre_tx, _pre_rx) = mpsc::unbounded();
+        let mut pre_snapshot = AppState::new(
+            pre_tx,
+            "0.0.0-test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        pre_snapshot.update(TuiEvent::ContextUpdated {
+            used_tokens: 30_000,
+            limit_tokens: 1_000_000,
+        });
+        pre_snapshot.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            expected.clone(),
+        )));
+        assert_eq!(pre_snapshot.context_used_tokens, 30_000);
+        let mut next_revision = expected.clone();
+        next_revision.context_revision = 2;
+        next_revision.context_used_tokens = 12_000;
+        pre_snapshot.update(TuiEvent::SurfaceProjectionSynced(Box::new(next_revision)));
+        assert_eq!(pre_snapshot.context_used_tokens, 12_000);
 
         let mut stale = expected.clone();
         stale.usage_revision = 6;

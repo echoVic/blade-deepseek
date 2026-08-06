@@ -165,12 +165,13 @@ pub(crate) enum SurfaceProjectionError {
 pub(crate) type TuiStreamDeliveryWatermark = BTreeMap<SurfaceStreamId, ByteOffset>;
 
 impl SurfaceProjectionState {
-    fn from_surface_snapshot(snapshot: &orca_runtime::surface::SurfaceSnapshot) -> Self {
+    pub(crate) fn from_surface_snapshot(snapshot: &orca_runtime::surface::SurfaceSnapshot) -> Self {
         Self {
             session_id: surface_thread_id_text(&snapshot.thread.thread_id),
             title: snapshot.thread.title.as_str().to_string(),
             usage_revision: snapshot.usage.revision.get(),
             usage: core_usage_totals(&snapshot.usage.thread_total),
+            context_revision: snapshot.context.revision.get(),
             context_used_tokens: usize::try_from(snapshot.context.used_tokens)
                 .unwrap_or(usize::MAX),
             context_limit_tokens: usize::try_from(snapshot.context.limit_tokens)
@@ -194,6 +195,7 @@ impl SurfaceProjectionState {
 pub(crate) struct TuiSurfaceProjection {
     cursor: SurfaceCursor,
     assistant_streams: BTreeMap<SurfaceStreamId, SurfaceAssistantStream>,
+    assistant_stream_order: Vec<SurfaceStreamId>,
     completed_items: Vec<SurfaceItem>,
     operation_turn_ids: BTreeMap<SurfaceOperationId, Vec<orca_runtime::surface::SurfaceTurnId>>,
     focused_operation: Option<SurfaceOperationId>,
@@ -208,6 +210,10 @@ impl TuiSurfaceProjection {
     pub(crate) fn from_snapshot(cursor: SurfaceCursor, streams: &[SurfaceAssistantStream]) -> Self {
         Self {
             cursor,
+            assistant_stream_order: streams
+                .iter()
+                .map(|stream| stream.stream_id.clone())
+                .collect(),
             assistant_streams: streams
                 .iter()
                 .map(|stream| (stream.stream_id.clone(), stream.clone()))
@@ -286,8 +292,9 @@ impl TuiSurfaceProjection {
             })
             .unwrap_or_default();
         projected.extend(
-            self.assistant_streams
-                .values()
+            self.assistant_stream_order
+                .iter()
+                .filter_map(|stream_id| self.assistant_streams.get(stream_id))
                 .filter(|stream| {
                     stream.state == SurfaceAssistantStreamState::Open
                         && !stream.text.as_str().is_empty()
@@ -326,8 +333,9 @@ impl TuiSurfaceProjection {
         watermark: &TuiStreamDeliveryWatermark,
     ) -> Result<Vec<TuiEvent>, SurfaceProjectionError> {
         let mut projected = self
-            .assistant_streams
-            .values()
+            .assistant_stream_order
+            .iter()
+            .filter_map(|stream_id| self.assistant_streams.get(stream_id))
             .filter(|stream| {
                 &stream.fence.operation_id == operation_id
                     && stream.state != SurfaceAssistantStreamState::Discarded
@@ -492,12 +500,16 @@ impl TuiSurfaceProjection {
         };
 
         let mut assistant_streams = self.assistant_streams.clone();
+        let mut assistant_stream_order = self.assistant_stream_order.clone();
         let mut focused_operation = self.focused_operation.clone();
         let mut goal = self.goal.clone();
         let mut projected = Vec::new();
         for envelope in batch.events.as_slice() {
             match &envelope.event {
                 SurfaceEvent::Assistant(AssistantPatch::StreamOpened { stream }) => {
+                    if !assistant_streams.contains_key(&stream.stream_id) {
+                        assistant_stream_order.push(stream.stream_id.clone());
+                    }
                     assistant_streams
                         .entry(stream.stream_id.clone())
                         .and_modify(|current| *current = stream.clone())
@@ -544,13 +556,17 @@ impl TuiSurfaceProjection {
                     }
                 }
                 SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted { response }) => {
+                    let response_matches_streams =
+                        response_matches_streamed_items(response, assistant_streams.values());
                     for stream in assistant_streams.values_mut().filter(|stream| {
                         stream.turn_id == response.turn_id
                             && stream.state == SurfaceAssistantStreamState::Open
                     }) {
                         stream.state = SurfaceAssistantStreamState::Completed;
                     }
-                    projected.push(response_completed_event(response));
+                    if !response_matches_streams {
+                        projected.push(response_completed_event(response));
+                    }
                 }
                 SurfaceEvent::Tool(ToolPatch::Requested { request }) => {
                     projected.push(TuiEvent::ToolRequested {
@@ -792,6 +808,7 @@ impl TuiSurfaceProjection {
             }
         }
         self.assistant_streams = assistant_streams;
+        self.assistant_stream_order = assistant_stream_order;
         self.focused_operation = focused_operation;
         self.goal = goal;
         self.reducer_state = next_reducer_state;
@@ -1356,14 +1373,53 @@ fn response_completed_event(response: &SurfaceCompletedModelResponse) -> TuiEven
     )
 }
 
+fn response_matches_streamed_items<'a>(
+    response: &SurfaceCompletedModelResponse,
+    streams: impl Iterator<Item = &'a SurfaceAssistantStream>,
+) -> bool {
+    let streams = streams
+        .filter(|stream| {
+            stream.turn_id == response.turn_id
+                && stream.state != SurfaceAssistantStreamState::Discarded
+        })
+        .collect::<Vec<_>>();
+    let expected = [
+        response
+            .message_item
+            .as_ref()
+            .map(|item| (&item.id, AssistantChannel::Message, item.text.as_str())),
+        response
+            .reasoning_item
+            .as_ref()
+            .map(|item| (&item.id, AssistantChannel::Reasoning, item.content.as_str())),
+        response
+            .plan_item
+            .as_ref()
+            .map(|item| (&item.id, AssistantChannel::Plan, item.text.as_str())),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    streams.len() == expected.len()
+        && expected.iter().all(|(item_id, channel, text)| {
+            streams.iter().any(|stream| {
+                &stream.item_id == *item_id
+                    && stream.channel == *channel
+                    && stream.text.as_str() == *text
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use orca_runtime::surface::{
         ByteOffset, CommitClass, CursorSourceRevision, DisplayText, DurableRevision, NonEmptyVec,
-        SequenceNumber, Sha256Digest, SurfaceCommitId, SurfaceEventEnvelope, SurfaceEventId,
-        SurfaceIncarnation, SurfaceInputCorrelationId, SurfaceItemId, SurfaceScope,
-        SurfaceThreadId, SurfaceTurnId, ThreadOwnerEpoch,
+        SequenceNumber, Sha256Digest, SurfaceAssistantMessageItem, SurfaceAssistantReasoningItem,
+        SurfaceCommitId, SurfaceEventEnvelope, SurfaceEventId, SurfaceIncarnation,
+        SurfaceInputCorrelationId, SurfaceItemId, SurfaceScope, SurfaceThreadId, SurfaceTurnId,
+        ThreadOwnerEpoch, UuidV7,
     };
     use orca_runtime::surface::{SurfaceGenerationId, SurfaceUsageSnapshot, UsageRevision};
 
@@ -1508,6 +1564,93 @@ mod tests {
             Err(SurfaceProjectionError::UnknownAssistantStream { stream_id: observed })
                 if observed == stream_id
         ));
+    }
+
+    #[test]
+    fn completed_response_does_not_reproject_identical_streamed_content() {
+        let before = cursor(0, 1);
+        let fence = operation_fence(12);
+        let turn_id = SurfaceTurnId::new();
+        let reasoning_item_id = SurfaceItemId::new();
+        let message_item_id = SurfaceItemId::new();
+        let reasoning_stream = SurfaceAssistantStream {
+            stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(13))
+                .expect("reasoning stream id"),
+            fence: fence.clone(),
+            turn_id: turn_id.clone(),
+            item_id: reasoning_item_id.clone(),
+            channel: AssistantChannel::Reasoning,
+            next_offset: ByteOffset::new(6),
+            text: DisplayText::new("reason"),
+            state: SurfaceAssistantStreamState::Open,
+        };
+        let message_stream = SurfaceAssistantStream {
+            stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(14))
+                .expect("message stream id"),
+            fence: fence.clone(),
+            turn_id: turn_id.clone(),
+            item_id: message_item_id.clone(),
+            channel: AssistantChannel::Message,
+            next_offset: ByteOffset::new(6),
+            text: DisplayText::new("answer"),
+            state: SurfaceAssistantStreamState::Open,
+        };
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: ThreadOwnerEpoch::new(1),
+            durable_revision: DurableRevision::try_new(2).unwrap(),
+            commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(15)).unwrap(),
+        };
+        let event = SurfaceEventEnvelope {
+            ordinal: 0,
+            event_id: SurfaceEventId::try_from_bytes(uuid_v7_bytes(16)).unwrap(),
+            commit_class: commit_class.clone(),
+            scope: SurfaceScope::Generation { fence },
+            event: SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted {
+                response: SurfaceCompletedModelResponse {
+                    response_id: UuidV7::try_from_bytes(uuid_v7_bytes(17)).unwrap(),
+                    turn_id: turn_id.clone(),
+                    message_item: Some(SurfaceAssistantMessageItem {
+                        id: message_item_id,
+                        turn_id: turn_id.clone(),
+                        text: DisplayText::new("answer"),
+                        pinned: false,
+                    }),
+                    reasoning_item: Some(SurfaceAssistantReasoningItem {
+                        id: reasoning_item_id,
+                        turn_id,
+                        summary: DisplayText::new(""),
+                        content: DisplayText::new("reason"),
+                        pinned: false,
+                    }),
+                    plan_item: None,
+                    tool_calls: Vec::new(),
+                },
+            }),
+        };
+        let batch = SurfaceCommitBatch {
+            cursor_before: before.clone(),
+            cursor_after: SurfaceCursor {
+                next_seq: SequenceNumber::new(1),
+                source_revision: CursorSourceRevision::Recorded {
+                    durable_revision: DurableRevision::try_new(2).unwrap(),
+                },
+                ..before.clone()
+            },
+            commit_class,
+            event_count: 1,
+            batch_digest: Sha256Digest::new([0; 32]),
+            events: NonEmptyVec::try_new(vec![event]).unwrap(),
+        };
+        let mut projection =
+            TuiSurfaceProjection::from_snapshot(before, &[reasoning_stream, message_stream]);
+
+        assert!(projection.reduce_typed_batch(&batch).unwrap().is_empty());
+        assert!(
+            projection
+                .assistant_streams
+                .values()
+                .all(|stream| stream.state == SurfaceAssistantStreamState::Completed)
+        );
     }
 
     #[test]
@@ -1657,6 +1800,7 @@ mod tests {
         let mut projection = TuiSurfaceProjection {
             cursor: cursor(0, 1),
             assistant_streams: BTreeMap::new(),
+            assistant_stream_order: Vec::new(),
             completed_items: Vec::new(),
             operation_turn_ids: BTreeMap::new(),
             focused_operation: None,
@@ -1680,6 +1824,42 @@ mod tests {
             }] if id == "task-1" && status == "running"
         ));
         assert!(projection.hydrate_open_streams().is_empty());
+    }
+
+    #[test]
+    fn snapshot_hydration_preserves_assistant_stream_open_order() {
+        let fence = operation_fence(10);
+        let turn_id = SurfaceTurnId::new();
+        let reasoning = SurfaceAssistantStream {
+            stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(31))
+                .expect("reasoning stream id"),
+            fence: fence.clone(),
+            turn_id: turn_id.clone(),
+            item_id: SurfaceItemId::new(),
+            channel: AssistantChannel::Reasoning,
+            next_offset: ByteOffset::new(6),
+            text: DisplayText::new("reason"),
+            state: SurfaceAssistantStreamState::Open,
+        };
+        let message = SurfaceAssistantStream {
+            stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(30))
+                .expect("message stream id"),
+            fence,
+            turn_id,
+            item_id: SurfaceItemId::new(),
+            channel: AssistantChannel::Message,
+            next_offset: ByteOffset::new(6),
+            text: DisplayText::new("answer"),
+            state: SurfaceAssistantStreamState::Open,
+        };
+        let mut projection =
+            TuiSurfaceProjection::from_snapshot(cursor(0, 1), &[reasoning, message]);
+
+        assert!(matches!(
+            projection.hydrate_open_streams().as_slice(),
+            [TuiEvent::ReasoningDelta(reasoning), TuiEvent::MessageDelta(message)]
+                if reasoning == "reason" && message == "answer"
+        ));
     }
 
     #[test]
@@ -1761,6 +1941,47 @@ mod tests {
     }
 
     #[test]
+    fn foreground_hydration_preserves_assistant_stream_open_order() {
+        let fence = operation_fence(33);
+        let turn_id = SurfaceTurnId::new();
+        let reasoning = SurfaceAssistantStream {
+            stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(35))
+                .expect("reasoning stream id"),
+            fence: fence.clone(),
+            turn_id: turn_id.clone(),
+            item_id: SurfaceItemId::new(),
+            channel: AssistantChannel::Reasoning,
+            next_offset: ByteOffset::new(6),
+            text: DisplayText::new("reason"),
+            state: SurfaceAssistantStreamState::Open,
+        };
+        let message = SurfaceAssistantStream {
+            stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(34))
+                .expect("message stream id"),
+            fence: fence.clone(),
+            turn_id,
+            item_id: SurfaceItemId::new(),
+            channel: AssistantChannel::Message,
+            next_offset: ByteOffset::new(6),
+            text: DisplayText::new("answer"),
+            state: SurfaceAssistantStreamState::Open,
+        };
+        let projection = TuiSurfaceProjection::from_snapshot(cursor(0, 1), &[reasoning, message]);
+
+        assert!(matches!(
+            projection
+                .hydrate_after_delivery_watermark(
+                    &fence.operation_id,
+                    &TuiStreamDeliveryWatermark::new(),
+                )
+                .expect("valid delivery watermark")
+                .as_slice(),
+            [TuiEvent::ReasoningDelta(reasoning), TuiEvent::MessageDelta(message)]
+                if reasoning == "reason" && message == "answer"
+        ));
+    }
+
+    #[test]
     fn foreground_hydration_reconciles_completed_item_for_discarded_stream() {
         let fence = operation_fence(40);
         let turn_id = SurfaceTurnId::new();
@@ -1776,9 +1997,11 @@ mod tests {
             text: DisplayText::new("partial"),
             state: SurfaceAssistantStreamState::Discarded,
         };
+        let stream_id = stream.stream_id.clone();
         let projection = TuiSurfaceProjection {
             cursor: cursor(0, 1),
-            assistant_streams: BTreeMap::from([(stream.stream_id.clone(), stream)]),
+            assistant_streams: BTreeMap::from([(stream_id.clone(), stream)]),
+            assistant_stream_order: vec![stream_id],
             completed_items: vec![SurfaceItem::AssistantMessage {
                 id: item_id,
                 turn_id: turn_id.clone(),
