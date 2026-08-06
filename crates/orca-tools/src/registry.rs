@@ -928,7 +928,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "tokenBudget": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Optional hard run-level token budget. New agents stop after settled child usage reaches this limit; the result reports total, spent, and remaining."
+                        "description": "Optional run-level token budget. Each child reserves available capacity before it starts, settled usage is reconciled after completion, and the result reports total, spent, and remaining."
                     },
                     "draftId": {
                         "type": "string",

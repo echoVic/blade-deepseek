@@ -109,7 +109,7 @@ Valid workflow scripts use exactly one of these shapes:
 
 Do not export `run`, `async function run`, helper functions, or arbitrary symbols. The workflow host only supports `export const meta`, `export const phases`, `export const args`, and `export default`.
 
-For long-running delegated work outside Workflow, prefer `subagent` with `"mode":"async"` so progress appears in `task_list` and results can be checked with `subagent_status`; use sync only for short child tasks where blocking the main turn is acceptable. If a subagent result has `output_next_offset`, call `subagent_status` again with that `offset` to recover the next page. Workflow runs may set `tokenBudget`; the final notification reports `total`, `spent`, and `remaining`, and new child agents stop when the settled run budget is exhausted.
+For long-running delegated work outside Workflow, prefer `subagent` with `"mode":"async"` so progress appears in `task_list` and results can be checked with `subagent_status`; use sync only for short child tasks where blocking the main turn is acceptable. If a subagent result has `output_next_offset`, call `subagent_status` again with that `offset` to recover the next page. Workflow runs may set `tokenBudget`; the final notification reports `total`, `spent`, and `remaining`, and each child reserves available run capacity before it starts so concurrent launches cannot claim the same tokens.
 
 ## Safety Rules
 1. NEVER execute destructive commands (rm -rf /, rm -rf ~, mkfs, dd if=/dev/zero, etc.).

@@ -2048,9 +2048,22 @@ fn cancelled_generation_persists_unconsumed_steer_input() {
         .wait_timeout(TEST_TIMEOUT)
         .expect("finish operation");
     let snapshot = thread.snapshot().expect("read completed snapshot");
-    assert!(snapshot.messages().iter().any(
-        |message| matches!(message, Message::User { content, .. } if content == "preserve this input")
-    ));
+    assert_eq!(
+        snapshot
+            .messages()
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::User { content, .. } if content == "preserve this input")
+            })
+            .count(),
+        1
+    );
+    assert!(
+        executor
+            .steer_inputs()
+            .iter()
+            .all(|inputs| inputs.is_empty())
+    );
     host.shutdown().expect("shutdown runtime host");
 }
 

@@ -522,3 +522,15 @@ jobs:
             }
           }
           & (Join-Path $root "extract/orca.exe") --version
+
+  pages:
+    if: ${{ github.ref_type == 'tag' && needs.verify.result == 'success' && needs.verify-windows.result == 'success' }}
+    needs: [verify, verify-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch Pages after public release verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pages.yml --repo "${{ github.repository }}" --ref main
