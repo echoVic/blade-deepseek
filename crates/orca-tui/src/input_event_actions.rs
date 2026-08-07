@@ -8,6 +8,7 @@ use orca_core::config::RunConfig;
 use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{insert_composer_paste, insert_pasted_text};
 use crate::selection::{SelectionGranularity, TranscriptSelection};
+use crate::session_picker_actions::load_next_session_page;
 use crate::terminal_presentation::TerminalPresentation;
 use crate::types::{AppState, AppStatus, PanelMode, SessionPickerPhase};
 
@@ -244,6 +245,12 @@ pub(crate) fn handle_scroll_lines(state: &mut AppState, lines: i32, now: Instant
     if state.status == AppStatus::SessionPicker {
         if state.session_picker_phase != SessionPickerPhase::Browsing {
             return;
+        }
+        if !upward
+            && state.filtered_session_indices().last().copied()
+                == Some(state.session_picker_selected)
+        {
+            load_next_session_page(state);
         }
         for _ in 0..steps {
             if upward {

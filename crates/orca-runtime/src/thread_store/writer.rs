@@ -20,6 +20,8 @@ use orca_platform::fs::{AtomicWritePolicy, atomic_write_with};
 
 use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 
+#[cfg(not(test))]
+use super::session_index;
 use super::types::{
     ManualCompactionDurableSnapshot, ManualCompactionSnapshotRecord, SessionMeta, SessionRecord,
     SessionTranscript, StoredConversationRecord, StoredMessage,
@@ -62,7 +64,22 @@ pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()
     let _lock = acquire_file_lock(path)?;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     write_record_line(&mut file, record)?;
-    file.flush()
+    file.flush()?;
+    #[cfg(not(test))]
+    {
+        match record {
+            SessionRecord::Meta(meta) => {
+                let _ = session_index::upsert_meta(path, meta, false);
+            }
+            SessionRecord::Completed { .. } => {
+                let _ = session_index::touch_path_force(path);
+            }
+            _ => {
+                let _ = session_index::touch_path(path);
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn write_durable_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
@@ -78,7 +95,10 @@ pub(crate) fn write_durable_record(path: &Path, record: &SessionRecord) -> io::R
     repair_incomplete_final_record(&mut file)?;
     write_record_line(&mut file, record)?;
     file.flush()?;
-    file.sync_data()
+    file.sync_data()?;
+    #[cfg(not(test))]
+    let _ = session_index::touch_path(path);
+    Ok(())
 }
 
 fn repair_incomplete_final_record(file: &mut File) -> io::Result<()> {
@@ -252,7 +272,10 @@ pub(crate) fn rewrite_records_unlocked(path: &Path, records: &[SessionRecord]) -
     atomic_write_with(path, AtomicWritePolicy::NoFollow, |temporary| {
         write_records_to(temporary, path, records)
     })
-    .map_err(io::Error::other)
+    .map_err(io::Error::other)?;
+    #[cfg(not(test))]
+    let _ = session_index::touch_path(path);
+    Ok(())
 }
 
 fn write_records_to(
@@ -785,6 +808,11 @@ fn restore_plaintext_transcript(path: PathBuf) -> io::Result<PathBuf> {
             return Err(io::Error::other(error));
         }
         fs::remove_file(&path)?;
+        #[cfg(not(test))]
+        {
+            let archived = plain_path.starts_with(super::local::archive_dir());
+            let _ = session_index::move_path(&path, &plain_path, archived);
+        }
         Ok(plain_path)
     })();
     result
@@ -845,6 +873,11 @@ impl SessionWriter {
         // make the whole transcript undecodable, so a compressed session must
         // be restored to plaintext before it can be continued.
         let path = restore_plaintext_transcript(path)?;
+        #[cfg(not(test))]
+        if let Ok(meta) = read_session_meta(&path) {
+            let archived = path.starts_with(super::local::archive_dir());
+            let _ = session_index::upsert_meta(&path, &meta, archived);
+        }
         append_usage_baseline(&path)?;
         let event_sequence_cursor = read_transcript(&path)?.next_event_seq;
         let mut conversation_records = Vec::new();
@@ -1135,6 +1168,8 @@ impl SessionWriter {
             &SessionRecord::EventSequenceReserved { next_seq },
         )?;
         file.flush()?;
+        #[cfg(not(test))]
+        let _ = session_index::touch_path(&self.path);
         *expected = (*expected).max(next_seq);
         Ok(())
     }
@@ -1190,7 +1225,10 @@ fn append_usage_baseline(path: &Path) -> io::Result<()> {
             return Ok(());
         };
         write_record_line(&mut file, &SessionRecord::UsageBaseline(usage))?;
-        file.flush()
+        file.flush()?;
+        #[cfg(not(test))]
+        let _ = session_index::touch_path(path);
+        Ok(())
     })();
     result
 }

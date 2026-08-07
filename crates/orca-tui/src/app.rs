@@ -290,10 +290,15 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
             config.history_mode,
             HistoryMode::Resume(_) | HistoryMode::Fork(_)
         );
-    let picker_sessions = if should_show_picker {
-        RuntimeSurfaceHostHandle::list_saved_sessions(200).unwrap_or_default()
+    let picker_page = if should_show_picker {
+        RuntimeSurfaceHostHandle::list_saved_session_page(
+            0,
+            crate::session_picker_actions::SESSION_PICKER_PAGE_SIZE,
+            None,
+        )
+        .ok()
     } else {
-        Vec::new()
+        None
     };
 
     let workspace_status = workspace_status::snapshot(&workspace_root);
@@ -306,9 +311,13 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     state.workspace_git = workspace_status.git;
     state.approval_mode = config.approval_mode;
     state.reasoning_effort = config.reasoning_effort;
-    if should_show_picker && !picker_sessions.is_empty() {
+    if let Some(page) = picker_page
+        && !page.sessions.is_empty()
+    {
         state.status = AppStatus::SessionPicker;
-        state.session_picker_sessions = picker_sessions;
+        state.session_picker_sessions = page.sessions;
+        state.session_picker_next_offset = page.next_offset;
+        state.session_picker_backfill_complete = page.backfill_complete;
     }
 
     if needs_setup {
@@ -9152,9 +9161,18 @@ fn switch_saved_hosted_session(
 }
 
 fn refresh_saved_session_picker(event_tx: &mpsc::Sender<TuiEvent>, notice: String) {
-    match RuntimeSurfaceHostHandle::list_saved_sessions(200) {
-        Ok(sessions) => {
-            let _ = event_tx.send(TuiEvent::SavedSessionsUpdated { sessions, notice });
+    match RuntimeSurfaceHostHandle::list_saved_session_page(
+        0,
+        crate::session_picker_actions::SESSION_PICKER_PAGE_SIZE,
+        None,
+    ) {
+        Ok(page) => {
+            let _ = event_tx.send(TuiEvent::SavedSessionsUpdated {
+                sessions: page.sessions,
+                next_offset: page.next_offset,
+                backfill_complete: page.backfill_complete,
+                notice,
+            });
         }
         Err(error) => {
             let _ = event_tx.send(TuiEvent::OperationRejected(format!(

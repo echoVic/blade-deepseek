@@ -3,8 +3,11 @@ use std::time::Instant;
 
 use crossbeam_channel as mpsc;
 use crossterm::event::{KeyCode, KeyEvent};
+use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::types::{AppState, AppStatus, SessionPickerPhase, UserAction};
+
+pub(crate) const SESSION_PICKER_PAGE_SIZE: usize = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionPickerAction {
@@ -69,13 +72,28 @@ where
     match phase {
         SessionPickerPhase::Browsing => match key.code {
             KeyCode::Up => state.select_previous_session(),
-            KeyCode::Down => state.select_next_session(),
+            KeyCode::Down => {
+                load_next_page_if_at_end(state);
+                state.select_next_session();
+            }
             KeyCode::PageUp => state.select_session_page_up(),
-            KeyCode::PageDown => state.select_session_page_down(),
+            KeyCode::PageDown => {
+                load_next_page_if_near_end(state, 10);
+                state.select_session_page_down();
+            }
             KeyCode::Home => state.select_first_session(),
-            KeyCode::End => state.select_last_session(),
-            KeyCode::Backspace => state.session_query_pop(),
-            KeyCode::Char(c) => state.session_query_push(c),
+            KeyCode::End => {
+                load_next_session_page(state);
+                state.select_last_session();
+            }
+            KeyCode::Backspace => {
+                state.session_query_pop();
+                reload_session_picker(state);
+            }
+            KeyCode::Char(c) => {
+                state.session_query_push(c);
+                reload_session_picker(state);
+            }
             KeyCode::Enter => dispatch_selected_resume(state, action_tx, clear_terminal)?,
             KeyCode::Tab => {
                 if let Some(session_id) = state.selected_session_id() {
@@ -314,6 +332,124 @@ fn close_picker(state: &mut AppState) {
     state.session_picker_query.clear();
     state.session_picker_phase = SessionPickerPhase::Browsing;
     state.session_picker_error = None;
+    state.session_picker_next_offset = None;
+    state.session_picker_backfill_complete = true;
+}
+
+pub(crate) fn open_session_picker(state: &mut AppState) -> io::Result<bool> {
+    let page =
+        RuntimeSurfaceHostHandle::list_saved_session_page(0, SESSION_PICKER_PAGE_SIZE, None)?;
+    state.reset_queued_user_messages();
+    state.session_picker_sessions = page.sessions;
+    state.session_picker_selected = 0;
+    state.session_picker_query.clear();
+    state.session_picker_phase = SessionPickerPhase::Browsing;
+    state.session_picker_error = None;
+    state.session_picker_next_offset = page.next_offset;
+    state.session_picker_backfill_complete = page.backfill_complete;
+    if state.session_picker_sessions.is_empty() {
+        return Ok(false);
+    }
+    state.status = AppStatus::SessionPicker;
+    Ok(true)
+}
+
+pub(crate) fn load_next_session_page(state: &mut AppState) -> usize {
+    if !state.session_picker_backfill_complete {
+        refresh_after_backfill(state);
+    }
+    let Some(offset) = state.session_picker_next_offset else {
+        return 0;
+    };
+    let query =
+        (!state.session_picker_query.is_empty()).then_some(state.session_picker_query.as_str());
+    match RuntimeSurfaceHostHandle::list_saved_session_page(offset, SESSION_PICKER_PAGE_SIZE, query)
+    {
+        Ok(page) => {
+            let mut seen = state
+                .session_picker_sessions
+                .iter()
+                .map(|session| session.session_id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            let before = state.session_picker_sessions.len();
+            state.session_picker_sessions.extend(
+                page.sessions
+                    .into_iter()
+                    .filter(|session| seen.insert(session.session_id.clone())),
+            );
+            state.session_picker_next_offset = page.next_offset;
+            state.session_picker_backfill_complete = page.backfill_complete;
+            state.session_picker_error = None;
+            state.session_picker_sessions.len().saturating_sub(before)
+        }
+        Err(error) => {
+            state.session_picker_error =
+                Some(format!("failed to load more conversations: {error}"));
+            0
+        }
+    }
+}
+
+fn refresh_after_backfill(state: &mut AppState) {
+    let query =
+        (!state.session_picker_query.is_empty()).then_some(state.session_picker_query.as_str());
+    let Ok(page) =
+        RuntimeSurfaceHostHandle::list_saved_session_page(0, SESSION_PICKER_PAGE_SIZE, query)
+    else {
+        return;
+    };
+    if !page.backfill_complete {
+        return;
+    }
+    let selected_id = state.selected_session_id();
+    state.session_picker_sessions = page.sessions;
+    state.session_picker_next_offset = page.next_offset;
+    state.session_picker_backfill_complete = true;
+    state.session_picker_selected = selected_id
+        .as_deref()
+        .and_then(|selected_id| {
+            state
+                .session_picker_sessions
+                .iter()
+                .position(|session| session.session_id == selected_id)
+        })
+        .unwrap_or(0);
+}
+
+fn reload_session_picker(state: &mut AppState) {
+    let query =
+        (!state.session_picker_query.is_empty()).then_some(state.session_picker_query.as_str());
+    match RuntimeSurfaceHostHandle::list_saved_session_page(0, SESSION_PICKER_PAGE_SIZE, query) {
+        Ok(page) => {
+            state.session_picker_sessions = page.sessions;
+            state.session_picker_next_offset = page.next_offset;
+            state.session_picker_backfill_complete = page.backfill_complete;
+            state.session_picker_error = None;
+            state.session_picker_selected = 0;
+        }
+        Err(error) => {
+            state.session_picker_error =
+                Some(format!("failed to search saved conversations: {error}"));
+        }
+    }
+}
+
+fn load_next_page_if_at_end(state: &mut AppState) {
+    let filtered = state.filtered_session_indices();
+    if filtered.last().copied() == Some(state.session_picker_selected) {
+        load_next_session_page(state);
+    }
+}
+
+fn load_next_page_if_near_end(state: &mut AppState, distance: usize) {
+    let filtered = state.filtered_session_indices();
+    let position = filtered
+        .iter()
+        .position(|index| *index == state.session_picker_selected)
+        .unwrap_or(0);
+    if position.saturating_add(distance) >= filtered.len().saturating_sub(1) {
+        load_next_session_page(state);
+    }
 }
 
 #[cfg(test)]

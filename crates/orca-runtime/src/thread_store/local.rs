@@ -17,6 +17,7 @@ use super::projection::{
     conversation_records_to_thread_items, conversation_records_to_thread_turns,
     is_surface_coordinator_record, normalized_stored_messages, stored_message_to_thread_json,
 };
+use super::session_index::{self, SessionSummaryPage};
 use super::types::{
     SessionMeta, SessionRecord, SessionSummary, SessionTranscript, SortDirection,
     StoredConversationRecord, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit,
@@ -352,6 +353,8 @@ pub fn delete_session(selector: &str) -> io::Result<PathBuf> {
         )
     })?;
     fs::remove_file(&path)?;
+    #[cfg(not(test))]
+    let _ = session_index::remove_path(&path);
     Ok(path)
 }
 
@@ -376,6 +379,8 @@ pub fn archive_session(selector: &str) -> io::Result<PathBuf> {
         fs::create_dir_all(parent)?;
     }
     fs::rename(&path, &archived_path)?;
+    #[cfg(not(test))]
+    let _ = session_index::move_path(&path, &archived_path, true);
     Ok(archived_path)
 }
 
@@ -417,6 +422,11 @@ pub fn compress_session(selector: &str) -> io::Result<PathBuf> {
             return Err(io::Error::other(error));
         }
         fs::remove_file(&path)?;
+        #[cfg(not(test))]
+        {
+            let archived = compressed_path.starts_with(archive_dir());
+            let _ = session_index::move_path(&path, &compressed_path, archived);
+        }
         Ok(compressed_path)
     })();
     result
@@ -471,32 +481,23 @@ pub fn list_sessions(limit: usize) -> io::Result<Vec<SessionSummary>> {
     list_sessions_with_archived(limit, false)
 }
 
+pub fn list_session_page(
+    offset: usize,
+    limit: usize,
+    include_archived: bool,
+    search_term: Option<&str>,
+) -> io::Result<SessionSummaryPage> {
+    session_index::list_page(offset, limit, include_archived, search_term)
+}
+
 pub fn list_sessions_with_archived(
     limit: usize,
     include_archived: bool,
 ) -> io::Result<Vec<SessionSummary>> {
-    let mut candidates: Vec<(PathBuf, std::time::SystemTime, bool)> = Vec::new();
-    collect_file_mtimes(&sessions_dir(), false, &mut candidates)?;
-    if include_archived {
-        collect_file_mtimes(&archive_dir(), true, &mut candidates)?;
+    if limit == usize::MAX {
+        session_index::ensure_backfill_complete()?;
     }
-
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
-    candidates.truncate(limit);
-
-    let mut summaries = Vec::with_capacity(candidates.len());
-    for (path, _mtime, archived) in &candidates {
-        if let Ok(summary) = summarize_session_with_archive_flag(path, *archived) {
-            summaries.push(summary);
-        }
-    }
-
-    summaries.sort_by(|a, b| {
-        b.updated_at
-            .cmp(&a.updated_at)
-            .then_with(|| b.created_at.cmp(&a.created_at))
-    });
-    Ok(summaries)
+    Ok(list_session_page(0, limit, include_archived, None)?.sessions)
 }
 
 pub fn load_session(selector: &str) -> io::Result<SessionTranscript> {
@@ -784,41 +785,16 @@ fn push_search_hit(
     }
 }
 
-fn collect_summaries_from_root(
-    root: &Path,
-    archived: bool,
-    summaries: &mut Vec<SessionSummary>,
-) -> io::Result<()> {
-    if !root.exists() {
-        return Ok(());
-    }
-    collect_session_files(root, &mut |path| {
-        if let Ok(summary) = summarize_session_with_archive_flag(path, archived) {
-            summaries.push(summary);
-        }
-    })
-}
-
-fn collect_file_mtimes(
-    root: &Path,
-    archived: bool,
-    out: &mut Vec<(PathBuf, std::time::SystemTime, bool)>,
-) -> io::Result<()> {
-    if !root.exists() {
-        return Ok(());
-    }
-    collect_session_files(root, &mut |path| {
-        if let Ok(metadata) = fs::metadata(path) {
-            let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-            out.push((path.to_path_buf(), mtime, archived));
-        }
-    })
-}
-
 pub(crate) fn find_session_path(
     selector: &str,
     include_archived: bool,
 ) -> io::Result<Option<PathBuf>> {
+    #[cfg(not(test))]
+    if let Ok(Some(path)) = session_index::find_path(selector, include_archived)
+        && path.exists()
+    {
+        return Ok(Some(path));
+    }
     let mut candidates: Vec<PathBuf> = Vec::new();
     collect_matching_paths(&sessions_dir(), selector, &mut candidates)?;
     if include_archived {
@@ -899,7 +875,7 @@ pub(crate) fn archive_dir() -> PathBuf {
     orca_home().join("archive")
 }
 
-fn orca_home() -> PathBuf {
+pub(crate) fn orca_home() -> PathBuf {
     std::env::var_os(ORCA_HOME_ENV)
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
@@ -1004,7 +980,10 @@ impl ThreadStore for JsonlThreadStore {
             ));
         }
         rewrite_records_unlocked(&path, &records)?;
-        summarize_session_with_archive_flag(&path, path.starts_with(archive_dir()))
+        let summary = summarize_session_with_archive_flag(&path, path.starts_with(archive_dir()))?;
+        #[cfg(not(test))]
+        let _ = session_index::upsert_summary(&summary);
+        Ok(summary)
     }
 
     fn read_thread(

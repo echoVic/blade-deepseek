@@ -422,7 +422,7 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
     frame.render_widget(block, area);
 
     let filtered = state.filtered_session_indices();
-    let total = state.session_picker_sessions.len();
+    let loaded = state.session_picker_sessions.len();
 
     let mut lines = Vec::new();
 
@@ -439,13 +439,21 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
         Span::styled("⌕ ", Style::default().fg(theme.border)),
         query_display,
         Span::styled(
-            format!("    {}/{} matches", filtered.len(), total),
+            if state.session_picker_backfill_complete {
+                format!("    {} loaded", filtered.len())
+            } else {
+                format!(
+                    "    {}/{} loaded · indexing history…",
+                    filtered.len(),
+                    loaded
+                )
+            },
             Style::default().fg(theme.muted),
         ),
     ]));
     let hints = match state.session_picker_phase {
         SessionPickerPhase::Browsing => {
-            "↑↓ select · Enter resume · Tab actions · Backspace edit · Esc quit"
+            "↑↓ select · PgUp/PgDn page · Enter resume · Tab actions · Backspace edit · Esc quit"
         }
         SessionPickerPhase::Actions { .. } => "↑↓ select action · Enter choose · Esc sessions",
         SessionPickerPhase::Renaming { .. } => "Enter rename · Esc actions",
@@ -480,9 +488,6 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
     for index in visible_sessions {
         let session = &state.session_picker_sessions[index];
         let selected = index == state.session_picker_selected;
-        if selected {
-            selected_line_offset = lines.len() as u16;
-        }
         let marker = if selected { "> " } else { "  " };
         let base = if selected {
             Style::default()
@@ -510,6 +515,9 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
                 Span::styled("    ", Style::default()),
                 Span::styled(metadata, Style::default().fg(theme.muted)),
             ]));
+        }
+        if selected {
+            selected_line_offset = lines.len() as u16;
         }
     }
 
@@ -583,9 +591,9 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
         }
     }
 
-    let available_height = inner.height;
-    let scroll_offset = if selected_line_offset >= available_height {
-        selected_line_offset - available_height + 2
+    let available_height = inner.height as u16;
+    let scroll_offset = if selected_line_offset + 1 >= available_height {
+        (selected_line_offset + 1).saturating_sub(available_height)
     } else {
         0
     };

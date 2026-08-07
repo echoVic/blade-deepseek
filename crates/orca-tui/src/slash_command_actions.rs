@@ -2,13 +2,12 @@ use crossbeam_channel as mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use orca_core::approval_types::ApprovalMode;
-use orca_core::config::RunConfig;
-use orca_runtime::surface::RuntimeSurfaceHostHandle;
-
 use crate::commands::{self, GoalSlashCommand, SlashCommand, TrustSlashCommand};
+use crate::session_picker_actions::open_session_picker;
 use crate::surface_actions::TuiHostActions;
 use crate::types::{AppState, AppStatus, ChatMessage, TuiMemoryScope, UserAction};
+use orca_core::approval_types::ApprovalMode;
+use orca_core::config::RunConfig;
 
 pub(crate) enum SlashOutcome {
     Continue,
@@ -150,16 +149,11 @@ pub(crate) fn handle_slash_command(
             state.enter_running();
             let _ = action_tx.send(UserAction::Compact);
         }
-        SlashCommand::Resume => match RuntimeSurfaceHostHandle::list_saved_sessions(200) {
-            Ok(sessions) if !sessions.is_empty() => {
-                state.reset_queued_user_messages();
-                state.session_picker_sessions = sessions;
-                state.session_picker_selected = 0;
-                state.session_picker_phase = crate::types::SessionPickerPhase::Browsing;
-                state.session_picker_error = None;
-                state.status = AppStatus::SessionPicker;
+        SlashCommand::Resume => match open_session_picker(state) {
+            Ok(true) => {}
+            Ok(false) => {
+                state.push_message(ChatMessage::System("No saved conversations.".to_string()))
             }
-            Ok(_) => state.push_message(ChatMessage::System("No saved conversations.".to_string())),
             Err(error) => state.push_message(ChatMessage::Error(format!(
                 "failed to list saved conversations: {error}"
             ))),

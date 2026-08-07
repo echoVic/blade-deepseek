@@ -2,6 +2,8 @@ mod live_thread;
 mod local;
 mod pagination;
 mod projection;
+#[cfg_attr(test, allow(dead_code))]
+mod session_index;
 mod types;
 mod writer;
 
@@ -15,13 +17,15 @@ pub(crate) use local::find_session_path;
 pub(crate) use local::sessions_dir;
 pub use local::{
     JsonlThreadStore, SearchHit, SessionStore, archive_session, compress_session, delete_session,
-    list_sessions, list_sessions_with_archived, load_session, rename_session, search_sessions,
+    list_session_page, list_sessions, list_sessions_with_archived, load_session, rename_session,
+    search_sessions,
 };
 pub(crate) use pagination::{page_thread_items, page_thread_turns};
 pub(crate) use projection::{
     conversation_records_to_thread_items, conversation_records_to_thread_turns,
     message_to_thread_json, messages_to_thread_items, messages_to_thread_turns,
 };
+pub use session_index::SessionSummaryPage;
 pub(crate) use types::{ManualCompactionDurableSnapshot, StoredConversationRecord};
 pub use types::{
     SessionMeta, SessionSummary, SessionTranscript, SortDirection, StoredThreadItem,

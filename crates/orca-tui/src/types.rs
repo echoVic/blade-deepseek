@@ -463,6 +463,8 @@ pub enum TuiEvent {
     },
     SavedSessionsUpdated {
         sessions: Vec<SessionSummary>,
+        next_offset: Option<usize>,
+        backfill_complete: bool,
         notice: String,
     },
     SavedSessionActionFailed(String),
@@ -943,6 +945,8 @@ pub struct AppState {
     pub session_picker_query: String,
     pub session_picker_phase: SessionPickerPhase,
     pub session_picker_error: Option<String>,
+    pub session_picker_next_offset: Option<usize>,
+    pub session_picker_backfill_complete: bool,
     pub usage: UsageTotals,
     usage_revision: Option<u64>,
     /// Revision of the typed surface context snapshot last applied. Legacy
@@ -1113,6 +1117,8 @@ impl AppState {
             session_picker_query: String::new(),
             session_picker_phase: SessionPickerPhase::Browsing,
             session_picker_error: None,
+            session_picker_next_offset: None,
+            session_picker_backfill_complete: true,
             usage: UsageTotals::default(),
             usage_revision: None,
             context_revision: None,
@@ -2691,8 +2697,15 @@ impl AppState {
                 )));
                 self.set_status(AppStatus::Idle);
             }
-            TuiEvent::SavedSessionsUpdated { sessions, notice } => {
+            TuiEvent::SavedSessionsUpdated {
+                sessions,
+                next_offset,
+                backfill_complete,
+                notice,
+            } => {
                 self.session_picker_sessions = sessions;
+                self.session_picker_next_offset = next_offset;
+                self.session_picker_backfill_complete = backfill_complete;
                 self.reset_session_selection_to_first_match();
                 self.session_picker_phase = SessionPickerPhase::Browsing;
                 self.session_picker_error = None;
