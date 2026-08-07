@@ -704,6 +704,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/interaction_broker.rs:register:interaction_broker.mutate", 1],
   ["crates/orca-tui/src/interaction_broker.rs:complete:interaction_broker.mutate", 1],
   ["crates/orca-tui/src/operation_controller.rs:shutdown:interaction_broker.mutate", 1],
+  ["crates/orca-tui/src/plan_approval_actions.rs:implement:user_action.route", 1],
   ["crates/orca-tui/src/running_actions.rs:handle_running_shortcut:user_action.route", 2],
   ["crates/orca-tui/src/runtime_event_actions.rs:handle_runtime_event:user_action.route", 1],
   ["crates/orca-tui/src/runtime_event_actions.rs:handle_runtime_event:workflow.continue", 2],
@@ -725,6 +726,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/surface_actions.rs:remember:memory.update", 2],
   ["crates/orca-tui/src/surface_actions.rs:save_api_key:credentials.update", 2],
   ["crates/orca-tui/src/types.rs:commit_queued_submission_admission:input_history.record", 1],
+  ["crates/orca-tui/src/types.rs:update:input_history.record", 1],
   ["crates/orca-tui/src/workflow_notifications.rs:submit_pending_workflow_notification:user_action.route", 1],
   ["crates/orca-tui/src/workflow_panel_actions.rs:handle_workflows_panel_key:user_action.route", 2],
 ]);
@@ -1326,11 +1328,11 @@ function invariantRegistry() {
       },
     ],
     [
-      "closed_inventory.current_tui_user_actions has exactly 32 unique variants matching UserAction at baseline",
+      "closed_inventory.current_tui_user_actions has exactly 33 unique variants matching UserAction at baseline",
       (manifest) => {
         assertCondition(
-          manifest.closed_inventory.current_tui_user_actions.length === 32,
-          "current_tui_user_actions must contain 32 variants",
+          manifest.closed_inventory.current_tui_user_actions.length === 33,
+          "current_tui_user_actions must contain 33 variants",
         );
         assertUnique(
           manifest.closed_inventory.current_tui_user_actions,
