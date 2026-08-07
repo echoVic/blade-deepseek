@@ -476,9 +476,13 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
             .filter(|index| *index == state.session_picker_selected)
             .collect()
     };
+    let mut selected_line_offset: u16 = lines.len() as u16;
     for index in visible_sessions {
         let session = &state.session_picker_sessions[index];
         let selected = index == state.session_picker_selected;
+        if selected {
+            selected_line_offset = lines.len() as u16;
+        }
         let marker = if selected { "> " } else { "  " };
         let base = if selected {
             Style::default()
@@ -579,7 +583,16 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
         }
     }
 
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let available_height = inner.height;
+    let scroll_offset = if selected_line_offset >= available_height {
+        selected_line_offset - available_height + 2
+    } else {
+        0
+    };
+
+    let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_offset, 0));
     frame.render_widget(paragraph, inner);
 }
 
