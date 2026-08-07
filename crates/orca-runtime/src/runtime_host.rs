@@ -74,7 +74,6 @@ use crate::runtime_actor::goal::{
     ActiveGoalControl, GoalBlockingCompletion, GoalOperationController, GoalSurfaceWorkerResult,
     OpenedGoalRuntime, PendingGoalPauseEvent,
 };
-use crate::runtime_pending_interaction::RuntimePendingInteractionStore;
 use crate::runtime_surface as surface;
 use crate::tasks::{DurableTypedProviderOutcome, MainSessionTerminalUpdate, TaskRegistry};
 use crate::thread::RuntimeThread;
@@ -401,7 +400,6 @@ pub struct HostedTurnRequest {
     main_session_task_id: Option<String>,
     root_task_id: Option<String>,
     generation_handler_factory: Option<Arc<HostedGenerationHandlerFactory>>,
-    pending_interactions: Option<RuntimePendingInteractionStore>,
     usage_credit: UsageTotals,
     surface_goal_owned: bool,
     surface_goal_turn: Option<crate::goal_actor::GoalTurnContext>,
@@ -474,7 +472,6 @@ struct GoalContinuationPreflight {
     cancelled: bool,
     disposition: GoalTurnDisposition,
     queued_user_input: bool,
-    pending_interaction: bool,
     active_workflow: bool,
     plan_mode: bool,
     duplicate_admission: bool,
@@ -503,12 +500,6 @@ fn goal_continuation_preflight(
         return Some(reject(
             GoalContinuationRejectCode::QueuedUserInput,
             "goal continuation yielded to queued user input",
-        ));
-    }
-    if input.pending_interaction {
-        return Some(reject(
-            GoalContinuationRejectCode::PendingInteraction,
-            "goal continuation waits for a pending user interaction",
         ));
     }
     if input.active_workflow {
@@ -563,7 +554,6 @@ impl HostedTurnRequest {
             main_session_task_id: None,
             root_task_id: None,
             generation_handler_factory: None,
-            pending_interactions: None,
             usage_credit: UsageTotals::default(),
             surface_goal_owned: false,
             surface_goal_turn: None,
@@ -729,11 +719,11 @@ impl HostedTurnRequest {
         self
     }
 
+    /// Compatibility no-op. Pending interactions are runtime-surface owned.
     pub fn with_pending_interactions(
-        mut self,
-        pending_interactions: RuntimePendingInteractionStore,
+        self,
+        _pending_interactions: crate::runtime_pending_interaction::RuntimePendingInteractionStore,
     ) -> Self {
-        self.pending_interactions = Some(pending_interactions);
         self
     }
 
@@ -35101,11 +35091,6 @@ impl ThreadActor {
                 cancelled: active.generation.cancel.is_cancelled(),
                 disposition,
                 queued_user_input: active.steer_handle.has_pending(),
-                pending_interaction: active
-                    .request
-                    .pending_interactions
-                    .as_ref()
-                    .is_some_and(|pending| !pending.is_empty()),
                 active_workflow: result.state.thread.session().has_active_workflows(),
                 plan_mode: active.config.approval_mode == ApprovalMode::Plan,
                 duplicate_admission: active.goal_admitted_generation == Some(fence),
@@ -48470,7 +48455,6 @@ mod tests {
             cancelled: false,
             disposition: GoalTurnDisposition::Advanced,
             queued_user_input: false,
-            pending_interaction: false,
             active_workflow: false,
             plan_mode: false,
             duplicate_admission: false,
@@ -48482,13 +48466,6 @@ mod tests {
                     ..baseline
                 },
                 GoalContinuationRejectCode::QueuedUserInput,
-            ),
-            (
-                GoalContinuationPreflight {
-                    pending_interaction: true,
-                    ..baseline
-                },
-                GoalContinuationRejectCode::PendingInteraction,
             ),
             (
                 GoalContinuationPreflight {
@@ -48521,7 +48498,6 @@ mod tests {
             cancelled: false,
             disposition: GoalTurnDisposition::Advanced,
             queued_user_input: false,
-            pending_interaction: false,
             active_workflow: false,
             plan_mode: false,
             duplicate_admission: false,

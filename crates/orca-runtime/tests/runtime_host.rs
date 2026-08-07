@@ -4370,7 +4370,7 @@ fn goal_run_rejects_automatic_continuation_in_plan_mode() {
 }
 
 #[test]
-fn goal_run_rejects_continuation_while_interaction_is_pending() {
+fn legacy_goal_pending_store_does_not_block_continuation() {
     with_orca_home(|_home| {
         let executor = Arc::new(ScriptedExecutor::new([TestBehavior::RecordUsage {
             input_tokens: 10,
@@ -4390,7 +4390,7 @@ fn goal_run_rejects_continuation_while_interaction_is_pending() {
             .create(orca_runtime::goal_store::CreateGoalInput {
                 session_id: session_id.clone(),
                 objective: "wait for user input".to_string(),
-                token_budget: None,
+                token_budget: Some(10),
                 now: 1,
             })
             .unwrap();
@@ -4424,12 +4424,13 @@ fn goal_run_rejects_continuation_while_interaction_is_pending() {
         assert_eq!(executor.call_count(), 1);
         assert!(matches!(
             runtime.read(&session_id).unwrap().unwrap().state,
-            orca_core::goal_runtime::GoalState::Paused {
-                reason: orca_core::goal_runtime::GoalPauseReason::User,
-                ..
-            }
+            orca_core::goal_runtime::GoalState::BudgetLimited
         ));
         assert!(observer.events().iter().any(|event| {
+            event.event_type == EventType::GoalContinuationRejected
+                && event.payload["reason"] == "budget_limited"
+        }));
+        assert!(!observer.events().iter().any(|event| {
             event.event_type == EventType::GoalContinuationRejected
                 && event.payload["reason"] == "pending_interaction"
         }));
