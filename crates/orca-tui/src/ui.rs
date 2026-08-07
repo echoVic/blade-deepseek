@@ -900,7 +900,7 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
         let detail_rows = if index == state.workflow_panel.selected {
             workflow_metadata_row_count(task)
                 + workflow_phase_detail_rows(task).len() as u16
-                + task.workflow_agents.len() as u16
+                + workflow_agent_row_count(task)
         } else {
             0
         };
@@ -957,7 +957,12 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
                     .iter()
                     .map(|_| Constraint::Length(1)),
             );
-            row_constraints.extend(task.workflow_agents.iter().map(|_| Constraint::Length(1)));
+            for agent in &task.workflow_agents {
+                row_constraints.push(Constraint::Length(1));
+                if agent.transcript_path.is_some() {
+                    row_constraints.push(Constraint::Length(1));
+                }
+            }
         }
         let parts = Layout::vertical(row_constraints).split(row_area);
 
@@ -995,9 +1000,16 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
                 let line = Paragraph::new(workflow_phase_row_label(phase, theme));
                 frame.render_widget(line, parts[detail_offset + phase_index]);
             }
-            for (agent_index, agent) in task.workflow_agents.iter().enumerate() {
+            let mut agent_row_index = detail_offset + phase_rows.len();
+            for agent in &task.workflow_agents {
                 let line = Paragraph::new(agent_row_label(agent, theme));
-                frame.render_widget(line, parts[detail_offset + phase_rows.len() + agent_index]);
+                frame.render_widget(line, parts[agent_row_index]);
+                agent_row_index += 1;
+                if let Some(path) = agent.transcript_path.as_deref() {
+                    let line = Paragraph::new(agent_transcript_row_label(path, theme));
+                    frame.render_widget(line, parts[agent_row_index]);
+                    agent_row_index += 1;
+                }
             }
         }
     }
@@ -1140,6 +1152,13 @@ fn workflow_metadata_row_count(task: &BackgroundTaskSummary) -> u16 {
             .as_deref()
             .map(task_detail_line_count)
             .unwrap_or_default() as u16
+}
+
+fn workflow_agent_row_count(task: &BackgroundTaskSummary) -> u16 {
+    task.workflow_agents
+        .iter()
+        .map(|agent| 1 + u16::from(agent.transcript_path.is_some()))
+        .sum()
 }
 
 fn workflow_metadata_rows<'a>(task: &BackgroundTaskSummary, theme: &Theme) -> Vec<Line<'a>> {
@@ -1427,6 +1446,13 @@ fn agent_row_label<'a>(agent: &WorkflowAgentTaskSummary, theme: &Theme) -> Line<
         Span::styled(elapsed, Style::default().fg(theme.muted)),
         Span::styled(usage, Style::default().fg(theme.muted)),
         Span::styled(detail, Style::default().fg(theme.error)),
+    ])
+}
+
+fn agent_transcript_row_label<'a>(path: &str, theme: &Theme) -> Line<'a> {
+    Line::from(vec![
+        Span::styled("      full result ", Style::default().fg(theme.muted)),
+        Span::styled(path.to_string(), Style::default().fg(theme.text)),
     ])
 }
 
@@ -3183,6 +3209,7 @@ fn context_cell(state: &AppState, theme: &Theme) -> Span<'static> {
     }
     let used = state.context_used_tokens.min(state.context_limit_tokens);
     let percent = (used * 100) / state.context_limit_tokens;
+    let remaining = state.context_limit_tokens.saturating_sub(used);
     let color = if percent < 50 {
         theme.success
     } else if percent < 80 {
@@ -3191,7 +3218,10 @@ fn context_cell(state: &AppState, theme: &Theme) -> Span<'static> {
         theme.error
     };
     Span::styled(
-        format!("  ·  context {percent}%"),
+        format!(
+            "  ·  context {percent}% · {} left",
+            format_token_count(remaining as u64)
+        ),
         Style::default().fg(color),
     )
 }
@@ -6292,7 +6322,7 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let cell = context_cell(&state, &theme);
         // 25% of the window used -> healthy/green.
-        assert_eq!(cell.content.as_ref(), "  ·  context 25%");
+        assert_eq!(cell.content.as_ref(), "  ·  context 25% · 750 left");
         assert_eq!(cell.style.fg, Some(theme.success));
     }
 
@@ -6303,7 +6333,7 @@ mod tests {
         state.context_used_tokens = 1200; // over-full estimate clamps to 100%
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let cell = context_cell(&state, &theme);
-        assert_eq!(cell.content.as_ref(), "  ·  context 100%");
+        assert_eq!(cell.content.as_ref(), "  ·  context 100% · 0 left");
         assert_eq!(cell.style.fg, Some(theme.error));
     }
 
@@ -6457,22 +6487,22 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
         let wide = status_line(&state, &theme, 180).to_string();
-        assert!(wide.contains("context 25%"));
+        assert!(wide.contains("context 25% · 750 left"));
         assert!(wide.contains("~/Documents/GitHub/blade-deepseek"));
         assert!(wide.contains("git:feature/footer"));
         assert!(wide.contains("8.7k tokens"));
         assert!(wide.contains("F1 shortcuts"));
 
         let medium = status_line(&state, &theme, 92).to_string();
-        assert!(medium.contains("context 25%"));
-        assert!(medium.contains("blade-deepseek"));
+        assert!(medium.contains("context 25% · 750 left"));
+        assert!(medium.contains("blade-d…"), "{medium}");
         assert!(medium.contains("git:feature/footer"));
         assert!(!medium.contains("tokens"));
         assert!(!medium.contains("shortcuts"));
 
         let narrow = status_line(&state, &theme, 46).to_string();
         assert!(narrow.contains("auto-edit"));
-        assert!(narrow.contains("context 25%"));
+        assert!(narrow.contains("context 25% · 750 left"));
         assert!(!narrow.contains("git:"));
         assert!(!narrow.contains("blade-deepseek"));
     }
@@ -6507,7 +6537,7 @@ mod tests {
         assert!(
             status_line(&state, &theme, 100)
                 .to_string()
-                .contains("context 39%")
+                .contains("context 39% · 606.5k left")
         );
     }
 
@@ -6524,7 +6554,7 @@ mod tests {
         let text = status_line(&state, &theme, 46).to_string();
 
         assert!(text.contains("auto-edit"));
-        assert!(text.contains("context 25%"));
+        assert!(text.contains("context 25% · 750 left"));
         assert!(!text.contains("~/workspace"));
         assert!(!text.contains("git:main"));
         assert!(UnicodeWidthStr::width(text.as_str()) <= 46);
@@ -6554,7 +6584,7 @@ mod tests {
 
         let narrow = status_line(&state, &theme, 46).to_string();
         assert!(narrow.contains("auto-edit"));
-        assert!(narrow.contains("context 25%"));
+        assert!(narrow.contains("context 25% · 750 left"));
         assert!(!narrow.contains("tokens"));
         assert!(!narrow.contains("shortcuts"));
 
@@ -7212,6 +7242,8 @@ mod tests {
         assert!(rendered.contains("elapsed 2s"));
         assert!(rendered.contains("150 tok"));
         assert!(rendered.contains("$0.000025"));
+        assert!(rendered.contains("full result"));
+        assert!(rendered.contains("/tmp/agent-1.json"));
         assert!(rendered.contains("run workflow-run-1"));
         assert!(
             rendered

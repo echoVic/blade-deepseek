@@ -23,6 +23,9 @@ use crate::runtime_state::RuntimeTurnReducer;
 use crate::tasks::TaskRegistry;
 use crate::workflow::WorkflowDraftStore;
 
+const DEFAULT_SUBAGENT_STATUS_PAGE_CHARS: usize = 12_000;
+const MAX_SUBAGENT_STATUS_PAGE_CHARS: usize = 32_000;
+
 fn goal_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -36,6 +39,24 @@ struct RuntimePermissionRequestArgs {
     #[serde(default)]
     reason: Option<String>,
     permissions: RequestPermissionProfile,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubagentStatusRequestArgs {
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+struct PagedAsyncSubagentResult {
+    output: Option<Value>,
+    task: Option<Value>,
+    total_chars: Option<usize>,
+    offset: Option<usize>,
+    next_offset: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -441,24 +462,33 @@ impl RuntimeToolActorContext {
         request: &ToolRequest,
         lookup: &dyn RuntimeSubagentStatusLookup,
     ) -> ToolResult {
-        let agent_id =
-            extract_tool_string_field(request, "agent_id").or_else(|| request.target.clone());
+        let args = match parse_subagent_status_request_args(request) {
+            Ok(args) => args,
+            Err(error) => return ToolResult::invalid_input(request, error),
+        };
+        let agent_id = args.agent_id.or_else(|| request.target.clone());
         let Some(agent_id) = agent_id else {
             return ToolResult::invalid_input(request, "missing agent_id");
         };
+        let limit = args.limit.unwrap_or(DEFAULT_SUBAGENT_STATUS_PAGE_CHARS);
+        if limit == 0 || limit > MAX_SUBAGENT_STATUS_PAGE_CHARS {
+            return ToolResult::invalid_input(
+                request,
+                format!("limit must be between 1 and {MAX_SUBAGENT_STATUS_PAGE_CHARS}"),
+            );
+        }
+        let offset = args.offset.unwrap_or_default();
         let Some(record) = lookup.subagent_status_record(&agent_id) else {
             return ToolResult::failed(request, format!("subagent '{agent_id}' not found"), None);
         };
-        let (result_output, result_task) = record
+        let result_page = record
             .output
             .as_deref()
-            .map(unpack_async_subagent_result)
-            .unwrap_or((None, None));
-        let (error_output, error_task) = record
+            .map(|raw| page_async_subagent_result(raw, offset, limit));
+        let error_page = record
             .error
             .as_deref()
-            .map(unpack_async_subagent_result)
-            .unwrap_or((None, None));
+            .map(|raw| page_async_subagent_result(raw, offset, limit));
         let output = json!({
             "agent_id": agent_id,
             "status": record.status,
@@ -467,9 +497,17 @@ impl RuntimeToolActorContext {
             "created_at_ms": record.created_at_ms,
             "started_at_ms": record.started_at_ms,
             "completed_at_ms": record.completed_at_ms,
-            "output": result_output,
-            "error": error_output,
-            "task": result_task.or(error_task),
+            "output": result_page.as_ref().and_then(|page| page.output.clone()),
+            "output_total_chars": result_page.as_ref().and_then(|page| page.total_chars),
+            "output_offset": result_page.as_ref().and_then(|page| page.offset),
+            "output_next_offset": result_page.as_ref().and_then(|page| page.next_offset),
+            "error": error_page.as_ref().and_then(|page| page.output.clone()),
+            "error_total_chars": error_page.as_ref().and_then(|page| page.total_chars),
+            "error_offset": error_page.as_ref().and_then(|page| page.offset),
+            "error_next_offset": error_page.as_ref().and_then(|page| page.next_offset),
+            "task": result_page
+                .and_then(|page| page.task)
+                .or_else(|| error_page.and_then(|page| page.task)),
             "usage": record.usage.map(runtime_usage_totals_json),
             "current_activity": record.subagent_current_activity,
             "turn": record.subagent_turn,
@@ -709,10 +747,11 @@ fn is_terminal_task_status(status: TaskStatus) -> bool {
     )
 }
 
-fn extract_tool_string_field(request: &ToolRequest, field: &str) -> Option<String> {
-    let raw = request.raw_arguments.as_deref()?;
-    let value = serde_json::from_str::<Value>(raw).ok()?;
-    value.get(field).and_then(Value::as_str).map(str::to_string)
+fn parse_subagent_status_request_args(
+    request: &ToolRequest,
+) -> Result<SubagentStatusRequestArgs, String> {
+    serde_json::from_str(request.raw_arguments.as_deref().unwrap_or("{}"))
+        .map_err(|error| format!("arguments are not valid for subagent_status: {error}"))
 }
 
 fn runtime_usage_totals_json(usage: RuntimeUsageTotals) -> Value {
@@ -734,6 +773,37 @@ fn unpack_async_subagent_result(raw: &str) -> (Option<Value>, Option<Value>) {
     };
     let task = value.get("task").cloned().filter(|task| !task.is_null());
     (Some(output.clone()), task)
+}
+
+fn page_async_subagent_result(
+    raw: &str,
+    requested_offset: usize,
+    limit: usize,
+) -> PagedAsyncSubagentResult {
+    let (output, task) = unpack_async_subagent_result(raw);
+    let Some(Value::String(text)) = output else {
+        return PagedAsyncSubagentResult {
+            output,
+            task,
+            total_chars: None,
+            offset: None,
+            next_offset: None,
+        };
+    };
+
+    let total_chars = text.chars().count();
+    let offset = requested_offset.min(total_chars);
+    let page: String = text.chars().skip(offset).take(limit).collect();
+    let next_offset = offset
+        .checked_add(page.chars().count())
+        .filter(|next_offset| *next_offset < total_chars);
+    PagedAsyncSubagentResult {
+        output: Some(Value::String(page)),
+        task,
+        total_chars: Some(total_chars),
+        offset: Some(offset),
+        next_offset,
+    }
 }
 
 fn workflow_draft_script_arg(request: &ToolRequest) -> io::Result<String> {

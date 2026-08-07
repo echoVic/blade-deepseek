@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.8":
+        "Improves long-running and delegated work reliability. The context footer shows remaining tokens; repeated compactions and queued steer input recover without restoring discarded context or losing user intent; asynchronous subagent results are durable and pageable; background task completion is announced proactively; stdio MCP reconnects after transport failures; and concurrent JSONL writers fail before reusing an event-sequence reservation. Workflow runs can enforce a shared tokenBudget, while /skills opens a searchable picker and slash settings reflect committed runtime state.",
       "v0.3.7":
         "Completes session-context and TUI projection reliability. Recorded sessions restore provider prompt occupancy before the first resumed turn; revision-aware projection prevents an older surface snapshot from replacing a newer context footer; reasoning, message, and plan streams preserve their opened order during hydration; and already-streamed completed responses are no longer rendered twice. The delegated execution, transcript locking, retry diagnostics, and task-registry guarantees from v0.3.6 remain included.",
       "v0.3.6":
@@ -572,6 +574,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.8":
+        "增强长会话与委派任务的可靠性。context footer 现在明确显示剩余 token；重复 compaction 与排队中的 steer input 在恢复时不会重新带回已丢弃上下文，也不会丢失用户意图；异步 subagent 结果可持久化并分页读取；后台任务完成后会主动通知；stdio MCP 在传输故障后自动重连；并发 JSONL 写入器会在复用事件序号前失败。Workflow run 可通过共享 tokenBudget 限制总用量，/skills 提供可搜索 picker，斜杠设置也统一读取已提交的 runtime state。",
       "v0.3.7":
         "完成 session context 与 TUI projection reliability 收口。恢复历史会话时会在首个 resumed turn 前还原 provider prompt 占用；revision-aware projection 不会让旧 surface snapshot 覆盖更新的 context footer；reasoning、message、plan stream 在 hydration 时保留打开顺序；已经流式展示的 completed response 不会再渲染一遍。v0.3.6 的 delegated execution、transcript lock、retry diagnostics 与 task registry 保证继续包含在本版本中。",
       "v0.3.6":

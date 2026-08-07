@@ -20,6 +20,8 @@ pub struct WorkflowInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub script_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_from_run_id: Option<String>,
@@ -90,6 +92,26 @@ pub struct WorkflowOutput {
     pub script_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<WorkflowTokenBudget>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowTokenBudget {
+    pub total: u64,
+    pub spent: u64,
+    pub remaining: u64,
+}
+
+impl WorkflowTokenBudget {
+    pub fn from_total_and_spent(total: u64, spent: u64) -> Self {
+        Self {
+            total,
+            spent,
+            remaining: total.saturating_sub(spent),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

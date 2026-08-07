@@ -1,6 +1,8 @@
 use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType, WorkflowTaskProgress};
 use orca_core::tool_types::ToolName;
-use orca_core::workflow_types::{WorkflowInput, WorkflowOutput, WorkflowRunStatus};
+use orca_core::workflow_types::{
+    WorkflowInput, WorkflowOutput, WorkflowRunStatus, WorkflowTokenBudget,
+};
 
 #[test]
 fn workflow_input_accepts_official_fields() {
@@ -12,7 +14,8 @@ fn workflow_input_accepts_official_fields() {
         "args": { "paths": ["src"] },
         "draftId": "workflow-draft-1",
         "scriptPath": "/tmp/workflow.js",
-        "resumeFromRunId": "workflow-run-1"
+        "resumeFromRunId": "workflow-run-1",
+        "tokenBudget": 12345
     }))
     .unwrap();
 
@@ -22,6 +25,7 @@ fn workflow_input_accepts_official_fields() {
     assert_eq!(input.draft_id.as_deref(), Some("workflow-draft-1"));
     assert_eq!(input.script_path.as_deref(), Some("/tmp/workflow.js"));
     assert_eq!(input.resume_from_run_id.as_deref(), Some("workflow-run-1"));
+    assert_eq!(input.token_budget, Some(12_345));
 }
 
 #[test]
@@ -36,6 +40,11 @@ fn workflow_output_serializes_claude_compatible_shape() {
         transcript_dir: Some("/tmp/transcripts".to_string()),
         script_path: Some("/tmp/script.js".to_string()),
         session_url: None,
+        budget: Some(WorkflowTokenBudget {
+            total: 12_345,
+            spent: 2_345,
+            remaining: 10_000,
+        }),
     };
 
     let value = serde_json::to_value(output).unwrap();
@@ -45,6 +54,9 @@ fn workflow_output_serializes_claude_compatible_shape() {
     assert_eq!(value["workflowName"], "audit");
     assert_eq!(value["runId"], "workflow-run-1");
     assert_eq!(value["scriptPath"], "/tmp/script.js");
+    assert_eq!(value["budget"]["total"], 12_345);
+    assert_eq!(value["budget"]["spent"], 2_345);
+    assert_eq!(value["budget"]["remaining"], 10_000);
     assert!(value.get("sessionUrl").is_none());
 }
 

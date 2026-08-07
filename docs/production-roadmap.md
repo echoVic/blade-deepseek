@@ -3,12 +3,17 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-08-06
-Current baseline: v0.3.7 adds explicit delegation-policy inheritance,
-cross-process transcript write serialization, durable retry and truncation
-diagnostics, context restoration with revision-safe TUI projection, ordered
-assistant stream replay, and full task-registry publication before session
-completion on headless and interactive surfaces on top of the native Windows x64 and ARM64 support across the
+Last updated: 2026-08-07
+Current baseline: v0.3.8 adds remaining-context visibility, one-to-one
+compaction replay, pending-steer recovery, durable paged subagent results,
+proactive background-task completion notices, stdio MCP reconnect, stale
+JSONL event-sequence writer rejection, and run-level workflow token budgets.
+It also adds the searchable `/skills` picker and makes slash settings read the
+committed runtime state. These changes build on v0.3.7's explicit
+delegation-policy inheritance, cross-process transcript write serialization,
+durable retry and truncation diagnostics, revision-safe TUI projection,
+ordered assistant stream replay, and full task-registry publication before
+session completion on headless and interactive surfaces, plus native Windows x64 and ARM64 support across the
 CLI, TUI, shell sessions, sandboxing, update flow, persistence, npm packages,
 release archives, and CI. Shell resolution preserves PowerShell 7, Windows
 PowerShell, cmd.exe, and explicit Git Bash dialects. PowerShell 7 is discovered

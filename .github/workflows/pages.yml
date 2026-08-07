@@ -21,7 +21,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  release-gate:
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.gate.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: gate
+        name: Wait for the advertised GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version="$(sed -nE 's/^export const releaseVersion = "([^"]+)";$/\1/p' site/src/shared.ts)"
+          test -n "$version"
+          if gh release view "$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "GitHub Release $version is not published yet; defer Pages deployment."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    if: needs.release-gate.outputs.ready == 'true'
+    needs: release-gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

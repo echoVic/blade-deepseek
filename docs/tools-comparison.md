@@ -2,7 +2,7 @@
 
 **初版日期**: 2026-06-22
 **Goal 控制面复核**: 2026-07-18
-**Orca 当前版本**: v0.2.46
+**Orca 当前版本**: v0.3.8
 **对比对象**:
 
 - Claude Code (`@anthropic-ai/claude-code`)
@@ -14,7 +14,7 @@
 
 ## 执行摘要
 
-v0.3.5 基线下，Orca 的工具系统已经从早期的硬编码分发，升级为"规格驱动"的注册表模型。每个工具都有统一的 `ToolSpec`，包含名称、别名、JSON Schema、能力集合、展示方式、可见性和并发安全信息。运行时审批、TUI 展示、provider tool schema、MCP 工具与 resources/resource templates、external tools、skills 工具、持久 goal 工具和结构化用户输入都围绕同一套规格工作。实时 app-server 与持久化 thread projection 现在共享 MCP tool 解析、JSON 参数解析、MCP started/completed item builder、dynamic started/completed item builder、MCP result shaping、camelCase tool error helper、exit-code 错误归一化和 completed 状态检查，降低 `mcpToolCall` / `dynamicToolCall` item schema drift；实时 app-server 的 `agent_message`、`plan`、`reasoning`、`commandExecution`、`fileChange` 和 `workflow` lifecycle item 也改由共享 projection builder 构造，持久化 history 的 `commandExecution` 与 `fileChange` 投影也复用同一边界，TUI runtime event projection、runtime approval 和 user-input handlers，以及 tool approval gate 都已从 `bridge` 抽到专门模块，继续把 Codex/package 3 风格 item schema、runtime-to-surface 映射、approval request 构造、preview 生成和交互等待逻辑收束到明确边界；tag-driven Release workflow 会串行运行 Rust test harness，降低 server-heavy contract 在 Linux release runner 上的进程干扰；历史投影还保留失败 commandExecution 不写入聚合输出的回归守卫。stdio MCP 测试 fixture 现在通过 `/bin/sh` 启动临时脚本，避免 Linux release runner 偶发 `Text file busy` 阻断发布。后台 turn 测试在轮询活跃 shared writer 时也会忽略尾部半行 JSONL，避免 CI-only 竞态污染 release gate。实时 item error 仍会在工具完成事件提供 `exit_code` 时携带 `exitCode`。MCP clients 现在会缓存 initialize 结果里的 resources capability；all-server resources/templates 发现会跳过未声明资源能力的 tools-only server，同时显式 server 查询仍然直接调用目标 server 并返回真实错误。MCP resources/templates 的 all-server 发现结果也会同时携带 registry 级启动错误和按 server 聚合的 list 失败，避免失败 MCP server 在模型上下文里静默消失。工具参数执行前校验现在覆盖常见 object keyword、enum、array item 以及 `oneOf` / `anyOf` 组合分支，减少模型看到的 schema 与 runtime 实际拒绝行为之间的偏差；生命周期 hooks 的结构化 JSON stdout 也会校验声明的 `action` 和必需字符串字段，避免拼写错误被静默当作上下文注入。
+v0.3.8 基线下，Orca 的工具系统已经从早期的硬编码分发，升级为"规格驱动"的注册表模型。每个工具都有统一的 `ToolSpec`，包含名称、别名、JSON Schema、能力集合、展示方式、可见性和并发安全信息。运行时审批、TUI 展示、provider tool schema、MCP 工具与 resources/resource templates、external tools、skills 工具、持久 goal 工具和结构化用户输入都围绕同一套规格工作。实时 app-server 与持久化 thread projection 现在共享 MCP tool 解析、JSON 参数解析、MCP started/completed item builder、dynamic started/completed item builder、MCP result shaping、camelCase tool error helper、exit-code 错误归一化和 completed 状态检查，降低 `mcpToolCall` / `dynamicToolCall` item schema drift；实时 app-server 的 `agent_message`、`plan`、`reasoning`、`commandExecution`、`fileChange` 和 `workflow` lifecycle item 也改由共享 projection builder 构造，持久化 history 的 `commandExecution` 与 `fileChange` 投影也复用同一边界，TUI runtime event projection、runtime approval 和 user-input handlers，以及 tool approval gate 都已从 `bridge` 抽到专门模块，继续把 Codex/package 3 风格 item schema、runtime-to-surface 映射、approval request 构造、preview 生成和交互等待逻辑收束到明确边界；tag-driven Release workflow 会串行运行 Rust test harness，降低 server-heavy contract 在 Linux release runner 上的进程干扰；历史投影还保留失败 commandExecution 不写入聚合输出的回归守卫。stdio MCP 测试 fixture 现在通过 `/bin/sh` 启动临时脚本，避免 Linux release runner 偶发 `Text file busy` 阻断发布。后台 turn 测试在轮询活跃 shared writer 时也会忽略尾部半行 JSONL，避免 CI-only 竞态污染 release gate。实时 item error 仍会在工具完成事件提供 `exit_code` 时携带 `exitCode`。MCP clients 现在会缓存 initialize 结果里的 resources capability；all-server resources/templates 发现会跳过未声明资源能力的 tools-only server，同时显式 server 查询仍然直接调用目标 server 并返回真实错误。MCP resources/templates 的 all-server 发现结果也会同时携带 registry 级启动错误和按 server 聚合的 list 失败，避免失败 MCP server 在模型上下文里静默消失。工具参数执行前校验现在覆盖常见 object keyword、enum、array item 以及 `oneOf` / `anyOf` 组合分支，减少模型看到的 schema 与 runtime 实际拒绝行为之间的偏差；生命周期 hooks 的结构化 JSON stdout 也会校验声明的 `action` 和必需字符串字段，避免拼写错误被静默当作上下文注入。
 
 这次变化的核心目标是接近 Codex CLI 的工具系统思路：工具不是散落在 prompt、审批和执行器里的字符串列表，而是一个可以解析、过滤、授权、渲染和扩展的统一能力表。v0.3.5 将结构化澄清统一为 TUI `ask_user_question` answer loop，让模型既能显式加载可复用流程，也能在交互式会话中提出结构化问题。
 
@@ -140,6 +140,7 @@ session、live extension context 或 GoalStore I/O 失败属于控制面错误�
 Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 
 - `list_skills` / `read_skill` 可发现和读取 `$ORCA_HOME/skills`、`~/.orca/skills` 和项目 `.orca/skills` 下的 Markdown skills。
+- TUI `/skills` 会打开可搜索的 `$` picker；选择后的 `$skill_id` 作为原子 composer token 处理，退格或删除不会留下半个 skill 引用。
 - 当 prompt 明确提到 `$skill_id` 时，Orca 会把对应 `SKILL.md` 注入当轮模型上下文。
 - `ask_user_question` 是唯一注册且模型可见的澄清工具：单次接受 1-4 个问题，每题需要短 header、问题正文和 2-4 个 `label`/`description` 选项，可附 `preview` 并用 `multiSelect` 标记多选。runtime 逐题生成唯一 interaction id，经现有 broker 等待 composer 答案，最后返回 `answers` JSON；任一题取消会取消整次工具调用。
 - headless 路径确定性失败而不阻塞。TUI 允许输入选项标签或自定义文本；多选答案以逗号分隔，preview 会随选项正文展示。
@@ -160,12 +161,17 @@ Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 
 | 能力 | 当前差距 | 建议优先级 |
 |------|----------|------------|
-| Shell 后台任务 | `bash` 仍是同步阻塞执行 | P1 |
 | Bash 超时/PTY/session | 还没有 Codex CLI 风格的 `exec_command` + `write_stdin` 会话模型 | P1 |
 | 图片/PDF/Notebook 读取 | `read_file` 仍以 UTF-8 文本为主 | P2 |
-| Worktree 隔离 | 还没有自动 enter/exit worktree 工具 | P1 |
-| 异步 subagent | 当前子代理是同步模式 | P1 |
 | apply_patch freeform | 仍以 JSON `edit` / `write_file` 为主 | P2 |
+
+## 可靠性保证
+
+- 历史恢复会按顺序重放压缩记录；相同消息计数的多次压缩只消费各自对应的一份摘要，避免恢复后上下文重新膨胀。
+- 异步 subagent 结果持久保存，`subagent_status` 通过 `offset` / `limit` 分页返回完整结果，并显式给出下一页游标。
+- 后台主会话、shell、subagent 和 workflow 的状态都进入任务列表；后台任务完成、失败、取消或等待审批时，TUI 会主动提示，完成结果可从任务详情查看。
+- stdio MCP 在超时、连接关闭或管道失败后会重建 transport、重新初始化并同步工具；后续请求不需要重启 Orca。
+- JSONL 会话记录逐条使用跨进程文件锁写入；事件序号区间也在锁内比较当前持久游标，旧游标写入会显式失败，不会生成重叠序号流。
 
 ---
 
@@ -180,9 +186,7 @@ Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 ### 中期
 
 1. 支持图片/PDF/Notebook 读取。
-2. 支持 worktree 隔离工具。
-3. 支持异步 subagent 和结果查询。
-4. 将 `apply_patch` 做成 grammar-backed freeform tool。
+2. 将 `apply_patch` 做成 grammar-backed freeform tool。
 
 ### 长期
 

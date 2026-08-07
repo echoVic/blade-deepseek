@@ -2297,6 +2297,76 @@ mod tests {
     }
 
     #[test]
+    fn subagent_status_pages_persisted_result_output() {
+        let mut context = RuntimeToolActorContext::new("test-run", DEFAULT_MAX_TURNS);
+        let registry = TaskRegistry::new("session-status-page".to_string());
+        let task = registry.create_subagent("inspect large output".to_string(), None);
+        registry
+            .complete(&task.id, "0123456789".to_string())
+            .unwrap();
+        let request = tool_types::ToolRequest {
+            id: "status-page".to_string(),
+            name: tool_types::ToolName::SubagentStatus,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({
+                    "agent_id": task.id,
+                    "offset": 4,
+                    "limit": 3,
+                })
+                .to_string(),
+            ),
+        };
+
+        let result = context.execute_subagent_status_tool(&request, &registry);
+
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        let payload: serde_json::Value =
+            serde_json::from_str(result.output.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["output"], "456");
+        assert_eq!(payload["output_total_chars"], 10);
+        assert_eq!(payload["output_offset"], 4);
+        assert_eq!(payload["output_next_offset"], 7);
+    }
+
+    #[test]
+    fn subagent_status_rejects_invalid_result_page_size() {
+        let mut context = RuntimeToolActorContext::new("test-run", DEFAULT_MAX_TURNS);
+        let registry = TaskRegistry::new("session-status-page-limit".to_string());
+        let task = registry.create_subagent("inspect output".to_string(), None);
+        registry.complete(&task.id, "result".to_string()).unwrap();
+        let request = tool_types::ToolRequest {
+            id: "status-page-limit".to_string(),
+            name: tool_types::ToolName::SubagentStatus,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({
+                    "agent_id": task.id,
+                    "limit": 0,
+                })
+                .to_string(),
+            ),
+        };
+
+        let result = context.execute_subagent_status_tool(&request, &registry);
+
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert_eq!(
+            result.terminal().kind,
+            tool_types::ToolResultKind::InvalidInput
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("between 1 and 32000")
+        );
+    }
+
+    #[test]
     fn readonly_batch_respects_parallel_limit() {
         let mut config = config(SubagentConfig::default());
         config.tools.max_read_parallel = 2;

@@ -2005,6 +2005,69 @@ fn actor_owned_steer_is_operation_fenced_and_drained_once() {
 }
 
 #[test]
+fn cancelled_generation_persists_unconsumed_steer_input() {
+    let first_gate = ManualGate::new();
+    let second_gate = ManualGate::new();
+    let executor = Arc::new(ScriptedExecutor::new([
+        TestBehavior::WaitForReleaseWithoutDrainingSteer {
+            gate: first_gate.clone(),
+            status: RunStatus::Cancelled,
+        },
+        TestBehavior::WaitForRelease {
+            gate: second_gate.clone(),
+            status: RunStatus::Success,
+        },
+    ]));
+    let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
+
+    let operation = thread
+        .start_turn(HostedTurnRequest::new("first"), io::sink())
+        .expect("start first turn");
+    first_gate.wait_until_entered();
+    assert!(matches!(
+        operation.steer("preserve this input").expect("queue steer"),
+        SteerOperationResult::Accepted { .. }
+    ));
+    assert_eq!(
+        operation.interrupt().expect("interrupt first turn"),
+        InterruptOperationResult::Requested {
+            generation: operation.initial_generation(),
+        }
+    );
+    assert_eq!(
+        operation.resume().expect("queue resume"),
+        ResumeOperationResult::Queued {
+            generation: operation.initial_generation(),
+        }
+    );
+    first_gate.release();
+    second_gate.wait_until_entered();
+
+    second_gate.release();
+    operation
+        .wait_timeout(TEST_TIMEOUT)
+        .expect("finish operation");
+    let snapshot = thread.snapshot().expect("read completed snapshot");
+    assert_eq!(
+        snapshot
+            .messages()
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::User { content, .. } if content == "preserve this input")
+            })
+            .count(),
+        1
+    );
+    assert!(
+        executor
+            .steer_inputs()
+            .iter()
+            .all(|inputs| inputs.is_empty())
+    );
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
 fn shutdown_joins_current_generation_without_starting_queued_resume() {
     let gate = CancelJoinGate::new();
     let executor = Arc::new(ScriptedExecutor::new([

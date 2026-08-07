@@ -109,8 +109,7 @@ fn background_task_notice_from_event(event: &TuiEvent) -> Option<String> {
     let TuiEvent::WorkflowTaskUpdated { task } = event else {
         return None;
     };
-    if task.task_type != TaskType::MainSession
-        || !task.is_backgrounded
+    if !task.is_backgrounded
         || !matches!(
             task.status,
             TaskStatus::Completed
@@ -122,17 +121,25 @@ fn background_task_notice_from_event(event: &TuiEvent) -> Option<String> {
     {
         return None;
     }
+    let subject = if task.task_type == TaskType::MainSession {
+        "Background session".to_string()
+    } else {
+        format!("Background task '{}'", task.description)
+    };
     Some(match task.status {
         TaskStatus::ApprovalRequired => match task.tool.as_deref() {
             Some(tool) => {
-                format!("Background session needs approval for {tool} before it can continue.")
+                format!("{subject} needs approval for {tool} before it can continue.")
             }
-            None => "Background session needs approval before it can continue.".to_string(),
+            None => format!("{subject} needs approval before it can continue."),
         },
-        TaskStatus::Completed => "Background session completed: success".to_string(),
-        TaskStatus::Failed => "Background session completed: failed".to_string(),
-        TaskStatus::Stopped => "Background session completed: stopped".to_string(),
-        TaskStatus::Cancelled => "Background session completed: cancelled".to_string(),
+        TaskStatus::Completed if task.result.is_some() => {
+            format!("{subject} completed: success. Result is ready.")
+        }
+        TaskStatus::Completed => format!("{subject} completed: success"),
+        TaskStatus::Failed => format!("{subject} completed: failed"),
+        TaskStatus::Stopped => format!("{subject} completed: stopped"),
+        TaskStatus::Cancelled => format!("{subject} completed: cancelled"),
         TaskStatus::Queued | TaskStatus::Running | TaskStatus::Paused | TaskStatus::Stopping => {
             unreachable!("non-terminal task status")
         }
@@ -152,8 +159,56 @@ mod tests {
 
     use orca_core::event_schema::{EventFactory, RunStatus};
     use orca_core::event_sink::observe_event;
+    use orca_core::task_types::BackgroundTaskSummary;
 
     use super::*;
+
+    fn background_task(task_type: TaskType, status: TaskStatus) -> BackgroundTaskSummary {
+        BackgroundTaskSummary {
+            id: "task-1".to_string(),
+            task_type,
+            status,
+            is_backgrounded: true,
+            description: "RDAP lookup".to_string(),
+            created_at_ms: 1,
+            started_at_ms: Some(2),
+            completed_at_ms: Some(3),
+            command: None,
+            agent_type: None,
+            server: None,
+            tool: Some("bash".to_string()),
+            pending_tool_call: None,
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: Some(3),
+            result: Some("domain is available".to_string()),
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+        }
+    }
+
+    #[test]
+    fn background_shell_completion_generates_a_result_notice() {
+        let task = background_task(TaskType::Shell, TaskStatus::Completed);
+        let notice = background_task_notice_from_event(&TuiEvent::WorkflowTaskUpdated { task });
+
+        assert_eq!(
+            notice.as_deref(),
+            Some("Background task 'RDAP lookup' completed: success. Result is ready.")
+        );
+    }
 
     #[test]
     fn hosted_observer_defers_terminal_until_operation_cleanup_finishes() {
