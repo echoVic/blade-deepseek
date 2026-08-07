@@ -125,15 +125,17 @@ pub(crate) fn handle_runtime_event(
         vim_state.reset_insert(textarea, theme);
         *textarea = make_textarea_with_text("", vim_state, theme);
     }
-    if workflow_notification_turn_boundary {
-        drain_pending_workflow_notifications(state, pending_workflow_notifications);
-        if dispatch_next_queued_user_message(state, action_tx) == QueuedDispatch::None
-            && !state.queued_follow_up_pending_or_in_flight()
-        {
-            submit_pending_workflow_notification(state, action_tx, false);
+    if state.plan_approval_dialog.is_none() {
+        if workflow_notification_turn_boundary {
+            drain_pending_workflow_notifications(state, pending_workflow_notifications);
+            if dispatch_next_queued_user_message(state, action_tx) == QueuedDispatch::None
+                && !state.queued_follow_up_pending_or_in_flight()
+            {
+                submit_pending_workflow_notification(state, action_tx, false);
+            }
+        } else if !state.queued_follow_up_pending_or_in_flight() {
+            submit_pending_workflow_notification(state, action_tx, true);
         }
-    } else if !state.queued_follow_up_pending_or_in_flight() {
-        submit_pending_workflow_notification(state, action_tx, true);
     }
     if state.status != initial_status {
         vim_state.flush_pending_insert_escape(textarea);

@@ -257,9 +257,11 @@ fn format_status(state: &AppState) -> String {
     let context = if state.context_limit_tokens == 0 {
         "-".to_string()
     } else {
+        let used = state.context_used_tokens.min(state.context_limit_tokens);
+        let remaining = state.context_limit_tokens.saturating_sub(used);
         format!(
-            "{} / {}",
-            state.context_used_tokens, state.context_limit_tokens
+            "{remaining} remaining / {} total",
+            state.context_limit_tokens,
         )
     };
     let active_tasks = state
@@ -477,7 +479,7 @@ mod tests {
             "deepseek-v4-pro",
             "plan",
             "/tmp/project",
-            "250 / 1000",
+            "750 remaining / 1000 total",
             "100 input, 50 output, 25 cache",
             "$0.125000",
             "recoverable: yes",

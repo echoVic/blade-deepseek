@@ -86,11 +86,13 @@ impl Message {
 }
 
 pub const RUNTIME_CONTEXT_FRAGMENT_ID: &str = "runtime";
+pub const MODE_CONTEXT_FRAGMENT_ID: &str = "mode";
 pub const GOAL_CONTEXT_FRAGMENT_ID: &str = "goal";
 pub const PLAN_CONTEXT_FRAGMENT_ID: &str = "plan";
 pub const SKILL_CONTEXT_FRAGMENT_ID: &str = "skill";
 
 pub const RUNTIME_CONTEXT_MAX_TOKENS: usize = 1_024;
+pub const MODE_CONTEXT_MAX_TOKENS: usize = 2_048;
 pub const GOAL_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const PLAN_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const SKILL_CONTEXT_MAX_TOKENS: usize = 4_096;
@@ -297,6 +299,18 @@ impl Conversation {
                 .filter(|text| !text.trim().is_empty())
                 .map(|text| format!("[Runtime context]\n{text}")),
             RUNTIME_CONTEXT_MAX_TOKENS,
+        );
+    }
+
+    pub fn replace_mode_context(&mut self, content: Option<String>) {
+        self.replace_internal_context(
+            MODE_CONTEXT_FRAGMENT_ID,
+            InternalContextKind::Runtime,
+            InternalContextOrigin::System,
+            content
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| format!("[Mode context]\n{text}")),
+            MODE_CONTEXT_MAX_TOKENS,
         );
     }
 
@@ -602,6 +616,40 @@ mod tests {
             conv.internal_context
                 .get(SKILL_CONTEXT_FRAGMENT_ID)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn replace_mode_context_is_independent_from_runtime_context() {
+        let mut conv = Conversation::new();
+        conv.replace_runtime_context(Some("resume hint".to_string()));
+        conv.replace_mode_context(Some("plan instructions".to_string()));
+
+        assert!(
+            conv.internal_context
+                .get(RUNTIME_CONTEXT_FRAGMENT_ID)
+                .unwrap()
+                .content
+                .contains("resume hint")
+        );
+        assert!(
+            conv.internal_context
+                .get(MODE_CONTEXT_FRAGMENT_ID)
+                .unwrap()
+                .content
+                .contains("plan instructions")
+        );
+
+        conv.replace_mode_context(None);
+        assert!(
+            conv.internal_context
+                .get(MODE_CONTEXT_FRAGMENT_ID)
+                .is_none()
+        );
+        assert!(
+            conv.internal_context
+                .get(RUNTIME_CONTEXT_FRAGMENT_ID)
+                .is_some()
         );
     }
 

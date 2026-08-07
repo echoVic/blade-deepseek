@@ -76,8 +76,10 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.9":
+        "Upgrades Plan mode from a permission-only gate to a full plan-then-execute workflow. The agent now performs read-only exploration, emits a formal proposed plan, and presents a bottom-anchored approval dialog. Approving restores the previous mode and executes the plan automatically; rejecting stays in Plan for further iteration. Per-turn mode context injection ensures Plan constraints apply immediately when switching modes mid-session. PageUp/PageDown and scroll review long plans inline.",
       "v0.3.8":
-        "Improves long-running and delegated work reliability. The context footer shows remaining tokens; repeated compactions and queued steer input recover without restoring discarded context or losing user intent; asynchronous subagent results are durable and pageable; background task completion is announced proactively; stdio MCP reconnects after transport failures; and concurrent JSONL writers fail before reusing an event-sequence reservation. Workflow runs can enforce a shared tokenBudget, while /skills opens a searchable picker and slash settings reflect committed runtime state.",
+        "Improves long-running and delegated work reliability. The context footer shows the remaining percentage, while /status reports remaining and total token counts; repeated compactions and queued steer input recover without restoring discarded context or losing user intent; asynchronous subagent results are durable and pageable; background task completion is announced proactively; stdio MCP reconnects after transport failures; and concurrent JSONL writers fail before reusing an event-sequence reservation. Workflow runs can enforce a shared tokenBudget, while /skills opens a searchable picker and slash settings reflect committed runtime state.",
       "v0.3.7":
         "Completes session-context and TUI projection reliability. Recorded sessions restore provider prompt occupancy before the first resumed turn; revision-aware projection prevents an older surface snapshot from replacing a newer context footer; reasoning, message, and plan streams preserve their opened order during hydration; and already-streamed completed responses are no longer rendered twice. The delegated execution, transcript locking, retry diagnostics, and task-registry guarantees from v0.3.6 remain included.",
       "v0.3.6":
@@ -85,7 +87,7 @@ const copy = {
       "v0.3.5":
         "Adds one canonical ask_user_question tool for one to four structured questions, with described choices, previews, multi-select answers, custom responses, and cancellation through the runtime-owned TUI interaction broker. Goal mode now starts provider work correctly in optimized builds, /workflows remains available during foreground turns, and unknown slash commands are rejected instead of reaching the model. Terminal-Bench now reports the mounted binary version, preserves JSONL trajectories for Harbor without extending its closed AgentContext model, documents supported filters, and keeps generated benchmark artifacts out of Git.",
       "v0.3.4":
-        "Fixes the context meter and compaction policy for large model windows. The TUI now shows provider-reported prompt usage as a used percentage of the full context window instead of displaying an estimate against the old 96k compaction budget. Automatic compaction now triggers at 80% of the model window, keeps a 90% hard safety ceiling, and retains a fixed recent-context budget of about 48k tokens before summarizing older history. New sessions now default to sandboxed auto-edit; suggest, full-auto, and plan remain available explicitly. Existing absolute compaction overrides remain compatible.",
+        "Fixes the context meter and compaction policy for large model windows. The TUI now derives the remaining percentage of the full context window from provider-reported prompt usage instead of displaying an estimate against the old 96k compaction budget. Automatic compaction now triggers at 80% of the model window, keeps a 90% hard safety ceiling, and retains a fixed recent-context budget of about 48k tokens before summarizing older history. New sessions now default to sandboxed auto-edit; suggest, full-auto, and plan remain available explicitly. Existing absolute compaction overrides remain compatible.",
       "v0.3.3":
         "Closes the Orca runtime and architecture audit. Goal persistence and terminal replies now settle in order without blocking Tokio actors, operation cancellation owns spawned task trees, and session switch, fork, rename, and stale-event handling are transactionally fenced. Runtime surfaces use an explicit facade, tool schemas are provider-neutral, root MCP ownership lives in RuntimeHost, and transcript streaming, reflow, search, deduplication, usage, and projection state now have bounded or revision-checked behavior.",
       "v0.3.2":
@@ -574,8 +576,10 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.9":
+        "Plan 模式从纯权限开关升级为正式的 plan-then-execute 工作流。Agent 在 Plan 模式下进行只读探索，完成后输出正式 proposed plan，底部弹出审批栏。批准后自动恢复进入 Plan 前的模式并执行计划；拒绝则留在 Plan 继续修改。每回合注入 mode context 确保 mid-session 切换模式即时生效。PageUp/PageDown 和滚轮可回看长计划。",
       "v0.3.8":
-        "增强长会话与委派任务的可靠性。context footer 现在明确显示剩余 token；重复 compaction 与排队中的 steer input 在恢复时不会重新带回已丢弃上下文，也不会丢失用户意图；异步 subagent 结果可持久化并分页读取；后台任务完成后会主动通知；stdio MCP 在传输故障后自动重连；并发 JSONL 写入器会在复用事件序号前失败。Workflow run 可通过共享 tokenBudget 限制总用量，/skills 提供可搜索 picker，斜杠设置也统一读取已提交的 runtime state。",
+        "增强长会话与委派任务的可靠性。context footer 现在只显示剩余百分比，/status 提供剩余与总 token 数；重复 compaction 与排队中的 steer input 在恢复时不会重新带回已丢弃上下文，也不会丢失用户意图；异步 subagent 结果可持久化并分页读取；后台任务完成后会主动通知；stdio MCP 在传输故障后自动重连；并发 JSONL 写入器会在复用事件序号前失败。Workflow run 可通过共享 tokenBudget 限制总用量，/skills 提供可搜索 picker，斜杠设置也统一读取已提交的 runtime state。",
       "v0.3.7":
         "完成 session context 与 TUI projection reliability 收口。恢复历史会话时会在首个 resumed turn 前还原 provider prompt 占用；revision-aware projection 不会让旧 surface snapshot 覆盖更新的 context footer；reasoning、message、plan stream 在 hydration 时保留打开顺序；已经流式展示的 completed response 不会再渲染一遍。v0.3.6 的 delegated execution、transcript lock、retry diagnostics 与 task registry 保证继续包含在本版本中。",
       "v0.3.6":
@@ -583,7 +587,7 @@ const copy = {
       "v0.3.5":
         "新增唯一规范名称 ask_user_question，一次可提出 1-4 个结构化问题，支持带说明的选项、preview、多选、自定义答案和取消，并复用 runtime-owned TUI 交互 broker。修复优化构建中 Goal mode 未发起 provider 调用、前台任务期间 /workflows 不可用，以及未知斜杠命令被错误发送给模型的问题。Terminal-Bench 现在从挂载二进制读取版本，在不扩展 Harbor 封闭 AgentContext 模型的前提下保留 JSONL trajectory，使用受支持的过滤参数，并阻止生成的 benchmark 产物进入 Git。",
       "v0.3.4":
-        "修复大模型窗口下的 context 指示器与自动压缩策略。TUI 现在展示 provider 回报的真实 prompt token 占完整模型窗口的已用百分比，不再拿本地估算值对照旧的 96k 压缩预算。自动压缩默认在模型窗口 80% 时触发，以 90% 作为硬安全线，并固定保留约 48k token 的近期上下文后总结更早历史。新会话现在默认使用沙箱内自主执行的 auto-edit；suggest、full-auto 和 plan 仍可显式选择。现有绝对压缩阈值覆盖仍保持兼容。",
+        "修复大模型窗口下的 context 指示器与自动压缩策略。TUI 现在根据 provider 回报的真实 prompt token 计算完整模型窗口的剩余百分比，不再拿本地估算值对照旧的 96k 压缩预算。自动压缩默认在模型窗口 80% 时触发，以 90% 作为硬安全线，并固定保留约 48k token 的近期上下文后总结更早历史。新会话现在默认使用沙箱内自主执行的 auto-edit；suggest、full-auto 和 plan 仍可显式选择。现有绝对压缩阈值覆盖仍保持兼容。",
       "v0.3.3":
         "完成 Orca runtime 与架构审计整改。Goal 持久化和 terminal reply 现在按顺序结算且不会阻塞 Tokio actor，operation 取消会收拢其创建的任务树；session 切换、fork、rename 与陈旧事件都受事务和 attachment fence 约束。Runtime surface 改为显式 facade，tool schema 与 provider 解耦，根 MCP 生命周期归 RuntimeHost 所有；transcript streaming、reflow、search、去重、usage 与 projection state 也具备有界或 revision 校验语义。",
       "v0.3.2":

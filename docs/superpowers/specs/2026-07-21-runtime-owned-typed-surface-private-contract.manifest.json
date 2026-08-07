@@ -229,6 +229,7 @@
       "Submit",
       "SubmitWithMentions",
       "SubmitQueued",
+      "ImplementApprovedPlan",
       "SubmitWorkflowNotification",
       "RunWorkflow",
       "SetModel",
@@ -4072,6 +4073,31 @@
       "MutationReply<AdmissionOutput>+OperationWaiter",
       "queued lifecycle consumes typed admission and terminal by id",
       "remove_tui_queued_admission_mirror"
+    ],
+    [
+      "ImplementApprovedPlan",
+      "current",
+      [
+        "crates/orca-tui/src/types.rs",
+        "crates/orca-tui/src/plan_approval_actions.rs",
+        "crates/orca-tui/src/app.rs"
+      ],
+      "runtime_mutation",
+      "UserAction::ImplementApprovedPlan{prompt,approval_mode}",
+      "UpdateRuntimeSettings(SetApprovalMode)+ReserveOperation+AdmitReserved",
+      "UpdateRuntimeSettings(SetApprovalMode)+ReserveOperation+AdmitReserved",
+      [
+        "UpdateRuntimeSettings",
+        "SubmitOperation",
+        "ControlBoundOperation"
+      ],
+      [
+        "SettingsRevision",
+        "SurfaceOperationFence"
+      ],
+      "MutationReply<SettingsSnapshot>+MutationReply<AdmissionOutput>+OperationWaiter",
+      "plan approval resumes execution only after the mode update commits",
+      "remove split settings-and-submit plan approval path"
     ],
     [
       "SubmitWorkflowNotification",

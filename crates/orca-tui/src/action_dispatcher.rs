@@ -187,6 +187,7 @@ fn route_action(
                 &action,
                 UserAction::Submit(_)
                     | UserAction::SubmitWithMentions { .. }
+                    | UserAction::ImplementApprovedPlan { .. }
                     | UserAction::SubmitWorkflowNotification(_)
                     | UserAction::Compact
                     | UserAction::ResumeOperation { .. }
@@ -256,6 +257,9 @@ fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
                 prompt,
                 message,
             });
+        }
+        UserAction::ImplementApprovedPlan { .. } => {
+            let _ = event_tx.try_send(TuiEvent::OperationRejected(message));
         }
         UserAction::NewSession
         | UserAction::ForkCurrentSession { .. }

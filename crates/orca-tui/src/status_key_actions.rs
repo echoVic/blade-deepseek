@@ -10,6 +10,7 @@ use orca_runtime::history::SessionTranscript;
 
 use crate::approval_dialog_actions::handle_approval_dialog_key;
 use crate::idle_key_actions::handle_idle_key;
+use crate::plan_approval_actions::handle_plan_approval_key;
 use crate::queued_input_actions::handle_running_key;
 use crate::running_actions::handle_running_shortcut;
 use crate::session_picker_actions::handle_session_picker_key;
@@ -70,6 +71,12 @@ where
     if state.status == AppStatus::WaitingApproval {
         vim_state.cancel_pending_command();
         handle_approval_dialog_key(key, state, action_tx);
+        return Ok(StatusKeyFlow::Continue);
+    }
+
+    if state.status == AppStatus::Idle && state.plan_approval_dialog.is_some() {
+        vim_state.cancel_pending_command();
+        handle_plan_approval_key(key, state, action_tx);
         return Ok(StatusKeyFlow::Continue);
     }
 

@@ -170,7 +170,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/cost", "Show session cost"),
         ("/config show", "Show merged config"),
         ("/mode", "Switch approval mode"),
-        ("/plan", "Toggle plan mode"),
+        ("/plan", "Plan first, then approve implementation"),
         ("/goal", "Manage a persistent goal"),
         ("/workflow:<name>", "Run a saved workflow"),
         ("/workflows", "Show workflow tasks"),

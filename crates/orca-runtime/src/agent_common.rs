@@ -10,6 +10,26 @@ use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
 use crate::system_prompt::build_system_prompt;
 
+const PLAN_MODE_INSTRUCTIONS: &str = r#"## Plan Mode
+You are in read-only planning mode. Your job is to investigate the request and produce an implementation-ready plan for user approval before any execution begins.
+
+- Explore the codebase and gather enough evidence to identify the relevant files, existing patterns, constraints, and verification steps.
+- Use only read-only operations. You must not modify files or attempt edits, writes, configuration changes, commits, or other mutations. Do not call a mutation tool just to discover that it is denied.
+- Ask focused clarification questions when a decision materially affects the implementation. If the plan is not ready, continue investigating or ask the question without emitting a proposed plan.
+- When the plan is complete, emit exactly one `<proposed_plan>` block. The block must contain the full plan in Markdown, including the intended behavior, concrete implementation steps with file paths, important reuse points or tradeoffs, and verification.
+- Do not put preliminary notes, tool logs, or incomplete checklists inside `<proposed_plan>`.
+- Do not ask whether to proceed in prose. After a complete `<proposed_plan>` is emitted, the client will present the approval controls.
+
+Example final shape:
+<proposed_plan>
+# Plan
+1. ...
+2. ...
+
+## Verification
+- ...
+</proposed_plan>"#;
+
 pub fn build_agent_system_prompt(
     cwd: &Path,
     subagent_depth: u32,
@@ -57,15 +77,18 @@ pub fn build_agent_system_prompt_with_goal(
         }
     }
     if approval_mode == ApprovalMode::Plan {
-        prompt.push_str(
-            "\n\n## Plan Mode\nYou are in read-only planning mode. You may analyze and inspect context, but you must not modify files, run shell commands, or perform write actions.",
-        );
+        prompt.push_str("\n\n");
+        prompt.push_str(PLAN_MODE_INSTRUCTIONS);
     }
     if let Some(goal) = active_goal {
         prompt.push_str("\n\n");
         prompt.push_str(&format_goal_mode_instructions(goal));
     }
     prompt
+}
+
+pub fn mode_context(approval_mode: ApprovalMode) -> Option<String> {
+    (approval_mode == ApprovalMode::Plan).then(|| PLAN_MODE_INSTRUCTIONS.to_string())
 }
 
 pub fn explicit_skill_context(cwd: &Path, prompt: &str) -> Option<String> {
@@ -188,6 +211,25 @@ pub fn requires_approval(action: ActionKind) -> bool {
 mod tests {
     use super::*;
     use orca_core::goal_types::{ThreadGoal, ThreadGoalStatus};
+
+    #[test]
+    fn plan_mode_requires_one_complete_proposed_plan_and_no_execution_prompt() {
+        let cwd = tempfile::tempdir().unwrap();
+        let prompt = build_agent_system_prompt(
+            cwd.path(),
+            0,
+            &SubagentType::General,
+            None,
+            ApprovalMode::Plan,
+            None,
+        );
+
+        assert!(prompt.contains("read-only planning mode"));
+        assert!(prompt.contains("must not modify files"));
+        assert!(prompt.contains("exactly one `<proposed_plan>` block"));
+        assert!(prompt.contains("Do not ask whether to proceed in prose"));
+        assert!(prompt.contains("concrete implementation steps with file paths"));
+    }
 
     #[test]
     fn goal_mode_instructions_name_objective_and_update_tool() {

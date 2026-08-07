@@ -8445,6 +8445,39 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     }
                 }
             }
+            Ok(UserAction::ImplementApprovedPlan {
+                prompt,
+                approval_mode,
+            }) => {
+                let settings_applied = apply_hosted_settings_action(
+                    thread.as_ref(),
+                    &config,
+                    &event_tx,
+                    vec![
+                        orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode {
+                            mode: surface_approval_mode(approval_mode),
+                        },
+                    ],
+                );
+                if settings_applied {
+                    let _ = event_tx.send(TuiEvent::PlanImplementationStarted {
+                        prompt: prompt.clone(),
+                    });
+                    handle_hosted_submitted_turn(
+                        SubmittedTurn::user(prompt),
+                        &config,
+                        &preloaded,
+                        &mut thread,
+                        &event_tx,
+                        &control,
+                        &pending_workflow_notifications,
+                        &host,
+                        &ordinary_turn_runner,
+                    );
+                } else {
+                    control.cancel_surface_activation();
+                }
+            }
             Ok(UserAction::Submit(prompt)) => handle_hosted_submitted_turn(
                 SubmittedTurn::user(prompt),
                 &config,
@@ -9848,24 +9881,30 @@ fn settings_intent_patches(
     if let Some(mode) = intent.approval_mode {
         patches.push(
             orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode {
-                mode: match mode {
-                    orca_core::approval_types::ApprovalMode::Suggest => {
-                        orca_runtime::surface::SurfaceApprovalMode::Suggest
-                    }
-                    orca_core::approval_types::ApprovalMode::AutoEdit => {
-                        orca_runtime::surface::SurfaceApprovalMode::AutoEdit
-                    }
-                    orca_core::approval_types::ApprovalMode::FullAuto => {
-                        orca_runtime::surface::SurfaceApprovalMode::FullAuto
-                    }
-                    orca_core::approval_types::ApprovalMode::Plan => {
-                        orca_runtime::surface::SurfaceApprovalMode::Plan
-                    }
-                },
+                mode: surface_approval_mode(mode),
             },
         );
     }
     patches
+}
+
+fn surface_approval_mode(
+    mode: orca_core::approval_types::ApprovalMode,
+) -> orca_runtime::surface::SurfaceApprovalMode {
+    match mode {
+        orca_core::approval_types::ApprovalMode::Suggest => {
+            orca_runtime::surface::SurfaceApprovalMode::Suggest
+        }
+        orca_core::approval_types::ApprovalMode::AutoEdit => {
+            orca_runtime::surface::SurfaceApprovalMode::AutoEdit
+        }
+        orca_core::approval_types::ApprovalMode::FullAuto => {
+            orca_runtime::surface::SurfaceApprovalMode::FullAuto
+        }
+        orca_core::approval_types::ApprovalMode::Plan => {
+            orca_runtime::surface::SurfaceApprovalMode::Plan
+        }
+    }
 }
 
 fn apply_hosted_settings_action(
@@ -9873,21 +9912,21 @@ fn apply_hosted_settings_action(
     config: &Arc<Mutex<RunConfig>>,
     event_tx: &mpsc::Sender<TuiEvent>,
     patches: Vec<orca_runtime::surface::RuntimeSettingsPatch>,
-) {
+) -> bool {
     if patches.is_empty() {
-        return;
+        return false;
     }
     if let Some(thread) = thread {
         let patches = match orca_runtime::surface::NonEmptyVec::try_new(patches) {
             Ok(patches) => patches,
-            Err(_) => return,
+            Err(_) => return false,
         };
         let actions = TuiSurfaceActions::new(thread.typed_surface());
         let settings = match actions.update_settings(patches) {
             Ok(settings) => settings,
             Err(error) => {
                 let _ = event_tx.send(TuiEvent::OperationRejected(error.to_string()));
-                return;
+                return false;
             }
         };
         let model = settings.effective.model.as_str().to_string();
@@ -9905,7 +9944,7 @@ fn apply_hosted_settings_action(
                 let _ = event_tx.send(TuiEvent::OperationRejected(
                     "runtime returned an unsupported reasoning effort".to_string(),
                 ));
-                return;
+                return false;
             }
         };
         let approval_mode = match settings.effective.approval_mode {
@@ -9932,7 +9971,7 @@ fn apply_hosted_settings_action(
             reasoning_effort,
             approval_mode,
         });
-        return;
+        return true;
     }
 
     let mut cfg = config
@@ -9983,4 +10022,5 @@ fn apply_hosted_settings_action(
         reasoning_effort: cfg.reasoning_effort,
         approval_mode: cfg.approval_mode,
     });
+    true
 }

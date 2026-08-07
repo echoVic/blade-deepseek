@@ -233,6 +233,14 @@ pub(crate) fn handle_scroll_lines(state: &mut AppState, lines: i32, now: Instant
 
     // The wheel drives whichever list currently has focus: the session
     // picker, an open popup menu, the workflows panel — or the transcript.
+    if state.plan_approval_dialog.is_some() {
+        if upward {
+            state.scroll_up(steps);
+        } else {
+            state.scroll_down(steps);
+        }
+        return;
+    }
     if state.status == AppStatus::SessionPicker {
         if state.session_picker_phase != SessionPickerPhase::Browsing {
             return;
@@ -367,6 +375,20 @@ pub(crate) fn handle_mouse_event(
         MouseEventKind::Down(MouseButton::Left) => {
             const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
             state.drag_edge_scroll = None;
+
+            if state.plan_approval_dialog.is_some() {
+                state.selection = None;
+                if let Some(index) =
+                    crate::ui::plan_approval_option_hit_index(state, mouse.column, mouse.row)
+                    && let Some(dialog) = state.plan_approval_dialog.as_mut()
+                {
+                    if dialog.selected == index {
+                        return MouseFlow::SyntheticEnter;
+                    }
+                    dialog.selected = index;
+                }
+                return MouseFlow::Handled;
+            }
 
             // Modal approval dialog: clicks select options, a click on the
             // already-selected option confirms it, anywhere else is inert.
@@ -610,7 +632,8 @@ mod tests {
     use crate::theme::Theme;
     use crate::transcript_view::TranscriptRenderContext;
     use crate::types::{
-        AppState, AppStatus, ApprovalDialog, ApprovalOption, ChatMessage, UserAction,
+        AppState, AppStatus, ApprovalDialog, ApprovalOption, ChatMessage, PlanApprovalDialog,
+        UserAction,
     };
 
     /// Test shim: most cases don't care about the composer, so route the real
@@ -1170,6 +1193,44 @@ mod tests {
                     40,
                     first_option_row + 2
                 ),
+                &mut state,
+                now,
+            ),
+            MouseFlow::SyntheticEnter
+        );
+    }
+
+    #[test]
+    fn plan_approval_clicks_select_then_confirm() {
+        let mut state = state_with_transcript();
+        state.frame_area = Some(Rect::new(0, 0, 100, 30));
+        state.plan_approval_dialog = Some(PlanApprovalDialog {
+            plan: "- inspect\n- implement".to_string(),
+            selected: 0,
+        });
+        let now = Instant::now();
+        let second_row = (0..30)
+            .find(|row| crate::ui::plan_approval_option_hit_index(&state, 50, *row) == Some(1))
+            .expect("second plan option should be hittable");
+
+        assert_eq!(
+            handle_mouse_event(
+                &mouse_at(MouseEventKind::Down(MouseButton::Left), 50, second_row),
+                &mut state,
+                now,
+            ),
+            MouseFlow::Handled
+        );
+        assert_eq!(
+            state
+                .plan_approval_dialog
+                .as_ref()
+                .map(|dialog| dialog.selected),
+            Some(1)
+        );
+        assert_eq!(
+            handle_mouse_event(
+                &mouse_at(MouseEventKind::Down(MouseButton::Left), 50, second_row),
                 &mut state,
                 now,
             ),

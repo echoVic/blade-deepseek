@@ -391,6 +391,9 @@ impl<'a> ThreadTurnContext<'a> {
         if let Some(writer) = parts.writer.as_deref_mut() {
             writer.enter_turn(request.turn_id().clone());
         }
+        parts
+            .conversation
+            .replace_mode_context(agent_common::mode_context(config.approval_mode));
         if request.prompt_placement() != ThreadTurnPromptPlacement::ExistingTurn {
             parts
                 .conversation
@@ -1581,6 +1584,53 @@ mod tests {
                 assert_eq!(event["seq"], sequence);
                 assert_eq!(event["run_id"], events[0]["run_id"]);
             }
+        });
+    }
+
+    #[test]
+    fn root_turn_refreshes_plan_mode_context_after_runtime_mode_changes() {
+        with_orca_home(|_| {
+            let mut config = config(SubagentConfig::default());
+            config.history_mode = HistoryMode::Disabled;
+            let mut thread = RuntimeThread::start(&config, "dynamic plan context").expect("thread");
+
+            config.approval_mode = ApprovalMode::Plan;
+            thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("inspect the implementation"),
+                    Vec::new(),
+                )
+                .expect("plan turn");
+            let plan_context = thread
+                .session()
+                .conversation()
+                .internal_context
+                .get(orca_core::conversation::MODE_CONTEXT_FRAGMENT_ID)
+                .expect("plan mode context");
+            assert!(plan_context.content.contains("[Mode context]"));
+            assert!(
+                plan_context
+                    .content
+                    .contains("exactly one `<proposed_plan>` block")
+            );
+
+            config.approval_mode = ApprovalMode::AutoEdit;
+            thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("implement the approved plan"),
+                    Vec::new(),
+                )
+                .expect("implementation turn");
+            assert!(
+                thread
+                    .session()
+                    .conversation()
+                    .internal_context
+                    .get(orca_core::conversation::MODE_CONTEXT_FRAGMENT_ID)
+                    .is_none()
+            );
         });
     }
 

@@ -509,6 +509,9 @@ pub enum TuiEvent {
         reasoning_effort: orca_core::config::ReasoningEffort,
         approval_mode: ApprovalMode,
     },
+    PlanImplementationStarted {
+        prompt: String,
+    },
     GoalUpdated(ThreadGoal),
     GoalCleared,
     GoalStatus(Option<ThreadGoal>),
@@ -557,6 +560,10 @@ pub enum UserAction {
         id: u64,
         prompt: String,
         bindings: MentionBindings,
+    },
+    ImplementApprovedPlan {
+        prompt: String,
+        approval_mode: ApprovalMode,
     },
     SubmitWorkflowNotification(PendingWorkflowNotification),
     RunWorkflow {
@@ -673,6 +680,12 @@ pub enum ChatMessage {
     },
     Error(String),
     System(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanApprovalDialog {
+    pub plan: String,
+    pub selected: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -898,6 +911,7 @@ pub struct AppState {
     pub model_name: String,
     pub reasoning_effort: orca_core::config::ReasoningEffort,
     pub approval_mode: ApprovalMode,
+    pub pre_plan_approval_mode: Option<ApprovalMode>,
     pub cwd: String,
     pub current_session_id: Option<String>,
     pub current_session_title: Option<String>,
@@ -906,6 +920,7 @@ pub struct AppState {
     #[allow(dead_code)]
     pub event_tx: mpsc::Sender<UserAction>,
     pub approval_dialog: Option<ApprovalDialog>,
+    pub plan_approval_dialog: Option<PlanApprovalDialog>,
     pub pending_input: Option<PendingTuiInput>,
     /// Tool / "tool\u{0}target" keys the user chose to always allow this
     /// session. Checked when a new approval arrives so the dialog is skipped.
@@ -1069,6 +1084,7 @@ impl AppState {
             model_name,
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             approval_mode: ApprovalMode::default(),
+            pre_plan_approval_mode: None,
             cwd,
             current_session_id: None,
             current_session_title: None,
@@ -1076,6 +1092,7 @@ impl AppState {
             workspace_git: None,
             event_tx,
             approval_dialog: None,
+            plan_approval_dialog: None,
             pending_input: None,
             approval_allowlist: std::collections::HashSet::new(),
             setup_step: 0,
@@ -1879,6 +1896,8 @@ impl AppState {
         self.mention = MentionPopupState::default();
         self.mention_bindings.clear();
         self.atomic_skill_tokens.clear();
+        self.plan_approval_dialog = None;
+        self.pre_plan_approval_mode = None;
         self.pending_pastes.clear();
         self.reset_history_navigation();
         self.last_ctrl_c = None;
@@ -2037,6 +2056,7 @@ impl AppState {
     }
 
     pub fn enter_running(&mut self) {
+        self.plan_approval_dialog = None;
         if self.running_started_at.is_none() {
             self.running_started_at = Some(Instant::now());
         }
@@ -3173,6 +3193,14 @@ impl AppState {
                 reasoning_effort,
                 approval_mode,
             } => {
+                let previous_mode = self.approval_mode;
+                if approval_mode == ApprovalMode::Plan && previous_mode != ApprovalMode::Plan {
+                    self.pre_plan_approval_mode = Some(previous_mode);
+                } else if approval_mode != ApprovalMode::Plan && previous_mode == ApprovalMode::Plan
+                {
+                    self.pre_plan_approval_mode = None;
+                    self.plan_approval_dialog = None;
+                }
                 self.model_name = model;
                 self.reasoning_effort = reasoning_effort;
                 self.approval_mode = approval_mode;
@@ -3182,6 +3210,12 @@ impl AppState {
                     self.reasoning_effort.as_str(),
                     self.approval_mode.as_str()
                 )));
+            }
+            TuiEvent::PlanImplementationStarted { prompt } => {
+                self.record_prompt(prompt.clone());
+                self.push_message(ChatMessage::User(prompt));
+                self.enter_running();
+                self.scroll_to_bottom();
             }
             TuiEvent::SessionCompleted { status } => {
                 self.recoverable_operation_id = None;
@@ -3195,6 +3229,11 @@ impl AppState {
                 self.finish_assistant_stream();
                 self.promote_trailing_reasoning();
                 self.archive_current_plan();
+                let proposed_plan = (status == "success"
+                    && self.approval_mode == ApprovalMode::Plan
+                    && !was_backgrounded)
+                    .then(|| self.current_turn_proposed_plan())
+                    .flatten();
                 if was_backgrounded {
                     self.push_message(ChatMessage::System(format!(
                         "Background session completed: {status}"
@@ -3202,6 +3241,10 @@ impl AppState {
                 }
                 self.finalize_turn();
                 self.set_status(AppStatus::Idle);
+                if let Some(plan) = proposed_plan {
+                    self.plan_approval_dialog = Some(PlanApprovalDialog { plan, selected: 0 });
+                    self.suspend_queued_follow_up_autosend();
+                }
                 self.last_completed_at = Some(Instant::now());
                 self.scroll_to_bottom();
             }
@@ -3443,6 +3486,18 @@ impl AppState {
         } else {
             self.push_message(ChatMessage::ProposedPlan(text));
         }
+    }
+
+    fn current_turn_proposed_plan(&self) -> Option<String> {
+        self.messages
+            .get(self.finalized_count.min(self.messages.len())..)
+            .into_iter()
+            .flatten()
+            .rev()
+            .find_map(|message| match message {
+                ChatMessage::ProposedPlan(plan) if !plan.trim().is_empty() => Some(plan.clone()),
+                _ => None,
+            })
     }
 
     /// Move the live plan out of the bottom panel and into the scrollback as an archived
@@ -5049,6 +5104,87 @@ mod tests {
         // After completion every message is frozen.
         assert_eq!(state.finalized_count, state.messages.len());
         assert!(state.finalized_count > 0);
+        assert!(
+            state.plan_approval_dialog.is_none(),
+            "update_plan is a task checklist, not a proposed plan"
+        );
+    }
+
+    #[test]
+    fn successful_plan_turn_opens_approval_only_for_current_proposed_plan() {
+        let mut state = state();
+        state.approval_mode = ApprovalMode::Plan;
+        state.pre_plan_approval_mode = Some(ApprovalMode::AutoEdit);
+        state.enter_running();
+        state.update(TuiEvent::MessageDelta(
+            "<proposed_plan>\n# Plan\n1. Inspect\n2. Implement\n</proposed_plan>".to_string(),
+        ));
+
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+
+        let dialog = state
+            .plan_approval_dialog
+            .as_ref()
+            .expect("completed proposed plan should request approval");
+        assert!(dialog.plan.contains("# Plan"));
+        assert_eq!(dialog.selected, 0);
+        assert_eq!(state.status, AppStatus::Idle);
+        assert!(!state.queued_follow_up_autosend);
+
+        state.plan_approval_dialog = None;
+        state.resume_queued_follow_up_autosend();
+        state.enter_running();
+        state.update(TuiEvent::MessageDelta(
+            "A clarification is still needed.".to_string(),
+        ));
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+        assert!(
+            state.plan_approval_dialog.is_none(),
+            "a historical plan must not reopen approval"
+        );
+    }
+
+    #[test]
+    fn proposed_plan_outside_plan_mode_or_failed_turn_does_not_open_approval() {
+        for (mode, status) in [
+            (ApprovalMode::AutoEdit, "success"),
+            (ApprovalMode::Plan, "failed"),
+        ] {
+            let mut state = state();
+            state.approval_mode = mode;
+            state.enter_running();
+            state.update(TuiEvent::MessageDelta(
+                "<proposed_plan>\n- inspect\n</proposed_plan>".to_string(),
+            ));
+            state.update(TuiEvent::SessionCompleted {
+                status: status.to_string(),
+            });
+            assert!(state.plan_approval_dialog.is_none(), "{mode:?} {status}");
+        }
+    }
+
+    #[test]
+    fn settings_transition_remembers_and_restores_pre_plan_mode() {
+        let mut state = state();
+        state.approval_mode = ApprovalMode::FullAuto;
+
+        state.update(TuiEvent::SettingsUpdated {
+            model: "model".to_string(),
+            reasoning_effort: orca_core::config::ReasoningEffort::High,
+            approval_mode: ApprovalMode::Plan,
+        });
+        assert_eq!(state.pre_plan_approval_mode, Some(ApprovalMode::FullAuto));
+
+        state.update(TuiEvent::SettingsUpdated {
+            model: "model".to_string(),
+            reasoning_effort: orca_core::config::ReasoningEffort::High,
+            approval_mode: ApprovalMode::FullAuto,
+        });
+        assert_eq!(state.pre_plan_approval_mode, None);
     }
 
     #[test]

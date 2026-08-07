@@ -275,6 +275,11 @@ where
         };
     }
 
+    if state.plan_approval_dialog.is_some() {
+        vim_state.cancel_pending_command();
+        return Ok(KeyEventFlow::Unhandled);
+    }
+
     if handle_transcript_search_key(key, state) == SearchKeyFlow::Handled {
         vim_state.cancel_pending_command();
         return Ok(KeyEventFlow::Continue);

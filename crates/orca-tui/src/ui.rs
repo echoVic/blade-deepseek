@@ -132,6 +132,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         render_approval_dialog(frame, state, theme);
     }
 
+    if state.status == AppStatus::Idle && state.plan_approval_dialog.is_some() {
+        render_plan_approval_dialog(frame, state, theme);
+    }
+
     if state.status == AppStatus::Idle && state.recovery_prompt_visible {
         render_recovery_prompt(frame, state, theme);
     }
@@ -254,7 +258,7 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn composer_visible(state: &AppState) -> bool {
-    !matches!(state.status, AppStatus::WaitingApproval)
+    !matches!(state.status, AppStatus::WaitingApproval) && state.plan_approval_dialog.is_none()
 }
 
 fn main_composer_hardware_cursor_visible(state: &AppState) -> bool {
@@ -263,6 +267,7 @@ fn main_composer_hardware_cursor_visible(state: &AppState) -> bool {
 
 fn search_visible(state: &AppState) -> bool {
     state.transcript_search.open
+        && state.plan_approval_dialog.is_none()
         && state.panel_mode == PanelMode::Conversation
         && matches!(
             state.status,
@@ -2279,7 +2284,9 @@ fn render_search_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         None,
         None,
         theme,
-        !state.show_shortcuts && state.status != AppStatus::WaitingApproval,
+        !state.show_shortcuts
+            && state.status != AppStatus::WaitingApproval
+            && state.plan_approval_dialog.is_none(),
     );
 }
 
@@ -3199,29 +3206,26 @@ fn format_elapsed_compact(elapsed_secs: u64) -> String {
     format!("{hours}h {minutes:02}m {seconds:02}s")
 }
 
-/// Used context as a percentage of the full model window (100% = window full).
+/// Remaining context as a percentage of the full model window (100% = empty).
 /// Fed by the provider-reported prompt tokens once a turn completes; a fresh
-/// session reads low. Pure local observability — never sent upstream, so it
+/// session reads high. Pure local observability — never sent upstream, so it
 /// cannot affect DeepSeek's prefix cache. Hidden until a real budget is known.
 fn context_cell(state: &AppState, theme: &Theme) -> Span<'static> {
     if state.context_limit_tokens == 0 {
         return Span::raw("");
     }
     let used = state.context_used_tokens.min(state.context_limit_tokens);
-    let percent = (used * 100) / state.context_limit_tokens;
     let remaining = state.context_limit_tokens.saturating_sub(used);
-    let color = if percent < 50 {
+    let percent = (remaining * 100) / state.context_limit_tokens;
+    let color = if percent > 50 {
         theme.success
-    } else if percent < 80 {
+    } else if percent > 20 {
         theme.warning
     } else {
         theme.error
     };
     Span::styled(
-        format!(
-            "  ·  context {percent}% · {} left",
-            format_token_count(remaining as u64)
-        ),
+        format!("  ·  context {percent}%"),
         Style::default().fg(color),
     )
 }
@@ -3559,6 +3563,92 @@ fn mention_status_text(
         SearchPhase::Incomplete { .. } => Some(("Search incomplete".to_string(), Color::Red)),
         SearchPhase::Stopping => Some(("Stopping search…".to_string(), Color::DarkGray)),
     }
+}
+
+fn plan_approval_popup(area: Rect) -> Rect {
+    let width = 78u16.min(area.width.saturating_sub(4));
+    let height = 8u16.min(area.height.saturating_sub(2));
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.bottom().saturating_sub(height + 1),
+        width,
+        height,
+    )
+}
+
+pub(crate) fn plan_approval_option_hit_index(
+    state: &AppState,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    state.plan_approval_dialog.as_ref()?;
+    let popup = plan_approval_popup(state.frame_area?);
+    if column <= popup.x || column + 1 >= popup.right() {
+        return None;
+    }
+    let first_option_row = popup.y + 3;
+    let index = row.checked_sub(first_option_row)? as usize;
+    (index < 2).then_some(index)
+}
+
+fn render_plan_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
+    let Some(dialog) = state.plan_approval_dialog.as_ref() else {
+        return;
+    };
+    let popup = plan_approval_popup(frame.area());
+    frame.render_widget(Clear, popup);
+
+    let target_mode = state.pre_plan_approval_mode.unwrap_or_default().as_str();
+    let options = [
+        (
+            "Yes, implement this plan",
+            format!("Switch to {target_mode} and start coding."),
+        ),
+        (
+            "No, stay in Plan mode",
+            "Continue planning with feedback.".to_string(),
+        ),
+    ];
+    let inner_width = popup.width.saturating_sub(4) as usize;
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "  The plan is ready. Choose whether to start implementation.",
+            Style::default().fg(theme.text),
+        )),
+        Line::from(""),
+    ];
+    for (index, (label, description)) in options.into_iter().enumerate() {
+        let selected = index == dialog.selected;
+        let marker = if selected { "▸ " } else { "  " };
+        let label_style = if selected {
+            Style::default()
+                .fg(theme.plan_mode)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        let prefix = format!("{marker}{}. {label}", index + 1);
+        let description_width = inner_width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+        lines.push(Line::from(vec![
+            Span::styled(prefix, label_style),
+            Span::styled(
+                truncate_to_display_width(&format!("  {description}"), description_width),
+                Style::default().fg(theme.muted),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  ↑↓ select · Enter confirm · PgUp/PgDn review plan · Esc stay in Plan mode",
+        Style::default().fg(theme.muted),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Implement this plan? ")
+        .border_style(Style::default().fg(theme.plan_mode));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// Shared layout for the approval dialog, used by the renderer and the mouse
@@ -4466,8 +4556,8 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
 mod tests {
     use super::*;
     use crate::types::{
-        SlashMenu, SlashMenuItem, SurfaceProjectionState, TuiEvent, TuiInteractionKey,
-        TuiInteractionKind,
+        PlanApprovalDialog, SlashMenu, SlashMenuItem, SurfaceProjectionState, TuiEvent,
+        TuiInteractionKey, TuiInteractionKind,
     };
     use chrono::Utc;
     use crossbeam_channel as mpsc;
@@ -5798,6 +5888,32 @@ mod tests {
     }
 
     #[test]
+    fn completed_plan_renders_implementation_prompt_without_composer() {
+        let mut state = test_state();
+        state.approval_mode = ApprovalMode::Plan;
+        state.pre_plan_approval_mode = Some(ApprovalMode::AutoEdit);
+        state.plan_approval_dialog = Some(PlanApprovalDialog {
+            plan: "# Plan\n1. Inspect\n2. Implement".to_string(),
+            selected: 0,
+        });
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("Implement this plan?"));
+        assert!(rendered.contains("Yes, implement this plan"));
+        assert!(rendered.contains("Switch to auto-edit and start coding."));
+        assert!(rendered.contains("No, stay in Plan mode"));
+        assert!(!rendered.contains("Input"));
+    }
+
+    #[test]
     fn waiting_approval_renders_numeric_shortcuts_in_semantic_order() {
         let mut state = test_state();
         state.update(TuiEvent::ApprovalNeeded {
@@ -6315,14 +6431,26 @@ mod tests {
     }
 
     #[test]
-    fn context_cell_shows_used_percentage() {
+    fn context_cell_starts_at_full_remaining_capacity() {
+        let mut state = test_state();
+        state.context_limit_tokens = 1_000_000;
+        state.context_used_tokens = 0;
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let cell = context_cell(&state, &theme);
+
+        assert_eq!(cell.content.as_ref(), "  ·  context 100%");
+        assert_eq!(cell.style.fg, Some(theme.success));
+    }
+
+    #[test]
+    fn context_cell_shows_remaining_percentage() {
         let mut state = test_state();
         state.context_limit_tokens = 1000;
         state.context_used_tokens = 250;
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let cell = context_cell(&state, &theme);
-        // 25% of the window used -> healthy/green.
-        assert_eq!(cell.content.as_ref(), "  ·  context 25% · 750 left");
+        // 25% of the window used means 75% remains.
+        assert_eq!(cell.content.as_ref(), "  ·  context 75%");
         assert_eq!(cell.style.fg, Some(theme.success));
     }
 
@@ -6330,25 +6458,25 @@ mod tests {
     fn context_cell_clamps_used_at_full_window() {
         let mut state = test_state();
         state.context_limit_tokens = 1000;
-        state.context_used_tokens = 1200; // over-full estimate clamps to 100%
+        state.context_used_tokens = 1200; // over-full estimate clamps to 0% remaining
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let cell = context_cell(&state, &theme);
-        assert_eq!(cell.content.as_ref(), "  ·  context 100% · 0 left");
+        assert_eq!(cell.content.as_ref(), "  ·  context 0%");
         assert_eq!(cell.style.fg, Some(theme.error));
     }
 
     #[test]
-    fn context_cell_warns_then_errors_as_window_fills() {
+    fn context_cell_warns_then_errors_as_remaining_context_shrinks() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
         let mut warn = test_state();
         warn.context_limit_tokens = 1000;
-        warn.context_used_tokens = 700; // 70% used
+        warn.context_used_tokens = 700; // 30% remains
         assert_eq!(context_cell(&warn, &theme).style.fg, Some(theme.warning));
 
         let mut danger = test_state();
         danger.context_limit_tokens = 1000;
-        danger.context_used_tokens = 900; // 90% used
+        danger.context_used_tokens = 900; // 10% remains
         assert_eq!(context_cell(&danger, &theme).style.fg, Some(theme.error));
     }
 
@@ -6487,22 +6615,22 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
         let wide = status_line(&state, &theme, 180).to_string();
-        assert!(wide.contains("context 25% · 750 left"));
+        assert!(wide.contains("context 75%"));
         assert!(wide.contains("~/Documents/GitHub/blade-deepseek"));
         assert!(wide.contains("git:feature/footer"));
         assert!(wide.contains("8.7k tokens"));
         assert!(wide.contains("F1 shortcuts"));
 
         let medium = status_line(&state, &theme, 92).to_string();
-        assert!(medium.contains("context 25% · 750 left"));
-        assert!(medium.contains("blade-d…"), "{medium}");
+        assert!(medium.contains("context 75%"));
+        assert!(medium.contains("blade-deepseek"), "{medium}");
         assert!(medium.contains("git:feature/footer"));
         assert!(!medium.contains("tokens"));
         assert!(!medium.contains("shortcuts"));
 
         let narrow = status_line(&state, &theme, 46).to_string();
         assert!(narrow.contains("auto-edit"));
-        assert!(narrow.contains("context 25% · 750 left"));
+        assert!(narrow.contains("context 75%"));
         assert!(!narrow.contains("git:"));
         assert!(!narrow.contains("blade-deepseek"));
     }
@@ -6537,7 +6665,7 @@ mod tests {
         assert!(
             status_line(&state, &theme, 100)
                 .to_string()
-                .contains("context 39% · 606.5k left")
+                .contains("context 60%")
         );
     }
 
@@ -6554,7 +6682,7 @@ mod tests {
         let text = status_line(&state, &theme, 46).to_string();
 
         assert!(text.contains("auto-edit"));
-        assert!(text.contains("context 25% · 750 left"));
+        assert!(text.contains("context 75%"));
         assert!(!text.contains("~/workspace"));
         assert!(!text.contains("git:main"));
         assert!(UnicodeWidthStr::width(text.as_str()) <= 46);
@@ -6584,7 +6712,7 @@ mod tests {
 
         let narrow = status_line(&state, &theme, 46).to_string();
         assert!(narrow.contains("auto-edit"));
-        assert!(narrow.contains("context 25% · 750 left"));
+        assert!(narrow.contains("context 75%"));
         assert!(!narrow.contains("tokens"));
         assert!(!narrow.contains("shortcuts"));
 

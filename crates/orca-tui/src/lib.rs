@@ -32,6 +32,7 @@ mod key_event_actions;
 mod mention_menu_actions;
 mod mention_search_manager;
 mod operation_controller;
+mod plan_approval_actions;
 mod queued_input;
 mod queued_input_actions;
 mod running_actions;
