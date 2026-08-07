@@ -6,7 +6,7 @@ use orca_runtime::runtime_host::{RuntimeHost, RuntimeHostHandle};
 
 use crate::action_dispatcher::TuiActionDispatcher;
 use crate::channels::USER_ACTION_CAPACITY;
-use crate::operation_controller::{TuiOperationController, TuiSurfaceTaskControl};
+use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::types::{TuiEvent, UserAction};
 
 pub(crate) struct TuiAgentRuntime {
@@ -21,15 +21,13 @@ impl TuiAgentRuntime {
         action_rx: Receiver<UserAction>,
         event_tx: Sender<TuiEvent>,
         task_capacity: usize,
-        controller: TuiOperationController,
+        control: TuiSurfaceTaskControl,
         run: impl FnOnce(TuiSurfaceTaskControl, Receiver<UserAction>, RuntimeHostHandle)
         + Send
         + 'static,
     ) -> io::Result<Self> {
         let host = RuntimeHost::start_with_background_capacity(task_capacity)
             .map_err(runtime_host_error)?;
-        let control = controller.surface_task_control();
-        drop(controller);
         Self::spawn_with_dispatch_capacities(
             action_rx,
             event_tx,
@@ -126,7 +124,6 @@ mod tests {
     use orca_runtime::runtime_host::HostedTurnRequest;
 
     use super::*;
-    use crate::interaction_broker::TuiInteractionBroker;
     use crate::surface_actions::TuiSurfaceActions;
 
     const TEST_ACTIVATION_OBSERVER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -170,7 +167,7 @@ mod tests {
         event_tx: Sender<TuiEvent>,
         ready_tx: crossbeam_channel::Sender<Result<(), &'static str>>,
     ) -> TuiAgentRuntime {
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::new();
         let operation_events = event_tx.clone();
         TuiAgentRuntime::spawn_hosted(
             action_rx,

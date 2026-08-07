@@ -1114,42 +1114,6 @@ for (const [predicate, functionName] of [
 }
 
 {
-  const relativePath = "crates/orca-tui/src/runtime_interaction_adapter_tests.rs";
-  const syntheticTestModule = `${readFileSync(path.join(repoRoot, relativePath), "utf8")}\n\
-fn ignored_external_cfg_test_helper() { thread.start_turn(request, sink); }\n`;
-  assert.doesNotThrow(
-    () =>
-      validateCurrentInventories(cloneManifest(), {
-        repoRoot,
-        sourceOverrides: new Map([[relativePath, syntheticTestModule]]),
-      }),
-    "externally stored cfg(test) modules do not enter the production mutation baseline",
-  );
-}
-
-{
-  const parentPath = "crates/orca-tui/src/runtime_interaction_adapter.rs";
-  const modulePath = "crates/orca-tui/src/runtime_interaction_adapter_tests.rs";
-  const parentSource = readFileSync(path.join(repoRoot, parentPath), "utf8").replace(
-    '#[cfg(test)]\n#[path = "runtime_interaction_adapter_tests.rs"]\nmod tests;',
-    '#[cfg(all(test, unix))]\n#[path = "runtime_interaction_adapter_tests.rs"]\nmod tests;',
-  );
-  const moduleSource = `${readFileSync(path.join(repoRoot, modulePath), "utf8")}\n\
-fn ignored_external_cfg_all_test_helper() { runtime_thread.mutate(mutation); operation.interrupt(); }\n`;
-  assert.doesNotThrow(
-    () =>
-      validateCurrentInventories(cloneManifest(), {
-        repoRoot,
-        sourceOverrides: new Map([
-          [parentPath, parentSource],
-          [modulePath, moduleSource],
-        ]),
-      }),
-    "external cfg(all(test, unix)) modules do not enter the production mutation baseline",
-  );
-}
-
-{
   const appPath = path.join(repoRoot, "crates/orca-tui/src/app.rs");
   const syntheticApp = `${readFileSync(appPath, "utf8")}\n\
 // ignored_comment.mutate(RuntimeThreadMutation::SetModel(None));\n\

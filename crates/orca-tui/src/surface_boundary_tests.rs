@@ -82,7 +82,7 @@ fn current_user_action_name(action: &UserAction) -> &'static str {
     }
 }
 
-const TUI_ENTRYPOINTS: [&str; 39] = [
+const TUI_ENTRYPOINTS: [&str; 31] = [
     "slash.new",
     "slash.model_write",
     "slash.model_read",
@@ -101,14 +101,6 @@ const TUI_ENTRYPOINTS: [&str; 39] = [
     "slash.trust_mutation",
     "slash_menu.discovery",
     "dispatcher.route_action",
-    "operation_controller.controls",
-    "provider_suspension.poll",
-    "run_hosted_operation",
-    "hosted_event_observer",
-    "approval_handler",
-    "permission_handler",
-    "user_input_handler",
-    "mcp_elicitation_handler",
     "approval_always",
     "background_approval_reconstruction",
     "workflow_result_autosubmit",

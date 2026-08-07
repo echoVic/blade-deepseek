@@ -49,9 +49,16 @@ function killGroup(child) {
 
 function terminalText(output) {
   return output
-    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "")
+    // TUI cell writes can place words in separate cursor-addressed spans.
+    .replace(/\x1b\[[0-9;]*[HfG]/g, " ")
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\x1b[@-_]/g, "");
+}
+
+function terminalOccurrences(output, expected) {
+  const normalized = terminalText(output);
+  return normalized.split(expected).length - 1;
 }
 
 function spawnCaptured(command, commandArgs, options, timeoutMs) {
@@ -139,20 +146,26 @@ async function waitFor(run, expected, timeoutMs, label) {
 
 async function waitForCount(run, expected, count, timeoutMs, label) {
   const deadline = Date.now() + timeoutMs;
-  while (terminalText(run.output()).split(expected).length - 1 < count) {
-    if (Date.now() >= deadline) {
+  while (true) {
+    if (terminalOccurrences(run.output(), expected) >= count) return;
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      // Give a just-delivered PTY chunk one event-loop turn before reporting a
+      // timeout. The child and its output streams are independent callbacks.
+      await new Promise((resolve) => setImmediate(resolve));
+      if (terminalOccurrences(run.output(), expected) >= count) return;
       throw new Error(`${label} missing occurrence ${count} of ${JSON.stringify(expected)}\nstdout:\n${run.output()}\nstderr:\n${run.stderr()}`);
     }
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    await new Promise((resolve) => setTimeout(resolve, Math.min(25, remainingMs)));
   }
 }
 
 async function waitForOptional(run, expected, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
-  while (!terminalText(run.output()).includes(expected) && Date.now() < deadline) {
+  while (terminalOccurrences(run.output(), expected) === 0 && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  return terminalText(run.output()).includes(expected);
+  return terminalOccurrences(run.output(), expected) > 0;
 }
 
 function spawnTui(bin, args, env, timeoutMs, cwd) {

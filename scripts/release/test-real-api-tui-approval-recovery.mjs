@@ -39,12 +39,16 @@ if (scenario === "timeout") {
         : scenario === "terminal-before-flush"
           ? ["approval_requested request-1", "approval_resolved request-1", "cancel_committed turn-1", "terminal_flushed turn-1", "terminal_committed turn-1", "restart_recovered turn-1"]
           : ["approval_requested request-1", "approval_resolved request-1", "cancel_committed turn-1", "terminal_committed turn-1", "terminal_flushed turn-1", "restart_recovered turn-1"];
+  if (scenario === "osc") process.stdout.write("\\u001b]0;before\\u001b\\\\");
   for (const line of lines) {
     const rendered = scenario === "ansi"
       ? line.split("").join("\\u001b[;m")
-      : line;
+      : scenario === "cursor"
+        ? line.replace(" ", "\\u001b[1;20H")
+        : line;
     process.stdout.write("TUI_HARNESS " + rendered + "\\n");
   }
+  if (scenario === "osc") process.stdout.write("\\u001b]0;after\\u001b\\\\");
 }
 `,
 );
@@ -86,6 +90,16 @@ if (!success.ok || !success.output.includes("ORCA_TUI_APPROVAL_RECOVERY_FAKE_OK"
 const ansi = invoke("ansi");
 if (!ansi.ok || !ansi.output.includes("ORCA_TUI_APPROVAL_RECOVERY_FAKE_OK")) {
   throw new Error(`TUI harness ANSI normalization failed:\n${ansi.output}`);
+}
+
+const cursor = invoke("cursor");
+if (!cursor.ok || !cursor.output.includes("ORCA_TUI_APPROVAL_RECOVERY_FAKE_OK")) {
+  throw new Error(`TUI harness cursor-span normalization failed:\n${cursor.output}`);
+}
+
+const osc = invoke("osc");
+if (!osc.ok || !osc.output.includes("ORCA_TUI_APPROVAL_RECOVERY_FAKE_OK")) {
+  throw new Error(`TUI harness OSC normalization failed:\n${osc.output}`);
 }
 
 for (const scenario of ["missing", "wrong-order", "stale", "terminal-before-flush", "timeout", "unreaped"]) {

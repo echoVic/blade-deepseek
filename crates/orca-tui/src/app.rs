@@ -17,8 +17,8 @@ use orca_core::conversation::Message;
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_runtime::history;
 use orca_runtime::runtime_host::{
-    HostedGenerationHandlers, HostedOperationKind, HostedTurnRequest, OperationOutcome,
-    RuntimeHostHandle, RuntimeThreadHandle, RuntimeThreadStartRequest,
+    HostedOperationKind, HostedTurnRequest, RuntimeHostHandle, RuntimeThreadHandle,
+    RuntimeThreadStartRequest,
 };
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
@@ -36,20 +36,16 @@ use crate::composer_textarea::{
     make_setup_textarea, make_textarea, textarea_cursor_byte_index, textarea_text,
 };
 use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
-use crate::hosted_runtime::{TuiHostedEventObserver, TuiHostedOperationOutcome};
+use crate::hosted_runtime::TuiHostedOperationOutcome;
 use crate::input_event_actions::{
     BatchedInputEvent, MouseFlow, coalesce_input_events, consume_focus_event, handle_mouse_event,
     handle_paste_event, handle_resize_event, handle_scroll_lines, should_queue_input_event,
 };
 use crate::input_runtime::{InputControl, InputRuntime, InputRuntimeOptions};
-use crate::interaction_broker::TuiInteractionBroker;
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
-use crate::operation_controller::{TuiOperationController, TuiSurfaceTaskControl, TuiTurnControl};
+use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::runtime_event_actions::handle_runtime_event;
-use crate::runtime_interaction_adapter::{
-    TuiApprovalHandler, TuiMcpElicitationHandler, TuiPermissionRequestHandler, TuiUserInputHandler,
-};
 use crate::slash_command_actions::{SettingsIntent, decode_settings_intent};
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::stdio_guard::RetryWriter;
@@ -341,7 +337,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     let agent_preloaded = Arc::clone(&preloaded_transcript);
     let agent_event_tx = event_tx.clone();
     let agent_workflow_notifications = pending_workflow_notifications.clone();
-    let agent_controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+    let agent_controller = TuiSurfaceTaskControl::new();
 
     let mut agent_runtime = match TuiAgentRuntime::spawn_hosted(
         action_rx,
@@ -1132,7 +1128,7 @@ fn spawn_hosted_tui_test_runtime_with_background_capacity(
 ) -> TuiAgentRuntime {
     let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
     let pending = bridge::PendingWorkflowNotifications::new();
-    let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+    let controller = TuiSurfaceTaskControl::new();
     let agent_config = Arc::clone(&config);
     let agent_preloaded = Arc::clone(&preloaded);
     let agent_events = event_tx.clone();
@@ -1158,41 +1154,6 @@ fn spawn_hosted_tui_test_runtime_with_background_capacity(
 }
 
 #[cfg(test)]
-fn spawn_legacy_feature_test_runtime(
-    config: Arc<Mutex<RunConfig>>,
-    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
-    event_tx: mpsc::Sender<TuiEvent>,
-    action_rx: mpsc::Receiver<UserAction>,
-) -> TuiAgentRuntime {
-    let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
-    let pending = bridge::PendingWorkflowNotifications::new();
-    let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
-    let agent_config = Arc::clone(&config);
-    let agent_preloaded = Arc::clone(&preloaded);
-    let agent_events = event_tx.clone();
-    let legacy_controller = controller.clone();
-    TuiAgentRuntime::spawn_hosted(
-        action_rx,
-        event_tx,
-        8,
-        controller,
-        move |control, commands, host| {
-            hosted_tui_controller_loop_with_ordinary_turn_runner(
-                agent_config,
-                agent_preloaded,
-                agent_events,
-                commands,
-                control,
-                pending,
-                host,
-                OrdinaryTurnRunner::Legacy(legacy_controller),
-            );
-        },
-    )
-    .expect("legacy feature TUI test runtime")
-}
-
-#[cfg(test)]
 fn run_hosted_tui_controller_for_test(
     config: Arc<Mutex<RunConfig>>,
     preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
@@ -1207,25 +1168,6 @@ fn run_hosted_tui_controller_for_test(
         std::thread::sleep(Duration::from_millis(5));
     }
     runtime.shutdown().expect("hosted TUI test shutdown");
-}
-
-#[cfg(test)]
-fn run_legacy_feature_tui_controller_for_test(
-    config: Arc<Mutex<RunConfig>>,
-    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
-    event_tx: mpsc::Sender<TuiEvent>,
-    action_rx: mpsc::Receiver<UserAction>,
-    _cancel: CancelToken,
-    _pending_workflow_notifications: bridge::PendingWorkflowNotifications,
-) {
-    let mut runtime = spawn_legacy_feature_test_runtime(config, preloaded, event_tx, action_rx);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !runtime.controller().is_shutdown() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    runtime
-        .shutdown()
-        .expect("legacy feature TUI test shutdown");
 }
 
 fn now_timestamp() -> i64 {
@@ -2995,15 +2937,14 @@ done
     #[test]
     fn manual_compaction_starts_with_a_fresh_cancel_state() {
         let (event_tx, _event_rx) = mpsc::unbounded();
-        let previous = crate::test_support::HostedOperationHarness::start();
-        let _ = previous.controller().interrupt_current();
-        assert!(previous.cancel_token().is_cancelled());
-        drop(previous);
-        let current = crate::test_support::HostedOperationHarness::start();
+        let previous = CancelToken::new();
+        previous.cancel();
+        assert!(previous.is_cancelled());
+        let current = CancelToken::new();
 
         run_manual_compaction_with_events(&event_tx, || {
             assert!(
-                !current.cancel_token().is_cancelled(),
+                !current.is_cancelled(),
                 "a prior turn interrupt must not cancel the next manual compaction"
             );
             (8, 3)
@@ -3738,7 +3679,7 @@ done
             let (event_tx, event_rx) = mpsc::unbounded();
             let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
             let (action_tx, action_rx) = mpsc::unbounded();
-            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let controller = TuiSurfaceTaskControl::new();
             let agent_config = Arc::clone(&config);
             let agent_preloaded = Arc::clone(&preloaded);
             let agent_events = event_tx.clone();
@@ -3803,8 +3744,8 @@ done
                 .handle()
                 .start_thread(config.clone(), "typed ordinary turn ingress")
                 .expect("runtime thread");
-            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
-            let control = controller.surface_task_control();
+            let controller = TuiSurfaceTaskControl::new();
+            let control = controller.clone();
             let (event_tx, event_rx) = mpsc::unbounded();
 
             run_hosted_ordinary_turn(
@@ -3931,8 +3872,8 @@ done
                 .handle()
                 .start_thread(config.clone(), "typed ordinary turn compaction")
                 .expect("runtime thread");
-            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
-            let control = controller.surface_task_control();
+            let controller = TuiSurfaceTaskControl::new();
+            let control = controller.clone();
             let (event_tx, event_rx) = mpsc::unbounded();
 
             run_hosted_ordinary_turn(
@@ -3947,7 +3888,7 @@ done
             )
             .expect("typed ordinary turn");
             let outcome = match TuiSurfaceActions::new(thread.typed_surface())
-                .manual_compact(&controller.surface_task_control(), &event_tx)
+                .manual_compact(&controller.clone(), &event_tx)
             {
                 Ok(outcome) => outcome,
                 Err(error) => panic!(
@@ -4582,7 +4523,7 @@ done
             let (event_tx, event_rx) = mpsc::unbounded();
             let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
             let (action_tx, action_rx) = mpsc::unbounded();
-            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let controller = TuiSurfaceTaskControl::new();
             let mut runtime = TuiAgentRuntime::spawn_hosted(
                 action_rx,
                 event_tx.clone(),
@@ -4619,7 +4560,7 @@ done
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(Some(transcript("preserved-session"))));
             let (event_tx, event_rx) = mpsc::unbounded();
-            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let controller = TuiSurfaceTaskControl::new();
             let pending = test_pending_workflow_notifications();
             let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
             let host_handle = host.handle();
@@ -4632,10 +4573,9 @@ done
                 &preloaded,
                 &mut thread,
                 &event_tx,
-                &controller.surface_task_control(),
+                &controller.clone(),
                 &pending,
                 &host_handle,
-                &OrdinaryTurnRunner::Typed,
             );
 
             assert!(matches!(
@@ -4855,79 +4795,6 @@ done
     }
 
     #[test]
-    fn hosted_operation_admission_failure_publishes_terminal_event() {
-        with_orca_home(|_| {
-            let cfg = test_config(HistoryMode::Record);
-            let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
-            let runtime_thread = host.start_thread(cfg.clone(), "closed thread").unwrap();
-            runtime_thread.shutdown().unwrap();
-            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
-            let (event_tx, event_rx) = mpsc::unbounded();
-
-            let result = run_hosted_operation(
-                &runtime_thread,
-                HostedTurnRequest::new("cannot start"),
-                cfg,
-                &controller,
-                &event_tx,
-                None,
-            );
-
-            assert!(result.is_err());
-            assert!(matches!(
-                event_rx.recv_timeout(Duration::from_secs(1)),
-                Ok(TuiEvent::SessionCompleted { status }) if status == "failed"
-            ));
-            host.shutdown().unwrap();
-        });
-    }
-
-    #[test]
-    fn queued_operation_controller_install_failure_preserves_queued_identity() {
-        with_orca_home(|_| {
-            let cfg = test_config(HistoryMode::Record);
-            let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
-            let runtime_thread = host
-                .start_thread(cfg.clone(), "queued install failure")
-                .unwrap();
-            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
-            controller.shutdown();
-            let (event_tx, event_rx) = mpsc::unbounded();
-
-            let result = run_hosted_operation(
-                &runtime_thread,
-                HostedTurnRequest::new("restore queued prompt"),
-                cfg,
-                &controller,
-                &event_tx,
-                Some(42),
-            );
-
-            assert!(result.is_err());
-            let events = event_rx.try_iter().collect::<Vec<_>>();
-            let acknowledged = events
-                .iter()
-                .any(|event| matches!(event, TuiEvent::QueuedSubmissionStarted { id: 42 }));
-            let rejected = events.iter().any(|event| {
-                matches!(
-                    event,
-                    TuiEvent::SubmissionRejected {
-                        queued_id: Some(42),
-                        prompt,
-                        message,
-                    } if prompt == "restore queued prompt"
-                        && message.contains("controller is shutting down")
-                )
-            });
-            assert_ne!(
-                acknowledged, rejected,
-                "queued identity must be acknowledged or rejected exactly once: {events:?}"
-            );
-            host.shutdown().unwrap();
-        });
-    }
-
-    #[test]
     fn queued_goal_preflight_failure_preserves_queued_identity() {
         with_orca_home(|_| {
             let cfg = test_config(HistoryMode::Disabled);
@@ -4935,8 +4802,8 @@ done
             let runtime_thread = host
                 .start_thread(cfg.clone(), "queued preflight failure")
                 .unwrap();
-            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
-            let control = controller.surface_task_control();
+            let controller = TuiSurfaceTaskControl::new();
+            let control = controller.clone();
             let (event_tx, event_rx) = mpsc::unbounded();
 
             run_hosted_goal_run(
@@ -4950,7 +4817,6 @@ done
                 orca_core::goal_runtime::GoalTurnOrigin::User,
                 &event_tx,
                 &control,
-                &OrdinaryTurnRunner::Typed,
             );
 
             assert!(matches!(
@@ -4975,7 +4841,7 @@ done
             let (event_tx, event_rx) = mpsc::unbounded();
             let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
             let (action_tx, action_rx) = mpsc::unbounded();
-            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let controller = TuiSurfaceTaskControl::new();
             let mut runtime = TuiAgentRuntime::spawn_hosted(
                 action_rx,
                 event_tx.clone(),
@@ -6131,7 +5997,7 @@ done
     }
 
     #[test]
-    fn workflow_notification_submit_uses_notification_task_label() {
+    fn workflow_notification_submit_uses_one_typed_turn_with_notification_label() {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
@@ -6144,7 +6010,7 @@ done
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_legacy_feature_tui_controller_for_test(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -6165,15 +6031,22 @@ done
                 ))
                 .unwrap();
 
-            let mut tasks = Vec::new();
+            let mut task_id = None;
+            let mut title = None;
+            let mut legacy_task_update_seen = false;
             loop {
                 let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 match event {
-                    TuiEvent::WorkflowTaskUpdated { task }
-                        if task.task_type == orca_core::task_types::TaskType::MainSession =>
-                    {
-                        tasks.push(task);
+                    TuiEvent::TurnStarted {
+                        task: Some(task), ..
+                    } => {
+                        task_id = Some(task.id);
                     }
+                    TuiEvent::SessionIdentityUpdated {
+                        title: session_title,
+                        ..
+                    } => title = Some(session_title),
+                    TuiEvent::WorkflowTaskUpdated { .. } => legacy_task_update_seen = true,
                     TuiEvent::SessionCompleted { .. } => break,
                     _ => {}
                 }
@@ -6182,23 +6055,17 @@ done
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
 
-            assert!(tasks.len() >= 2);
             assert!(
-                tasks.iter().all(|task| task.id == tasks[0].id),
-                "actor and temporary TUI executor must share one task id"
-            );
-            assert!(
-                tasks
-                    .iter()
-                    .all(|task| { task.description == "Workflow notification notification-1" })
+                task_id.is_some(),
+                "typed surface must publish the turn task"
             );
             assert_eq!(
-                tasks.first().unwrap().status,
-                orca_core::task_types::TaskStatus::Running
+                title.as_deref(),
+                Some("Workflow notification notification-1")
             );
-            assert_eq!(
-                tasks.last().unwrap().status,
-                orca_core::task_types::TaskStatus::Completed
+            assert!(
+                !legacy_task_update_seen,
+                "foreground notifications must not publish a second legacy task rail"
             );
         });
     }
@@ -6217,7 +6084,7 @@ done
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_legacy_feature_tui_controller_for_test(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -6240,11 +6107,11 @@ done
 
             loop {
                 let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                if matching_task_update(event, |task| {
-                    task.task_type == orca_core::task_types::TaskType::MainSession
-                })
-                .is_some()
-                {
+                if matches!(
+                    event,
+                    TuiEvent::SessionIdentityUpdated { ref title, .. }
+                        if title == "Workflow notification notification-1"
+                ) {
                     break;
                 }
             }
@@ -8105,32 +7972,6 @@ fn send_submission_error(
     }
 }
 
-#[derive(Clone)]
-enum OrdinaryTurnRunner {
-    Typed,
-    #[cfg(test)]
-    Legacy(TuiOperationController),
-}
-
-impl OrdinaryTurnRunner {
-    fn run(
-        &self,
-        config: &RunConfig,
-        thread: &RuntimeThreadHandle,
-        request: HostedTurnRequest,
-        event_tx: &mpsc::Sender<TuiEvent>,
-        control: &TuiSurfaceTaskControl,
-    ) -> io::Result<TuiHostedOperationOutcome> {
-        match self {
-            Self::Typed => run_hosted_ordinary_turn(config, thread, request, event_tx, control),
-            #[cfg(test)]
-            Self::Legacy(controller) => {
-                run_legacy_feature_turn_for_test(config, thread, request, event_tx, controller)
-            }
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn hosted_tui_controller_loop(
     config: Arc<Mutex<RunConfig>>,
@@ -8140,29 +7981,6 @@ fn hosted_tui_controller_loop(
     control: TuiSurfaceTaskControl,
     pending_workflow_notifications: bridge::PendingWorkflowNotifications,
     host: RuntimeHostHandle,
-) {
-    hosted_tui_controller_loop_with_ordinary_turn_runner(
-        config,
-        preloaded,
-        event_tx,
-        action_rx,
-        control,
-        pending_workflow_notifications,
-        host,
-        OrdinaryTurnRunner::Typed,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn hosted_tui_controller_loop_with_ordinary_turn_runner(
-    config: Arc<Mutex<RunConfig>>,
-    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
-    event_tx: mpsc::Sender<TuiEvent>,
-    action_rx: mpsc::Receiver<UserAction>,
-    control: TuiSurfaceTaskControl,
-    pending_workflow_notifications: bridge::PendingWorkflowNotifications,
-    host: RuntimeHostHandle,
-    ordinary_turn_runner: OrdinaryTurnRunner,
 ) {
     let root_event_tx = event_tx;
     let mut session_attachment = SessionAttachmentId::new(1);
@@ -8481,7 +8299,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                         &control,
                         &pending_workflow_notifications,
                         &host,
-                        &ordinary_turn_runner,
                     );
                 } else {
                     control.cancel_surface_activation();
@@ -8496,7 +8313,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                 &control,
                 &pending_workflow_notifications,
                 &host,
-                &ordinary_turn_runner,
             ),
             Ok(UserAction::SubmitWithMentions { prompt, bindings }) => {
                 handle_hosted_submitted_turn(
@@ -8508,7 +8324,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &control,
                     &pending_workflow_notifications,
                     &host,
-                    &ordinary_turn_runner,
                 );
             }
             Ok(UserAction::SubmitQueued {
@@ -8525,7 +8340,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &control,
                     &pending_workflow_notifications,
                     &host,
-                    &ordinary_turn_runner,
                 );
             }
             Ok(UserAction::SubmitWorkflowNotification(notification)) => {
@@ -8538,7 +8352,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &control,
                     &pending_workflow_notifications,
                     &host,
-                    &ordinary_turn_runner,
                 );
             }
             Ok(UserAction::RunWorkflow { name, args }) => {
@@ -9323,7 +9136,6 @@ fn handle_hosted_submitted_turn(
     control: &TuiSurfaceTaskControl,
     _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     host: &RuntimeHostHandle,
-    ordinary_turn_runner: &OrdinaryTurnRunner,
 ) {
     let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
     let queued_id = submitted_turn.queued_id();
@@ -9362,135 +9174,10 @@ fn handle_hosted_submitted_turn(
         orca_core::goal_runtime::GoalTurnOrigin::User,
         event_tx,
         control,
-        ordinary_turn_runner,
     );
     if cfg.desktop_notifications {
         let _ = orca_runtime::notify::notify("Orca", "Task completed");
     }
-}
-
-pub(crate) fn run_hosted_operation(
-    thread: &RuntimeThreadHandle,
-    request: HostedTurnRequest,
-    config: RunConfig,
-    controller: &TuiOperationController,
-    event_tx: &mpsc::Sender<TuiEvent>,
-    queued_id: Option<u64>,
-) -> io::Result<TuiHostedOperationOutcome> {
-    let operation_kind = request.operation_kind().clone();
-    let rejection_prompt = queued_id.map(|_| request.prompt().to_string());
-    if !matches!(request.operation_kind(), HostedOperationKind::GoalRun) {
-        if let Err(error) = controller.begin_surface_activation() {
-            if let Some(id) = queued_id {
-                let _ = event_tx.send(TuiEvent::SubmissionRejected {
-                    queued_id: Some(id),
-                    prompt: rejection_prompt.unwrap_or_default(),
-                    message: error.to_string(),
-                });
-            } else {
-                send_hosted_operation_terminal_failure(event_tx, &operation_kind);
-            }
-            return Err(error);
-        }
-    }
-    let observer = Arc::new(TuiHostedEventObserver::new_with_queued_id(
-        event_tx.clone(),
-        queued_id,
-    ));
-    let pending_interactions =
-        orca_runtime::runtime_pending_interaction::RuntimePendingInteractionStore::default();
-    let generation_pending_interactions = pending_interactions.clone();
-    let generation_controller = controller.clone();
-    let generation_event_tx = event_tx.clone();
-    let request = request
-        .with_pending_interactions(pending_interactions)
-        .with_event_observer(observer.clone())
-        .with_generation_handlers(move |fence, cancel| {
-            let control = TuiTurnControl::for_generation(
-                generation_controller.clone(),
-                fence.operation_id(),
-                cancel,
-            );
-            HostedGenerationHandlers::default()
-                .with_provider_suspension_control(Arc::new(control.clone()))
-                .with_approval_handler(Arc::new(
-                    TuiApprovalHandler::new(generation_event_tx.clone(), control.clone())
-                        .with_pending_interactions(generation_pending_interactions.clone()),
-                ))
-                .with_permission_handler(Arc::new(
-                    TuiPermissionRequestHandler::new(generation_event_tx.clone(), control.clone())
-                        .with_pending_interactions(generation_pending_interactions.clone()),
-                ))
-                .with_user_input_handler(Arc::new(
-                    TuiUserInputHandler::new(generation_event_tx.clone(), control.clone())
-                        .with_pending_interactions(generation_pending_interactions.clone()),
-                ))
-                .with_mcp_elicitation_handler(Arc::new(
-                    TuiMcpElicitationHandler::new(generation_event_tx.clone(), control)
-                        .with_pending_interactions(generation_pending_interactions.clone()),
-                ))
-        });
-    let operation = match thread.start_turn_with_config(request, io::sink(), config) {
-        Ok(operation) => Arc::new(operation),
-        Err(error) => {
-            if let Some(id) = queued_id {
-                let _ = event_tx.send(TuiEvent::SubmissionRejected {
-                    queued_id: Some(id),
-                    prompt: rejection_prompt.unwrap_or_default(),
-                    message: error.to_string(),
-                });
-            } else {
-                send_hosted_operation_terminal_failure(event_tx, &operation_kind);
-            }
-            return Err(io::Error::other(error.to_string()));
-        }
-    };
-    let operation_id = operation.id();
-    if let Err(error) = controller.install_hosted(Arc::clone(&operation)) {
-        let _ = operation.interrupt();
-        let _ = operation.wait();
-        controller.complete_hosted(operation_id);
-        if let Some(id) = queued_id
-            && !observer.queued_submission_started()
-        {
-            let _ = event_tx.send(TuiEvent::SubmissionRejected {
-                queued_id: Some(id),
-                prompt: rejection_prompt.unwrap_or_default(),
-                message: error.to_string(),
-            });
-        }
-        let terminal_published = observer.finish_foreground().unwrap_or(false);
-        if queued_id.is_none() && !terminal_published {
-            send_hosted_operation_terminal_failure(event_tx, &operation_kind);
-        }
-        return Err(error);
-    }
-    let terminal = operation.wait();
-    controller.complete_hosted(operation_id);
-    let terminal_published = observer.finish_foreground()?;
-    let outcome = match terminal.outcome() {
-        OperationOutcome::Completed(status) => match operation_kind {
-            HostedOperationKind::ManualCompaction => {
-                Ok(TuiHostedOperationOutcome::ManualCompaction)
-            }
-            HostedOperationKind::Turn
-            | HostedOperationKind::GoalRun
-            | HostedOperationKind::BackgroundContinuation { .. } => {
-                Ok(TuiHostedOperationOutcome::Turn {
-                    status: status.as_str().to_string(),
-                })
-            }
-        },
-        OperationOutcome::Backgrounded { .. } => Ok(TuiHostedOperationOutcome::Turn {
-            status: "backgrounded".to_string(),
-        }),
-        OperationOutcome::ExecutionFailed { message, .. }
-        | OperationOutcome::Panicked { message } => Err(io::Error::other(message.clone())),
-    };
-    if outcome.is_err() && !terminal_published {
-        send_hosted_operation_terminal_failure(event_tx, &operation_kind);
-    }
-    outcome
 }
 
 fn send_hosted_action_failure(event_tx: &mpsc::Sender<TuiEvent>, message: String) {
@@ -9525,7 +9212,6 @@ fn run_hosted_goal_run(
     origin: orca_core::goal_runtime::GoalTurnOrigin,
     event_tx: &mpsc::Sender<TuiEvent>,
     control: &TuiSurfaceTaskControl,
-    ordinary_turn_runner: &OrdinaryTurnRunner,
 ) {
     let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
     let queued_id = submitted_turn.queued_id();
@@ -9576,7 +9262,7 @@ fn run_hosted_goal_run(
         let _ = event_tx.send(TuiEvent::QueuedSubmissionStarted { id });
     }
     let request = hosted_turn_request(&submitted_turn, false);
-    let outcome = ordinary_turn_runner.run(config, thread, request, event_tx, control);
+    let outcome = run_hosted_ordinary_turn(config, thread, request, event_tx, control);
     let status = match outcome {
         Ok(TuiHostedOperationOutcome::Turn { status }) => status,
         Ok(TuiHostedOperationOutcome::ManualCompaction) => {
@@ -9606,17 +9292,6 @@ fn run_hosted_ordinary_turn(
         control,
         event_tx,
     )
-}
-
-#[allow(dead_code)]
-fn run_legacy_feature_turn_for_test(
-    config: &RunConfig,
-    thread: &RuntimeThreadHandle,
-    request: HostedTurnRequest,
-    event_tx: &mpsc::Sender<TuiEvent>,
-    controller: &TuiOperationController,
-) -> io::Result<TuiHostedOperationOutcome> {
-    run_hosted_operation(thread, request, config.clone(), controller, event_tx, None)
 }
 
 fn hosted_turn_request(

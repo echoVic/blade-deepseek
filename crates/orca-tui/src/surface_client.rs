@@ -2569,9 +2569,7 @@ mod tests {
 
     #[test]
     fn background_presentation_shutdown_does_not_deadlock_on_a_full_tui_mailbox() {
-        let operation = crate::test_support::HostedOperationHarness::start();
-        let owner = operation.controller().clone();
-        let controller = owner.surface_task_control();
+        let controller = TuiSurfaceTaskControl::new();
         let monitor_controller = controller.clone();
         let (event_tx, _event_rx) = mpsc::bounded(1);
         event_tx
@@ -2605,7 +2603,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("monitor entered send loop");
 
-        owner.shutdown();
+        controller.shutdown();
 
         assert!(exited.load(std::sync::atomic::Ordering::Acquire));
     }

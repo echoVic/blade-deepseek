@@ -31,6 +31,14 @@ domain-restricted network policy fail closed. Atomic replacement and OS locks
 cover the runtime's durable stores, while native x64 and ARM64 runners execute
 platform contracts and the full workspace test suite.
 
+The 2026-08-07 TUI single-surface interaction slice removes the process-local
+TUI interaction broker, four legacy interaction adapters, and the legacy hosted
+turn runner. Production turns and interaction tests now use the typed runtime
+surface and its supervised presentation control. `RuntimePendingInteractionStore`
+remains only for runtime-host's legacy Goal-continuation preflight; deleting it
+is a separate gate requiring a runtime-wide migration plus server/CLI recovery
+evidence.
+
 Earlier v0.2.56 kept the executable as a thin parser and forwarding layer while
 `orca-runtime` and `orca-tui` took ownership of configuration, launch, update,
 history, trust, workflow, protocol, and worker behavior. Stateless JSONL turns
