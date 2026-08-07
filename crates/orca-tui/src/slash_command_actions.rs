@@ -150,7 +150,7 @@ pub(crate) fn handle_slash_command(
             state.enter_running();
             let _ = action_tx.send(UserAction::Compact);
         }
-        SlashCommand::Resume => match RuntimeSurfaceHostHandle::list_saved_sessions(20) {
+        SlashCommand::Resume => match RuntimeSurfaceHostHandle::list_saved_sessions(200) {
             Ok(sessions) if !sessions.is_empty() => {
                 state.reset_queued_user_messages();
                 state.session_picker_sessions = sessions;

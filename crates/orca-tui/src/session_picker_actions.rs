@@ -70,6 +70,10 @@ where
         SessionPickerPhase::Browsing => match key.code {
             KeyCode::Up => state.select_previous_session(),
             KeyCode::Down => state.select_next_session(),
+            KeyCode::PageUp => state.select_session_page_up(),
+            KeyCode::PageDown => state.select_session_page_down(),
+            KeyCode::Home => state.select_first_session(),
+            KeyCode::End => state.select_last_session(),
             KeyCode::Backspace => state.session_query_pop(),
             KeyCode::Char(c) => state.session_query_push(c),
             KeyCode::Enter => dispatch_selected_resume(state, action_tx, clear_terminal)?,

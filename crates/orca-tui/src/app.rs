@@ -291,7 +291,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
             HistoryMode::Resume(_) | HistoryMode::Fork(_)
         );
     let picker_sessions = if should_show_picker {
-        RuntimeSurfaceHostHandle::list_saved_sessions(20).unwrap_or_default()
+        RuntimeSurfaceHostHandle::list_saved_sessions(200).unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -9152,7 +9152,7 @@ fn switch_saved_hosted_session(
 }
 
 fn refresh_saved_session_picker(event_tx: &mpsc::Sender<TuiEvent>, notice: String) {
-    match RuntimeSurfaceHostHandle::list_saved_sessions(20) {
+    match RuntimeSurfaceHostHandle::list_saved_sessions(200) {
         Ok(sessions) => {
             let _ = event_tx.send(TuiEvent::SavedSessionsUpdated { sessions, notice });
         }

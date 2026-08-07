@@ -2552,6 +2552,44 @@ impl AppState {
         self.session_picker_selected = filtered[new_pos];
     }
 
+    pub fn select_session_page_up(&mut self) {
+        let filtered = self.filtered_session_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let pos = filtered
+            .iter()
+            .position(|&i| i == self.session_picker_selected)
+            .unwrap_or(0);
+        let new_pos = pos.saturating_sub(10);
+        self.session_picker_selected = filtered[new_pos];
+    }
+
+    pub fn select_session_page_down(&mut self) {
+        let filtered = self.filtered_session_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let pos = filtered
+            .iter()
+            .position(|&i| i == self.session_picker_selected)
+            .unwrap_or(0);
+        let new_pos = (pos + 10).min(filtered.len() - 1);
+        self.session_picker_selected = filtered[new_pos];
+    }
+
+    pub fn select_first_session(&mut self) {
+        if let Some(&first) = self.filtered_session_indices().first() {
+            self.session_picker_selected = first;
+        }
+    }
+
+    pub fn select_last_session(&mut self) {
+        if let Some(&last) = self.filtered_session_indices().last() {
+            self.session_picker_selected = last;
+        }
+    }
+
     /// Append a character to the search query and reset selection to the first
     /// match so the highlighted row is always within the filtered set.
     pub fn session_query_push(&mut self, ch: char) {

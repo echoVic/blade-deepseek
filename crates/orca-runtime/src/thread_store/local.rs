@@ -475,10 +475,20 @@ pub fn list_sessions_with_archived(
     limit: usize,
     include_archived: bool,
 ) -> io::Result<Vec<SessionSummary>> {
-    let mut summaries = Vec::new();
-    collect_summaries_from_root(&sessions_dir(), false, &mut summaries)?;
+    let mut candidates: Vec<(PathBuf, std::time::SystemTime, bool)> = Vec::new();
+    collect_file_mtimes(&sessions_dir(), false, &mut candidates)?;
     if include_archived {
-        collect_summaries_from_root(&archive_dir(), true, &mut summaries)?;
+        collect_file_mtimes(&archive_dir(), true, &mut candidates)?;
+    }
+
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.truncate(limit);
+
+    let mut summaries = Vec::with_capacity(candidates.len());
+    for (path, _mtime, archived) in &candidates {
+        if let Ok(summary) = summarize_session_with_archive_flag(path, *archived) {
+            summaries.push(summary);
+        }
     }
 
     summaries.sort_by(|a, b| {
@@ -486,7 +496,6 @@ pub fn list_sessions_with_archived(
             .cmp(&a.updated_at)
             .then_with(|| b.created_at.cmp(&a.created_at))
     });
-    summaries.truncate(limit);
     Ok(summaries)
 }
 
@@ -786,6 +795,22 @@ fn collect_summaries_from_root(
     collect_session_files(root, &mut |path| {
         if let Ok(summary) = summarize_session_with_archive_flag(path, archived) {
             summaries.push(summary);
+        }
+    })
+}
+
+fn collect_file_mtimes(
+    root: &Path,
+    archived: bool,
+    out: &mut Vec<(PathBuf, std::time::SystemTime, bool)>,
+) -> io::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    collect_session_files(root, &mut |path| {
+        if let Ok(metadata) = fs::metadata(path) {
+            let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+            out.push((path.to_path_buf(), mtime, archived));
         }
     })
 }
