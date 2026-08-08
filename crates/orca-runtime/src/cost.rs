@@ -1,6 +1,14 @@
 use orca_core::cost_types::UsageTotals;
 use orca_core::provider_types::Usage;
 
+pub(crate) fn usd_to_micros(usd: f64) -> u64 {
+    if usd.is_finite() && usd > 0.0 {
+        (usd * 1_000_000.0).round().min(u64::MAX as f64) as u64
+    } else {
+        0
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CostTracker {
     totals: UsageTotals,
@@ -145,5 +153,13 @@ mod tests {
         assert!(
             (parent.totals.estimated_cost_usd - (parent_cost_before + child_cost)).abs() < 1e-12
         );
+    }
+
+    #[test]
+    fn usd_to_micros_rounds_and_rejects_invalid_values() {
+        assert_eq!(usd_to_micros(0.000_001_5), 2);
+        assert_eq!(usd_to_micros(0.0), 0);
+        assert_eq!(usd_to_micros(-0.1), 0);
+        assert_eq!(usd_to_micros(f64::NAN), 0);
     }
 }

@@ -720,12 +720,13 @@ pub(crate) fn goal_usage_delta(
     before: UsageTotals,
     after: UsageTotals,
 ) -> orca_core::goal_runtime::GoalUsage {
+    let cost_delta = (after.estimated_cost_usd - before.estimated_cost_usd).max(0.0);
+    let cost_micros = i64::try_from(crate::cost::usd_to_micros(cost_delta)).unwrap_or(i64::MAX);
     orca_core::goal_runtime::GoalUsage {
         charged_input_tokens: after.input_tokens.saturating_sub(before.input_tokens) as i64,
         output_tokens: after.output_tokens.saturating_sub(before.output_tokens) as i64,
         cache_tokens: after.cache_tokens.saturating_sub(before.cache_tokens) as i64,
-        cost_micros: ((after.estimated_cost_usd - before.estimated_cost_usd).max(0.0) * 1_000_000.0)
-            as i64,
+        cost_micros,
         ..orca_core::goal_runtime::GoalUsage::default()
     }
 }
@@ -879,6 +880,23 @@ mod tests {
             ..TurnProgressEvidence::default()
         };
         assert!(plan_only.has_substantive_progress());
+    }
+
+    #[test]
+    fn goal_usage_delta_rounds_cost_micros_like_surface_projection() {
+        let usage = goal_usage_delta(
+            UsageTotals::default(),
+            UsageTotals {
+                input_tokens: 7,
+                output_tokens: 3,
+                cache_tokens: 0,
+                estimated_cost_usd: 0.000_001_5,
+            },
+        );
+
+        assert_eq!(usage.charged_input_tokens, 7);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.cost_micros, 2);
     }
 
     #[test]

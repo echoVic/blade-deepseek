@@ -6668,7 +6668,7 @@ fn apply_goal_patch(
                     "finished goal outer-turn receipt does not contain the settled run",
                 ));
             }
-            current.usage = usage.clone();
+            current.usage = accumulate_goal_usage(&current.usage, usage);
             state.snapshot.goal = Some(goal_with_present_receipt(current, &goal_envelope.receipt));
             return Ok(());
         }
@@ -7111,6 +7111,19 @@ fn goal_usage_is_nonnegative(usage: &GoalUsage) -> bool {
         && usage.verifier_tokens >= 0
         && usage.cost_micros >= 0
         && usage.elapsed_seconds >= 0
+}
+
+fn accumulate_goal_usage(total: &GoalUsage, delta: &GoalUsage) -> GoalUsage {
+    GoalUsage {
+        charged_input_tokens: total
+            .charged_input_tokens
+            .saturating_add(delta.charged_input_tokens),
+        output_tokens: total.output_tokens.saturating_add(delta.output_tokens),
+        cache_tokens: total.cache_tokens.saturating_add(delta.cache_tokens),
+        verifier_tokens: total.verifier_tokens.saturating_add(delta.verifier_tokens),
+        cost_micros: total.cost_micros.saturating_add(delta.cost_micros),
+        elapsed_seconds: total.elapsed_seconds.saturating_add(delta.elapsed_seconds),
+    }
 }
 
 fn goal_receipt_is_contiguous(

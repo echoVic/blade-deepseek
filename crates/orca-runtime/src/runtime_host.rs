@@ -12020,6 +12020,10 @@ fn prepare_goal_surface_finalization_worker(
         surface::OperationTerminal::BudgetExhausted { .. } => {
             surface::GoalOuterTurnStatus::BudgetExhausted
         }
+        surface::OperationTerminal::Failed {
+            class: surface::FailureClass::LegacyApprovalRequired,
+            ..
+        } => surface::GoalOuterTurnStatus::ApprovalRequired,
         _ => surface::GoalOuterTurnStatus::Failed,
     };
     let mut goal_usage = surface::GoalUsage {
@@ -37779,18 +37783,11 @@ fn subtract_usage_totals(total: UsageTotals, credit: UsageTotals) -> UsageTotals
 }
 
 fn surface_usage_totals(usage: UsageTotals) -> surface::UsageTotals {
-    let micros = if usage.estimated_cost_usd.is_finite() && usage.estimated_cost_usd > 0.0 {
-        (usage.estimated_cost_usd * 1_000_000.0)
-            .round()
-            .min(u64::MAX as f64) as u64
-    } else {
-        0
-    };
     surface::UsageTotals {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cache_tokens: usage.cache_tokens,
-        estimated_cost_usd_micros: micros,
+        estimated_cost_usd_micros: crate::cost::usd_to_micros(usage.estimated_cost_usd),
     }
 }
 
@@ -38319,6 +38316,10 @@ mod tests {
 
     struct SurfaceGoalCostBudgetExecutor;
 
+    struct SurfaceGoalApprovalExecutor {
+        marker_path: PathBuf,
+    }
+
     struct SharedOutputWriter(Arc<Mutex<Vec<u8>>>);
 
     impl io::Write for SharedOutputWriter {
@@ -38658,6 +38659,100 @@ mod tests {
                 end_reason: crate::lifecycle::TurnEndReason::CostBudgetExhausted,
                 background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
             })
+        }
+    }
+
+    impl ThreadOperationExecutor for SurfaceGoalApprovalExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            events: &mut EventFactory,
+            writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            thread
+                .session_mut()
+                .cost_tracker_mut()
+                .add_usage(orca_core::provider_types::Usage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    cache_tokens: 0,
+                });
+            let turn_id = request.turn_id().as_str();
+            let approval_tool = ToolRequest {
+                id: format!("goal-approval-tool-{turn_id}"),
+                name: ToolName::WriteFile,
+                action: ActionKind::Write,
+                target: Some(self.marker_path.display().to_string()),
+                raw_arguments: Some(
+                    serde_json::json!({
+                        "path": self.marker_path,
+                        "content": "allowed"
+                    })
+                    .to_string(),
+                ),
+            };
+            let update_goal_tool = ToolRequest {
+                id: format!("goal-approval-complete-{turn_id}"),
+                name: ToolName::UpdateGoal,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(
+                    r#"{"status":"complete","reason":"approved Goal tool completed","evidence":[{"kind":"observation","summary":"typed Goal approval fixture passed","target":"runtime_host"}]}"#
+                        .to_string(),
+                ),
+            };
+            let continuation = RuntimeTurnContinuation::from_response(
+                ProviderResponse {
+                    steps: vec![
+                        ProviderStep::ToolCall(approval_tool.clone()),
+                        ProviderStep::ToolCall(update_goal_tool.clone()),
+                    ],
+                    assistant_content: Some("Completing the approved Goal operation.".to_string()),
+                    assistant_reasoning: None,
+                    tool_calls: [&approval_tool, &update_goal_tool]
+                        .into_iter()
+                        .map(|tool| orca_core::conversation::RawToolCall {
+                            id: tool.id.clone(),
+                            function_name: tool.name.as_str().to_string(),
+                            arguments: tool.raw_arguments.clone().unwrap_or_default(),
+                        })
+                        .collect(),
+                    usage: None,
+                },
+                request.turn_id().clone(),
+            );
+            let turn_request = request
+                .thread_turn_request(generation)
+                .with_continuation(continuation);
+            thread
+                .run_request_with_event_factory_and_cancel_outcome_unbound(
+                    generation.config(),
+                    &turn_request,
+                    writer,
+                    events,
+                    cancel.clone(),
+                )
+                .map(|outcome| match outcome {
+                    crate::controller::ThreadTurnOutcome::Completed {
+                        status,
+                        end_reason,
+                        background_workflows,
+                    } => ThreadOperationOutcome::Completed {
+                        status,
+                        end_reason,
+                        background_workflows,
+                    },
+                    crate::controller::ThreadTurnOutcome::ProviderSuspended {
+                        suspension,
+                        background_workflows,
+                    } => ThreadOperationOutcome::ProviderSuspended {
+                        suspension,
+                        background_workflows,
+                    },
+                })
         }
     }
 
@@ -39644,6 +39739,41 @@ mod tests {
                 "typed interaction request was not published"
             );
             std::thread::yield_now();
+        }
+    }
+
+    fn fresh_surface_goal_approval_attachment(
+        handle: &surface::RuntimeSurfaceHandle,
+    ) -> surface::FreshSurfaceAttachment {
+        match handle.attach_fresh(surface::FreshAttachRequest {
+            request_id: surface_request_id(),
+            role: surface::SurfaceAttachmentRole::Tui,
+            requested_capabilities: BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageGoal,
+                surface::SurfaceCapability::RespondGrantedInteraction,
+            ]),
+            interaction_capabilities: BTreeSet::from([
+                surface::SurfaceInteractionKind::ToolApproval,
+            ]),
+        }) {
+            surface::AttachResult::FreshAttached { attachment } => attachment,
+            _ => panic!("attach Goal approval client"),
+        }
+    }
+
+    fn supplied_surface_goal_input(text: &str) -> surface::GoalRunInput {
+        surface::GoalRunInput::Supplied {
+            request: surface::SurfaceInputRequest {
+                blocks: surface::NonEmptyVec::try_new(vec![
+                    surface::SurfaceInputRequestBlock::Text {
+                        text: surface::DisplayText::new(text),
+                    },
+                ])
+                .unwrap(),
+            },
         }
     }
 
@@ -49296,6 +49426,342 @@ mod tests {
             Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
             None => unsafe { std::env::remove_var("ORCA_HOME") },
         }
+    }
+
+    #[test]
+    fn surface_goal_tool_approval_settles_allow_once() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = OrcaHomeRestore::set(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let marker_path = std::fs::canonicalize(cwd.path())
+            .unwrap()
+            .join("goal-approval-allowed");
+        let host = RuntimeHost::start_with_executor(Arc::new(SurfaceGoalApprovalExecutor {
+            marker_path: marker_path.clone(),
+        }))
+        .expect("start Goal approval runtime");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "typed Goal approval allow",
+            )
+            .expect("start recorded Goal approval thread");
+        let surface_handle = thread.surface();
+        let attachment = fresh_surface_goal_approval_attachment(&surface_handle);
+        let mut subscription = surface_handle
+            .claim_subscription(&attachment.subscription)
+            .expect("claim Goal approval subscription");
+        let output = committed_surface_value(
+            attachment
+                .client
+                .goal_mutation(
+                    surface_request_id(),
+                    surface::GoalMutationAction::SetAndRun {
+                        expected_goal: surface::ExpectedGoal::None,
+                        objective: surface::NonEmptyText::try_new(
+                            "complete after one allowed Goal tool",
+                        )
+                        .unwrap(),
+                        token_budget: None,
+                        input: supplied_surface_goal_input(
+                            "request one approval and complete when allowed",
+                        ),
+                    },
+                )
+                .expect("submit allowed Goal approval operation"),
+        );
+        let operation_id = output.operation_id.expect("Goal approval operation id");
+        let goal_id = output
+            .goal
+            .as_ref()
+            .expect("Goal mutation returns Goal projection")
+            .goal_id
+            .clone();
+        let interaction = collect_requested_surface_interaction(&mut subscription);
+        assert!(matches!(
+            interaction.request,
+            surface::SurfaceInteractionRequest::ToolApproval { .. }
+        ));
+        committed_surface_value(
+            attachment
+                .client
+                .respond_interaction_by_id(
+                    surface_request_id(),
+                    interaction.interaction_id,
+                    surface::SurfaceClientInteractionAnswer::ToolApproval {
+                        decision: surface::SurfaceAllowDeny::Allow,
+                    },
+                )
+                .expect("allow Goal tool approval"),
+        );
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait allowed Goal terminal");
+        let surface::WaitOperationTerminalResult::Terminal { value } = terminal else {
+            panic!("allowed Goal terminal wait timed out");
+        };
+        assert!(
+            matches!(value.terminal, surface::OperationTerminal::Succeeded { .. }),
+            "unexpected allowed Goal terminal: {:?}",
+            value.terminal
+        );
+        let snapshot = fresh_surface_attachment(&surface_handle).baseline.snapshot;
+        let goal = snapshot
+            .goal
+            .as_ref()
+            .expect("settled Goal remains visible");
+        assert!(matches!(
+            goal.state,
+            surface::SurfaceGoalState::Complete { .. }
+        ));
+        assert!(
+            goal.current_run.is_none(),
+            "settled Goal run must be terminal"
+        );
+        assert!(marker_path.exists(), "allowed Goal tool must execute once");
+        assert_eq!(goal.usage.charged_input_tokens, 7);
+        assert_eq!(goal.usage.output_tokens, 3);
+        let goal_id = orca_core::goal_runtime::GoalId::parse(goal_id.as_str()).unwrap();
+        let audit = GoalStore::load_default()
+            .unwrap()
+            .audit_snapshot(&goal_id)
+            .unwrap();
+        assert_eq!(audit.outer_turns, 1);
+        assert_eq!(audit.usage_events, 1);
+        assert_eq!(audit.in_flight_runs, 0);
+        host.shutdown().expect("shutdown allowed Goal runtime");
+    }
+
+    #[test]
+    fn surface_goal_approval_denial_pauses_and_resumes_fresh() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = OrcaHomeRestore::set(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let marker_path = std::fs::canonicalize(cwd.path())
+            .unwrap()
+            .join("goal-approval-denied");
+        let host = RuntimeHost::start_with_executor(Arc::new(SurfaceGoalApprovalExecutor {
+            marker_path: marker_path.clone(),
+        }))
+        .expect("start Goal approval runtime");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "typed Goal approval denial",
+            )
+            .expect("start recorded Goal approval thread");
+        let surface_handle = thread.surface();
+        let attachment = fresh_surface_goal_approval_attachment(&surface_handle);
+        let mut subscription = surface_handle
+            .claim_subscription(&attachment.subscription)
+            .expect("claim Goal approval subscription");
+        let output = committed_surface_value(
+            attachment
+                .client
+                .goal_mutation(
+                    surface_request_id(),
+                    surface::GoalMutationAction::SetAndRun {
+                        expected_goal: surface::ExpectedGoal::None,
+                        objective: surface::NonEmptyText::try_new(
+                            "settle approval denial as a typed Goal stop",
+                        )
+                        .unwrap(),
+                        token_budget: None,
+                        input: supplied_surface_goal_input(
+                            "request one approval and stop when denied",
+                        ),
+                    },
+                )
+                .expect("submit Goal approval operation"),
+        );
+        let initial_run = output
+            .goal
+            .as_ref()
+            .and_then(|goal| goal.current_run.as_ref())
+            .expect("Goal mutation starts a live run")
+            .clone();
+        let operation_id = output.operation_id.expect("Goal approval operation id");
+        let goal_id = output
+            .goal
+            .as_ref()
+            .expect("Goal mutation returns Goal projection")
+            .goal_id
+            .clone();
+        let interaction = collect_requested_surface_interaction(&mut subscription);
+        assert!(matches!(
+            interaction.request,
+            surface::SurfaceInteractionRequest::ToolApproval { .. }
+        ));
+        let denied_operation_fence = interaction.fence.clone();
+        committed_surface_value(
+            attachment
+                .client
+                .respond_interaction_by_id(
+                    surface_request_id(),
+                    interaction.interaction_id,
+                    surface::SurfaceClientInteractionAnswer::ToolApproval {
+                        decision: surface::SurfaceAllowDeny::Deny,
+                    },
+                )
+                .expect("deny Goal tool approval"),
+        );
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id.clone())
+            .expect("wait denied Goal terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(
+                    value.terminal,
+                    surface::OperationTerminal::Failed {
+                        class: surface::FailureClass::LegacyApprovalRequired,
+                        ..
+                    }
+                )
+        ));
+        let snapshot = fresh_surface_attachment(&surface_handle).baseline.snapshot;
+        let goal = snapshot
+            .goal
+            .as_ref()
+            .expect("settled Goal remains visible");
+        assert!(matches!(
+            goal.state,
+            surface::SurfaceGoalState::Paused { .. }
+        ));
+        assert!(
+            goal.current_run.is_none(),
+            "settled Goal run must be terminal"
+        );
+        assert!(!marker_path.exists(), "denied Goal tool must not execute");
+        let goal_finished = std::iter::from_fn(|| subscription.try_recv())
+            .flat_map(|item| match item {
+                surface::SurfaceSubscriptionItem::Batch { batch } => batch
+                    .events
+                    .as_slice()
+                    .iter()
+                    .filter_map(|event| match &event.event {
+                        surface::SurfaceEvent::Goal(patch) => Some(patch.patch.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .any(|patch| {
+                matches!(
+                    patch,
+                    surface::GoalPatch::OuterTurnFinished {
+                        status: surface::GoalOuterTurnStatus::ApprovalRequired,
+                        ..
+                    }
+                )
+            });
+        assert!(
+            goal_finished,
+            "approval denial must remain typed at the Goal outer-turn boundary"
+        );
+        assert_eq!(goal.usage.charged_input_tokens, 7);
+        assert_eq!(goal.usage.output_tokens, 3);
+        let goal_id = orca_core::goal_runtime::GoalId::parse(goal_id.as_str()).unwrap();
+        let audit = GoalStore::load_default()
+            .unwrap()
+            .audit_snapshot(&goal_id)
+            .unwrap();
+        assert_eq!(audit.outer_turns, 1);
+        assert_eq!(audit.usage_events, 1);
+        assert_eq!(audit.in_flight_runs, 0);
+
+        let resume_fence = surface::SurfaceGoalFence {
+            goal_id: goal.goal_id.clone(),
+            goal_revision: goal.goal_revision,
+            goal_owner_epoch: goal.goal_owner_epoch,
+        };
+        let resumed = committed_surface_value(
+            attachment
+                .client
+                .goal_mutation(
+                    surface_request_id(),
+                    surface::GoalMutationAction::ResumeAndRun {
+                        fence: resume_fence,
+                        input: supplied_surface_goal_input(
+                            "resume explicitly and allow the fresh operation",
+                        ),
+                    },
+                )
+                .expect("resume denied Goal explicitly"),
+        );
+        let resumed_operation_id = resumed
+            .operation_id
+            .expect("resumed Goal approval operation id");
+        let resumed_run = resumed
+            .goal
+            .as_ref()
+            .and_then(|goal| goal.current_run.as_ref())
+            .expect("resumed Goal starts a live run");
+        assert_ne!(resumed_run.goal_run_id, initial_run.goal_run_id);
+        assert_ne!(resumed_operation_id, operation_id);
+
+        let resumed_interaction = collect_requested_surface_interaction(&mut subscription);
+        assert_eq!(resumed_interaction.fence.operation_id, resumed_operation_id);
+        assert_ne!(resumed_interaction.fence, denied_operation_fence);
+        committed_surface_value(
+            attachment
+                .client
+                .respond_interaction_by_id(
+                    surface_request_id(),
+                    resumed_interaction.interaction_id,
+                    surface::SurfaceClientInteractionAnswer::ToolApproval {
+                        decision: surface::SurfaceAllowDeny::Allow,
+                    },
+                )
+                .expect("allow resumed Goal tool approval"),
+        );
+        let resumed_terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), resumed_operation_id)
+            .expect("wait resumed Goal terminal");
+        let surface::WaitOperationTerminalResult::Terminal { value } = resumed_terminal else {
+            panic!("resumed Goal terminal wait timed out");
+        };
+        let surface::OperationTerminal::Succeeded { usage } = value.terminal else {
+            panic!("resumed Goal did not succeed");
+        };
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 3);
+        let resumed_snapshot = fresh_surface_attachment(&surface_handle).baseline.snapshot;
+        let resumed_goal = resumed_snapshot
+            .goal
+            .as_ref()
+            .expect("resumed Goal remains visible");
+        assert!(matches!(
+            resumed_goal.state,
+            surface::SurfaceGoalState::Complete { .. }
+        ));
+        assert!(resumed_goal.current_run.is_none());
+        assert!(
+            marker_path.exists(),
+            "denied tool may execute only after an explicit fresh resume and Allow"
+        );
+        let final_audit = GoalStore::load_default()
+            .unwrap()
+            .audit_snapshot(&goal_id)
+            .unwrap();
+        let stored_goal = GoalStore::load_default()
+            .unwrap()
+            .get_by_session(thread.thread_id())
+            .unwrap()
+            .expect("resumed Goal remains stored");
+        assert_eq!(resumed_goal.usage.charged_input_tokens, 14);
+        assert_eq!(resumed_goal.usage.output_tokens, 6);
+        assert_eq!(stored_goal.usage.charged_input_tokens, 14);
+        assert_eq!(stored_goal.usage.output_tokens, 6);
+        assert_eq!(final_audit.outer_turns, 2);
+        assert_eq!(final_audit.usage_events, 2);
+        assert_eq!(final_audit.in_flight_runs, 0);
+        host.shutdown().expect("shutdown Goal approval runtime");
     }
 
     #[test]

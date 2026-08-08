@@ -3,7 +3,7 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-08-07
+Last updated: 2026-08-08
 Current baseline: v0.3.8 adds remaining-context visibility, one-to-one
 compaction replay, pending-steer recovery, durable paged subagent results,
 proactive background-task completion notices, stdio MCP reconnect, stale
@@ -41,6 +41,15 @@ source-compatible no-op shims until legacy Goal/server/CLI callers migrate and
 durable broker recovery evidence passes the deletion gate. A Rust deprecation
 attribute is deferred to a separately versioned API migration because it is a
 semver minor change.
+
+The 2026-08-08 Goal interaction-settlement slice keeps TUI approval semantics
+typed across the runtime-to-Goal boundary. Allow executes the approved tool and
+settles the operation and outer turn once. Deny persists `ApprovalRequired`,
+performs no tool side effect, leaves no in-flight run, and requires explicit
+resume with a fresh run, operation, and interaction fence. Operation and durable
+Goal usage now share one rounded micro-dollar conversion, while the surface Goal
+accumulates outer-turn deltas to remain consistent with SQLite across resume.
+This changes no CLI, TUI, server JSONL, or persistence schema.
 
 Earlier v0.2.56 kept the executable as a thin parser and forwarding layer while
 `orca-runtime` and `orca-tui` took ownership of configuration, launch, update,
