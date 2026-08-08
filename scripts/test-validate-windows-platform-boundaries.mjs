@@ -290,7 +290,8 @@ const migratedLockBoundaries = [
 for (const [relativePath, label] of migratedLockBoundaries) {
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   assert.ok(
-    source.includes("orca_platform::fs::ExclusiveFileLock"),
+    source.includes("use orca_platform::fs") &&
+      source.includes("ExclusiveFileLock::"),
     `${label} must use the cross-platform exclusive file lock`,
   );
 }

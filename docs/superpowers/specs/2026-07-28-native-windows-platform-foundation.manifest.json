@@ -25,6 +25,20 @@
   "foundation_exceptions": [],
   "deferred_boundaries": [
     [
+      "thread-store-session-index-unix-fixture",
+      "crates/orca-runtime/src/thread_store/local.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
+      "session-index-unix-fixture",
+      "crates/orca-runtime/src/thread_store/session_index.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "workflow-command-shell-fixture",
       "crates/orca-runtime/src/workflow/command.rs",
       "unix_shell_spawn",
