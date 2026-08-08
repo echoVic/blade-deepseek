@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.10":
+        "Makes TUI interaction lifecycle runtime-owned end to end. Approvals, user input, cancellation, terminal settlement, and replay now use one typed surface rail instead of parallel client state. Goal tool Allow and Deny settle durably with exact usage; Deny pauses without executing the tool, and explicit resume starts a fresh fenced run. Session browsing ignores symlinks, FIFOs, devices, and other non-regular transcript entries, preventing special files from stalling the picker or transcript reader.",
       "v0.3.9":
         "Upgrades Plan mode from a permission-only gate to a full plan-then-execute workflow. The agent now performs read-only exploration, emits a formal proposed plan, and presents a bottom-anchored approval dialog. Approving restores the previous mode and executes the plan automatically; rejecting stays in Plan for further iteration. Per-turn mode context injection ensures Plan constraints apply immediately when switching modes mid-session. PageUp/PageDown and scroll review long plans inline.",
       "v0.3.8":
@@ -576,6 +578,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.10":
+        "TUI 交互生命周期现在端到端归 runtime 所有。审批、用户输入、取消、终态结算与 replay 统一通过一条 typed surface rail，不再维护并行的客户端状态。Goal 工具 Allow 与 Deny 会持久、精确地结算 usage；Deny 不执行工具并暂停 Goal，显式 resume 则启动新的 fenced run。会话浏览会忽略符号链接、FIFO、设备及其他非普通 transcript 文件，避免特殊文件卡住 picker 或历史读取。",
       "v0.3.9":
         "Plan 模式从纯权限开关升级为正式的 plan-then-execute 工作流。Agent 在 Plan 模式下进行只读探索，完成后输出正式 proposed plan，底部弹出审批栏。批准后自动恢复进入 Plan 前的模式并执行计划；拒绝则留在 Plan 继续修改。每回合注入 mode context 确保 mid-session 切换模式即时生效。PageUp/PageDown 和滚轮可回看长计划。",
       "v0.3.8":
