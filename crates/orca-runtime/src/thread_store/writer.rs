@@ -15,8 +15,9 @@ use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_core::thread_identity::{ConversationItemId, TurnId};
 use orca_core::thread_item_projection::CompletedModelResponse;
 use orca_core::tool_types::ToolResult;
-use orca_platform::fs::ExclusiveFileLock;
-use orca_platform::fs::{AtomicWritePolicy, atomic_write_with};
+use orca_platform::fs::{
+    AtomicWritePolicy, ExclusiveFileLock, atomic_write_with, open_nofollow_nonblocking,
+};
 
 use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 
@@ -303,8 +304,19 @@ pub(crate) fn read_history_lines(path: &Path) -> io::Result<Vec<String>> {
     open_history_reader(path)?.lines().collect()
 }
 
+pub(crate) fn open_regular_history_file(path: &Path) -> io::Result<File> {
+    let file = open_nofollow_nonblocking(path).map_err(io::Error::other)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("session history is not a regular file: {}", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
 pub(crate) fn open_history_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
-    let file = File::open(path)?;
+    let file = open_regular_history_file(path)?;
     if path.extension().and_then(|ext| ext.to_str()) == Some("zst") {
         let decoder = zstd::stream::read::Decoder::new(file)?;
         return Ok(Box::new(BufReader::new(decoder)));
@@ -801,7 +813,7 @@ fn restore_plaintext_transcript(path: PathBuf) -> io::Result<PathBuf> {
     let plain_path = path.with_extension("");
     let _lock = acquire_file_lock(&path)?;
     let result = (|| {
-        let input = File::open(&path)?;
+        let input = open_regular_history_file(&path)?;
         let output = File::create(&plain_path)?;
         if let Err(error) = zstd::stream::copy_decode(input, output) {
             let _ = fs::remove_file(&plain_path);
@@ -1265,6 +1277,29 @@ mod tests {
             "expected cost {}, got {}",
             expected.estimated_cost_usd,
             actual.estimated_cost_usd
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_reader_rejects_fifo_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::sync::mpsc;
+
+        let directory = tempfile::tempdir().expect("temporary transcript directory");
+        let fifo = directory.path().join("blocked.jsonl");
+        let fifo_path = CString::new(fifo.as_os_str().as_encoded_bytes()).expect("FIFO path");
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = tx.send(open_history_reader(&fifo).is_err());
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("history reader waited for FIFO writer"),
+            "history reader accepted a FIFO"
         );
     }
 

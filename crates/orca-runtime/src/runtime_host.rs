@@ -37863,7 +37863,6 @@ mod tests {
     use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
     use std::ffi::OsString;
     use std::fs;
-    use std::io::Write;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -37915,7 +37914,6 @@ mod tests {
     #[test]
     fn session_listing_does_not_block_host_supervisor() {
         use std::ffi::CString;
-        use std::fs::OpenOptions;
 
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
@@ -37941,8 +37939,6 @@ mod tests {
             );
             let _ = list_tx.send(result);
         });
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(matches!(list_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
 
         let cwd = tempfile::tempdir().unwrap();
         let (start_tx, start_rx) = mpsc::sync_channel(1);
@@ -37959,15 +37955,11 @@ mod tests {
             .expect("blocked session listing stalled the host supervisor")
             .expect("unrelated runtime thread failed to start");
 
-        OpenOptions::new()
-            .write(true)
-            .open(&fifo)
-            .and_then(|mut writer| writer.write_all(b"\n"))
-            .expect("release blocked session-list reader");
-        list_rx
+        let page = list_rx
             .recv_timeout(SURFACE_TEST_TIMEOUT)
-            .expect("session listing did not settle after FIFO release")
-            .expect("session listing failed after FIFO release");
+            .expect("session listing opened a non-regular history entry")
+            .expect("session listing failed while ignoring a non-regular history entry");
+        assert!(page.data.is_empty());
         list_request.join().unwrap();
         start_request.join().unwrap();
         host.shutdown().expect("shutdown runtime host");

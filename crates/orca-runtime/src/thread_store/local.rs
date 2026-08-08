@@ -26,8 +26,9 @@ use super::types::{
     TurnItemsView,
 };
 use super::writer::{
-    acquire_file_lock, conversation_record_from_semantic_event, read_history_lines, read_records,
-    read_session_meta, read_transcript, rewrite_records_unlocked, write_durable_record,
+    acquire_file_lock, conversation_record_from_semantic_event, open_regular_history_file,
+    read_history_lines, read_records, read_session_meta, read_transcript, rewrite_records_unlocked,
+    write_durable_record,
 };
 use super::{LiveThread, ORCA_HOME_ENV};
 
@@ -415,7 +416,7 @@ pub fn compress_session(selector: &str) -> io::Result<PathBuf> {
     let compressed_path = path.with_extension("jsonl.zst");
     let _lock = acquire_file_lock(&path)?;
     let result = (|| {
-        let input = File::open(&path)?;
+        let input = open_regular_history_file(&path)?;
         let output = File::create(&compressed_path)?;
         if let Err(error) = zstd::stream::copy_encode(input, output, 3) {
             let _ = fs::remove_file(&compressed_path);
@@ -850,14 +851,20 @@ pub(crate) fn is_latest_selector(selector: &str) -> bool {
 pub(crate) fn collect_session_files(dir: &Path, on_file: &mut dyn FnMut(&Path)) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
+        let file_type = entry.file_type()?;
         let path = entry.path();
-        if path.is_dir() {
+        if file_type.is_dir() {
             collect_session_files(&path, on_file)?;
-        } else if is_history_file(&path) {
+        } else if file_type.is_file() && is_history_file(&path) {
             on_file(&path);
         }
     }
     Ok(())
+}
+
+pub(crate) fn is_regular_history_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+        && is_history_file(path)
 }
 
 fn is_history_file(path: &Path) -> bool {
@@ -1238,6 +1245,33 @@ pub(crate) fn sort_thread_search_hits(hits: &mut [StoredThreadSearchHit], sort_k
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn session_discovery_ignores_non_regular_history_entries() {
+        use std::ffi::CString;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let regular = root.path().join("regular.jsonl");
+        fs::write(&regular, b"{}\n").unwrap();
+
+        let fifo = root.path().join("blocked.jsonl");
+        let fifo_path = CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+
+        let symlink_path = root.path().join("linked.jsonl");
+        symlink(&regular, &symlink_path).unwrap();
+
+        let mut discovered = Vec::new();
+        collect_session_files(root.path(), &mut |path| {
+            discovered.push(path.to_path_buf());
+        })
+        .unwrap();
+        discovered.sort();
+
+        assert_eq!(discovered, vec![regular]);
+    }
 
     fn match_line(path: &Path, line_text: &str, line_number: usize) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({

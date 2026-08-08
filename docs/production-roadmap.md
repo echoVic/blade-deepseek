@@ -23,6 +23,15 @@ ConstrainedLanguage. ConPTY owns interactive terminal I/O and resize; Job
 Objects own process-tree cleanup; AltGr and clipboard input follow Windows
 behavior.
 
+The current unreleased session-picker line uses a paginated, searchable SQLite
+summary index. Its filesystem boundary admits only regular `.jsonl` and
+`.jsonl.zst` transcripts, never follows symlinks, and evicts indexed paths that
+become non-regular. History readers also open no-follow/nonblocking handles and
+verify the resulting handle is regular, so a concurrent FIFO replacement cannot
+stall a picker or transcript read. Stateless server checks distinguish recorded
+catalog/transcript state from the empty index infrastructure created by listing.
+This changes no public protocol, SQLite schema, or persisted transcript format.
+
 The Windows sandbox uses restricted tokens or AppContainer according to the
 requested filesystem and network policy. The PowerShell installer verifies the
 release checksum, installs the runner and setup helper, and can provision,

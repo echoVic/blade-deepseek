@@ -9,7 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 
-use super::local::{collect_session_files, orca_home, summarize_session_with_archive_flag};
+use super::local::{
+    collect_session_files, is_regular_history_file, orca_home, summarize_session_with_archive_flag,
+};
 use super::types::{SessionMeta, SessionSummary};
 
 const DATABASE_FILENAME: &str = "sessions-index.sqlite3";
@@ -79,7 +81,7 @@ fn list_page_at(
     for row in rows {
         let (summary_json, path, archived, updated_at_ms) = row.map_err(io::Error::other)?;
         let path = PathBuf::from(path);
-        if !path.exists() {
+        if !is_regular_history_file(&path) {
             stale_paths.push(path);
             continue;
         }
@@ -226,7 +228,7 @@ fn managed_home(path: &Path) -> Option<(PathBuf, bool)> {
 
 pub(crate) fn find_path(session_id: &str, include_archived: bool) -> io::Result<Option<PathBuf>> {
     let connection = open_index(&orca_home())?;
-    connection
+    let path = connection
         .query_row(
             "SELECT path FROM sessions
              WHERE session_id = ?1 AND (?2 = 1 OR archived = 0)",
@@ -235,7 +237,15 @@ pub(crate) fn find_path(session_id: &str, include_archived: bool) -> io::Result<
         )
         .optional()
         .map(|path| path.map(PathBuf::from))
-        .map_err(io::Error::other)
+        .map_err(io::Error::other)?;
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if is_regular_history_file(&path) {
+        return Ok(Some(path));
+    }
+    remove_path_with_connection(&connection, &path)?;
+    Ok(None)
 }
 
 pub(crate) fn ensure_backfill_complete() -> io::Result<()> {
@@ -594,8 +604,13 @@ fn sorted_subdirs(dir: &Path) -> Vec<PathBuf> {
     };
     let mut directories = entries
         .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|file_type| file_type.is_dir())
+                .map(|_| entry.path())
+        })
         .collect::<Vec<_>>();
     directories.sort_by(|left, right| right.cmp(left));
     directories
@@ -607,21 +622,27 @@ fn collect_leaf_files(
     limit: usize,
     out: &mut Vec<(PathBuf, bool)>,
 ) -> io::Result<()> {
-    let mut files = fs::read_dir(dir)?
+    let mut entries = fs::read_dir(dir)?
         .filter_map(Result::ok)
-        .map(|entry| entry.path())
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .map(|file_type| (entry.path(), file_type))
+        })
         .collect::<Vec<_>>();
-    files.sort_by(|left, right| right.cmp(left));
-    for path in files {
+    entries.sort_by(|(left, _), (right, _)| right.cmp(left));
+    for (path, file_type) in entries {
         if out.len() >= limit {
             break;
         }
-        if path.is_dir() {
+        if file_type.is_dir() {
             collect_leaf_files(&path, archived, limit, out)?;
-        } else if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
+        } else if file_type.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
         {
             out.push((path, archived));
         }
@@ -724,6 +745,37 @@ mod tests {
         let second = list_page_at(home.path(), 20, 20, false, None).unwrap();
         assert_eq!(second.sessions.len(), 5);
         assert!(second.backfill_complete);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn indexed_path_replaced_by_symlink_is_evicted() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let summary = write_legacy_session(home.path(), 0);
+        let connection = open_index(home.path()).unwrap();
+        upsert_summary_with_connection(&connection, &summary).unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO index_meta(key, value)
+                 VALUES('backfill_complete', '1')",
+                [],
+            )
+            .unwrap();
+
+        let replacement = home.path().join("replacement.jsonl");
+        fs::rename(&summary.path, &replacement).unwrap();
+        symlink(&replacement, &summary.path).unwrap();
+
+        let page = list_page_at(home.path(), 0, 20, false, None).unwrap();
+        assert!(page.sessions.is_empty());
+        let indexed_count = connection
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(indexed_count, 0);
     }
 
     fn write_legacy_session(home: &Path, index: usize) -> SessionSummary {

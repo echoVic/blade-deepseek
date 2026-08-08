@@ -6095,7 +6095,7 @@ enabled = true
                 1,
                 "terminal transport worker retained its projection writer"
             );
-            assert_stateless_storage_is_empty(&state, home);
+            assert_stateless_session_is_unpersisted(&state, home);
 
             state
                 .shutdown(JsonlSupervisorCloseTrigger::NonIo(
@@ -6135,7 +6135,7 @@ enabled = true
                 .expect("task id binds the ephemeral thread")
                 .to_string();
             assert!(state.threads.jsonl_surface(&thread_id).is_some());
-            assert_stateless_storage_is_empty(&state, home);
+            assert_stateless_session_is_unpersisted(&state, home);
 
             let shutdown_started = std::time::Instant::now();
             state
@@ -6164,9 +6164,9 @@ enabled = true
             assert_eq!(terminals.len(), 1, "shutdown must emit one terminal");
             assert_eq!(terminals[0]["status"], "cancelled");
             assert_eq!(
-                persisted_files_under(home),
+                recorded_session_files_under(home),
                 Vec::<std::path::PathBuf>::new(),
-                "adapter shutdown materialized persisted state under ORCA_HOME"
+                "adapter shutdown materialized a recorded session transcript"
             );
 
             state
@@ -7855,7 +7855,7 @@ rl.on("line", (line) => {
         }
     }
 
-    fn assert_stateless_storage_is_empty(state: &ServerState, home: &std::path::Path) {
+    fn assert_stateless_session_is_unpersisted(state: &ServerState, home: &std::path::Path) {
         assert!(
             state
                 .threads
@@ -7873,14 +7873,17 @@ rl.on("line", (line) => {
             "stateless submit entered the recorded thread catalog"
         );
         assert_eq!(
-            persisted_files_under(home),
+            recorded_session_files_under(home),
             Vec::<std::path::PathBuf>::new(),
-            "stateless submit materialized persisted state under ORCA_HOME"
+            "stateless submit materialized a recorded session transcript"
         );
     }
 
-    fn persisted_files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut pending = vec![root.to_path_buf()];
+    fn recorded_session_files_under(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut pending = [home.join("sessions"), home.join("archive")]
+            .into_iter()
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
         let mut files = Vec::new();
         while let Some(directory) = pending.pop() {
             let Ok(entries) = std::fs::read_dir(directory) else {
@@ -7888,10 +7891,18 @@ rl.on("line", (line) => {
             };
             for entry in entries {
                 let entry = entry.expect("read ORCA_HOME entry");
+                let file_type = entry.file_type().expect("read ORCA_HOME entry type");
                 let path = entry.path();
-                if path.is_dir() {
+                if file_type.is_dir() {
                     pending.push(path);
-                } else {
+                } else if file_type.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.ends_with(".jsonl") || name.ends_with(".jsonl.zst")
+                        })
+                {
                     files.push(path);
                 }
             }
